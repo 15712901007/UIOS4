@@ -1,0 +1,1 @@
+{"uuid": "5aeb31ec-69c9-4080-8b51-33dfe07a0ae9", "children": ["bc2696fa-a9f3-446e-b419-caf93943d486"], "befores": [{"name": "setup_multiple_vlans", "status": "passed", "start": 1771033447765, "stop": 1771033464211}], "afters": [{"name": "setup_multiple_vlans::0", "status": "passed", "start": 1771033483203, "stop": 1771033543858}], "start": 1771033447765, "stop": 1771033543858}

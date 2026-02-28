@@ -1,0 +1,31 @@
+# 爱快路由器4.0自动化测试框架依赖
+
+# Web自动化
+playwright>=1.40.0
+
+# 测试框架
+pytest>=7.4.0
+pytest-html>=4.1.0
+pytest-playwright>=0.4.0
+pytest-xdist>=3.5.0  # 并行执行
+
+# 报告模板
+jinja2>=3.1.0
+
+# GUI框架
+pyside6>=6.6.0
+
+# 定时任务
+apscheduler>=3.10.0
+
+# 配置管理
+pyyaml>=6.0.0
+
+# 数据处理
+pandas>=2.1.0
+
+# 日志增强
+colorlog>=6.8.0
+
+# 工具库
+python-dotenv>=1.0.0

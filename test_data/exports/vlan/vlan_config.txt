@@ -1,0 +1,7 @@
+id=1 enabled=yes comment= vlan_id=100 vlan_name=vlan_edit_1 mac= ip_addr= netmask=255.255.255.0 ip_mask= interface=lan1
+id=2 enabled=yes comment= vlan_id=4090 vlan_name=vlan_max_4090 mac= ip_addr= netmask=255.255.255.0 ip_mask= interface=lan1
+id=4 enabled=yes comment= vlan_id=102 vlan_name=vlan_ip mac= ip_addr=192.168.102.1 netmask=255.255.255.0 ip_mask= interface=lan1
+id=5 enabled=yes comment= vlan_id=103 vlan_name=vlan_mac_ip mac=00:11:22:33:44:03 ip_addr=192.168.103.1 netmask=255.255.255.0 ip_mask= interface=lan1
+id=6 enabled=yes comment=测试备注 vlan_id=104 vlan_name=vlan_remark mac=00:11:22:33:44:04 ip_addr=192.168.104.1 netmask=255.255.255.0 ip_mask= interface=lan1
+id=7 enabled=yes comment= vlan_id=105 vlan_name=vlan_ext mac=00:11:22:33:44:05 ip_addr=192.168.105.1 netmask=255.255.255.0 ip_mask=192.168.105.2/255.255.255.0 interface=lan1
+id=8 enabled=yes comment=完整信息测试 vlan_id=106 vlan_name=vlan_complete mac=00:11:22:33:44:06 ip_addr=192.168.106.1 netmask=255.255.255.0 ip_mask=192.168.106.2/255.255.255.0 interface=lan1

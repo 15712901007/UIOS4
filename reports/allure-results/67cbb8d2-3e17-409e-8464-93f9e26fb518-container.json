@@ -1,0 +1,1 @@
+{"uuid": "2de018c4-04dc-4314-b9b8-a0f13bb6bd54", "children": ["e3bc02c4-6312-4bc4-9b50-10ab0b6d9c7d"], "befores": [{"name": "setup_vlan", "status": "passed", "start": 1770982076061, "stop": 1770982081352}], "afters": [{"name": "setup_vlan::0", "status": "passed", "start": 1770982082029, "stop": 1770982082029}], "start": 1770982076061, "stop": 1770982082029}

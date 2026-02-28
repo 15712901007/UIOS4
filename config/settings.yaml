@@ -1,0 +1,48 @@
+# 爱快路由器4.0自动化测试配置文件
+
+# 设备配置
+device:
+  ip: "10.66.0.150"
+  username: "admin"
+  password: "admin123"
+  port: 80
+  timeout: 30000
+
+# 浏览器配置
+browser:
+  browser_type: "chromium"  # chromium, firefox, webkit
+  headless: false
+  slow_mo: 0
+  timeout: 30000
+  screenshot_on_failure: true
+  video_on_failure: false
+
+# 报告配置
+report:
+  output_dir: "reports/output"
+  template_dir: "reports/templates"
+  screenshot_dir: "reports/screenshots"
+  report_name_prefix: "test_report"
+
+# 测试数据配置
+test_data:
+  # 导出文件存放目录（相对于项目根目录）
+  export_dir: "test_data/exports"
+  # 导入文件存放目录（相对于项目根目录）
+  import_dir: "test_data/imports"
+  # 各模块的导出文件名
+  modules:
+    vlan:
+      export_filename: "vlan_config.csv"  # 导出格式为CSV（导入只支持CSV/TXT）
+      import_filename: "vlan_import.csv"
+    ip_rate_limit:
+      export_filename: "ip_rate_limit_config.csv"
+      import_filename: "ip_rate_limit_import.csv"
+    mac_rate_limit:
+      export_filename: "mac_rate_limit_config.csv"
+      import_filename: "mac_rate_limit_import.csv"
+    # 后续可扩展其他模块
+    # dhcp:
+    #   export_filename: "dhcp_config.csv"
+    # dns:
+    #   export_filename: "dns_config.csv"
