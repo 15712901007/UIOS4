@@ -17,6 +17,17 @@ class VlanPage(IkuaiTablePage):
     # 页面URL路径
     VLAN_URL = "/login#/networkConfiguration/vlanSettings"
 
+    # 列名到HTML id的映射（用于排序）
+    COLUMN_ID_MAP = {
+        "VLAN 名称": "vlan_name",
+        "VLAN ID": "vlan_id",
+        "MAC地址": "mac",
+        "IP地址": "ip_addr_int",
+        "子网掩码": "netmask",
+        "线路": "interface",
+        "备注": "comment",
+    }
+
     # ==================== 导航 ====================
     def navigate_to_vlan_settings(self):
         """导航到VLAN设置页面"""
@@ -373,6 +384,48 @@ class VlanPage(IkuaiTablePage):
         file_chooser = fc_info.value
         file_chooser.set_files(file_path)
         return self
+
+    # ==================== VLAN特有：sort_by_column覆盖 ====================
+    def sort_by_column(self, column_name: str) -> bool:
+        """点击列头排序
+
+        关键发现（通过Playwright录制确认）：
+        1. 排序图标默认不可见，需要先hover到th元素才能显示
+        2. 点击目标是.sortIcon里面的svg图标，而不是th本身
+        3. 每个可排序的列头都有特定的id属性
+        4. 选择器：th#id .sortIcon .anticon svg
+        """
+        try:
+            self.page.wait_for_load_state("networkidle")
+            self.page.wait_for_timeout(300)
+
+            col_id = self.COLUMN_ID_MAP.get(column_name)
+            if not col_id:
+                print(f"[DEBUG] 未知的列名: {column_name}")
+                return False
+
+            # 步骤1：hover到th元素，让排序图标显示
+            th = self.page.locator(f"th#{col_id}")
+            if th.count() == 0:
+                print(f"[DEBUG] 未找到列头 th#{col_id}")
+                return False
+
+            th.hover()
+            self.page.wait_for_timeout(300)
+
+            # 步骤2：点击排序图标（使用force=True因为图标可能仍被判定为不可见）
+            sort_icon = th.locator(".sortIcon .anticon svg")
+            if sort_icon.count() > 0:
+                sort_icon.first.click(force=True)
+                self.page.wait_for_timeout(500)
+                return True
+            else:
+                print(f"[DEBUG] 未找到 '{column_name}' 的排序图标")
+                return False
+
+        except Exception as e:
+            print(f"[DEBUG] sort_by_column error: {e}")
+        return False
 
     # ==================== 向后兼容别名 ====================
     # 测试代码中使用的VLAN特定方法名，映射到基类的通用方法名

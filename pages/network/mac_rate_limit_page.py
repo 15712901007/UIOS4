@@ -464,24 +464,53 @@ class MacRateLimitPage(IkuaiTablePage):
             return False
 
     # ==================== MAC限速特有：sort_by_column覆盖 ====================
+    # 列名到HTML id的映射
+    COLUMN_ID_MAP = {
+        "协议栈": "ip_type",
+        "线路": "interface",
+        "限速模式": "type",
+        "上行限速": "upload",
+        "下行限速": "download",
+    }
+
     def sort_by_column(self, column_name: str) -> bool:
-        """点击列头排序（限定在MAC限速tabpanel内）"""
+        """点击列头排序
+
+        关键发现（通过Playwright录制确认）：
+        1. 排序图标默认不可见，需要先hover到th元素才能显示
+        2. 点击目标是.sortIcon里面的svg图标，而不是th本身
+        3. 每个可排序的列头都有特定的id属性（协议栈=ip_type, 线路=interface等）
+        4. 选择器：th#id .sortIcon .anticon svg
+        """
         try:
-            mac_panel = self.page.get_by_role("tabpanel", name="MAC限速")
-            if mac_panel.count() == 0:
-                mac_panel = self.page.locator("[role='tabpanel']").filter(has_text="MAC")
-            if mac_panel.count() == 0:
-                mac_panel = self.page.locator("[role='tabpanel']").last
-            header = mac_panel.locator("th").filter(has_text=column_name)
-            if header.count() > 0:
-                header.first.click()
+            # 确保在MAC限速tab上
+            self._ensure_mac_tab_active()
+            self.page.wait_for_timeout(500)
+
+            col_id = self.COLUMN_ID_MAP.get(column_name)
+            if not col_id:
+                print(f"[DEBUG] 未知的列名: {column_name}")
+                return False
+
+            # 步骤1：hover到th元素，让排序图标显示
+            th = self.page.locator(f"th#{col_id}")
+            if th.count() == 0:
+                print(f"[DEBUG] 未找到列头 th#{col_id}")
+                return False
+
+            th.hover()
+            self.page.wait_for_timeout(300)  # 等待图标显示动画
+
+            # 步骤2：点击排序图标（使用force=True因为图标可能仍被判定为不可见）
+            sort_icon = th.locator(".sortIcon .anticon svg")
+            if sort_icon.count() > 0:
+                sort_icon.first.click(force=True)
                 self.page.wait_for_timeout(500)
                 return True
-            col_header = mac_panel.get_by_role("columnheader", name=column_name)
-            if col_header.count() > 0:
-                col_header.click()
-                self.page.wait_for_timeout(500)
-                return True
+            else:
+                print(f"[DEBUG] 未找到 '{column_name}' 的排序图标")
+                return False
+
         except Exception as e:
             print(f"[DEBUG] sort_by_column error: {e}")
         return False

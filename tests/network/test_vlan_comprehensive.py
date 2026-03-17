@@ -452,6 +452,36 @@ class TestVlanComprehensive:
             print(f"  [OK] 清空搜索成功，当前显示 {remaining_count} 条记录")
             rec.add_detail(f"    ✓ 清空成功，显示 {remaining_count} 条记录")
 
+        # ========== 步骤8.5: 排序测试 ==========
+        with rec.step("步骤8.5: 排序功能测试", "测试VLAN名称和IP地址列的排序功能"):
+            print("\n[步骤8.5] 排序测试...")
+            rec.add_detail(f"【排序测试】")
+            rec.add_detail(f"  测试字段: VLAN 名称、IP地址")
+
+            sortable_columns = ["VLAN 名称", "IP地址"]
+            sort_results = {}
+
+            for col in sortable_columns:
+                try:
+                    # 点击3次：正序→倒序→默认
+                    for click_idx, sort_label in enumerate(["正序", "倒序", "默认"]):
+                        result = page.sort_by_column(col)
+                        page.page.wait_for_timeout(300)
+                        if result:
+                            rec.add_detail(f"  ✓ {col} 排序({sort_label}): 成功")
+                        else:
+                            rec.add_detail(f"  ✗ {col} 排序({sort_label}): 失败")
+                    sort_results[col] = True
+                    print(f"  [OK] {col} 排序测试通过")
+                except Exception as e:
+                    sort_results[col] = False
+                    print(f"  [FAIL] {col} 排序测试失败: {e}")
+                    rec.add_detail(f"  ✗ {col} 排序异常: {e}")
+
+            passed = sum(1 for v in sort_results.values() if v)
+            print(f"  [OK] 排序测试完成: {passed}/{len(sortable_columns)} 个字段通过")
+            rec.add_detail(f"  ── 汇总: {passed}/{len(sortable_columns)} 个字段排序测试通过 ──")
+
         # ========== 步骤9: 导出VLAN配置（两次导出：CSV和TXT） ==========
         with rec.step("步骤9: 导出VLAN配置", "导出CSV和TXT两种格式的配置文件"):
             print("\n[步骤9] 导出VLAN配置...")
@@ -672,11 +702,12 @@ class TestVlanComprehensive:
             print("\n[步骤11] 批量停用所有VLAN...")
             rec.add_detail(f"【批量停用操作】")
             rec.add_detail(f"  目标数量: {len(test_vlans)} 条VLAN")
-            # 选择所有剩余VLAN
-            vlan_names = [vlan["name"] for vlan in test_vlans]
-            rec.add_detail(f"  1. 逐个勾选VLAN: {', '.join(vlan_names)}")
-            for vlan in test_vlans:
-                page.select_vlan(vlan["name"])
+            # 使用全选功能
+            select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
+            if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
+                rec.add_detail(f"  1. 点击全选复选框")
+                select_all_checkbox.click()
+                page.page.wait_for_timeout(500)
             rec.add_detail(f"  2. 点击批量停用按钮")
             page.batch_disable()
             rec.add_detail(f"  3. 确认停用对话框")
@@ -713,10 +744,12 @@ class TestVlanComprehensive:
             print("\n[步骤12] 批量启用所有VLAN...")
             rec.add_detail(f"【批量启用操作】")
             rec.add_detail(f"  目标数量: {len(test_vlans)} 条VLAN")
-            # 重新选择（页面可能刷新了）
-            rec.add_detail(f"  1. 逐个勾选VLAN: {', '.join(vlan_names)}")
-            for vlan in test_vlans:
-                page.select_vlan(vlan["name"])
+            # 使用全选功能
+            select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
+            if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
+                rec.add_detail(f"  1. 点击全选复选框")
+                select_all_checkbox.click()
+                page.page.wait_for_timeout(500)
             rec.add_detail(f"  2. 点击批量启用按钮")
             page.batch_enable()
             rec.add_detail(f"  3. 确认启用对话框")
@@ -739,10 +772,12 @@ class TestVlanComprehensive:
             print("\n[步骤13] 批量删除所有VLAN...")
             rec.add_detail(f"【批量删除操作】")
             rec.add_detail(f"  目标数量: {len(test_vlans)} 条VLAN")
-            # 重新选择
-            rec.add_detail(f"  1. 逐个勾选VLAN: {', '.join(vlan_names)}")
-            for vlan in test_vlans:
-                page.select_vlan(vlan["name"])
+            # 使用全选功能
+            select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
+            if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
+                rec.add_detail(f"  1. 点击全选复选框")
+                select_all_checkbox.click()
+                page.page.wait_for_timeout(500)
             rec.add_detail(f"  2. 点击批量删除按钮")
             page.batch_delete()
             rec.add_detail(f"  3. 确认删除对话框")

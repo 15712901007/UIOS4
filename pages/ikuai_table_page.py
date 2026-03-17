@@ -366,9 +366,19 @@ class IkuaiTablePage(BasePage):
 
     # ==================== 排序 ====================
 
+    # 子类可覆盖此映射，提供列名到HTML id的映射
+    # 示例: {"协议栈": "ip_type", "线路": "interface"}
+    COLUMN_ID_MAP = {}
+
     def sort_by_column(self, column_name: str) -> bool:
         """
         点击列头排序
+
+        关键发现（通过Playwright录制确认）：
+        1. Ant Design Table排序图标默认不可见，需要先hover到th元素才能显示
+        2. 点击目标是.sortIcon里面的svg图标，而不是th本身
+        3. 子类可通过COLUMN_ID_MAP提供列名到HTML id的精确映射
+        4. 选择器：th#id .sortIcon .anticon svg
 
         Args:
             column_name: 列名
@@ -377,17 +387,48 @@ class IkuaiTablePage(BasePage):
             是否成功
         """
         try:
-            header = self.page.get_by_role("columnheader", name=column_name)
-            if header.count() > 0:
-                header.click()
+            self.page.wait_for_load_state("networkidle")
+            self.page.wait_for_timeout(300)
+
+            th = None
+
+            # 优先使用COLUMN_ID_MAP精确选择
+            if hasattr(self, 'COLUMN_ID_MAP') and column_name in self.COLUMN_ID_MAP:
+                col_id = self.COLUMN_ID_MAP[column_name]
+                th = self.page.locator(f"th#{col_id}")
+                if th.count() == 0:
+                    print(f"[DEBUG] 未找到列头 th#{col_id}")
+                    th = None
+
+            # 备用：通过列名文本查找
+            if th is None:
+                # 尝试通过columnheader role
+                header = self.page.get_by_role("columnheader", name=column_name)
+                if header.count() > 0:
+                    th = header.first
+                else:
+                    # 最后尝试通过th + filter
+                    th_locator = self.page.locator("th").filter(has_text=column_name)
+                    if th_locator.count() > 0:
+                        th = th_locator.first
+                    else:
+                        print(f"[DEBUG] 未找到列头: {column_name}")
+                        return False
+
+            # 步骤1：hover到th元素，让排序图标显示
+            th.hover()
+            self.page.wait_for_timeout(300)  # 等待图标显示动画
+
+            # 步骤2：点击排序图标（使用force=True因为图标可能仍被判定为不可见）
+            sort_icon = th.locator(".sortIcon .anticon svg")
+            if sort_icon.count() > 0:
+                sort_icon.first.click(force=True)
                 self.page.wait_for_timeout(500)
                 return True
-            # 备用：通过th + filter
-            header = self.page.locator("th").filter(has_text=column_name)
-            if header.count() > 0:
-                header.click()
-                self.page.wait_for_timeout(500)
-                return True
+            else:
+                print(f"[DEBUG] 未找到 '{column_name}' 的排序图标")
+                return False
+
         except Exception as e:
             print(f"[DEBUG] sort_by_column error: {e}")
         return False

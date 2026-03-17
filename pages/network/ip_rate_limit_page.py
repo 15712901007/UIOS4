@@ -618,6 +618,56 @@ class IpRateLimitPage(IkuaiTablePage):
 
         return result
 
+    # ==================== IP限速特有：sort_by_column覆盖 ====================
+    # 列名到HTML id的映射
+    COLUMN_ID_MAP = {
+        "线路": "interface",
+        "限速模式": "type",
+        "上行限速": "upload",
+        "下行限速": "download",
+    }
+
+    def sort_by_column(self, column_name: str) -> bool:
+        """点击列头排序
+
+        关键发现（通过Playwright录制确认）：
+        1. 排序图标默认不可见，需要先hover到th元素才能显示
+        2. 点击目标是.sortIcon里面的svg图标，而不是th本身
+        3. 每个可排序的列头都有特定的id属性
+        4. 选择器：th#id .sortIcon .anticon svg
+        """
+        try:
+            self._ensure_ip_tab_active()
+            self.page.wait_for_timeout(500)
+
+            col_id = self.COLUMN_ID_MAP.get(column_name)
+            if not col_id:
+                print(f"[DEBUG] 未知的列名: {column_name}")
+                return False
+
+            # 步骤1：hover到th元素，让排序图标显示
+            th = self.page.locator(f"th#{col_id}")
+            if th.count() == 0:
+                print(f"[DEBUG] 未找到列头 th#{col_id}")
+                return False
+
+            th.hover()
+            self.page.wait_for_timeout(300)
+
+            # 步骤2：点击排序图标（使用force=True因为图标可能仍被判定为不可见）
+            sort_icon = th.locator(".sortIcon .anticon svg")
+            if sort_icon.count() > 0:
+                sort_icon.first.click(force=True)
+                self.page.wait_for_timeout(500)
+                return True
+            else:
+                print(f"[DEBUG] 未找到 '{column_name}' 的排序图标")
+                return False
+
+        except Exception as e:
+            print(f"[DEBUG] sort_by_column error: {e}")
+        return False
+
     # ==================== 排序测试 ====================
     def test_sorting(self) -> dict:
         """测试排序功能"""
@@ -628,14 +678,12 @@ class IpRateLimitPage(IkuaiTablePage):
             "下行限速": False
         }
 
-        columns = ["线路", "限速模式", "上行限速", "下行限速"]
-
-        for col in columns:
+        for col in result.keys():
             try:
-                self.sort_by_column(col)
-                self.page.wait_for_timeout(300)
-                self.sort_by_column(col)
-                self.page.wait_for_timeout(300)
+                # 点击3次：正序→倒序→默认
+                for click_num in range(3):
+                    self.sort_by_column(col)
+                    self.page.wait_for_timeout(500)
                 result[col] = True
             except Exception:
                 result[col] = False

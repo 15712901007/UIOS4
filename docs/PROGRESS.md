@@ -70,6 +70,21 @@
 - [x] **线路选择修复** (2026-03-17)
   - [x] Ant Design多选下拉框选择器修复(.ant-select-item[title='xxx'])
   - [x] 移除错误的早期返回逻辑，确保正确选择wan1/wan2/wan3
+- [x] **排序功能修复** (2026-03-17)
+  - [x] Ant Design Table排序图标默认隐藏，需先hover再点击SVG
+  - [x] 添加COLUMN_ID_MAP映射列名到HTML id
+  - [x] 修复基类IkuaiTablePage.sort_by_column方法
+  - [x] IP限速/静态路由/VLAN模块同步修复
+  - [x] IP限速test_sorting补全第3次点击（正序→倒序→默认）
+
+## Phase 6.5: VLAN模块优化 [100%] (2026-03-17)
+
+- [x] **排序测试补充**
+  - [x] 添加步骤8.5: 排序功能测试
+  - [x] 测试VLAN名称和IP地址两列的排序
+- [x] **批量操作优化**
+  - [x] 步骤11-13批量操作改用全选复选框（原逐个勾选）
+  - [x] 优化后每次批量操作节省约5-6秒，总计约15-18秒
 
 ## Phase 7: SSH后台验证 [100%]
 
