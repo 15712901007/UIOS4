@@ -76,25 +76,19 @@ class MacRateLimitPage(IkuaiTablePage):
             return self
 
         try:
-            # 点击线路下拉框
-            line_combobox = self.page.locator(".ant-select").first
+            # 点击线路下拉框打开
+            # 表单中下拉框顺序: [0]协议栈 [1]线路 [2]MAC组 [3]限速模式 [4]上行单位 [5]下行单位
+            # 线路是第二个下拉框，使用 nth(1)
+            line_combobox = self.page.locator(".ant-select").nth(1)
             if line_combobox.count() > 0:
                 line_combobox.click()
                 self.page.wait_for_timeout(500)
 
-            # 等待下拉选项加载
-            self.page.wait_for_timeout(300)
-
-            # 在下拉框的tooltip容器内查找包含目标线路名称的label
-            # MAC限速的线路下拉框选项结构是: tooltip > generic > label > checkbox + text
-            # 使用更精确的选择器：在下拉框容器内查找label
-            dropdown_container = self.page.locator(".ant-select-dropdown")
-            if dropdown_container.count() > 0:
-                # 在下拉框容器内查找包含目标文本的label
-                line_option = dropdown_container.locator("label").filter(has_text=line).first
-                if line_option.count() > 0:
-                    line_option.click()
-                    self.page.wait_for_timeout(200)
+            # 使用 checkbox role 选择线路 - 这是多选下拉框，选项结构是 checkbox + text
+            line_checkbox = self.page.get_by_role("checkbox", name=line)
+            if line_checkbox.count() > 0:
+                line_checkbox.click()
+                self.page.wait_for_timeout(200)
 
             # 关闭下拉框
             self.page.keyboard.press("Escape")

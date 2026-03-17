@@ -1,5 +1,107 @@
 # 开发日志
 
+## 2026-03-17 MAC限速线路选择修复（第四次修复 - 最终版）
+
+### 问题描述
+- **现象**: MAC限速测试添加的规则线路都显示为"任意"，实际应该是指定的线路(wan1/wan2/wan3/全部)
+- **前三次修复失败原因**:
+  1. 第一次: 移除了早期返回逻辑，但选择器 `.ant-select-item[title='xxx']` 不正确
+  2. 第二次: 选择器 `.ant-select-dropdown` + `label.filter(has_text=line)` 不匹配实际DOM
+  3. 第三次: `get_by_role("checkbox", name=line)` 选择器正确，但使用了 `.ant-select.first` 打开了错误的下拉框
+
+### 根因分析（MCP-Playwright实测确认）
+通过 `page.evaluate()` 检查表单中的 `.ant-select` 元素顺序：
+```javascript
+document.querySelectorAll('.ant-select')
+// 结果:
+// [0] 协议栈 (IPv4)     ← .first 选择的是这个！
+// [1] 线路 (任意/wan1...)  ← 这才是正确的目标
+// [2] MAC组
+// [3] 限速模式
+// [4] 上行限速单位
+// [5] 下行限速单位
+```
+
+**关键错误**: 代码使用 `.ant-select.first` 打开的是协议栈下拉框，而不是线路下拉框！
+
+### 最终修复方案
+使用 `nth(1)` 选择第二个下拉框（线路）：
+
+```python
+def select_line(self, line: str = "任意"):
+    if line == "任意":
+        return self
+    try:
+        # 点击线路下拉框打开
+        # 表单中下拉框顺序: [0]协议栈 [1]线路 [2]MAC组 [3]限速模式 [4]上行单位 [5]下行单位
+        # 线路是第二个下拉框，使用 nth(1)
+        line_combobox = self.page.locator(".ant-select").nth(1)
+        if line_combobox.count() > 0:
+            line_combobox.click()
+            self.page.wait_for_timeout(500)
+
+        # 使用 checkbox role 选择线路 - 这是多选下拉框，选项结构是 checkbox + text
+        line_checkbox = self.page.get_by_role("checkbox", name=line)
+        if line_checkbox.count() > 0:
+            line_checkbox.click()
+            self.page.wait_for_timeout(200)
+
+        # 关闭下拉框
+        self.page.keyboard.press("Escape")
+        self.page.wait_for_timeout(200)
+    except Exception as e:
+        print(f"[DEBUG] select_line error: {e}")
+    return self
+```
+
+### 文件变更
+```
+修改:
+  pages/network/mac_rate_limit_page.py  # select_line()方法 - 使用nth(1)选择正确的下拉框
+```
+
+### 验证方法
+1. MCP-Playwright实测：使用 `nth(1)` 后，`get_by_role("checkbox", name="wan1")` 成功选中wan1
+2. 运行MAC限速综合测试，检查报告中线路值是否正确
+
+---
+
+## 2026-03-17 MAC限速线路选择修复（第三次修复）
+
+### 问题描述
+- **现象**: MAC限速测试添加的规则线路都显示为"任意"，实际应该是指定的线路(wan1/wan2/wan3/全部)
+- **前两次修复失败原因**:
+  1. 第一次: 移除了早期返回逻辑，但选择器 `.ant-select-item[title='xxx']` 不正确
+  2. 第二次: 选择器 `.ant-select-dropdown` + `label.filter(has_text=line)` 仍然不匹配实际DOM
+
+### 根因分析（MCP-Playwright实测确认）
+通过MCP-Playwright探索MAC限速页面，发现线路下拉框的实际DOM结构：
+```yaml
+- tooltip "全部 wan1 wan2 wan3":
+  - generic:
+    - generic [cursor=pointer]:
+      - checkbox "全部"
+      - generic: 全部
+    - generic:
+      - generic [cursor=pointer]:
+        - checkbox "wan1"
+        - generic: wan1
+      ...
+```
+- 下拉框容器是 `tooltip`（不是 `.ant-select-dropdown`）
+- 选项是 `checkbox` role，直接带name属性
+
+### 修复方案（仍有问题）
+使用 `get_by_role("checkbox", name=line)` 直接选择（但使用了错误的 `.first` 选择器）
+
+### 文件变更
+```
+修改:
+  pages/network/mac_rate_limit_page.py  # select_line()方法 - 使用get_by_role("checkbox", name=line)
+```
+
+---
+
 ## 2026-03-17 MAC限速线路选择修复（第二次修复）
 
 ### 问题描述
