@@ -23,12 +23,7 @@ import pytest
 import os
 import sys
 import io
-
-# 解决Windows控制台GBK编码问题，同时确保实时输出
-if sys.platform == 'win32':
-    # 使用write_through=True确保实时输出（Python 3.7+）
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', write_through=True)
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', write_through=True)
+from datetime import datetime
 
 from pages.network.ip_rate_limit_page import IpRateLimitPage
 from config.config import get_config
@@ -40,14 +35,65 @@ from utils.step_recorder import StepRecorder
 class TestIpRateLimitComprehensive:
     """IP限速综合测试 - 一次测试覆盖所有功能"""
 
-    def test_ip_rate_limit_comprehensive(self, ip_rate_limit_page_logged_in: IpRateLimitPage, step_recorder: StepRecorder):
+    def test_ip_rate_limit_comprehensive(self, ip_rate_limit_page_logged_in: IpRateLimitPage, step_recorder: StepRecorder, request):
         """
         综合测试: 添加8种场景 -> 编辑 -> 停用 -> 启用 -> 删除 -> 搜索 -> 排序 -> 导出 -> 异常测试 -> 批量操作
 
         测试步骤参照测试文档v1.5
+        集成SSH后台验证：在关键操作后验证数据库/iptables/ipset/内核状态
         """
         page = ip_rate_limit_page_logged_in
         rec = step_recorder
+
+        # 动态获取backend_verifier fixture（可选，未配置SSH时为None）
+        try:
+            backend_verifier = request.getfixturevalue('backend_verifier')
+        except (pytest.FixtureLookupError, Exception):
+            backend_verifier = None
+
+        # SSH后台验证辅助函数 + 软断言收集器
+        ssh_failures = []  # 收集must_pass=True但验证失败的项，测试末尾统一断言
+
+        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
+            """执行SSH后台验证并记录结果。must_pass=True时失败会记录到ssh_failures"""
+            if backend_verifier is None:
+                return None
+            try:
+                result = verify_func(*args, **kwargs)
+                status = '通过' if result.passed else '失败'
+                print(f"    SSH-{label}: {status} - {result.message}")
+                rec.add_detail(f"    SSH-{label}: {'✓' if result.passed else '✗'} {result.message}")
+                if must_pass and not result.passed:
+                    ssh_failures.append(f"SSH-{label}: {result.message}")
+                return result
+            except Exception as e:
+                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                return None
+
+        def ssh_find_rule(tagname):
+            """通过SSH查找数据库中的规则"""
+            if backend_verifier is None:
+                return None
+            try:
+                return backend_verifier.find_qos_rule("simple_qos", tagname=tagname)
+            except Exception:
+                return None
+
+        def capture_error_screenshot(rule_name, context="add"):
+            """在操作失败时立即截图，保存到reports/screenshots目录"""
+            try:
+                config = get_config()
+                screenshot_dir = config.report.screenshot_dir
+                os.makedirs(screenshot_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_name = f"{rule_name}_{context}_{timestamp}_error.png"
+                screenshot_path = os.path.join(screenshot_dir, screenshot_name)
+                page.page.screenshot(path=screenshot_path)
+                print(f"  [截图] 错误现场已保存: {screenshot_path}")
+                rec.add_detail(f"  [截图] 错误现场: {screenshot_name}")
+            except Exception as e2:
+                print(f"  [截图] 保存失败: {str(e2)[:50]}")
 
         # 测试数据 - 9条规则，覆盖各种数据组合场景
         # 包含：不同线路、不同协议、不同内网地址、有意义的备注
@@ -63,9 +109,9 @@ class TestIpRateLimitComprehensive:
             # 规则5: CIDR格式 + 全部协议 + 全部线路
             {"name": "ip_test_005", "line": "全部", "ip": "192.168.10.0/24", "protocol": "tcp+udp", "mode": "独立限速", "upload": 1024, "download": 2048, "remark": "CIDR格式限速-全部协议-全部线路", "desc": "CIDR+全部协议"},
             # 规则6: IP分组（需要在步骤4中创建）
-            {"name": "ip_test_006", "line": "任意", "ip_group": "test_ip_group_001", "protocol": "tcp", "mode": "独立限速", "upload": 1024, "download": 2048, "remark": "IP分组限速测试", "desc": "IP分组"},
+            {"name": "ip_test_006", "line": "任意", "ip_group": "t_ipgrp_001", "protocol": "tcp", "mode": "独立限速", "upload": 1024, "download": 2048, "remark": "IP分组限速测试", "desc": "IP分组"},
             # 规则7: 时间计划（需要在步骤5中创建）
-            {"name": "ip_test_007", "line": "任意", "time_plan": "test_time_plan_001", "protocol": "udp", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "时间计划限速-udp协议", "desc": "时间计划"},
+            {"name": "ip_test_007", "line": "任意", "time_plan": "t_plan_ip_001", "protocol": "udp", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "时间计划限速-udp协议", "desc": "时间计划"},
             # 规则8: 完整信息 - 共享限速 + wan1线路
             {"name": "ip_test_008", "line": "wan1", "ip": "192.168.20.1-192.168.20.100", "protocol": "tcp+udp", "mode": "共享限速", "upload": 2048, "download": 4096, "remark": "共享限速测试-wan1线路-完整信息", "desc": "完整信息"},
             # 规则9: 批量添加多个IP（使用"批量"按钮）- 包含单个IP和CIDR格式（批量对话框不支持IP段）
@@ -233,10 +279,10 @@ class TestIpRateLimitComprehensive:
         with rec.step("步骤5: 创建测试用时间计划", "导航到时间计划页面创建"):
             print("\n[步骤5] 创建测试用时间计划...")
             rec.add_detail(f"【创建时间计划】")
-            rec.add_detail(f"  计划名称: test_time_plan_001")
+            rec.add_detail(f"  计划名称: t_plan_ip_001")
             rec.add_detail(f"  计划类型: 按周循环")
             rec.add_detail(f"  生效日期: 周一至周五")
-            rec.add_detail(f"  生效时间: 09:00-18:00")
+            rec.add_detail(f"  生效时间: 23:11-23:12（故意设为非生效时间，验证时间计划未生效时iptables无规则）")
             rec.add_detail(f"  创建方式: 跳转到时间计划专门页面创建")
 
             # 导航到路由对象页面，点击时间计划tab
@@ -259,7 +305,7 @@ class TestIpRateLimitComprehensive:
 
             try:
                 # 填写计划名称
-                page.page.get_by_role("textbox", name="计划名称").fill("test_time_plan_001")
+                page.page.get_by_role("textbox", name="计划名称").fill("t_plan_ip_001")
 
                 # 选择按周循环（通常默认选中）
                 week_radio = page.page.get_by_role("radio", name="按周循环")
@@ -267,29 +313,35 @@ class TestIpRateLimitComprehensive:
                     week_radio.click()
                     page.page.wait_for_timeout(200)
 
-                # 选择周一到周五
-                weekdays = ["一", "二", "三", "四", "五"]
-                for day in weekdays:
-                    day_locator = page.page.locator(f"text={day}").first
-                    if day_locator.count() > 0:
-                        parent = day_locator.locator("..")
-                        checkbox = parent.locator("input[type='checkbox']")
-                        if checkbox.count() > 0 and not checkbox.is_checked():
-                            checkbox.click()
-                            page.page.wait_for_timeout(100)
+                # 选择周一到周五：默认全选(一到日)，点击"六"和"日"取消选中
+                # 生效日期区域的星期按钮是可点击的generic元素，不是checkbox
+                date_section = page.page.locator("text=生效日期").locator("..")
+                for day in ["六", "日"]:
+                    day_btn = date_section.locator(f"text={day}")
+                    if day_btn.count() > 0:
+                        day_btn.click()
+                        page.page.wait_for_timeout(100)
 
-                # 设置时间范围
-                time_inputs = page.page.locator("input[type='time']")
-                if time_inputs.count() >= 2:
-                    time_inputs.first.fill("09:00")
-                    time_inputs.last.fill("18:00")
+                # 设置时间范围：故意设为23:11-23:12，确保测试时不在生效时间内
+                # 注意：iKuai时间输入框fill()可能不触发onChange，需要先清空再输入
+                start_time = page.page.get_by_placeholder("开始时间")
+                end_time = page.page.get_by_role("textbox", name="结束时间")
+                if start_time.count() > 0:
+                    start_time.click()
+                    start_time.press("Control+a")
+                    start_time.type("23:11", delay=50)
+                if end_time.count() > 0:
+                    end_time.click()
+                    end_time.press("Control+a")
+                    end_time.type("23:12", delay=50)
+                page.page.wait_for_timeout(200)
 
                 # 点击保存
                 page.page.get_by_role("button", name="保存").click()
                 page.page.wait_for_timeout(500)
 
                 rec.add_detail(f"  [OK] 时间计划创建成功")
-                print("  [OK] 时间计划 test_time_plan_001 创建成功")
+                print("  [OK] 时间计划 t_plan_ip_001 创建成功")
             except Exception as e:
                 rec.add_detail(f"  [WARN] 时间计划创建失败: {str(e)[:50]}")
                 print(f"  [WARN] 时间计划创建失败: {e}")
@@ -363,15 +415,25 @@ class TestIpRateLimitComprehensive:
                             print(f"  + 已添加: {rule['name']} - {rule['desc']} (含IP分组创建)")
                             rec.add_detail(f"  ✓ 添加成功（已创建IP分组）")
                             added_count += 1
+                            # 等待页面自动返回列表并刷新，确保下一条规则能正常添加
+                            page.page.wait_for_timeout(1500)
+                            page.page.reload()
+                            page.page.wait_for_load_state("networkidle")
+                            page.page.wait_for_timeout(500)
                         else:
                             print(f"  - 添加失败: {rule['name']}")
                             rec.add_detail(f"  ✗ 添加失败")
                             page.close_modal_if_exists()
+                            page.navigate_to_ip_rate_limit()
+                            page.page.wait_for_timeout(500)
 
                     except Exception as e:
                         print(f"  - 添加失败: {rule['name']}, 错误: {e}")
                         rec.add_detail(f"  ✗ 添加失败: {str(e)[:50]}")
+                        capture_error_screenshot(rule["name"], "ip_group_add")
                         page.close_modal_if_exists()
+                        page.navigate_to_ip_rate_limit()
+                        page.page.wait_for_timeout(500)
 
                 # 对于需要时间计划的规则，时间计划已在步骤5创建，直接选择即可
                 elif rule.get("time_plan"):
@@ -408,15 +470,25 @@ class TestIpRateLimitComprehensive:
                             print(f"  + 已添加: {rule['name']} - {rule['desc']} (使用时间计划)")
                             rec.add_detail(f"  ✓ 添加成功（使用时间计划）")
                             added_count += 1
+                            # 等待页面自动返回列表并刷新，确保下一条规则能正常添加
+                            page.page.wait_for_timeout(1500)
+                            page.page.reload()
+                            page.page.wait_for_load_state("networkidle")
+                            page.page.wait_for_timeout(500)
                         else:
                             print(f"  - 添加失败: {rule['name']}")
                             rec.add_detail(f"  ✗ 添加失败")
                             page.close_modal_if_exists()
+                            page.navigate_to_ip_rate_limit()
+                            page.page.wait_for_timeout(500)
 
                     except Exception as e:
                         print(f"  - 添加失败: {rule['name']}, 错误: {e}")
                         rec.add_detail(f"  ✗ 添加失败: {str(e)[:50]}")
+                        capture_error_screenshot(rule["name"], "time_plan_add")
                         page.close_modal_if_exists()
+                        page.navigate_to_ip_rate_limit()
+                        page.page.wait_for_timeout(500)
 
                 # 对于需要批量添加IP的规则，使用"批量"按钮添加多个IP
                 elif rule.get("batch_ips"):
@@ -455,15 +527,25 @@ class TestIpRateLimitComprehensive:
                             print(f"  + 已添加: {rule['name']} - {rule['desc']} (批量添加{len(rule['batch_ips'])}个IP)")
                             rec.add_detail(f"  ✓ 添加成功（批量添加{len(rule['batch_ips'])}个IP）")
                             added_count += 1
+                            # 等待页面自动返回列表并刷新，确保下一条规则能正常添加
+                            page.page.wait_for_timeout(1500)
+                            page.page.reload()
+                            page.page.wait_for_load_state("networkidle")
+                            page.page.wait_for_timeout(500)
                         else:
                             print(f"  - 添加失败: {rule['name']}")
                             rec.add_detail(f"  ✗ 添加失败")
                             page.close_modal_if_exists()
+                            page.navigate_to_ip_rate_limit()
+                            page.page.wait_for_timeout(500)
 
                     except Exception as e:
                         print(f"  - 添加失败: {rule['name']}, 错误: {e}")
                         rec.add_detail(f"  ✗ 添加失败: {str(e)[:50]}")
+                        capture_error_screenshot(rule["name"], "batch_add")
                         page.close_modal_if_exists()
+                        page.navigate_to_ip_rate_limit()
+                        page.page.wait_for_timeout(500)
 
                 # 普通规则，使用标准流程
                 else:
@@ -495,6 +577,7 @@ class TestIpRateLimitComprehensive:
                     else:
                         print(f"  - 添加失败: {rule['name']}")
                         rec.add_detail(f"  ✗ 添加失败")
+                        capture_error_screenshot(rule["name"], "normal_add")
                         # 关闭弹窗，避免遮挡后续操作
                         page.close_modal_if_exists()
 
@@ -516,11 +599,94 @@ class TestIpRateLimitComprehensive:
             print(f"  [OK] 成功添加 {actual_added}/{len(test_rules)} 条规则")
             rec.add_detail(f"  ✓ 实际验证: {actual_added}/{len(test_rules)} 条规则已存在于列表中")
 
+        # ========== 步骤6.5: 后台数据验证（SSH全链路） ==========
+        if backend_verifier is not None:
+            with rec.step("步骤6.5: 后台数据验证（SSH全链路）", "SSH验证每条规则的数据库/iptables/ipset/内核"):
+                print("\n[步骤6.5] 后台数据验证（SSH全链路）...")
+                rec.add_detail("【SSH后台全链路验证】")
+
+                # L4: 内核验证（全局检查一次即可）
+                ssh_verify("L4-内核", backend_verifier.verify_kernel, must_pass=True)
+
+                # 逐条验证已添加的规则
+                verify_passed = 0
+                verify_total = 0
+                for rule in test_rules:
+                    verify_total += 1
+                    rule_name = rule["name"]
+                    rec.add_detail(f"  ── 验证规则: {rule_name} ──")
+                    print(f"  验证规则: {rule_name}")
+
+                    # L1: 数据库验证 - 检查规则存在且字段正确
+                    expected_fields = {
+                        "upload": str(rule["upload"]),
+                        "download": str(rule["download"]),
+                    }
+                    l1 = ssh_verify(
+                        f"L1-数据库({rule_name})",
+                        backend_verifier.verify_qos_database,
+                        "simple_qos",
+                        must_pass=True,
+                        expected_fields=expected_fields,
+                        tagname=rule_name,
+                    )
+
+                    if l1 and l1.passed:
+                        rule_id = l1.details.get("rule", {}).get("id")
+                        db_rule = l1.details.get("rule", {})
+                        rec.add_detail(f"      数据库字段: id={rule_id}, upload={db_rule.get('upload')}, download={db_rule.get('download')}, enabled={db_rule.get('enabled')}")
+
+                        # L2: iptables验证 - 检查上下行限速规则
+                        # 无IP的规则跳过（0限速已在外层跳过）
+                        # 时间计划规则(23:11-23:12)不在生效时间内，iptables中无规则，跳过断言
+                        l2_must_pass = rule.get("ip") is not None and "time_plan" not in rule
+                        if rule["upload"] > 0:
+                            ssh_verify(
+                                f"L2-iptables-上行({rule_name})",
+                                backend_verifier.verify_iptables_rule,
+                                "IP_QOS",
+                                must_pass=l2_must_pass,
+                                rule_id=rule_id,
+                                expected_speed_kbps=rule["upload"],
+                            )
+                        if rule["download"] > 0:
+                            ssh_verify(
+                                f"L2-iptables-下行({rule_name})",
+                                backend_verifier.verify_iptables_rule,
+                                "IP_QOS",
+                                must_pass=l2_must_pass,
+                                rule_id=rule_id,
+                                expected_speed_kbps=rule["download"],
+                            )
+
+                        # L3: ipset验证 - 检查IP是否在ipset中
+                        rule_ip = rule.get("ip")
+                        if rule_ip and rule_id:
+                            # 取第一个IP（如果是IP段取起始IP，CIDR取网络地址）
+                            check_ip = rule_ip.split("-")[0].split("/")[0]
+                            ssh_verify(
+                                f"L3-ipset({rule_name})",
+                                backend_verifier.verify_ipset_member,
+                                rule_id,
+                                check_ip,
+                            )
+
+                        verify_passed += 1
+                    elif l1 is None:
+                        rec.add_detail(f"      跳过（SSH不可用）")
+                    else:
+                        rec.add_detail(f"      L1验证未通过，跳过L2/L3")
+
+                print(f"  [OK] 后台验证完成: {verify_passed}/{verify_total} 条规则L1验证通过")
+                rec.add_detail(f"  ── 验证汇总: {verify_passed}/{verify_total} 条规则数据库验证通过 ──")
+        else:
+            print("\n[步骤6.5] 后台数据验证: 跳过（未配置SSH或paramiko未安装）")
+
         # ========== 步骤7: 编辑IP限速规则 ==========
         with rec.step("步骤7: 编辑IP限速规则", "编辑第1条规则的名称和限速值"):
             print("\n[步骤7] 编辑IP限速规则...")
             edit_rule = test_rules[0]
-            new_name = "ip_test_edit_001"
+            new_name = "ip_t_edit_001"
             rec.add_detail(f"【编辑操作】")
             rec.add_detail(f"  目标规则: {edit_rule['name']}")
             rec.add_detail(f"  新名称: {new_name}")
@@ -554,6 +720,22 @@ class TestIpRateLimitComprehensive:
                 print(f"  [WARN] 编辑验证失败，原名称仍存在")
                 rec.add_detail(f"  ✗ 编辑验证失败")
 
+            # SSH后台验证：编辑后数据库字段是否更新
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-编辑后】")
+                # iKuai数据库tagname最长15字符，超过会自动截取
+                db_name = new_name[:15] if len(new_name) > 15 else new_name
+                if db_name != new_name:
+                    rec.add_detail(f"  注意: 名称'{new_name}'超15字符，数据库中为'{db_name}'")
+                ssh_verify(
+                    "L1-编辑验证",
+                    backend_verifier.verify_qos_database,
+                    "simple_qos",
+                    must_pass=True,
+                    expected_fields={"upload": "2048"},
+                    tagname=db_name,
+                )
+
         # ========== 步骤8: 单独停用IP限速规则 ==========
         with rec.step("步骤8: 单独停用IP限速规则", "停用第2条规则"):
             print("\n[步骤8] 单独停用第2条规则...")
@@ -574,6 +756,18 @@ class TestIpRateLimitComprehensive:
                 print(f"  [WARN] 停用状态验证失败")
                 rec.add_detail(f"  - 停用状态未确认")
 
+            # SSH后台验证：停用后数据库enabled字段应为no
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-停用后】")
+                ssh_verify(
+                    "L1-停用验证",
+                    backend_verifier.verify_qos_database,
+                    "simple_qos",
+                    must_pass=True,
+                    expected_fields={"enabled": "no"},
+                    tagname=disable_rule["name"],
+                )
+
         # ========== 步骤9: 单独启用IP限速规则 ==========
         with rec.step("步骤9: 单独启用IP限速规则", "启用第2条规则"):
             print("\n[步骤9] 单独启用第2条规则...")
@@ -593,6 +787,18 @@ class TestIpRateLimitComprehensive:
                 print(f"  [WARN] 启用状态验证失败")
                 rec.add_detail(f"  - 启用状态未确认")
 
+            # SSH后台验证：启用后数据库enabled字段应为yes
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-启用后】")
+                ssh_verify(
+                    "L1-启用验证",
+                    backend_verifier.verify_qos_database,
+                    "simple_qos",
+                    must_pass=True,
+                    expected_fields={"enabled": "yes"},
+                    tagname=disable_rule["name"],
+                )
+
         # ========== 步骤10: 单独删除IP限速规则 ==========
         with rec.step("步骤10: 单独删除IP限速规则", "删除第3条规则"):
             print("\n[步骤10] 单独删除第3条规则...")
@@ -609,6 +815,18 @@ class TestIpRateLimitComprehensive:
                 print(f"  [OK] 规则删除成功: {delete_rule['name']}")
                 rec.add_detail(f"【验证结果】")
                 rec.add_detail(f"  ✓ 删除成功，条目数从 {count_before} 减少到 {count_after}")
+
+                # SSH后台验证：删除后数据库中应找不到该规则
+                if backend_verifier is not None:
+                    rec.add_detail(f"  【SSH验证-删除后】")
+                    db_rule = ssh_find_rule(delete_rule["name"])
+                    if db_rule is None:
+                        print(f"    SSH-L1-删除验证: 通过 - 规则已从数据库删除")
+                        rec.add_detail(f"    SSH-L1-删除验证: ✓ 规则已从数据库删除")
+                    else:
+                        print(f"    SSH-L1-删除验证: 失败 - 规则仍在数据库中(id={db_rule.get('id')})")
+                        rec.add_detail(f"    SSH-L1-删除验证: ✗ 规则仍在数据库中")
+                        ssh_failures.append(f"SSH-L1-删除验证: 规则{delete_rule['name']}仍在数据库中(id={db_rule.get('id')})")
             else:
                 print(f"  [WARN] 删除验证失败")
                 rec.add_detail(f"  - 删除未确认")
@@ -866,6 +1084,17 @@ class TestIpRateLimitComprehensive:
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ 批量停用完成，当前共 {final_count} 条规则（test_rules中{disabled_count}条已停用）")
 
+            # SSH后台验证：批量停用后所有规则enabled应为no
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-批量停用后】")
+                rules_db = backend_verifier.query_qos_rules("simple_qos")
+                disabled_in_db = sum(1 for r in rules_db if r.get("enabled") == "no")
+                print(f"    SSH: 数据库中{disabled_in_db}/{len(rules_db)}条规则已停用")
+                rec.add_detail(f"    SSH: 数据库中{disabled_in_db}/{len(rules_db)}条规则enabled=no")
+                # 所有规则都应被停用
+                if len(rules_db) > 0 and disabled_in_db < len(rules_db):
+                    ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_in_db}/{len(rules_db)}条规则停用")
+
         # ========== 步骤16: 批量启用IP限速规则 ==========
         with rec.step("步骤16: 批量启用IP限速规则", f"批量启用剩余的 {len(test_rules)} 条规则"):
             print("\n[步骤16] 批量启用所有规则...")
@@ -936,6 +1165,21 @@ class TestIpRateLimitComprehensive:
             print(f"  [OK] 批量删除完成，剩余 {final_count} 条规则")
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ 批量删除完成，剩余 {final_count} 条规则（test_rules中{deleted_count}条已删除）")
+
+            # SSH后台验证：批量删除后数据库应为空
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-批量删除后】")
+                rules_db = backend_verifier.query_qos_rules("simple_qos")
+                # 过滤掉测试数据（可能有其他用户的规则）
+                test_names = {r["name"] for r in test_rules}
+                remaining_test_rules = [r for r in rules_db if r.get("tagname") in test_names]
+                if len(remaining_test_rules) == 0:
+                    print(f"    SSH: 数据库中测试规则已全部删除（总规则数: {len(rules_db)}）")
+                    rec.add_detail(f"    SSH-L1-批量删除验证: ✓ 测试规则已全部删除")
+                else:
+                    print(f"    SSH: 数据库中仍有 {len(remaining_test_rules)} 条测试规则")
+                    rec.add_detail(f"    SSH-L1-批量删除验证: ✗ 仍有{len(remaining_test_rules)}条测试规则")
+                    ssh_failures.append(f"SSH-L1-批量删除: 数据库中仍有{len(remaining_test_rules)}条测试规则")
 
         # ========== 步骤18: 导入IP限速规则 ==========
         with rec.step("步骤18: 导入IP限速规则", "使用导出的CSV和TXT文件进行导入测试"):
@@ -1035,7 +1279,7 @@ class TestIpRateLimitComprehensive:
                     page.page.wait_for_timeout(500)
 
                 # 查找并删除测试IP分组
-                group_locator = page.page.locator("text=test_ip_group_001")
+                group_locator = page.page.locator("text=t_ipgrp_001")
                 if group_locator.count() > 0:
                     # 点击删除按钮
                     group_locator.first.evaluate("""(el) => {
@@ -1060,8 +1304,8 @@ class TestIpRateLimitComprehensive:
                     if confirm_btn.count() > 0:
                         confirm_btn.click()
                         page.page.wait_for_timeout(500)
-                    rec.add_detail(f"  [OK] 已清理IP分组: test_ip_group_001")
-                    print("  [OK] 已清理IP分组: test_ip_group_001")
+                    rec.add_detail(f"  [OK] 已清理IP分组: t_ipgrp_001")
+                    print("  [OK] 已清理IP分组: t_ipgrp_001")
             except Exception as e:
                 rec.add_detail(f"  [WARN] IP分组清理失败: {str(e)[:50]}")
 
@@ -1074,7 +1318,7 @@ class TestIpRateLimitComprehensive:
                     page.page.wait_for_timeout(500)
 
                     # 查找并删除测试时间计划
-                    plan_locator = page.page.locator("text=test_time_plan_001")
+                    plan_locator = page.page.locator("text=t_plan_ip_001")
                     if plan_locator.count() > 0:
                         # 点击删除按钮
                         plan_locator.first.evaluate("""(el) => {
@@ -1099,8 +1343,8 @@ class TestIpRateLimitComprehensive:
                         if confirm_btn.count() > 0:
                             confirm_btn.click()
                             page.page.wait_for_timeout(500)
-                        rec.add_detail(f"  [OK] 已清理时间计划: test_time_plan_001")
-                        print("  [OK] 已清理时间计划: test_time_plan_001")
+                        rec.add_detail(f"  [OK] 已清理时间计划: t_plan_ip_001")
+                        print("  [OK] 已清理时间计划: t_plan_ip_001")
             except Exception as e:
                 rec.add_detail(f"  [WARN] 时间计划清理失败: {str(e)[:50]}")
 
@@ -1112,8 +1356,8 @@ class TestIpRateLimitComprehensive:
         print("=" * 60)
         print("测试覆盖功能:")
         print("  - 环境清理: 测试前检查并批量清理")
-        print("  - 创建IP分组: test_ip_group_001")
-        print("  - 创建时间计划: test_time_plan_001")
+        print("  - 创建IP分组: t_ipgrp_001")
+        print("  - 创建时间计划: t_plan_ip_001")
         print("  - 添加: 8条规则")
         print("    * 线路覆盖: 任意/wan1/wan2/全部")
         print("    * 协议覆盖: tcp/udp/tcp+udp/任意")
@@ -1133,3 +1377,10 @@ class TestIpRateLimitComprehensive:
         print("  - 导入: CSV和TXT")
         print("  - 帮助功能: 右下角帮助图标")
         print("  - 清理IP分组和时间计划")
+
+        # ========== SSH后台验证汇总断言 ==========
+        if ssh_failures:
+            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项后台验证失败:")
+            for f in ssh_failures:
+                print(f"  - {f}")
+            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"

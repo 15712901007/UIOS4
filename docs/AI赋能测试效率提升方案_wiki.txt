@@ -1,0 +1,403 @@
+h1. AI赋能爱快路由器测试效率提升方案
+
+----
+
+h2. 背景与目标
+
+爱快路由器4.0测试团队已建立一套基于Playwright的Python UI自动化测试框架，覆盖VLAN、IP限速、MAC限速等模块。在此基础上，引入Claude Code + MCP工具链，目标是：
+
+* *提升测试编写效率*：AI辅助生成测试用例和自动化代码
+* *增加验证深度*：从纯UI验证扩展到数据库→iptables→内核→实际带宽的全链路验证
+* *降低人工成本*：AI执行冒烟测试、自动总结BUG、格式化报告
+* *持久化测试知识*：通过AI记忆系统沉淀测试经验和模式
+
+----
+
+h2. 工具链介绍
+
+||工具||作用||在测试中的角色||
+|*Claude Code*|AI编程助手 (CLI)|核心引擎：分析、编码、验证|
+|*MCP-Playwright*|浏览器自动化协议|前端UI操作：点击、填写、截图、快照|
+|*MCP-SSH*|远程命令执行协议|后台验证：SSH连接路由器/客户端执行命令|
+|*Paramiko*|Python SSH库|自动化代码中的SSH操作|
+|*iperf3*|网络带宽测量工具|L5层：实际限速效果验证|
+
+*工具协作关系：*
+
+{code}
+Claude Code (AI)
+    │
+    ├── MCP-Playwright → 前端操作（新增规则、验证UI状态）
+    │
+    ├── MCP-SSH → 路由器后台（数据库查询、iptables检查）
+    │           → 测试客户端（iperf3测速）
+    │
+    └── 代码生成 → Python自动化脚本（Page Object + Test Case）
+{code}
+
+----
+
+h2. 8个效率提升方向
+
+h3. 方向1：AI辅助测试用例编写
+
+*方法：* Claude Code + MCP-Playwright探索UI → 按团队规定格式输出测试用例
+
+*工作流：*
+# {{browser_navigate}} 打开目标页面
+# {{browser_snapshot}} 获取页面结构（优先用snapshot而非screenshot，节省token约10倍）
+# AI识别所有交互元素（输入框、下拉框、按钮、表格、Tab）
+# 按14步综合测试模式生成用例
+
+*14步测试模式（团队标准）：*
+{code}
+新增8条规则 → 编辑 → 禁用 → 启用 → 删除 → 搜索 → 排序
+→ 导出 → 异常输入 → 批量禁用 → 批量启用 → 批量删除 → 导入 → 帮助
+{code}
+
+----
+
+h3. 方向2：AI执行初步冒烟测试
+
+*方法：* Claude Code + MCP-Playwright按测试用例执行操作，自动总结BUG
+
+*执行流程：*
+# 按冒烟清单逐项执行：页面加载 → 新增记录 → 验证表格 → 编辑 → 删除
+# 每步操作后截取snapshot对比预期状态
+# 发现异常时自动采集：页面快照 + console错误 + 网络请求
+# 汇总输出BUG报告
+
+*成本优化：* 冒烟执行使用Sonnet模型（性价比高），仅在分析异常时使用Opus
+
+----
+
+h3. 方向3：MCP交互转Python自动化代码
+
+*方法：* 将Claude Code + MCP-Playwright的交互会话转换为可复用的Python代码
+
+*转换规则（已验证）：*
+
+||MCP-Playwright操作||Python Playwright等价代码||
+|browser_click(ref="button(保存)")|page.get_by_role("button", name="保存").click()|
+|browser_type(ref="textbox(名称)", text="xxx")|page.get_by_role("textbox", name="名称").fill("xxx")|
+|browser_fill_form(fields=...)|多个 page.get_by_role().fill() 调用|
+|browser_snapshot()|page.wait_for_load_state("networkidle") + 断言|
+
+*输出文件对应关系：*
+* {{pages/network/<module>_page.py}} — Page Object类（封装页面操作）
+* {{tests/network/test_<module>_comprehensive.py}} — 综合测试类（14步模式）
+
+*已成功转换的模块：* VLAN、IP限速、MAC限速
+
+----
+
+h3. 方向4：SSH后台深度数据验证
+
+*方法：* Claude Code + MCP-SSH登录路由器后台，多层次验证前端操作结果
+
+*5层验证体系（由浅入深）：*
+
+||层级||验证内容||命令||置信度||
+|L1 数据库|配置数据是否写入|/usr/ikuai/function/simple_qos show|必要不充分|
+|L2 iptables|限速规则是否下发|iptables -L IP_QOS -n -v|必要不充分|
+|L3 ipset|目标IP是否加入集合|ipset list _simple_qos_ID|必要不充分|
+|L4 内核|ik_core模块 + dmesg|lsmod / dmesg|辅助判断|
+|L5 iperf3|实际带宽测量|iperf3 -c server -B src_ip -J|*充分证明*|
+
+*关键洞察：* 数据库有数据 ≠ 功能正常。必须验证iptables规则实际下发到IP_QOS链。
+
+----
+
+h3. 方向5：全链路测试实战
+
+完整的全链路验证流程（以IP限速为例）：
+
+{code}
+步骤1: 前端配置（MCP-Playwright / Python自动化）
+  → 打开终端限速页面，新增规则：IP=192.168.148.2, 上传=2048KB/s, 下载=4096KB/s
+
+步骤2: L1 数据库验证（MCP-SSH / Paramiko）
+  → /usr/ikuai/function/simple_qos show | jq '.data[] | select(.tagname=="全链路测试")'
+  → 验证 upload=2048, download=4096
+
+步骤3: L2 iptables规则验证
+  → iptables -L IP_QOS -n -v
+  → 确认存在 "limit: 2048 kBps mode srcip" (上传) 和 "limit: 4096 kBps mode dstip" (下载)
+
+步骤4: L3 ipset验证
+  → ipset list _simple_qos_{id}
+  → 确认Members包含 192.168.148.2
+
+步骤5: L4 内核验证
+  → lsmod | grep ik_core → 确认模块加载
+  → dmesg | tail -50 | grep -iE "error|fail" → 确认无异常
+
+步骤6: L5 iperf3实测（可选，较耗时）
+  → 添加策略路由让流量经过路由器
+  → iperf3 -c 10.66.0.40 -B 192.168.148.2 -t 10 -J
+  → 对比实测带宽与配置值（允许20%误差）
+{code}
+
+*实测结果（2026-03-04确认）：*
+* 上传：实测18.66 Mbps vs 配置16.38 Mbps (2048 KB/s × 8) → +14%，限速生效
+* 下载：实测36.38 Mbps vs 配置32.77 Mbps (4096 KB/s × 8) → +11%，限速生效
+* 大量TCP retransmit证实限速通过丢包机制实现
+
+----
+
+h3. 方向6：终端功能验证（iperf3实测）
+
+*测试环境拓扑：*
+{code}
+路由器(10.66.0.150) ← Web管理: admin/admin123, SSH: sshd/ikuai8.com(root)
+    │
+    ├── LAN1
+    │   └── Ubuntu客户端(外网10.66.0.18, 内网192.168.148.2)  SSH: iktest/iktest
+    │
+    └── WAN → iperf3服务端(10.66.0.40:5201)
+{code}
+
+*iperf3验证关键注意事项：*
+# 测试流量必须走FORWARD链（通过路由器转发），不能直接发给路由器（那走INPUT链，不受QoS限制）
+# Ubuntu客户端有双网卡（10.66.0.18外网 + 192.168.148.2内网），需用策略路由指定走内网
+# 命令：{{sudo ip route add 10.66.0.40/32 via 192.168.148.1 dev ens11 src 192.168.148.2}}
+# 测速完成后记得清理临时路由
+
+----
+
+h3. 方向7：AI辅助BUG报告
+
+*标准BUG报告模板：*
+{code}
+## [BUG-XXX] 一句话概述
+
+### 环境信息
+- 设备: iKuai Router 4.0 | 固件版本: [SSH查询]
+- 测试模块: [如: 网络配置-终端限速-IP限速]
+- 浏览器: Chromium | 测试日期: YYYY-MM-DD
+
+### 严重等级
+Critical / Major / Normal / Minor
+
+### 复现步骤
+1. 登录路由管理页 http://10.66.0.150
+2. 导航至 xxx 页面
+3. 执行 xxx 操作
+4. 观察到 xxx
+
+### 预期结果 / 实际结果 / 证据
+[截图 + Console错误 + 网络请求 + 后台状态]
+{code}
+
+----
+
+h3. 方向8：补充建议
+
+||建议||说明||预估收益||
+|*API层测试*|直接调POST /Action/call，跳过UI，~200ms/次 vs 30s/次|速度提升150倍|
+|*环境自动重置*|teardown fixture通过API/SSH清除脏数据|避免测试污染|
+|*网络请求拦截*|Playwright page.route()验证前端API调用|中间层验证|
+|*测试数据外部化*|数据迁移到YAML，支持数据驱动|可维护性|
+|*失败重试*|pytest-rerunfailures，避免UI时序假失败|稳定性|
+|*Session登录复用*|context.storage_state()缓存认证|每用例省10s|
+|*健康检查前置*|测试前验证Web+SSH可达|快速失败|
+|*CI/CD集成*|GitHub Actions/Jenkins流水线|自动化|
+
+----
+
+h2. 全链路验证实战案例
+
+h3. 配置项
+
+* 规则名称：全链路测试
+* 目标IP：192.168.148.2（Ubuntu客户端内网IP）
+* 上行限速：2048 KB/s = 2 MB/s = 16.38 Mbps
+* 下行限速：4096 KB/s = 4 MB/s = 32.77 Mbps
+
+h3. 各层验证结果
+
+*L1 数据库验证：*
+{code:json}
+{
+  "id": 1,
+  "tagname": "全链路测试",
+  "ip_addr": "192.168.148.2",
+  "upload": 2048,
+  "download": 4096,
+  "enabled": "yes"
+}
+{code}
+结论：{color:green}*PASS*{color} - 规则存在，字段正确
+
+*L2 iptables验证：*
+{code}
+IP_QOS链:
+  规则1(下载): match-set simple_qos_1 dst → limit: 4096 kBps mode dstip
+  规则2(上传): match-set simple_qos_1 src → limit: 2048 kBps mode srcip
+{code}
+结论：{color:green}*PASS*{color} - 上下行限速规则均已下发
+
+*L3 ipset验证：*
+{code}
+_simple_qos_1 (hash:net):
+  Members: 192.168.148.2
+{code}
+结论：{color:green}*PASS*{color} - 目标IP已加入集合
+
+*L4 内核验证：*
+{code}
+ik_core 1427456 3 - Live 0xffffffff... (O)
+dmesg: 无error/fail/panic
+{code}
+结论：{color:green}*PASS*{color} - ik_core加载正常，无异常日志
+
+*L5 iperf3实测：*
+
+||方向||配置值||实测值||偏差||retransmit||
+|上传|16.38 Mbps|18.66 Mbps|+14%|2133|
+|下载|32.77 Mbps|36.38 Mbps|+11%|3693|
+
+结论：{color:green}*PASS*{color} - 限速生效，偏差在合理范围内（<=20%）
+
+----
+
+h2. iKuai QoS架构发现
+
+h3. 核心发现（2026-03-04实测）
+
+iKuai路由器 *不使用* 标准Linux QoS工具（tc/htb/tbf），而是通过自定义方案实现：
+
+{code}
+自定义内核模块 ik_core (1.4MB)
+    │
+    ├── iptables filter表 FORWARD链
+    │   └── IP_QOS / MAC_QOS 自定义链
+    │       └── 自定义target: "limit: XXXX kBps mode dstip/srcip"
+    │
+    └── ipset 管理限速目标
+        └── simple_qos_{id} (list:set) → _simple_qos_{id} (hash:net)
+{code}
+
+h3. FORWARD链调用顺序
+
+{code}
+FORWARD → AUTH_EXPIRES → ACL_MAC → FLOW_CONTROL → WECOM_BLOCK_MAC
+        → CONNLIMIT → LAYER7 → QOS → SIMPLE → IP_QOS → MAC_QOS
+        → COUPON_QOS → WEBAUTH_QOS → OVPN_QOS → L2TP_QOS → PPTP_QOS
+        → PPPOE_QOS → IKE_QOS → FIREWALL → LAN_VISIT → NONAT
+        → WEBAUTH → PPPOE → PPP → ARP
+{code}
+
+h3. 对测试的影响
+
+* 不能用{{tc class show}}或{{iptables -t mangle}}查规则，要看{{iptables -L IP_QOS -n -v}}（filter表）
+* ipset是两层嵌套结构，外层list:set引用内层hash:net
+* 限速通过丢包实现，所以iperf3会有大量retransmit
+
+----
+
+h2. 多模型成本优化策略
+
+||任务类型||推荐模型||Token成本||原因||
+|测试用例编写|Claude Opus|高|需要深度推理和创造性|
+|冒烟测试执行|Claude Sonnet|中|结构化执行，按步骤操作|
+|SSH后台验证|Claude Sonnet|中|命令执行，结果解析|
+|BUG报告格式化|GLM-5/MiniMax|低|模板填充，推理要求低|
+|截图分析|Claude Opus(多模态)|高|需要视觉理解能力|
+
+*注意：* 国产模型不建议用于MCP工具调用（tool-calling可靠性不足），仅用于纯文本生成任务。
+
+----
+
+h2. 上下文管理最佳实践
+
+h3. 模块化会话设计
+
+||会话类型||内容||预估Token||
+|UI探索会话|探索一个页面，输出页面结构|~20K|
+|代码生成会话|输入页面结构+模板，输出代码|~30K|
+|SSH验证会话|单模块后台验证|~15K|
+|BUG报告会话|格式化失败数据|~10K|
+
+*原则：* 一个会话只做一件事。接近100%时：总结→存MEMORY→新会话。
+
+h3. Snapshot优先于Screenshot
+
+* Snapshot: ~2-5K tokens（结构化文本，可操作元素）
+* Screenshot: ~20-50K tokens（base64图片，不可操作）
+* 仅在需要视觉验证时使用截图
+
+h3. 200K窗口Token预算分配
+
+||类别||Token预算||用途||
+|系统提示+工具|~20K|固定开销|
+|Memory+Skills|~10K|持久知识|
+|当前文件上下文|~40K|正在操作的文件|
+|对话历史|~80K|操作和响应|
+|安全余量|~50K|工具输出空间|
+
+----
+
+h2. 已实现成果清单
+
+h3. 代码文件
+
+||文件||类型||说明||
+|{{utils/backend_verifier.py}}|新建|SSH后台验证工具类，支持L1-L5全链路验证|
+|{{tests/network/test_ip_rate_limit_full_chain.py}}|新建|IP限速全链路验证测试示例|
+|{{config/settings.yaml}}|修改|新增SSH配置段（路由器、客户端、iperf3）|
+|{{config/config.py}}|修改|新增SSHConfig、SSHHostConfig数据类|
+|{{tests/conftest.py}}|修改|新增backend_verifier、router_ssh fixtures|
+
+h3. 记忆文件
+
+||文件||说明||
+|{{memory/MEMORY.md}}|项目总记忆（环境拓扑、选择器模式、已知问题）|
+|{{memory/ai_testing_strategy.md}}|AI测试策略精简版（8方向、多模型、验证层次）|
+|{{memory/backend_commands.md}}|路由器后台命令速查表（QoS架构、CLI命令集）|
+
+h3. BackendVerifier API
+
+{code:python}
+from utils.backend_verifier import BackendVerifier
+
+# 创建验证器
+verifier = BackendVerifier()
+verifier.connect_router()
+
+# L1: 数据库验证
+result = verifier.verify_qos_database("simple_qos", tagname="规则名")
+
+# L2: iptables验证
+result = verifier.verify_iptables_rule("IP_QOS", rule_id=1, expected_speed_kbps=2048)
+
+# L3: ipset验证
+result = verifier.verify_ipset_member(rule_id=1, expected_ip="192.168.148.2")
+
+# L4: 内核验证
+result = verifier.verify_kernel()
+
+# L5: iperf3实测
+result = verifier.verify_iperf3("upload", expected_kbps=2048)
+
+# 全链路一键验证
+chain_result = verifier.verify_ip_qos_full_chain(
+    tagname="规则名", ip="192.168.148.2",
+    upload_kbps=2048, download_kbps=4096,
+    run_iperf3=False  # True则包含L5
+)
+print(chain_result.summary())
+
+verifier.close()
+{code}
+
+----
+
+h2. 后续扩展方向
+
+# *MAC限速全链路验证* — 扩展BackendVerifier支持MAC_QOS链验证
+# *API层快速回归* — 创建RouterAPIClient直接调POST /Action/call
+# *CI/CD集成* — GitHub Actions自动运行冒烟测试 + 钉钉通知
+# *更多模块覆盖* — ACL、防火墙、端口映射等模块的全链路验证
+# *Claude Skills* — 测试用例编写Skill、BUG报告Skill、代码转换Skill
+# *数据驱动测试* — 测试数据外部化到YAML，支持参数化

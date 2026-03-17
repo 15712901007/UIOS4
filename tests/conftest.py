@@ -6,9 +6,20 @@ pytest配置和fixtures
 import pytest
 import os
 import sys
+import io
 import ctypes
 from datetime import datetime
 from typing import Generator, Dict, List
+
+# 解决Windows控制台GBK编码问题（全局只执行一次）
+if sys.platform == 'win32':
+    try:
+        if hasattr(sys.stdout, 'buffer') and not sys.stdout.closed:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', write_through=True)
+        if hasattr(sys.stderr, 'buffer') and not sys.stderr.closed:
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', write_through=True)
+    except Exception:
+        pass
 
 # 添加项目根目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,8 +30,20 @@ from pages.login_page import LoginPage
 from pages.network.vlan_page import VlanPage
 from pages.network.ip_rate_limit_page import IpRateLimitPage
 from pages.network.mac_rate_limit_page import MacRateLimitPage
+from pages.network.static_route_page import StaticRoutePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
+
+
+# ==================== SSH后台验证 ====================
+
+def _create_backend_verifier():
+    """安全创建BackendVerifier（paramiko可能未安装）"""
+    try:
+        from utils.backend_verifier import BackendVerifier
+        return BackendVerifier()
+    except ImportError:
+        return None
 
 
 def get_system_dpi_scale() -> float:
@@ -60,6 +83,7 @@ TEST_NAME_MAPPING = {
     'test_import_vlans': 'VLAN导入测试',
     'test_ip_rate_limit_comprehensive': 'IP限速综合测试',
     'test_mac_rate_limit_comprehensive': 'MAC限速综合测试',
+    'test_static_route_comprehensive': '静态路由综合测试',
 }
 
 
@@ -304,6 +328,20 @@ def mac_rate_limit_page_logged_in(logged_in_page: Page, config: Config) -> MacRa
     return mac_page
 
 
+@pytest.fixture(scope="function")
+def static_route_page(page: Page, config: Config) -> StaticRoutePage:
+    """创建静态路由页面实例"""
+    return StaticRoutePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def static_route_page_logged_in(logged_in_page: Page, config: Config) -> StaticRoutePage:
+    """已登录并导航到静态路由页面的实例"""
+    sr_page = StaticRoutePage(logged_in_page, config.get_base_url())
+    sr_page.navigate_to_static_route()
+    return sr_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -316,6 +354,51 @@ def test_data_dir() -> str:
 def vlan_test_data_dir(test_data_dir: str) -> str:
     """VLAN测试数据目录"""
     return os.path.join(test_data_dir, "vlan")
+
+
+# ==================== SSH后台验证fixtures ====================
+
+@pytest.fixture(scope="session")
+def backend_verifier():
+    """
+    SSH后台验证器 (session级别复用连接)
+
+    需要 paramiko 库: pip install paramiko
+    如果未安装paramiko，此fixture返回None
+
+    Returns:
+        BackendVerifier实例或None
+    """
+    verifier = _create_backend_verifier()
+    if verifier is None:
+        yield None
+        return
+
+    try:
+        verifier.connect_router()
+        yield verifier
+    finally:
+        verifier.close()
+
+
+@pytest.fixture(scope="session")
+def router_ssh():
+    """
+    路由器SSH直连 (session级别复用)
+
+    Returns:
+        SSHClient实例或None
+    """
+    verifier = _create_backend_verifier()
+    if verifier is None:
+        yield None
+        return
+
+    try:
+        verifier.connect_router()
+        yield verifier._router
+    finally:
+        verifier.close()
 
 
 # ==================== 报告相关fixtures ====================
@@ -393,11 +476,16 @@ def pytest_runtest_makereport(item, call):
             # 保存截图
             try:
                 page.screenshot(path=screenshot_path)
-                # 将截图路径添加到报告
+                # 将截图转为base64内嵌，避免HTML报告中路径引用失败
+                import base64
+                with open(screenshot_path, 'rb') as img_file:
+                    img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                screenshot_data_uri = f"data:image/png;base64,{img_base64}"
+                # 将base64截图添加到报告
                 report.extra = getattr(report, "extra", [])
                 report.extra.append({
                     "name": "Screenshot",
-                    "content": screenshot_path,
+                    "content": screenshot_data_uri,
                     "type": "image",
                 })
             except Exception as e:
@@ -417,6 +505,9 @@ def pytest_configure(config):
         "markers", "mac_rate_limit: MAC限速模块测试"
     )
     config.addinivalue_line(
+        "markers", "static_route: 静态路由模块测试"
+    )
+    config.addinivalue_line(
         "markers", "network: 网络配置模块测试"
     )
     config.addinivalue_line(
@@ -424,6 +515,12 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "smoke: 冒烟测试"
+    )
+    config.addinivalue_line(
+        "markers", "backend: 后台SSH验证测试"
+    )
+    config.addinivalue_line(
+        "markers", "full_chain: 全链路验证测试"
     )
 
     # 记录开始时间
@@ -526,7 +623,26 @@ def pytest_runtest_logreport(report):
         if report.failed:
             _test_results['failed'] += 1
             if hasattr(report, 'longrepr'):
-                test_case['error_message'] = str(report.longrepr)
+                longrepr = str(report.longrepr)
+                # 提取简明错误信息：取AssertionError行或最后一行有意义的错误
+                error_lines = longrepr.strip().split('\n')
+                short_error = None
+                for line in error_lines:
+                    line_stripped = line.strip()
+                    if line_stripped.startswith('E ') and ('assert' in line_stripped.lower() or 'Error' in line_stripped):
+                        short_error = line_stripped[2:].strip()  # 去掉 "E " 前缀
+                        break
+                    if line_stripped.startswith('AssertionError:') or line_stripped.startswith('AssertionError:'):
+                        short_error = line_stripped
+                        break
+                if short_error is None:
+                    # 回退：取最后一行E开头的
+                    for line in reversed(error_lines):
+                        if line.strip().startswith('E '):
+                            short_error = line.strip()[2:].strip()
+                            break
+                test_case['error_message'] = short_error or longrepr[-500:]
+                test_case['error_traceback'] = longrepr  # 保留完整traceback备用
         elif report.passed:
             _test_results['passed'] += 1
         else:

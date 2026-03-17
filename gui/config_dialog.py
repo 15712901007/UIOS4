@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, QTime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.config import Config, DeviceConfig, BrowserConfig, ReportConfig
+from config.config import Config, DeviceConfig, BrowserConfig, ReportConfig, SSHConfig, SSHHostConfig
 
 
 class ConfigDialog(QDialog):
@@ -54,6 +54,10 @@ class ConfigDialog(QDialog):
         report_tab = self._create_report_tab()
         self.tab_widget.addTab(report_tab, "报告设置")
 
+        # SSH配置标签页
+        ssh_tab = self._create_ssh_tab()
+        self.tab_widget.addTab(ssh_tab, "SSH配置")
+
         # 定时任务标签页
         schedule_tab = self._create_schedule_tab()
         self.tab_widget.addTab(schedule_tab, "定时任务")
@@ -61,7 +65,7 @@ class ConfigDialog(QDialog):
         layout.addWidget(self.tab_widget)
 
         # 设置当前标签页
-        tab_index = {"device": 0, "browser": 1, "report": 2, "schedule": 3}
+        tab_index = {"device": 0, "browser": 1, "report": 2, "ssh": 3, "schedule": 4}
         self.tab_widget.setCurrentIndex(tab_index.get(self.current_tab, 0))
 
         # 按钮
@@ -203,6 +207,82 @@ class ConfigDialog(QDialog):
 
         return widget
 
+    def _create_ssh_tab(self) -> QWidget:
+        """创建SSH配置标签页"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # 路由器SSH配置
+        router_group = QGroupBox("路由器SSH")
+        form_layout = QFormLayout(router_group)
+
+        self.ssh_router_host = QLineEdit()
+        self.ssh_router_host.setPlaceholderText("如: 10.66.0.150")
+        form_layout.addRow("主机地址:", self.ssh_router_host)
+
+        self.ssh_router_username = QLineEdit()
+        self.ssh_router_username.setPlaceholderText("如: sshd")
+        form_layout.addRow("用户名:", self.ssh_router_username)
+
+        self.ssh_router_password = QLineEdit()
+        self.ssh_router_password.setEchoMode(QLineEdit.Password)
+        form_layout.addRow("密码:", self.ssh_router_password)
+
+        self.ssh_router_port = QSpinBox()
+        self.ssh_router_port.setRange(1, 65535)
+        self.ssh_router_port.setValue(22)
+        form_layout.addRow("端口:", self.ssh_router_port)
+
+        layout.addWidget(router_group)
+
+        # 测试客户端SSH配置
+        client_group = QGroupBox("测试客户端SSH")
+        form_layout = QFormLayout(client_group)
+
+        self.ssh_client_host = QLineEdit()
+        self.ssh_client_host.setPlaceholderText("如: 10.66.0.18")
+        form_layout.addRow("主机地址:", self.ssh_client_host)
+
+        self.ssh_client_username = QLineEdit()
+        self.ssh_client_username.setPlaceholderText("如: iktest")
+        form_layout.addRow("用户名:", self.ssh_client_username)
+
+        self.ssh_client_password = QLineEdit()
+        self.ssh_client_password.setEchoMode(QLineEdit.Password)
+        form_layout.addRow("密码:", self.ssh_client_password)
+
+        self.ssh_client_port = QSpinBox()
+        self.ssh_client_port.setRange(1, 65535)
+        self.ssh_client_port.setValue(22)
+        form_layout.addRow("端口:", self.ssh_client_port)
+
+        layout.addWidget(client_group)
+
+        # iperf3配置
+        iperf_group = QGroupBox("iperf3测速配置")
+        form_layout = QFormLayout(iperf_group)
+
+        self.iperf3_server = QLineEdit()
+        self.iperf3_server.setPlaceholderText("如: 10.66.0.40")
+        form_layout.addRow("iperf3服务端:", self.iperf3_server)
+
+        self.iperf3_duration = QSpinBox()
+        self.iperf3_duration.setRange(1, 300)
+        self.iperf3_duration.setValue(10)
+        self.iperf3_duration.setSuffix(" 秒")
+        form_layout.addRow("测速时长:", self.iperf3_duration)
+
+        self.iperf3_tolerance = QSpinBox()
+        self.iperf3_tolerance.setRange(1, 100)
+        self.iperf3_tolerance.setValue(20)
+        self.iperf3_tolerance.setSuffix(" %")
+        form_layout.addRow("允许误差:", self.iperf3_tolerance)
+
+        layout.addWidget(iperf_group)
+        layout.addStretch()
+
+        return widget
+
     def _create_schedule_tab(self) -> QWidget:
         """创建定时任务配置标签页"""
         widget = QWidget()
@@ -287,6 +367,21 @@ class ConfigDialog(QDialog):
         self.screenshot_dir_input.setText(self.config.report.screenshot_dir)
         self.report_prefix_input.setText(self.config.report.report_name_prefix)
 
+        # SSH配置
+        self.ssh_router_host.setText(self.config.ssh.router.host)
+        self.ssh_router_username.setText(self.config.ssh.router.username)
+        self.ssh_router_password.setText(self.config.ssh.router.password)
+        self.ssh_router_port.setValue(self.config.ssh.router.port)
+
+        self.ssh_client_host.setText(self.config.ssh.client.host)
+        self.ssh_client_username.setText(self.config.ssh.client.username)
+        self.ssh_client_password.setText(self.config.ssh.client.password)
+        self.ssh_client_port.setValue(self.config.ssh.client.port)
+
+        self.iperf3_server.setText(self.config.ssh.iperf3_server)
+        self.iperf3_duration.setValue(self.config.ssh.iperf3_duration)
+        self.iperf3_tolerance.setValue(int(self.config.ssh.iperf3_tolerance * 100))
+
     def _save_and_accept(self):
         """保存配置并接受"""
         # 设备配置
@@ -308,6 +403,21 @@ class ConfigDialog(QDialog):
         self.config.report.output_dir = self.output_dir_input.text()
         self.config.report.screenshot_dir = self.screenshot_dir_input.text()
         self.config.report.report_name_prefix = self.report_prefix_input.text()
+
+        # SSH配置
+        self.config.ssh.router.host = self.ssh_router_host.text()
+        self.config.ssh.router.username = self.ssh_router_username.text()
+        self.config.ssh.router.password = self.ssh_router_password.text()
+        self.config.ssh.router.port = self.ssh_router_port.value()
+
+        self.config.ssh.client.host = self.ssh_client_host.text()
+        self.config.ssh.client.username = self.ssh_client_username.text()
+        self.config.ssh.client.password = self.ssh_client_password.text()
+        self.config.ssh.client.port = self.ssh_client_port.value()
+
+        self.config.ssh.iperf3_server = self.iperf3_server.text()
+        self.config.ssh.iperf3_duration = self.iperf3_duration.value()
+        self.config.ssh.iperf3_tolerance = self.iperf3_tolerance.value() / 100.0
 
         self.accept()
 

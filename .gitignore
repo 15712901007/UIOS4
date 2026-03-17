@@ -39,6 +39,7 @@ env/
 # Test reports (generated)
 reports/output/
 reports/screenshots/
+reports/allure-results/
 
 # OS files
 .DS_Store

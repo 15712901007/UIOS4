@@ -83,6 +83,19 @@ class TestRunner(QThread):
             # 自适应屏幕模式（让浏览器像原生浏览器一样自动适应屏幕大小和DPI缩放）
             auto_adapt = getattr(self.config.browser, 'auto_adapt_screen', True)
             env["AUTO_ADAPT_SCREEN"] = "true" if auto_adapt else "false"
+            # SSH配置（供后台验证使用）
+            if hasattr(self.config, 'ssh') and self.config.ssh:
+                env["SSH_ROUTER_HOST"] = self.config.ssh.router.host or ""
+                env["SSH_ROUTER_USERNAME"] = self.config.ssh.router.username or ""
+                env["SSH_ROUTER_PASSWORD"] = self.config.ssh.router.password or ""
+                env["SSH_ROUTER_PORT"] = str(self.config.ssh.router.port)
+                env["SSH_CLIENT_HOST"] = self.config.ssh.client.host or ""
+                env["SSH_CLIENT_USERNAME"] = self.config.ssh.client.username or ""
+                env["SSH_CLIENT_PASSWORD"] = self.config.ssh.client.password or ""
+                env["SSH_CLIENT_PORT"] = str(self.config.ssh.client.port)
+                env["IPERF3_SERVER"] = self.config.ssh.iperf3_server or ""
+                env["IPERF3_DURATION"] = str(self.config.ssh.iperf3_duration)
+                env["IPERF3_TOLERANCE"] = str(self.config.ssh.iperf3_tolerance)
             # 设置Python输出编码为UTF-8，解决中文乱码问题
             env["PYTHONIOENCODING"] = "utf-8"
             # 设置控制台代码页为UTF-8（Windows）

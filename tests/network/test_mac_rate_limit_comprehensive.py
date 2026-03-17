@@ -24,12 +24,6 @@ import os
 import sys
 import io
 
-# 解决Windows控制台GBK编码问题，同时确保实时输出
-if sys.platform == 'win32':
-    # 使用write_through=True确保实时输出（Python 3.7+）
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', write_through=True)
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', write_through=True)
-
 from pages.network.mac_rate_limit_page import MacRateLimitPage
 from config.config import get_config
 from utils.step_recorder import StepRecorder
@@ -40,34 +34,70 @@ from utils.step_recorder import StepRecorder
 class TestMacRateLimitComprehensive:
     """MAC限速综合测试 - 一次测试覆盖所有功能"""
 
-    def test_mac_rate_limit_comprehensive(self, mac_rate_limit_page_logged_in: MacRateLimitPage, step_recorder: StepRecorder):
+    def test_mac_rate_limit_comprehensive(self, mac_rate_limit_page_logged_in: MacRateLimitPage, step_recorder: StepRecorder, request):
         """
         综合测试: 添加8种场景 -> 编辑 -> 停用 -> 启用 -> 删除 -> 搜索 -> 排序 -> 导出 -> 异常测试 -> 批量操作
 
         测试步骤参照测试文档v1.5
+        集成SSH后台验证：在关键操作后验证数据库状态
         """
         page = mac_rate_limit_page_logged_in
         rec = step_recorder
 
+        # 动态获取backend_verifier fixture（可选，未配置SSH时为None）
+        try:
+            backend_verifier = request.getfixturevalue('backend_verifier')
+        except (pytest.FixtureLookupError, Exception):
+            backend_verifier = None
+
+        # SSH后台验证辅助函数 + 软断言收集器
+        ssh_failures = []  # 收集must_pass=True但验证失败的项，测试末尾统一断言
+
+        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
+            """执行SSH后台验证并记录结果。must_pass=True时失败会记录到ssh_failures"""
+            if backend_verifier is None:
+                return None
+            try:
+                result = verify_func(*args, **kwargs)
+                status = '通过' if result.passed else '失败'
+                print(f"    SSH-{label}: {status} - {result.message}")
+                rec.add_detail(f"    SSH-{label}: {'✓' if result.passed else '✗'} {result.message}")
+                if must_pass and not result.passed:
+                    ssh_failures.append(f"SSH-{label}: {result.message}")
+                return result
+            except Exception as e:
+                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                return None
+
+        def ssh_find_rule(tagname, qos_type="mac_qos"):
+            """通过SSH查找数据库中的MAC限速规则"""
+            if backend_verifier is None:
+                return None
+            try:
+                return backend_verifier.find_qos_rule(qos_type, tagname=tagname)
+            except Exception:
+                return None
+
         # 测试数据 - 8条规则，覆盖各种数据组合场景
-        # 包含：不同线路、不同协议栈、有意义的备注
+        # 包含：不同线路(任意/全部/wan1/wan2/wan3)、不同协议栈、MAC组、批量MAC、时间计划等
         test_rules = [
             # 规则1: IPv4基础 - 任意线路
-            {"name": "mac_test_001", "line": "任意", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "IPv4基础限速测试", "desc": "IPv4基础"},
+            {"name": "mac_test_001", "line": "任意", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "IPv4基础限速测试", "desc": "IPv4基础-任意线路"},
             # 规则2: IPv6协议栈 + wan1线路
-            {"name": "mac_test_002", "line": "wan1", "protocol_stack": "IPv6", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "IPv6协议栈限速-wan1线路", "desc": "IPv6+wan1"},
-            # 规则3: 线路选择wan2
-            {"name": "mac_test_003", "line": "wan2", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 1024, "download": 2048, "remark": "wan2线路限速测试", "desc": "wan2线路"},
-            # 规则4: 单个MAC + 全部线路
-            {"name": "mac_test_004", "line": "全部", "mac": "AA:BB:CC:DD:EE:01", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "单个MAC限速-全部线路", "desc": "单个MAC+全部线路"},
-            # 规则5: wan1线路（再次覆盖）
-            {"name": "mac_test_005", "line": "wan1", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 2048, "download": 4096, "remark": "wan1线路限速测试", "desc": "wan1线路"},
-            # 规则6: MAC组（需要在步骤4中创建）
-            {"name": "mac_test_006", "line": "任意", "mac_group": "test_mac_group_001", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 1024, "download": 2048, "remark": "MAC组限速测试", "desc": "MAC组"},
-            # 规则7: 时间计划（需要在步骤5中创建）
-            {"name": "mac_test_007", "line": "任意", "time_plan": "test_time_plan_mac_001", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "时间计划限速测试", "desc": "时间计划"},
-            # 规则8: 完整信息 - 共享限速 + wan2线路
-            {"name": "mac_test_008", "line": "wan2", "protocol_stack": "IPv4", "mode": "共享限速", "upload": 1024, "download": 2048, "remark": "共享限速测试-wan2-完整信息", "desc": "完整信息"},
+            {"name": "mac_test_002", "line": "wan1", "protocol_stack": "IPv6", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "IPv6协议栈限速-wan1线路", "desc": "IPv6+wan1线路"},
+            # 规则3: wan2线路 + 单个MAC地址
+            {"name": "mac_test_003", "line": "wan2", "mac": "AA:BB:CC:DD:EE:02", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 1024, "download": 2048, "remark": "wan2线路-单MAC限速", "desc": "wan2线路+单MAC"},
+            # 规则4: wan3线路
+            {"name": "mac_test_004", "line": "wan3", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "wan3线路限速测试", "desc": "wan3线路"},
+            # 规则5: 全部线路 + 批量MAC地址
+            {"name": "mac_test_005", "line": "全部", "batch_macs": ["AA:BB:CC:DD:EE:03", "AA:BB:CC:DD:EE:04", "AA:BB:CC:DD:EE:05"], "protocol_stack": "IPv4", "mode": "独立限速", "upload": 2048, "download": 4096, "remark": "全部线路-批量MAC", "desc": "全部线路+批量MAC"},
+            # 规则6: MAC组（需要在步骤4中创建）+ 任意线路
+            {"name": "mac_test_006", "line": "任意", "mac_group": "test_mac_group_001", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 1024, "download": 2048, "remark": "MAC组限速测试", "desc": "MAC组+任意线路"},
+            # 规则7: 时间计划（需要在步骤5中创建）+ wan1线路
+            {"name": "mac_test_007", "line": "wan1", "time_plan": "t_plan_mac_001", "protocol_stack": "IPv4", "mode": "独立限速", "upload": 512, "download": 1024, "remark": "时间计划限速-wan1", "desc": "时间计划+wan1线路"},
+            # 规则8: 共享限速 + wan2线路 + 时间段生效
+            {"name": "mac_test_008", "line": "wan2", "protocol_stack": "IPv4", "mode": "共享限速", "upload": 1024, "download": 2048, "time_type": "时间段", "time_start": "2026-03-01 00:00", "time_end": "2026-03-31 23:59", "remark": "共享限速-wan2-时间段", "desc": "共享限速+wan2+时间段"},
         ]
 
         print("\n" + "=" * 60)
@@ -84,11 +114,19 @@ class TestMacRateLimitComprehensive:
             rec.add_detail(f"  ✓ 页面加载成功")
 
         # ========== 步骤2: 清理已有数据 ==========
-        with rec.step("步骤2: 清理已有数据", "检查并清理MAC限速列表中的残留数据"):
+        with rec.step("步骤2: 清理已有数据", "先清理MAC限速规则，再清理路由对象中的MAC分组和时间计划"):
             print("\n[步骤2] 清理已有数据...")
+
+            # === 2.1 先清理MAC限速规则（因为规则可能引用了MAC分组和时间计划） ===
+            print("  [2.1] 清理MAC限速规则...")
+            rec.add_detail(f"【2.1 清理MAC限速规则】")
+
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
+
             current_count = page.get_rule_count()
             print(f"  当前规则数量: {current_count}")
-            rec.add_detail(f"【环境检查】")
             rec.add_detail(f"  当前规则数量: {current_count}")
 
             if current_count > 0:
@@ -102,7 +140,7 @@ class TestMacRateLimitComprehensive:
                     rec.add_detail("  2. 点击批量删除按钮")
                     page.batch_delete()
                     page.page.wait_for_timeout(1500)
-                    page.page.reload()
+                    page.navigate_to_mac_rate_limit()
                     page.page.wait_for_timeout(500)
                     final_count = page.get_rule_count()
                     print(f"  [OK] MAC限速规则清理完成，剩余 {final_count} 条规则")
@@ -112,9 +150,9 @@ class TestMacRateLimitComprehensive:
                 print("  [OK] MAC限速规则干净，无需清理")
                 rec.add_detail("  环境干净，无需清理")
 
-            # 清理路由对象中的MAC分组和时间计划（需要先清理引用的规则）
-            print("  清理路由对象数据...")
-            rec.add_detail(f"【清理路由对象数据】")
+            # === 2.2 再清理路由对象中的MAC分组和时间计划 ===
+            print("  [2.2] 清理路由对象数据...")
+            rec.add_detail(f"【2.2 清理路由对象数据】")
 
             # 获取当前URL的基础部分
             current_url = page.page.url
@@ -209,16 +247,30 @@ class TestMacRateLimitComprehensive:
         with rec.step("步骤3: 二次检查测试数据", "确保测试数据已清理"):
             print("\n[步骤3] 检查测试数据是否已清理...")
             rec.add_detail(f"【二次检查】")
-            cleaned_count = 0
-            for rule in test_rules:
-                if page.rule_exists(rule["name"]):
-                    rec.add_detail(f"  发现残留: {rule['name']}，执行删除")
-                    page.delete_rule(rule["name"])
-                    cleaned_count += 1
-            if cleaned_count == 0:
-                rec.add_detail("  无需清理，数据已干净")
+
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
+
+            current_count = page.get_rule_count()
+            if current_count > 0:
+                # 使用批量删除清理残留数据（而非逐条删除）
+                print(f"  发现 {current_count} 条残留数据，执行批量清理...")
+                rec.add_detail(f"  发现 {current_count} 条残留数据，执行批量清理")
+                select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
+                if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
+                    select_all_checkbox.click()
+                    page.page.wait_for_timeout(500)
+                    page.batch_delete()
+                    page.page.wait_for_timeout(1500)
+                    page.navigate_to_mac_rate_limit()
+                    page.page.wait_for_timeout(500)
+                    final_count = page.get_rule_count()
+                    print(f"  [OK] 批量清理完成，剩余 {final_count} 条规则")
+                    rec.add_detail(f"  批量清理完成，剩余 {final_count} 条规则")
             else:
-                rec.add_detail(f"  共清理 {cleaned_count} 条残留数据")
+                print("  [OK] 无需清理，数据已干净")
+                rec.add_detail("  无需清理，数据已干净")
 
         # ========== 步骤4: 创建测试用MAC组 ==========
         with rec.step("步骤4: 创建测试用MAC组", "导航到路由对象-MAC分组页面创建MAC组"):
@@ -254,8 +306,9 @@ class TestMacRateLimitComprehensive:
                         page.page.get_by_role("textbox", name="分组名称").fill("test_mac_group_001")
 
                         # 填写MAC列表（文本框名称是"MAC"）
-                        # 注意：MAC组不支持MAC地址段格式，使用单个MAC地址
-                        page.page.get_by_role("textbox", name="MAC").fill("AA:BB:CC:11:00:01")
+                        # 页面提示"请填写MAC，每行一个"，多个MAC用换行符分隔
+                        mac_textarea = page.page.get_by_role("textbox", name="MAC")
+                        mac_textarea.fill("AA:BB:CC:11:00:01\nAA:BB:CC:11:00:02\nAA:BB:CC:11:00:03")
 
                         # 点击保存（MAC分组添加页面的按钮是"保存"）
                         page.page.get_by_role("button", name="保存").click()
@@ -281,10 +334,10 @@ class TestMacRateLimitComprehensive:
         with rec.step("步骤5: 创建测试用时间计划", "导航到时间计划页面创建"):
             print("\n[步骤5] 创建测试用时间计划...")
             rec.add_detail(f"【创建时间计划】")
-            rec.add_detail(f"  计划名称: test_time_plan_mac_001")
+            rec.add_detail(f"  计划名称: t_plan_mac_001")
             rec.add_detail(f"  计划类型: 按周循环")
             rec.add_detail(f"  生效日期: 周一至周五")
-            rec.add_detail(f"  生效时间: 09:00-18:00")
+            rec.add_detail(f"  生效时间: 23:11-23:12（故意设为非生效时间，验证时间计划未生效时iptables无规则）")
             rec.add_detail(f"  创建方式: 跳转到时间计划专门页面创建")
 
             # 导航到路由对象页面，点击时间计划tab
@@ -307,7 +360,7 @@ class TestMacRateLimitComprehensive:
 
             try:
                 # 填写计划名称
-                page.page.get_by_role("textbox", name="计划名称").fill("test_time_plan_mac_001")
+                page.page.get_by_role("textbox", name="计划名称").fill("t_plan_mac_001")
 
                 # 选择按周循环（通常默认选中）
                 week_radio = page.page.get_by_role("radio", name="按周循环")
@@ -315,29 +368,35 @@ class TestMacRateLimitComprehensive:
                     week_radio.click()
                     page.page.wait_for_timeout(200)
 
-                # 选择周一到周五
-                weekdays = ["一", "二", "三", "四", "五"]
-                for day in weekdays:
-                    day_locator = page.page.locator(f"text={day}").first
-                    if day_locator.count() > 0:
-                        parent = day_locator.locator("..")
-                        checkbox = parent.locator("input[type='checkbox']")
-                        if checkbox.count() > 0 and not checkbox.is_checked():
-                            checkbox.click()
-                            page.page.wait_for_timeout(100)
+                # 选择周一到周五：默认全选(一到日)，点击"六"和"日"取消选中
+                # 生效日期区域的星期按钮是可点击的generic元素，不是checkbox
+                date_section = page.page.locator("text=生效日期").locator("..")
+                for day in ["六", "日"]:
+                    day_btn = date_section.locator(f"text={day}")
+                    if day_btn.count() > 0:
+                        day_btn.click()
+                        page.page.wait_for_timeout(100)
 
-                # 设置时间范围
-                time_inputs = page.page.locator("input[type='time']")
-                if time_inputs.count() >= 2:
-                    time_inputs.first.fill("09:00")
-                    time_inputs.last.fill("18:00")
+                # 设置时间范围：故意设为23:11-23:12，确保测试时不在生效时间内
+                # 注意：iKuai时间输入框fill()可能不触发onChange，需要先清空再输入
+                start_time = page.page.get_by_placeholder("开始时间")
+                end_time = page.page.get_by_role("textbox", name="结束时间")
+                if start_time.count() > 0:
+                    start_time.click()
+                    start_time.press("Control+a")
+                    start_time.type("23:11", delay=50)
+                if end_time.count() > 0:
+                    end_time.click()
+                    end_time.press("Control+a")
+                    end_time.type("23:12", delay=50)
+                page.page.wait_for_timeout(200)
 
                 # 点击保存
                 page.page.get_by_role("button", name="保存").click()
                 page.page.wait_for_timeout(500)
 
                 rec.add_detail(f"  [OK] 时间计划创建成功")
-                print("  [OK] 时间计划 test_time_plan_mac_001 创建成功")
+                print("  [OK] 时间计划 t_plan_mac_001 创建成功")
             except Exception as e:
                 rec.add_detail(f"  [WARN] 时间计划创建失败: {str(e)[:50]}")
                 print(f"  [WARN] 时间计划创建失败: {e}")
@@ -350,7 +409,7 @@ class TestMacRateLimitComprehensive:
         with rec.step("步骤6: 批量添加MAC限速规则", f"添加 {len(test_rules)} 条规则，覆盖各种数据组合场景"):
             print("\n[步骤6] 批量添加8条MAC限速规则...")
             rec.add_detail(f"【添加计划】共 {len(test_rules)} 条规则")
-            rec.add_detail(f"  场景覆盖: 不同线路(wan1/wan2/全部/任意)、不同协议栈(IPv4/IPv6)、有意义的备注")
+            rec.add_detail(f"  场景覆盖: 不同线路(任意/全部/wan1/wan2/wan3)、不同协议栈(IPv4/IPv6)、MAC组、批量MAC")
             added_count = 0
 
             for rule in test_rules:
@@ -358,12 +417,16 @@ class TestMacRateLimitComprehensive:
                 rec.add_detail(f"  线路: {rule.get('line', '任意')}")
                 rec.add_detail(f"  协议栈: {rule.get('protocol_stack', 'IPv4')}")
                 if rule.get('mac'):
-                    rec.add_detail(f"  MAC地址: {rule['mac']}")
+                    rec.add_detail(f"  MAC地址(单个): {rule['mac']}")
+                if rule.get('batch_macs'):
+                    rec.add_detail(f"  MAC地址(批量): {', '.join(rule['batch_macs'])}")
                 if rule.get('mac_group'):
                     rec.add_detail(f"  MAC组: {rule['mac_group']}")
                 if rule.get('time_plan'):
                     rec.add_detail(f"  时间计划: {rule['time_plan']}")
-                rec.add_detail(f"  限速模式: {rule.get('mode', '独立限速')}")
+                if rule.get('time_type') == '时间段':
+                    rec.add_detail(f"  时间段: {rule.get('time_start', '')} ~ {rule.get('time_end', '')}")
+                rec.add_detail(f"  限速模式: {rule.get('mode', '独立限��')}")
                 rec.add_detail(f"  上行/下行: {rule.get('upload', 512)}/{rule.get('download', 1024)} KB/s")
                 rec.add_detail(f"  备注: {rule.get('remark', '')}")
                 rec.add_detail(f"  场景: {rule['desc']}")
@@ -380,18 +443,26 @@ class TestMacRateLimitComprehensive:
                     "remark": rule.get("remark", ""),
                 }
 
-                # 添加MAC地址
+                # 添加单个MAC地址
                 if rule.get("mac"):
                     add_params["mac"] = rule["mac"]
+
+                # 添加批量MAC地址
+                if rule.get("batch_macs"):
+                    add_params["batch_macs"] = rule["batch_macs"]
 
                 # 添加MAC组
                 if rule.get("mac_group"):
                     add_params["mac_group"] = rule["mac_group"]
 
-                # 设置时间计划
+                # 设置生效时间
                 if rule.get("time_plan"):
                     add_params["time_type"] = "时间计划"
                     add_params["time_plan"] = rule["time_plan"]
+                elif rule.get("time_type") == "时间段":
+                    add_params["time_type"] = "时间段"
+                    add_params["time_start"] = rule.get("time_start", "2026-03-01 00:00")
+                    add_params["time_end"] = rule.get("time_end", "2026-03-31 23:59")
                 else:
                     add_params["time_type"] = "按周循环"
 
@@ -408,8 +479,8 @@ class TestMacRateLimitComprehensive:
             # 验证所有规则都已添加（参照VLAN综合测试）
             rec.add_detail(f"【验证结果】")
             page.clear_search()  # 清空搜索条件
-            page.page.reload()
-            page.page.wait_for_load_state("networkidle")
+            # 导航回MAC限速页面（确保在正确的标签页）
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(1000)
 
             # 验证每条规则是否存在
@@ -423,14 +494,107 @@ class TestMacRateLimitComprehensive:
             print(f"  [OK] 成功添加 {actual_added}/{len(test_rules)} 条规则")
             rec.add_detail(f"  ✓ 实际验证: {actual_added}/{len(test_rules)} 条规则已存在于列表中")
 
+        # ========== 步骤6.5: 后台数据验证（SSH全链路） ==========
+        if backend_verifier is not None:
+            with rec.step("步骤6.5: 后台数据验证（SSH全链路）", "SSH验证每条规则的数据库/iptables/内核"):
+                print("\n[步骤6.5] 后台数据验证（SSH全链路）...")
+                rec.add_detail("【SSH后台全链路验证】")
+
+                # L4: 内核验证（全局检查一次即可）
+                ssh_verify("L4-内核", backend_verifier.verify_kernel, must_pass=True)
+
+                # 逐条验证已添加的规则
+                verify_passed = 0
+                verify_total = 0
+                for rule in test_rules:
+                    verify_total += 1
+                    rule_name = rule["name"]
+                    rec.add_detail(f"  ── 验证规则: {rule_name} ──")
+                    print(f"  验证规则: {rule_name}")
+
+                    # L1: 数据库验证 - MAC限速可能使用 mac_qos 或 dt_mac_qos
+                    expected_fields = {
+                        "upload": str(rule["upload"]),
+                        "download": str(rule["download"]),
+                    }
+                    l1 = ssh_verify(
+                        f"L1-数据库({rule_name})",
+                        backend_verifier.verify_qos_database,
+                        "mac_qos",
+                        must_pass=True,
+                        expected_fields=expected_fields,
+                        tagname=rule_name,
+                    )
+                    qos_type_found = "mac_qos"
+                    if l1 is None or not l1.passed:
+                        # 尝试 dt_mac_qos
+                        l1 = ssh_verify(
+                            f"L1-dt_mac_qos({rule_name})",
+                            backend_verifier.verify_qos_database,
+                            "dt_mac_qos",
+                            expected_fields=expected_fields,
+                            tagname=rule_name,
+                        )
+                        qos_type_found = "dt_mac_qos"
+                    # 两种表都找不到则记录失败
+                    if l1 is not None and not l1.passed:
+                        ssh_failures.append(f"SSH-L1-数据库({rule_name}): mac_qos和dt_mac_qos均未找到规则")
+
+                    if l1 and l1.passed:
+                        rule_id = l1.details.get("rule", {}).get("id")
+                        db_rule = l1.details.get("rule", {})
+                        rec.add_detail(f"      数据库({qos_type_found}): id={rule_id}, upload={db_rule.get('upload')}, download={db_rule.get('download')}, enabled={db_rule.get('enabled')}")
+
+                        # L2: iptables验证 - MAC_QOS链
+                        # 无MAC地址的规则不创建iptables规则（与IP限速中无IP规则逻辑一致）
+                        # 时间计划规则(23:11-23:12)不在生效时间内，iptables中也无规则
+                        has_mac = rule.get("mac") is not None or rule.get("batch_macs") is not None or rule.get("mac_group") is not None
+                        l2_must_pass = has_mac and "time_plan" not in rule
+                        set_prefix = "mac_qos" if qos_type_found == "mac_qos" else "dt_mac_qos"
+                        if rule["upload"] > 0:
+                            ssh_verify(
+                                f"L2-iptables-上行({rule_name})",
+                                backend_verifier.verify_iptables_rule,
+                                "MAC_QOS",
+                                must_pass=l2_must_pass,
+                                rule_id=rule_id,
+                                expected_speed_kbps=rule["upload"],
+                                set_prefix=set_prefix,
+                            )
+                        if rule["download"] > 0:
+                            ssh_verify(
+                                f"L2-iptables-下行({rule_name})",
+                                backend_verifier.verify_iptables_rule,
+                                "MAC_QOS",
+                                must_pass=l2_must_pass,
+                                rule_id=rule_id,
+                                expected_speed_kbps=rule["download"],
+                                set_prefix=set_prefix,
+                            )
+
+                        verify_passed += 1
+                    elif l1 is None:
+                        rec.add_detail(f"      跳过（SSH不可用）")
+                    else:
+                        rec.add_detail(f"      L1验证未通过，跳过L2")
+
+                print(f"  [OK] 后台验证完成: {verify_passed}/{verify_total} 条规则L1验证通过")
+                rec.add_detail(f"  ── 验证汇总: {verify_passed}/{verify_total} 条规则验证通过 ──")
+        else:
+            print("\n[步骤6.5] 后台数据验证: 跳过（未配置SSH或paramiko未安装）")
+
         # ========== 步骤7: 编辑MAC限速规则 ==========
         with rec.step("步骤7: 编辑MAC限速规则", "编辑第1条规则的名称和限速值"):
             print("\n[步骤7] 编辑MAC限速规则...")
             edit_rule = test_rules[0]
-            new_name = "mac_test_edit_001"
+            new_name = "mac_t_edit_001"
             rec.add_detail(f"【编辑操作】")
             rec.add_detail(f"  目标规则: {edit_rule['name']}")
             rec.add_detail(f"  新名称: {new_name}")
+
+            # 确保在MAC限速页面再操作
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
 
             page.edit_rule(edit_rule["name"])
             page.page.wait_for_timeout(500)
@@ -439,10 +603,8 @@ class TestMacRateLimitComprehensive:
             page.click_save()
             page.wait_for_success_message()
 
-            # 确保返回列表页
+            # 确保返回MAC限速列表页
             page.navigate_to_mac_rate_limit()
-            page.page.wait_for_timeout(500)
-            page.page.reload()
             page.page.wait_for_timeout(1000)
 
             # 验证编辑结果：检查新名称是否存在，或者原名称是否已不存在
@@ -464,6 +626,22 @@ class TestMacRateLimitComprehensive:
                 print(f"  [WARN] 编辑验证失败，原名称仍存在")
                 rec.add_detail(f"  ✗ 编辑验证失败")
 
+            # SSH后台验证：编辑后数据库字段是否更新
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-编辑后】")
+                # iKuai数据库tagname最长15字符，超过会自动截取
+                db_name = new_name[:15] if len(new_name) > 15 else new_name
+                if db_name != new_name:
+                    rec.add_detail(f"  注意: 名称'{new_name}'超15字符，数据库中为'{db_name}'")
+                ssh_verify(
+                    "L1-编辑验证",
+                    backend_verifier.verify_qos_database,
+                    "mac_qos",
+                    must_pass=True,
+                    expected_fields={"upload": "1024"},
+                    tagname=db_name,
+                )
+
         # ========== 步骤8: 单独停用MAC限速规则 ==========
         with rec.step("步骤8: 单独停用MAC限速规则", "停用第2条规则"):
             print("\n[步骤8] 单独停用第2条规则...")
@@ -471,9 +649,15 @@ class TestMacRateLimitComprehensive:
             rec.add_detail(f"【停用操作】")
             rec.add_detail(f"  目标规则: {disable_rule['name']}")
 
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
+
             result = page.disable_rule(disable_rule["name"])
             page.page.wait_for_timeout(1000)
-            page.page.reload()
+
+            # 刷新后确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(500)
 
             if page.is_rule_disabled(disable_rule["name"]):
@@ -484,15 +668,31 @@ class TestMacRateLimitComprehensive:
                 print(f"  [WARN] 停用状态验证失败")
                 rec.add_detail(f"  - 停用状态未确认")
 
-        # ========== 步骤9: 单独启用MAC限速规则 ==========
+            # SSH后台验证：停用后enabled应为no
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-停用后】")
+                ssh_verify(
+                    "L1-停用验证",
+                    backend_verifier.verify_qos_database,
+                    "mac_qos",
+                    must_pass=True,
+                    expected_fields={"enabled": "no"},
+                    tagname=disable_rule["name"],
+                )
         with rec.step("步骤9: 单独启用MAC限速规则", "启用第2条规则"):
             print("\n[步骤9] 单独启用第2条规则...")
             rec.add_detail(f"【启用操作】")
             rec.add_detail(f"  目标规则: {disable_rule['name']}")
 
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
+
             result = page.enable_rule(disable_rule["name"])
             page.page.wait_for_timeout(1000)
-            page.page.reload()
+
+            # 刷新后确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(500)
 
             if page.is_rule_enabled(disable_rule["name"]):
@@ -503,12 +703,28 @@ class TestMacRateLimitComprehensive:
                 print(f"  [WARN] 启用状态验证失败")
                 rec.add_detail(f"  - 启用状态未确认")
 
+            # SSH后台验证：启用后enabled应为yes
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-启用后】")
+                ssh_verify(
+                    "L1-启用验证",
+                    backend_verifier.verify_qos_database,
+                    "mac_qos",
+                    must_pass=True,
+                    expected_fields={"enabled": "yes"},
+                    tagname=disable_rule["name"],
+                )
+
         # ========== 步骤10: 单独删除MAC限速规则 ==========
         with rec.step("步骤10: 单独删除MAC限速规则", "删除第3条规则"):
             print("\n[步骤10] 单独删除第3条规则...")
             delete_rule = test_rules[2]
             rec.add_detail(f"【删除操作】")
             rec.add_detail(f"  目标规则: {delete_rule['name']}")
+
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
 
             count_before = page.get_rule_count()
             result = page.delete_rule(delete_rule["name"])
@@ -519,6 +735,18 @@ class TestMacRateLimitComprehensive:
                 print(f"  [OK] 规则删除成功: {delete_rule['name']}")
                 rec.add_detail(f"【验证结果】")
                 rec.add_detail(f"  ✓ 删除成功，条目数从 {count_before} 减少到 {count_after}")
+
+                # SSH后台验证：删除后数据库中应找不到该规则
+                if backend_verifier is not None:
+                    rec.add_detail(f"  【SSH验证-删除后】")
+                    db_rule = ssh_find_rule(delete_rule["name"])
+                    if db_rule is None:
+                        print(f"    SSH-L1-删除验证: 通过 - 规则已从数据库删除")
+                        rec.add_detail(f"    SSH-L1-删除验证: ✓ 规则已从数据库删除")
+                    else:
+                        print(f"    SSH-L1-删除验证: 失败 - 规则仍在数据库中")
+                        rec.add_detail(f"    SSH-L1-删除验证: ✗ 规则仍在数据库中")
+                        ssh_failures.append(f"SSH-L1-删除验证: 规则{delete_rule['name']}仍在数据库中")
             else:
                 print(f"  [WARN] 删除验证失败")
                 rec.add_detail(f"  - 删除未确认")
@@ -527,6 +755,10 @@ class TestMacRateLimitComprehensive:
         with rec.step("步骤11: 搜索MAC限速规则", "测试搜索存在/不存在的规则"):
             print("\n[步骤11] 搜索测试...")
             rec.add_detail(f"【搜索测试】")
+
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
 
             # 搜索存在的规则
             search_target = test_rules[2]["name"]  # mac_test_004
@@ -563,16 +795,21 @@ class TestMacRateLimitComprehensive:
             rec.add_detail(f"    ✓ 清空成功，显示 {remaining_count} 条记录")
 
         # ========== 步骤12: 列表排序测试 ==========
-        with rec.step("步骤12: 列表排序测试", "测试各可排序字段的排序功能"):
-            print("\n[步骤12] 排序测试...")
+        with rec.step("步骤12: 列表排序测试", "测试各可排序字段的排序功能（每字段点击3次：正序→倒序→默认）"):
+            print("\n[步骤12] 排序测试（每字段点击3次：正序→倒序→默认）...")
             rec.add_detail(f"【排序测试】")
             rec.add_detail(f"  测试字段: 协议栈、线路、限速模式、上行限速、下行限速")
+            rec.add_detail(f"  每个字段点击3次: 正序 → 倒序 → 恢复默认")
+
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
 
             sort_result = page.test_sorting()
             for field, result in sort_result.items():
                 status = "[OK]" if result else "[FAIL]"
-                print(f"  {status} {field} 排序: {'成功' if result else '失败'}")
-                rec.add_detail(f"  {status} {field} 排序: {'成功' if result else '失败'}")
+                print(f"  {status} {field} 排序(正序→倒序→默认): {'成功' if result else '失败'}")
+                rec.add_detail(f"  {status} {field} 排序(3次点击): {'成功' if result else '失败'}")
 
         # ========== 步骤13: 导出MAC限速规则 ==========
         with rec.step("步骤13: 导出MAC限速规则", "导出CSV和TXT两种格式的配置文件"):
@@ -610,12 +847,16 @@ class TestMacRateLimitComprehensive:
                 rec.add_detail(f"  导出异常: {str(e)}")
 
             page.close_modal_if_exists()
-            page.page.reload()
+            # 导航回MAC限速页面（reload后可能不在MAC限速标签页）
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(500)
 
         # ========== 步骤14: 异常输入测试 ==========
         with rec.step("步骤14: 异常输入测试", "测试各种不合规输入的验证拦截"):
             print("\n[步骤14] 异常输入测试...")
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
+            page.page.wait_for_timeout(500)
 
             # 14.1 名称为空测试
             print("\n  [14.1] 名称为空测试...")
@@ -736,8 +977,6 @@ class TestMacRateLimitComprehensive:
             # 确保返回列表页并刷新页面
             page.navigate_to_mac_rate_limit()
             page.page.wait_for_load_state("networkidle")
-            page.page.reload()
-            page.page.wait_for_load_state("networkidle")
             page.page.wait_for_timeout(1000)
 
         # ========== 步骤15: 批量停用MAC限速规则 ==========
@@ -759,7 +998,8 @@ class TestMacRateLimitComprehensive:
             page.batch_disable()
             page.page.wait_for_timeout(1500)
 
-            page.page.reload()
+            # 刷新后确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(500)
 
             # 验证停用结果 - 以实际页面数据为准
@@ -778,13 +1018,25 @@ class TestMacRateLimitComprehensive:
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ 批量停用完成，当前共 {final_count} 条规则（test_rules中{disabled_count}条已停用）")
 
+            # SSH后台验证：批量停用后所有规则enabled应为no
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-批量停用后】")
+                rules_db = backend_verifier.query_qos_rules("mac_qos")
+                if not rules_db:
+                    rules_db = backend_verifier.query_qos_rules("dt_mac_qos")
+                disabled_in_db = sum(1 for r in rules_db if r.get("enabled") == "no")
+                print(f"    SSH: 数据库中{disabled_in_db}/{len(rules_db)}条规则已停用")
+                rec.add_detail(f"    SSH: 数据库中{disabled_in_db}/{len(rules_db)}条规则enabled=no")
+                if len(rules_db) > 0 and disabled_in_db < len(rules_db):
+                    ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_in_db}/{len(rules_db)}条规则停用")
+
         # ========== 步骤16: 批量启用MAC限速规则 ==========
         with rec.step("步骤16: 批量启用MAC限速规则", f"批量启用剩余的 {len(test_rules)} 条规则"):
             print("\n[步骤16] 批量启用所有规则...")
             rec.add_detail(f"【批量启用操作】")
 
-            # 刷新页面清除选择状态
-            page.page.reload()
+            # 导航回MAC限速页面清除选择状态
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(500)
 
             # 获取当前实际规则数量
@@ -796,7 +1048,8 @@ class TestMacRateLimitComprehensive:
             page.batch_enable()
             page.page.wait_for_timeout(1500)
 
-            page.page.reload()
+            # 刷新后确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(500)
 
             # 验证启用结果 - 以实际页面数据为准
@@ -821,8 +1074,8 @@ class TestMacRateLimitComprehensive:
             rec.add_detail(f"【批量删除操作】")
             rec.add_detail(f"  目标数量: {len(test_rules)} 条规则")
 
-            # 刷新页面清除选择状态
-            page.page.reload()
+            # 导航回MAC限速页面清除选择状态
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(500)
 
             # 使用全选功能
@@ -830,7 +1083,8 @@ class TestMacRateLimitComprehensive:
             page.batch_delete()
             page.page.wait_for_timeout(1500)
 
-            page.page.reload()
+            # 刷新后确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(500)
 
             # 以实际页面数据为准
@@ -849,6 +1103,22 @@ class TestMacRateLimitComprehensive:
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ 批量删除完成，剩余 {final_count} 条规则（test_rules中{deleted_count}条已删除）")
 
+            # SSH后台验证：批量删除后数据库应为空
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-批量删除后】")
+                rules_db = backend_verifier.query_qos_rules("mac_qos")
+                if not rules_db:
+                    rules_db = backend_verifier.query_qos_rules("dt_mac_qos")
+                test_names = {r["name"] for r in test_rules}
+                remaining_test_rules = [r for r in rules_db if r.get("tagname") in test_names]
+                if len(remaining_test_rules) == 0:
+                    print(f"    SSH: 数据库中测试规则已全部删除（总规则数: {len(rules_db)}）")
+                    rec.add_detail(f"    SSH-L1-批量删除验证: ✓ 测试规则已全部删除")
+                else:
+                    print(f"    SSH: 数据库中仍有 {len(remaining_test_rules)} 条测试规则")
+                    rec.add_detail(f"    SSH-L1-批量删除验证: ✗ 仍有{len(remaining_test_rules)}条测试规则")
+                    ssh_failures.append(f"SSH-L1-批量删除: 数据库中仍有{len(remaining_test_rules)}条测试规则")
+
         # ========== 步骤18: 导入MAC限速规则 ==========
         with rec.step("步骤18: 导入MAC限速规则", "使用导出的CSV和TXT文件进行导入测试"):
             print("\n[步骤18] 导入MAC限速规则测试...")
@@ -860,7 +1130,8 @@ class TestMacRateLimitComprehensive:
                 rec.add_detail(f"    导入文件: {os.path.basename(export_file_csv)}")
                 count_before = page.get_rule_count()
                 result = page.import_rules(export_file_csv, clear_existing=False)
-                page.page.reload()
+                # 导航回MAC限速页面
+                page.navigate_to_mac_rate_limit()
                 page.page.wait_for_timeout(500)
                 count_after = page.get_rule_count()
                 if count_after > count_before:
@@ -880,7 +1151,8 @@ class TestMacRateLimitComprehensive:
                 rec.add_detail(f"  测试2: TXT文件导入（清空现有数据）")
                 rec.add_detail(f"    导入文件: {os.path.basename(export_file_txt)}")
                 result = page.import_rules(export_file_txt, clear_existing=True)
-                page.page.reload()
+                # 导航回MAC限速页面
+                page.navigate_to_mac_rate_limit()
                 page.page.wait_for_timeout(500)
                 print(f"  [OK] TXT导入完成")
                 rec.add_detail(f"    ✓ TXT导入完成（已清空旧数据）")
@@ -892,7 +1164,8 @@ class TestMacRateLimitComprehensive:
         with rec.step("步骤19: 清理导入的MAC限速规则", "清理导入测试产生的规则数据"):
             print("\n[步骤19] 清理导入的规则...")
             rec.add_detail(f"【环境清理】")
-            page.page.reload()
+            # 确保在MAC限速页面
+            page.navigate_to_mac_rate_limit()
             page.page.wait_for_timeout(1000)
 
             current_count = page.get_rule_count()
@@ -903,7 +1176,8 @@ class TestMacRateLimitComprehensive:
                     page.page.wait_for_timeout(500)
                     page.batch_delete()
                     page.page.wait_for_timeout(1500)
-                    page.page.reload()
+                    # 刷新后确保在MAC限速页面
+                    page.navigate_to_mac_rate_limit()
                     page.page.wait_for_timeout(500)
                     final_count = page.get_rule_count()
                     print(f"  [OK] 清理完成，剩余 {final_count} 条规则")
@@ -986,7 +1260,7 @@ class TestMacRateLimitComprehensive:
                     page.page.wait_for_timeout(500)
 
                     # 查找并删除测试时间计划
-                    plan_locator = page.page.locator("text=test_time_plan_mac_001")
+                    plan_locator = page.page.locator("text=t_plan_mac_001")
                     if plan_locator.count() > 0:
                         # 点击删除按钮
                         plan_locator.first.evaluate("""(el) => {
@@ -1011,8 +1285,8 @@ class TestMacRateLimitComprehensive:
                         if confirm_btn.count() > 0:
                             confirm_btn.click()
                             page.page.wait_for_timeout(500)
-                        rec.add_detail(f"  [OK] 已清理时间计划: test_time_plan_mac_001")
-                        print("  [OK] 已清理时间计划: test_time_plan_mac_001")
+                        rec.add_detail(f"  [OK] 已清理时间计划: t_plan_mac_001")
+                        print("  [OK] 已清理时间计划: t_plan_mac_001")
             except Exception as e:
                 rec.add_detail(f"  [WARN] 时间计划清理失败: {str(e)[:50]}")
 
@@ -1025,7 +1299,7 @@ class TestMacRateLimitComprehensive:
         print("测试覆盖功能:")
         print("  - 环境清理: 测试前检查并批量清理")
         print("  - 创建MAC组: test_mac_group_001")
-        print("  - 创建时间计划: test_time_plan_mac_001")
+        print("  - 创建时间计划: t_plan_mac_001")
         print("  - 添加: 8条规则")
         print("    * 线路覆盖: 任意/wan1/wan2/全部")
         print("    * 协议栈覆盖: IPv4/IPv6")
@@ -1044,3 +1318,10 @@ class TestMacRateLimitComprehensive:
         print("  - 导入: CSV和TXT")
         print("  - 帮助功能: 右下角帮助图标")
         print("  - 清理MAC组和时间计划")
+
+        # ========== SSH后台验证汇总断言 ==========
+        if ssh_failures:
+            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项后台验证失败:")
+            for f in ssh_failures:
+                print(f"  - {f}")
+            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"

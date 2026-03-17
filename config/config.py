@@ -78,12 +78,32 @@ class TestDataConfig:
 
 
 @dataclass
+class SSHHostConfig:
+    """单个SSH主机配置"""
+    host: str = ""
+    username: str = ""
+    password: str = ""
+    port: int = 22
+
+
+@dataclass
+class SSHConfig:
+    """SSH后台验证配置"""
+    router: SSHHostConfig = field(default_factory=SSHHostConfig)
+    client: SSHHostConfig = field(default_factory=SSHHostConfig)
+    iperf3_server: str = "10.66.0.40"
+    iperf3_duration: int = 10
+    iperf3_tolerance: float = 0.20
+
+
+@dataclass
 class Config:
     """全局配置类"""
     device: DeviceConfig = field(default_factory=DeviceConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
     test_data: TestDataConfig = field(default_factory=TestDataConfig)
+    ssh: SSHConfig = field(default_factory=SSHConfig)
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "Config":
@@ -136,6 +156,18 @@ class Config:
                     )
             config.test_data = test_data_config
 
+        if "ssh" in data:
+            ssh_data = data["ssh"]
+            ssh_config = SSHConfig()
+            if "router" in ssh_data:
+                ssh_config.router = SSHHostConfig(**ssh_data["router"])
+            if "client" in ssh_data:
+                ssh_config.client = SSHHostConfig(**ssh_data["client"])
+            ssh_config.iperf3_server = ssh_data.get("iperf3_server", "10.66.0.40")
+            ssh_config.iperf3_duration = ssh_data.get("iperf3_duration", 10)
+            ssh_config.iperf3_tolerance = ssh_data.get("iperf3_tolerance", 0.20)
+            config.ssh = ssh_config
+
         return config
 
     def to_yaml(self, yaml_path: str):
@@ -177,6 +209,23 @@ class Config:
                     }
                     for name, mod in self.test_data.modules.items()
                 }
+            },
+            "ssh": {
+                "router": {
+                    "host": self.ssh.router.host,
+                    "username": self.ssh.router.username,
+                    "password": self.ssh.router.password,
+                    "port": self.ssh.router.port,
+                },
+                "client": {
+                    "host": self.ssh.client.host,
+                    "username": self.ssh.client.username,
+                    "password": self.ssh.client.password,
+                    "port": self.ssh.client.port,
+                },
+                "iperf3_server": self.ssh.iperf3_server,
+                "iperf3_duration": self.ssh.iperf3_duration,
+                "iperf3_tolerance": self.ssh.iperf3_tolerance,
             }
         }
 

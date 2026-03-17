@@ -24,6 +24,26 @@ report:
   screenshot_dir: "reports/screenshots"
   report_name_prefix: "test_report"
 
+# SSH后台验证配置
+ssh:
+  # 路由器SSH
+  router:
+    host: "10.66.0.150"
+    username: "sshd"
+    password: "ikuai8.com"
+    port: 22
+  # Ubuntu测试客户端SSH
+  client:
+    host: "10.66.0.18"
+    username: "iktest"
+    password: "iktest"
+    port: 22
+  # iperf3测速服务器
+  iperf3_server: "10.66.0.40"
+  # iperf3测速参数
+  iperf3_duration: 10  # 测速时长（秒）
+  iperf3_tolerance: 0.20  # 允许的带宽误差（20%）
+
 # 测试数据配置
 test_data:
   # 导出文件存放目录（相对于项目根目录）
@@ -41,6 +61,9 @@ test_data:
     mac_rate_limit:
       export_filename: "mac_rate_limit_config.csv"
       import_filename: "mac_rate_limit_import.csv"
+    static_route:
+      export_filename: "static_route_config.csv"
+      import_filename: "static_route_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"

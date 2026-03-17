@@ -117,6 +117,10 @@ class MainWindow(QMainWindow):
         schedule_config_action.triggered.connect(lambda: self._show_config_dialog("schedule"))
         settings_menu.addAction(schedule_config_action)
 
+        ssh_config_action = QAction("SSH配置", self)
+        ssh_config_action.triggered.connect(lambda: self._show_config_dialog("ssh"))
+        settings_menu.addAction(ssh_config_action)
+
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
 
@@ -530,6 +534,33 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "全链路验证": {
+                                "testcases": [
+                                    # IP限速全链路验证（UI + 后台数据库/iptables/ipset/内核验证）
+                                    "test_ip_rate_limit_full_chain.py::TestIpRateLimitFullChain::test_full_chain_verification",
+                                    # IP限速全链路验证 + iperf3实测（较耗时）
+                                    "test_ip_rate_limit_full_chain.py::TestIpRateLimitFullChain::test_full_chain_with_iperf3",
+                                ],
+                                "groups": {
+                                    "全链路验证（推荐）": [
+                                        "test_ip_rate_limit_full_chain.py::TestIpRateLimitFullChain::test_full_chain_verification",
+                                    ],
+                                    "全链路验证 + iperf3实测": [
+                                        "test_ip_rate_limit_full_chain.py::TestIpRateLimitFullChain::test_full_chain_with_iperf3",
+                                    ],
+                                }
+                            },
+                        }
+                    },
+                    "静态路由": {
+                        "testcases": [
+                            # 静态路由综合测试（19步：添加8条+编辑+复制+停用+启用+删除+搜索+排序+导出+异常+路由表+批量操作+导入+帮助）
+                            "test_static_route_comprehensive.py::TestStaticRouteComprehensive::test_static_route_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "test_static_route_comprehensive.py::TestStaticRouteComprehensive::test_static_route_comprehensive",
+                            ],
                         }
                     },
                     "内外网设置": {
@@ -685,7 +716,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(count)
 
     def _test_connection(self):
-        """测试设备连接"""
+        """测试设备连接（Web UI + SSH）"""
         self.status_label.setText("正在连接...")
         self.connect_btn.setEnabled(False)
 
@@ -694,6 +725,11 @@ class MainWindow(QMainWindow):
         self.config.device.username = self.username_input.text()
         self.config.device.password = self.password_input.text()
 
+        web_ok = False
+        ssh_ok = False
+        results = []
+
+        # 1. 测试Web UI连接
         try:
             from playwright.sync_api import sync_playwright
 
@@ -702,24 +738,65 @@ class MainWindow(QMainWindow):
                 page = browser.new_page()
                 page.goto(f"http://{self.config.device.ip}", timeout=10000)
 
-                # 检查页面标题
                 title = page.title()
                 browser.close()
 
-                self.connection_status.setText("● 已连接")
-                self.connection_status.setStyleSheet("color: green;")
-                self.status_label.setText(f"连接成功 - {title}")
-                self._log("INFO", f"成功连接到设备 {self.config.device.ip}")
+                web_ok = True
+                results.append(f"Web UI: 连接成功 - {title}")
+                self._log("INFO", f"Web UI连接成功: {self.config.device.ip}")
 
         except Exception as e:
+            results.append(f"Web UI: 连接失败 - {str(e)}")
+            self._log("ERROR", f"Web UI连接失败: {str(e)}")
+
+        # 2. 测试SSH连接（如果配置了SSH信息）
+        if self.config.ssh.router.host and self.config.ssh.router.username:
+            try:
+                import paramiko
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(
+                    hostname=self.config.ssh.router.host,
+                    port=self.config.ssh.router.port,
+                    username=self.config.ssh.router.username,
+                    password=self.config.ssh.router.password,
+                    timeout=10
+                )
+                ssh.close()
+                ssh_ok = True
+                results.append(f"路由器SSH: 连接成功")
+                self._log("INFO", f"路由器SSH连接成功: {self.config.ssh.router.host}")
+            except ImportError:
+                results.append("路由器SSH: paramiko未安装，跳过")
+                self._log("WARNING", "paramiko未安装，SSH检查跳过")
+            except Exception as e:
+                results.append(f"路由器SSH: 连接失败 - {str(e)}")
+                self._log("ERROR", f"路由器SSH连接失败: {str(e)}")
+        else:
+            results.append("路由器SSH: 未配置，跳过")
+            self._log("INFO", "路由器SSH未配置，跳过检查（可在 设置→SSH配置 中配置）")
+
+        # 更新UI状态
+        if web_ok:
+            self.connection_status.setText("● 已连接")
+            self.connection_status.setStyleSheet("color: green;")
+            status_text = "Web连接成功"
+            if self.config.ssh.router.host:
+                status_text += f" | SSH{'正常' if ssh_ok else '失败'}"
+            self.status_label.setText(status_text)
+        else:
             self.connection_status.setText("● 连接失败")
             self.connection_status.setStyleSheet("color: red;")
             self.status_label.setText("连接失败")
-            self._log("ERROR", f"连接失败: {str(e)}")
-            QMessageBox.warning(self, "连接失败", f"无法连接到设备:\n{str(e)}")
 
-        finally:
-            self.connect_btn.setEnabled(True)
+        # 显示详细结果
+        detail_msg = "\n".join(results)
+        if not web_ok:
+            QMessageBox.warning(self, "连接结果", f"环境检查结果:\n\n{detail_msg}")
+        elif not ssh_ok and self.config.ssh.router.host:
+            QMessageBox.information(self, "连接结果", f"环境检查结果:\n\n{detail_msg}\n\n提示: SSH连接失败不影响UI自动化测试，但后台验证功能将不可用。")
+
+        self.connect_btn.setEnabled(True)
 
     def _start_tests(self):
         """开始测试"""

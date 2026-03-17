@@ -36,7 +36,7 @@ from utils.step_recorder import StepRecorder
 class TestVlanComprehensive:
     """VLAN综合测试 - 一次测试覆盖所有功能"""
 
-    def test_comprehensive_flow(self, vlan_page_logged_in: VlanPage, step_recorder: StepRecorder):
+    def test_comprehensive_flow(self, vlan_page_logged_in: VlanPage, step_recorder: StepRecorder, request):
         """
         综合测试: 添加8种场景 -> 编辑 -> 停用 -> 删除 -> 搜索 -> 导出 -> 批量操作
 
@@ -54,6 +54,31 @@ class TestVlanComprehensive:
         """
         page = vlan_page_logged_in
         rec = step_recorder  # 简化变量名
+
+        # 动态获取backend_verifier fixture（可选，未配置SSH时为None）
+        try:
+            backend_verifier = request.getfixturevalue('backend_verifier')
+        except Exception:
+            backend_verifier = None
+
+        ssh_failures = []  # 收集must_pass=True但验证失败的项
+
+        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
+            """执行SSH后台验证并记录结果"""
+            if backend_verifier is None:
+                return None
+            try:
+                result = verify_func(*args, **kwargs)
+                status = '通过' if result.passed else '失败'
+                print(f"    SSH-{label}: {status} - {result.message}")
+                rec.add_detail(f"    SSH-{label}: {'✓' if result.passed else '✗'} {result.message}")
+                if must_pass and not result.passed:
+                    ssh_failures.append(f"SSH-{label}: {result.message}")
+                return result
+            except Exception as e:
+                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                return None
 
         # 测试数据 - 8条VLAN，覆盖各种数据组合场景
         test_vlans = [
@@ -196,6 +221,55 @@ class TestVlanComprehensive:
             print("  [OK] 所有8条VLAN添加成功")
             rec.add_detail(f"  ✓ 所有 {len(test_vlans)} 条VLAN添加成功")
 
+        # ========== 步骤3.5: 后台数据验证（SSH全链路） ==========
+        if backend_verifier is not None:
+            with rec.step("步骤3.5: 后台数据验证（SSH全链路）", "SSH验证每条VLAN的数据库/网络接口/proc"):
+                print("\n[步骤3.5] 后台数据验证（SSH全链路）...")
+                rec.add_detail("【SSH后台全链路验证】")
+
+                verify_passed = 0
+                for vlan in test_vlans:
+                    vlan_name = vlan["name"]
+                    rec.add_detail(f"  ── 验证VLAN: {vlan_name} ──")
+                    print(f"  验证VLAN: {vlan_name}")
+
+                    # L1: 数据库验证
+                    expected_fields = {"vlan_id": vlan["id"], "enabled": "yes"}
+                    l1 = ssh_verify(
+                        f"L1-数据库({vlan_name})",
+                        backend_verifier.verify_vlan_database,
+                        vlan_name,
+                        must_pass=True,
+                        expected_fields=expected_fields,
+                    )
+
+                    if l1 and l1.passed:
+                        db_rule = l1.details.get("rule", {})
+                        rec.add_detail(f"      数据库: id={db_rule.get('id')}, vlan_id={db_rule.get('vlan_id')}, enabled={db_rule.get('enabled')}")
+
+                        # L2: 网络接口验证
+                        ssh_verify(
+                            f"L2-网络接口({vlan_name})",
+                            backend_verifier.verify_vlan_interface,
+                            vlan_name,
+                            must_pass=True,
+                        )
+
+                        # L3: /proc/net/vlan验证
+                        ssh_verify(
+                            f"L3-proc({vlan_name})",
+                            backend_verifier.verify_vlan_proc,
+                            vlan_name,
+                            expected_vlan_id=vlan["id"],
+                        )
+
+                        verify_passed += 1
+
+                print(f"  [OK] 后台验证完成: {verify_passed}/{len(test_vlans)} 条VLAN验证通过")
+                rec.add_detail(f"  ── 验证汇总: {verify_passed}/{len(test_vlans)} 条VLAN验证通过 ──")
+        else:
+            print("\n[步骤3.5] 后台数据验证: 跳过（未配置SSH或paramiko未安装）")
+
         # ========== 步骤4: 编辑第1条VLAN ==========
         with rec.step("步骤4: 编辑VLAN", "编辑第1条VLAN的名称"):
             print("\n[步骤4] 编辑第1条VLAN...")
@@ -228,6 +302,15 @@ class TestVlanComprehensive:
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ 编辑成功，新名称已生效")
 
+            # SSH验证编辑后数据库更新
+            if backend_verifier is not None:
+                ssh_verify(
+                    "L1-编辑验证",
+                    backend_verifier.verify_vlan_database,
+                    new_name,
+                    expected_fields={"vlan_id": edit_vlan["id"]},
+                )
+
         # ========== 步骤5: 停用第2条VLAN ==========
         with rec.step("步骤5: 停用VLAN", "停用第2条VLAN"):
             print("\n[步骤5] 停用第2条VLAN...")
@@ -250,6 +333,16 @@ class TestVlanComprehensive:
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ VLAN状态已变为停用")
 
+            # SSH验证停用后数据库字段
+            if backend_verifier is not None:
+                ssh_verify(
+                    "L1-停用验证",
+                    backend_verifier.verify_vlan_database,
+                    disable_vlan["name"],
+                    must_pass=True,
+                    expected_fields={"enabled": "no"},
+                )
+
         # ========== 步骤6: 单独启用第2条VLAN ==========
         with rec.step("步骤6: 启用VLAN", "单独启用第2条VLAN（测试启用功能）"):
             print("\n[步骤6] 单独启用第2条VLAN（测试启用功能）...")
@@ -270,6 +363,16 @@ class TestVlanComprehensive:
             print(f"  [OK] VLAN启用成功: {disable_vlan['name']}")
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ VLAN状态已变为启用")
+
+            # SSH验证启用后数据库字段
+            if backend_verifier is not None:
+                ssh_verify(
+                    "L1-启用验证",
+                    backend_verifier.verify_vlan_database,
+                    disable_vlan["name"],
+                    must_pass=True,
+                    expected_fields={"enabled": "yes"},
+                )
 
         # ========== 步骤7: 删除第3条VLAN ==========
         with rec.step("步骤7: 删除VLAN", "删除第3条VLAN"):
@@ -301,6 +404,20 @@ class TestVlanComprehensive:
             print(f"  [OK] VLAN删除成功: {delete_vlan['name']}")
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ 删除成功，条目数减少 {count_before_delete - count_after_delete}")
+
+            # SSH验证删除后数据库中规则不存在
+            if backend_verifier is not None:
+                try:
+                    db_rule = backend_verifier.find_vlan_rule(tagname=delete_vlan["name"])
+                    if db_rule is None:
+                        print(f"    SSH-L1-删除验证: 通过 - 规则已从数据库删除")
+                        rec.add_detail(f"    SSH-L1-删除验证: ✓ 规则已从数据库删除")
+                    else:
+                        print(f"    SSH-L1-删除验证: 失败 - 规则仍在数据库中")
+                        ssh_failures.append(f"SSH-L1-删除验证: VLAN {delete_vlan['name']}仍在数据库中")
+                except Exception as e:
+                    print(f"    SSH-L1-删除验证: 跳过 - {str(e)[:80]}")
+                    rec.add_detail(f"    SSH-L1-删除验证: 跳过 - {str(e)[:80]}")
 
         # ========== 步骤8: 搜索测试 ==========
         with rec.step("步骤8: 搜索功能测试", "测试搜索存在的VLAN和不存在的VLAN"):
@@ -577,6 +694,20 @@ class TestVlanComprehensive:
             print(f"  [OK] 批量停用 {len(test_vlans)} 条VLAN成功")
             rec.add_detail(f"  ✓ 所有 {disabled_count} 条VLAN已停用")
 
+            # SSH验证批量停用后数据库中所有规则enabled=no
+            if backend_verifier is not None:
+                try:
+                    vlan_rules = backend_verifier.query_vlan_rules()
+                    test_names = {v["name"] for v in test_vlans}
+                    disabled_in_db = sum(1 for r in vlan_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                    print(f"    SSH: 数据库中{disabled_in_db}/{len(test_vlans)}条VLAN已停用")
+                    rec.add_detail(f"    SSH: {disabled_in_db}/{len(test_vlans)}条停用")
+                    if disabled_in_db < len(test_vlans):
+                        ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_in_db}/{len(test_vlans)}条VLAN停用")
+                except Exception as e:
+                    print(f"    SSH-L1-批量停用验证: 跳过 - {str(e)[:80]}")
+                    rec.add_detail(f"    SSH-L1-批量停用验证: 跳过 - {str(e)[:80]}")
+
         # ========== 步骤12: 批量启用所有VLAN ==========
         with rec.step("步骤12: 批量启用VLAN", f"批量启用剩余的 {len(test_vlans)} 条VLAN"):
             print("\n[步骤12] 批量启用所有VLAN...")
@@ -626,6 +757,22 @@ class TestVlanComprehensive:
                 assert not page.vlan_exists(vlan["name"]), f"VLAN {vlan['name']} 仍然存在"
             print(f"  [OK] 批量删除 {len(test_vlans)} 条VLAN成功")
             rec.add_detail(f"  ✓ 所有 {len(test_vlans)} 条VLAN已删除")
+
+            # SSH验证批量删除后数据库中测试规则不存在
+            if backend_verifier is not None:
+                try:
+                    vlan_rules = backend_verifier.query_vlan_rules()
+                    test_names = {v["name"] for v in test_vlans}
+                    remaining = [r for r in vlan_rules if r.get("tagname") in test_names]
+                    if remaining:
+                        print(f"    SSH: 数据库中仍有{len(remaining)}条测试VLAN")
+                        ssh_failures.append(f"SSH-L1-批量删除: 数据库中仍有{len(remaining)}条测试VLAN")
+                    else:
+                        print(f"    SSH: 数据库中测试VLAN已全部删除（总规则数: {len(vlan_rules)}）")
+                        rec.add_detail(f"    SSH: 测试VLAN已全部删除")
+                except Exception as e:
+                    print(f"    SSH-L1-批量删除验证: 跳过 - {str(e)[:80]}")
+                    rec.add_detail(f"    SSH-L1-批量删除验证: 跳过 - {str(e)[:80]}")
 
         # ========== 步骤14: 导入VLAN配置测试 ==========
         with rec.step("步骤14: 导入VLAN配置", "使用导出的CSV和TXT文件进行导入测试"):
@@ -822,6 +969,13 @@ class TestVlanComprehensive:
         print("  - 导入TXT: 1次（有数据，需要清空现有配置）")
         print("  - 清理: 导入后删除所有VLAN")
         print("  - 帮助功能: 右下角帮助图标/面板显示/链接跳转")
+
+        # SSH后台验证最终断言
+        if ssh_failures:
+            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项后台验证失败:")
+            for f in ssh_failures:
+                print(f"  - {f}")
+            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
 
 
 @pytest.mark.vlan
