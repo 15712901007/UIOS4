@@ -1,5 +1,57 @@
 # 开发日志
 
+## 2026-03-17 MAC限速线路选择修复
+
+### 问题描述
+- **现象**: MAC限速测试在选择线路(wan1/wan2/wan3)时超时30秒
+- **根因**: 原代码使用 `get_by_text(line, exact=True).first.click()` 无法定位Ant Design多选下拉框的checkbox元素
+
+### 修复内容
+
+#### 1. 线路下拉框选择器修复
+- 使用 `.ant-select-item[title='xxx']` 选择器替代 `get_by_text()`
+- 支持Ant Design多选下拉框的checkbox交互
+
+#### 2. 选择逻辑修复
+- **问题**: 之前的修复有逻辑错误 - 当当前值为"任意"时直接返回，不执行实际选择
+- **修复**: 移除错误的早期返回逻辑，无论当前值是什么都执行选择操作
+- **流程**: 先取消"全部"选中状态(如果已选中) → 点击指定线路选项 → 关闭下拉框
+
+```python
+def select_line(self, line: str = "任意"):
+    if line == "任意":
+        return self
+    # 点击下拉框
+    line_combobox = self.page.locator(".ant-select").first
+    line_combobox.click()
+
+    # 如果是"全部"，直接点击
+    if line == "全部":
+        self.page.locator(f".ant-select-item[title='全部']").click()
+        return self
+
+    # 取消"全部"选中状态（如果已选中）
+    all_checkbox = self.page.locator(f".ant-select-item[title='全部'] input[type='checkbox']")
+    if all_checkbox.is_checked():
+        all_checkbox.click(force=True)
+
+    # 点击指定线路
+    self.page.locator(f".ant-select-item[title='{line}']").click()
+    self.page.keyboard.press("Escape")
+```
+
+### 测试结果
+- 8/8条规则添加成功（无超时）
+- 线路正确显示为指定值（wan1/wan2/wan3）
+
+### 文件变更
+```
+修改:
+  pages/network/mac_rate_limit_page.py  # select_line()方法修复
+```
+
+---
+
 ## 2026-03-06 IP限速测试ip_test_007失败修复 + 错误截图优化
 
 ### 问题描述

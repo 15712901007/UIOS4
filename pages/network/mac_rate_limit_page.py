@@ -64,26 +64,52 @@ class MacRateLimitPage(IkuaiTablePage):
         return self
 
     def select_line(self, line: str = "任意"):
-        """选择线路"""
+        """选择线路 - 支持选择具体线路如: wan1, wan2, wan3, 或"全部"选中所有线路
+
+        Args:
+            line: 线路名称，可以是: "wan1", "wan2", "wan3", "全部", 或其他
+
+        Returns:
+            self
+        """
         if line == "任意":
             return self
 
         try:
+            # 点击线路下拉框
             line_combobox = self.page.locator(".ant-select").first
             if line_combobox.count() > 0:
                 line_combobox.click()
                 self.page.wait_for_timeout(500)
 
-                label_option = self.page.locator("label").filter(has_text=line)
-                if label_option.count() > 0:
-                    label_option.first.click()
-                    self.page.wait_for_timeout(300)
-                else:
-                    self.page.get_by_text(line, exact=True).first.click()
-                    self.page.wait_for_timeout(300)
+            # 等待下拉选项加载
+            self.page.wait_for_timeout(300)
 
-                self.page.keyboard.press("Escape")
+            # 如果是"全部"，直接点击"全部"选项
+            if line == "全部":
+                all_option = self.page.locator(f".ant-select-item[title='全部']")
+                if all_option.count() > 0:
+                    all_option.click()
+                    self.page.keyboard.press("Escape")
+                return self
+
+            # 选择具体线路：先取消"全部"选中状态，再选择指定线路
+            # 点击"全部"checkbox来取消选中（如果已选中）
+            all_checkbox = self.page.locator(f".ant-select-item[title='全部'] input[type='checkbox']")
+            if all_checkbox.count() > 0 and all_checkbox.is_checked():
+                all_checkbox.click(force=True)
                 self.page.wait_for_timeout(200)
+
+            # 点击对应的线路选项
+            if line not in ["任意", "全部"]:
+                line_option = self.page.locator(f".ant-select-item[title='{line}']")
+                if line_option.count() > 0:
+                    line_option.click()
+                    self.page.wait_for_timeout(200)
+
+            # 关闭下拉框
+            self.page.keyboard.press("Escape")
+            self.page.wait_for_timeout(200)
         except Exception as e:
             print(f"[DEBUG] select_line error: {e}")
         return self
