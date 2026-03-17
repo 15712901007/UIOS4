@@ -85,24 +85,13 @@ class MacRateLimitPage(IkuaiTablePage):
             # 等待下拉选项加载
             self.page.wait_for_timeout(300)
 
-            # 如果是"全部"，直接点击"全部"选项
-            if line == "全部":
-                all_option = self.page.locator(f".ant-select-item[title='全部']")
-                if all_option.count() > 0:
-                    all_option.click()
-                    self.page.keyboard.press("Escape")
-                return self
-
-            # 选择具体线路：先取消"全部"选中状态，再选择指定线路
-            # 点击"全部"checkbox来取消选中（如果已选中）
-            all_checkbox = self.page.locator(f".ant-select-item[title='全部'] input[type='checkbox']")
-            if all_checkbox.count() > 0 and all_checkbox.is_checked():
-                all_checkbox.click(force=True)
-                self.page.wait_for_timeout(200)
-
-            # 点击对应的线路选项
-            if line not in ["任意", "全部"]:
-                line_option = self.page.locator(f".ant-select-item[title='{line}']")
+            # 在下拉框的tooltip容器内查找包含目标线路名称的label
+            # MAC限速的线路下拉框选项结构是: tooltip > generic > label > checkbox + text
+            # 使用更精确的选择器：在下拉框容器内查找label
+            dropdown_container = self.page.locator(".ant-select-dropdown")
+            if dropdown_container.count() > 0:
+                # 在下拉框容器内查找包含目标文本的label
+                line_option = dropdown_container.locator("label").filter(has_text=line).first
                 if line_option.count() > 0:
                     line_option.click()
                     self.page.wait_for_timeout(200)

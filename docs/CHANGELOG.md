@@ -1,21 +1,43 @@
 # 开发日志
 
-## 2026-03-17 MAC限速线路选择修复
+## 2026-03-17 MAC限速线路选择修复（第二次修复）
 
 ### 问题描述
-- **现象**: MAC限速测试在选择线路(wan1/wan2/wan3)时超时30秒
-- **根因**: 原代码使用 `get_by_text(line, exact=True).first.click()` 无法定位Ant Design多选下拉框的checkbox元素
+- **现象**: MAC限速测试添加的规则线路都显示为"任意"，实际应该是指定的线路(wan1/wan2/wan3/全部)
+- **根因**:
+  1. 选择器使用 `.ant-select-item[title='xxx']` 无法定位到实际的DOM结构
+  2. 实际DOM结构是 `tooltip > generic > label > checkbox + text`，不是 `.ant-select-item`
 
 ### 修复内容
 
-#### 1. 线路下拉框选择器修复
-- 使用 `.ant-select-item[title='xxx']` 选择器替代 `get_by_text()`
-- 支持Ant Design多选下拉框的checkbox交互
+#### 线路下拉框选择器修复
+- 使用 `.ant-select-dropdown` 定位下拉框容器
+- 在容器内使用 `label` 配合 `filter(has_text=line)` 精确定位选项
+- 先打开下拉框 → 等待加载 → 在下拉框容器内查找并点击label → 关闭下拉框
 
-#### 2. 选择逻辑修复
-- **问题**: 之前的修复有逻辑错误 - 当当前值为"任意"时直接返回，不执行实际选择
-- **修复**: 移除错误的早期返回逻辑，无论当前值是什么都执行选择操作
-- **流程**: 先取消"全部"选中状态(如果已选中) → 点击指定线路选项 → 关闭下拉框
+```python
+def select_line(self, line: str = "任意"):
+    if line == "任意":
+        return self
+    # 点击下拉框
+    self.page.locator(".ant-select").first.click()
+    self.page.wait_for_timeout(500)
+
+    # 在下拉框容器内查找label
+    dropdown_container = self.page.locator(".ant-select-dropdown")
+    line_option = dropdown_container.locator("label").filter(has_text=line).first
+    if line_option.count() > 0:
+        line_option.click()
+
+    # 关闭下拉框
+    self.page.keyboard.press("Escape")
+```
+
+### 文件变更
+```
+修改:
+  pages/network/mac_rate_limit_page.py  # select_line()方法修复
+```
 
 ```python
 def select_line(self, line: str = "任意"):
