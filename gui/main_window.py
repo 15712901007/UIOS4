@@ -21,9 +21,116 @@ from PySide6.QtGui import QAction, QIcon, QFont, QColor, QPalette
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.config import get_config, Config
+from config.config import get_config, Config, SSHHostConfig
 from gui.test_runner import TestRunner
 from gui.config_dialog import ConfigDialog
+
+
+class ConnectionTestWorker(QThread):
+    """后台连接测试工作线程"""
+    finished = Signal(dict)  # 测试完成信号，携带结果字典
+    log_message = Signal(str, str)  # (level, message) 日志信号
+
+    def __init__(self, device_config, ssh_config):
+        super().__init__()
+        self.device_config = device_config
+        self.ssh_config = ssh_config
+
+    def _log(self, level: str, message: str):
+        """发送日志消息到主线程"""
+        self.log_message.emit(level, message)
+
+    def run(self):
+        """在后台线程执行连接测试"""
+        result = {
+            'web_ok': False,
+            'ssh_ok': False,
+            'console_mode': False,
+            'console_disabled': False,  # 是否关闭了控制台密码
+            'results': [],
+            'web_title': '',
+            'ssh_error': None
+        }
+
+        # 1. 测试Web UI连接
+        self._log("INFO", "正在测试Web UI连接...")
+        try:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(f"http://{self.device_config.ip}", timeout=10000)
+                result['web_title'] = page.title()
+                browser.close()
+                result['web_ok'] = True
+                result['results'].append(f"Web UI: 连接成功 - {result['web_title']}")
+                self._log("INFO", f"Web UI连接成功: {result['web_title']}")
+        except Exception as e:
+            result['results'].append(f"Web UI: 连接失败 - {str(e)}")
+            self._log("ERROR", f"Web UI连接失败: {str(e)}")
+
+        # 2. 测试SSH连接（使用智能登录，支持控制台密码）
+        if self.ssh_config.host and self.ssh_config.username:
+            try:
+                from utils.backend_verifier import SSHClient
+
+                self._log("INFO", f"正在连接SSH: {self.ssh_config.username}@{self.ssh_config.host}")
+                client = SSHClient(self.ssh_config)
+                client.connect()
+
+                # 检测是否使用了控制台登录流程（不仅仅是登录成功）
+                used_console_login = getattr(client, '_used_console_login', False)
+                result['console_mode'] = used_console_login
+
+                if used_console_login:
+                    self._log("INFO", "[OK] 控制台登录成功，shell已修复")
+                    result['console_disabled'] = True  # _login_console内部已经修复了shell
+                else:
+                    self._log("INFO", "[OK] SSH标准模式连接成功（无需控制台登录）")
+
+                # 执行测试命令验证
+                self._log("INFO", "正在验证命令执行...")
+                cmd_result = client.exec_command("echo SSH_TEST_OK", timeout=10)
+
+                # 验证shell状态
+                passwd_result = client.exec_command("cat /etc/passwd | grep sshd", timeout=5)
+                self._log("DEBUG", f"passwd: {passwd_result.strip()}")
+
+                client.close()
+
+                if "SSH_TEST_OK" in cmd_result:
+                    result['ssh_ok'] = True
+                    if used_console_login:
+                        result['results'].append("路由器SSH: 连接成功 (控制台密码已关闭)")
+                    else:
+                        result['results'].append("路由器SSH: 连接成功 (标准模式)")
+                    self._log("INFO", "[OK] SSH命令执行正常")
+                else:
+                    result['results'].append("路由器SSH: 连接成功但命令执行异常")
+                    self._log("WARNING", "SSH命令执行异常")
+
+            except ImportError:
+                result['results'].append("路由器SSH: paramiko未安装，跳过")
+                self._log("WARNING", "paramiko未安装，SSH测试跳过")
+            except RuntimeError as e:
+                err_msg = str(e)
+                result['ssh_error'] = err_msg
+                if "控制台登录失败" in err_msg:
+                    result['results'].append("路由器SSH: 控制台登录失败 - 请检查控制台账号密码")
+                    self._log("ERROR", f"控制台登录失败: {err_msg}")
+                else:
+                    result['results'].append(f"路由器SSH: 连接失败 - {err_msg}")
+                    self._log("ERROR", f"SSH连接失败: {err_msg}")
+            except Exception as e:
+                result['ssh_error'] = str(e)
+                result['results'].append(f"路由器SSH: 连接失败 - {str(e)}")
+                self._log("ERROR", f"SSH连接失败: {str(e)}")
+        else:
+            result['results'].append("路由器SSH: 未配置，跳过")
+            self._log("INFO", "SSH未配置，跳过测试")
+
+        self.finished.emit(result)
 
 
 class MainWindow(QMainWindow):
@@ -478,7 +585,8 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         self.statusbar.addWidget(self.status_label)
 
-        self.statusbar.addPermanentWidget(QLabel(f"设备: {self.config.device.ip}"))
+        self.device_status_label = QLabel(f"设备: {self.config.device.ip}")
+        self.statusbar.addPermanentWidget(self.device_status_label)
 
         self.memory_label = QLabel("内存: -- MB")
         self.statusbar.addPermanentWidget(self.memory_label)
@@ -716,7 +824,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(count)
 
     def _test_connection(self):
-        """测试设备连接（Web UI + SSH智能登录）"""
+        """测试设备连接（Web UI + SSH智能登录）- 启动后台线程"""
         self.status_label.setText("正在连接...")
         self.connect_btn.setEnabled(False)
 
@@ -725,76 +833,38 @@ class MainWindow(QMainWindow):
         self.config.device.username = self.username_input.text()
         self.config.device.password = self.password_input.text()
 
-        web_ok = False
-        ssh_ok = False
-        console_mode = False  # 控制台密码是否开启
-        results = []
+        # 更新状态栏显示的设备IP
+        self.device_status_label.setText(f"设备: {self.config.device.ip}")
 
-        # 1. 测试Web UI连接
-        try:
-            from playwright.sync_api import sync_playwright
+        # 同步SSH配置的IP地址（使用主页面输入的IP）
+        ssh_config = self.config.ssh.router
+        # 创建一个临时配置对象，使用当前输入的IP
+        from config.config import SSHHostConfig
+        temp_ssh_config = SSHHostConfig(
+            host=self.config.device.ip,  # 使用主页面输入的IP
+            username=ssh_config.username,
+            password=ssh_config.password,
+            port=ssh_config.port,
+            console_username=ssh_config.console_username,
+            console_password=ssh_config.console_password
+        )
 
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(f"http://{self.config.device.ip}", timeout=10000)
+        # 创建并启动后台测试线程
+        self._connection_worker = ConnectionTestWorker(
+            self.config.device,
+            temp_ssh_config
+        )
+        self._connection_worker.finished.connect(self._on_connection_test_finished)
+        self._connection_worker.log_message.connect(self._log)  # 连接日志信号
+        self._connection_worker.start()
 
-                title = page.title()
-                browser.close()
-
-                web_ok = True
-                results.append(f"Web UI: 连接成功 - {title}")
-                self._log("INFO", f"Web UI连接成功: {self.config.device.ip}")
-
-        except Exception as e:
-            results.append(f"Web UI: 连接失败 - {str(e)}")
-            self._log("ERROR", f"Web UI连接失败: {str(e)}")
-
-        # 2. 测试SSH连接（使用智能登录，支持控制台密码）
-        if self.config.ssh.router.host and self.config.ssh.router.username:
-            try:
-                from utils.backend_verifier import SSHClient
-
-                client = SSHClient(self.config.ssh.router)
-                client.connect()
-
-                # 检测是否使用了控制台登录
-                console_mode = client._console_logged_in
-
-                # 执行测试命令验证
-                result = client.exec_command("echo SSH_TEST_OK", timeout=10)
-                client.close()
-
-                if "SSH_TEST_OK" in result:
-                    ssh_ok = True
-                    if console_mode:
-                        results.append(f"路由器SSH: 连接成功 (控制台密码已开启，智能登录通过)")
-                        self._log("INFO", f"路由器SSH连接成功 (控制台模式): {self.config.ssh.router.host}")
-                    else:
-                        results.append(f"路由器SSH: 连接成功 (控制台密码未开启)")
-                        self._log("INFO", f"路由器SSH连接成功 (标准模式): {self.config.ssh.router.host}")
-                else:
-                    results.append(f"路由器SSH: 连接成功但命令执行异常")
-                    self._log("WARNING", f"SSH连接成功但命令执行异常")
-
-            except ImportError:
-                results.append("路由器SSH: paramiko未安装，跳过")
-                self._log("WARNING", "paramiko未安装，SSH检查跳过")
-            except RuntimeError as e:
-                # 控制台登录失败（密码错误等）
-                err_msg = str(e)
-                if "控制台登录失败" in err_msg:
-                    results.append(f"路由器SSH: 控制台登录失败 - 请检查控制台账号密码")
-                    self._log("ERROR", f"SSH控制台登录失败: {err_msg}")
-                else:
-                    results.append(f"路由器SSH: 连接失败 - {err_msg}")
-                    self._log("ERROR", f"SSH连接失败: {err_msg}")
-            except Exception as e:
-                results.append(f"路由器SSH: 连接失败 - {str(e)}")
-                self._log("ERROR", f"路由器SSH连接失败: {str(e)}")
-        else:
-            results.append("路由器SSH: 未配置，跳过")
-            self._log("INFO", "路由器SSH未配置，跳过检查（可在 设置→SSH配置 中配置）")
+    def _on_connection_test_finished(self, result):
+        """连接测试完成回调（在主线程执行）"""
+        web_ok = result['web_ok']
+        ssh_ok = result['ssh_ok']
+        console_mode = result['console_mode']
+        console_disabled = result.get('console_disabled', False)
+        results = result['results']
 
         # 更新UI状态
         if web_ok:
@@ -803,10 +873,14 @@ class MainWindow(QMainWindow):
             status_text = "Web连接成功"
             if self.config.ssh.router.host:
                 if ssh_ok:
-                    mode_text = "控制台模式" if console_mode else "标准模式"
-                    status_text += f" | SSH正常({mode_text})"
+                    if console_disabled:
+                        status_text += " | SSH正常(控制台已关闭)"
+                    elif console_mode:
+                        status_text += " | SSH正常(控制台模式)"
+                    else:
+                        status_text += " | SSH正常(标准模式)"
                 else:
-                    status_text += f" | SSH失败"
+                    status_text += " | SSH失败"
             self.status_label.setText(status_text)
         else:
             self.connection_status.setText("● 连接失败")
@@ -820,8 +894,8 @@ class MainWindow(QMainWindow):
         elif not ssh_ok and self.config.ssh.router.host:
             console_hint = "\n\n提示: 如果控制台密码已开启，请在SSH配置中填写控制台账号密码。" if "控制台" in detail_msg else ""
             QMessageBox.information(self, "连接结果", f"环境检查结果:\n\n{detail_msg}\n\n提示: SSH连接失败不影响UI自动化测试，但后台验证功能将不可用。{console_hint}")
-        elif ssh_ok and console_mode:
-            QMessageBox.information(self, "连接结果", f"环境检查结果:\n\n{detail_msg}\n\n提示: 检测到控制台密码已开启，已通过智能登录自动处理。")
+        elif ssh_ok and console_disabled:
+            QMessageBox.information(self, "连接结果", f"环境检查结果:\n\n{detail_msg}\n\n提示: 已自动关闭控制台密码，后续SSH连接将直接进入bash。")
 
         self.connect_btn.setEnabled(True)
 

@@ -58,6 +58,7 @@ class SSHClient:
         self._config = host_config
         self._client: Optional[paramiko.SSHClient] = None
         self._console_logged_in = False  # 控制台登录状态
+        self._used_console_login = False  # 是否使用了控制台登录流程
 
     def connect(self):
         if self._client is not None:
@@ -91,28 +92,51 @@ class SSHClient:
         """检测是否进入交互式菜单，如果是则自动登录"""
         # 如果已登录过，跳过
         if self._console_logged_in:
+            logger.debug("Console already logged in, skipping check")
             return
 
         # 尝试执行简单命令检测是否需要控制台登录
-        try:
-            # 设置较短超时，快速检测
-            _, stdout, _ = self._client.exec_command("echo __CONSOLE_CHECK__", timeout=3)
-            output = stdout.read().decode("utf-8", errors="replace").strip()
-            if "__CONSOLE_CHECK__" in output:
-                # exec_command正常工作，不需要控制台登录
-                self._console_logged_in = True
-                return
-        except Exception:
-            # exec_command超时或失败，可能进入了交互式菜单
-            pass
+        # 使用线程+超时来避免阻塞
+        import threading
+
+        check_result = {"done": False, "output": "", "error": None}
+
+        def do_check():
+            try:
+                _, stdout, stderr = self._client.exec_command("echo __CONSOLE_CHECK__", timeout=5)
+                # 设置 channel 超时
+                stdout.channel.settimeout(5)
+                check_result["output"] = stdout.read().decode("utf-8", errors="replace").strip()
+            except Exception as e:
+                check_result["error"] = e
+            finally:
+                check_result["done"] = True
+
+        logger.debug("Checking if console login is needed...")
+        thread = threading.Thread(target=do_check, daemon=True)
+        thread.start()
+        thread.join(timeout=5)  # 最多等待5秒
+
+        if not check_result["done"]:
+            # 超时，说明进入了交互式菜单
+            logger.debug("exec_command timeout - likely interactive shell")
+        elif check_result["error"]:
+            logger.debug(f"exec_command check failed: {type(check_result['error']).__name__}")
+        elif "__CONSOLE_CHECK__" in check_result["output"]:
+            # exec_command正常工作，不需要控制台登录
+            self._console_logged_in = True
+            logger.debug("exec_command works, no console login needed")
+            return
 
         # 检查是否配置了控制台凭据
         if not self._config.console_username or not self._config.console_password:
             logger.warning("SSH可能进入交互式菜单，但未配置控制台凭据(console_username/console_password)")
             return
 
+        logger.info(f"Starting console login with username: {self._config.console_username}")
         # 执行控制台登录
         self._login_console()
+        self._used_console_login = True  # 标记使用了控制台登录
 
     def _login_console(self) -> bool:
         """通过交互式shell登录控制台
@@ -211,21 +235,33 @@ class SSHClient:
             # 关键步骤：通过交互式shell修复/etc/passwd，让后续exec_command能正常工作
             # 当控制台密码开启时，sshd的shell是/etc/setup/rc，每次exec_command都会进入菜单
             # 必须修改/etc/passwd把shell改为/bin/bash
-            logger.debug("通过交互式shell修复sshd shell...")
+            logger.info("通过交互式shell修复sshd shell...")
+
+            # 先读取当前passwd内容确认状态
+            channel.send("cat /etc/passwd | grep -E '^sshd:'\n")
+            time.sleep(1.0)
+            before_output = recv_all(timeout=2.0)
+            logger.info(f"修复前 passwd: {before_output.strip()}")
+
+            # 执行修复命令
             fix_cmd = "sed -i 's|^sshd:x:0:0:sshd:/root:.*|sshd:x:0:0:sshd:/root:/bin/bash|' /etc/passwd"
             channel.send(f"{fix_cmd}\n")
-            time.sleep(1.0)
+            time.sleep(1.5)
             fix_output = recv_all(timeout=2.0)
-            logger.debug(f"Fix command output: {fix_output[:100]}")
+            logger.debug(f"Fix command output: {fix_output[:100] if fix_output else '(empty)'}")
 
             # 验证修复是否成功
-            channel.send("cat /etc/passwd | grep sshd\n")
+            channel.send("cat /etc/passwd | grep -E '^sshd:'\n")
             time.sleep(1.0)
             passwd_output = recv_all(timeout=2.0)
+            logger.info(f"修复后 passwd: {passwd_output.strip()}")
+
             if "/bin/bash" in passwd_output:
-                logger.info("sshd shell已修复为/bin/bash")
+                logger.info("[OK] sshd shell已修复为/bin/bash")
             else:
-                logger.warning(f"sshd shell修复可能失败: {passwd_output[:100]}")
+                error_msg = f"sshd shell修复失败！当前状态: {passwd_output.strip()}"
+                logger.error(error_msg)
+                # 不抛出异常，继续尝试后续流程
 
             # 关闭交互式channel
             channel.close()
@@ -314,6 +350,10 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
 
         except Exception as e:
             logger.warning(f"部署防重置脚本失败: {e}")
+
+    def exec_command(self, command: str, timeout: int = 30) -> str:
+        """执行命令并返回stdout（exec方法的别名，保持兼容性）"""
+        return self.exec(command, timeout)
 
     def exec(self, command: str, timeout: int = 30) -> str:
         """执行命令并返回stdout，连接断开时自动重连一次"""

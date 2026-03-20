@@ -235,12 +235,14 @@ class ConfigDialog(QDialog):
 
         # 控制台登录凭据（当控制台密码开启时使用）
         self.ssh_router_console_username = QLineEdit()
-        self.ssh_router_console_username.setPlaceholderText("控制台登录账号（可选）")
+        self.ssh_router_console_username.setPlaceholderText("控制台登录账号（如: whoami）")
+        self.ssh_router_console_username.setText("whoami")  # 默认值
         form_layout.addRow("控制台账号:", self.ssh_router_console_username)
 
         self.ssh_router_console_password = QLineEdit()
         self.ssh_router_console_password.setEchoMode(QLineEdit.Password)
-        self.ssh_router_console_password.setPlaceholderText("控制台登录密码（可选）")
+        self.ssh_router_console_password.setPlaceholderText("控制台登录密码")
+        self.ssh_router_console_password.setText("haohao!!xuexi@@tiantian##xiangshang")  # 默认值
         form_layout.addRow("控制台密码:", self.ssh_router_console_password)
 
         layout.addWidget(router_group)
