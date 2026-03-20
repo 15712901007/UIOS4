@@ -17,6 +17,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import Config
 
 
+def get_python_executable() -> str:
+    """获取Python解释器路径
+
+    PyInstaller打包后，sys.executable指向exe文件。
+    我们使用 --run-tests 参数来区分运行模式。
+    """
+    return sys.executable
+
+
+def is_frozen() -> bool:
+    """检查是否在PyInstaller打包环境中运行"""
+    return getattr(sys, 'frozen', False)
+
+
 class TestRunner(QThread):
     """测试执行线程"""
 
@@ -107,15 +121,22 @@ class TestRunner(QThread):
             env["PYTHONUNBUFFERED"] = "1"
 
             # 执行pytest
+            # 设置工作目录：打包后使用exe所在目录，源码运行使用项目根目录
+            if is_frozen():
+                work_dir = os.path.dirname(sys.executable)
+            else:
+                work_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
             process = subprocess.Popen(
                 pytest_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                cwd=work_dir,
                 env=env,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                bufsize=1,  # 行缓冲，实现实时输出
             )
 
             # 实时读取输出
@@ -156,30 +177,53 @@ class TestRunner(QThread):
 
         注意: 不使用pytest-html，而是使用conftest.py中的自定义Jinja2报告生成器
         """
-        cmd = [
-            sys.executable, "-m", "pytest",
-            "-v",  # 详细输出
-            "-s",  # 显示print输出
-            "--tb=short",  # 简短的traceback
-            # 不使用pytest-html，使用conftest.py中的自定义Jinja2报告
-        ]
+        # 获取正确的Python解释器路径
+        python_exe = get_python_executable()
+
+        if is_frozen():
+            # PyInstaller打包后，使用 --run-tests 参数
+            # 使用 -o 覆盖pytest.ini中的addopts设置（避免allure等未打包插件的问题）
+            cmd = [
+                python_exe, "--run-tests",
+                "-v",  # 详细输出
+                "-s",  # 显示print输出
+                "--tb=short",  # 简短的traceback
+                "-o", "addopts=",  # 覆盖pytest.ini中的addopts
+                "-p", "no:allure",  # 禁用allure插件
+            ]
+        else:
+            # 源码运行，使用正常的 pytest 命令
+            cmd = [
+                python_exe, "-m", "pytest",
+                "-v",  # 详细输出
+                "-s",  # 显示print输出
+                "--tb=short",  # 简短的traceback
+            ]
 
         # 注意: 如需使用--timeout参数，请先安装pytest-timeout插件
         # pip install pytest-timeout
         # timeout_sec = self.config.browser.timeout // 1000
         # cmd.append(f"--timeout={timeout_sec}")
 
-        # 添加测试用例
+        # 获取测试文件的根目录
+        if is_frozen():
+            # 打包后，测试文件在_MEIPASS目录中
+            tests_root = sys._MEIPASS
+        else:
+            # 源码运行，使用项目根目录
+            tests_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # 添加测试用例（使用绝对路径）
         for tc in self.testcases:
             # 判断测试用例格式
             if ".py::" in tc:
                 # 新格式: 包含文件名和类名，如 "test_vlan.py::TestVlanAdd::test_add_min_vlan_id"
                 # 或 "test_vlan_comprehensive.py::TestVlanComprehensive::test_comprehensive_flow"
-                cmd.append(f"tests/network/{tc}")
+                cmd.append(os.path.join(tests_root, "tests", "network", tc))
             else:
                 # 旧格式: 只有函数名，假设在 test_vlan.py 中（兼容处理）
                 # 但这种格式不支持类内的测试函数，建议使用新格式
-                cmd.append(f"tests/network/test_vlan.py::{tc}")
+                cmd.append(os.path.join(tests_root, "tests", "network", f"test_vlan.py::{tc}"))
 
         return cmd
 

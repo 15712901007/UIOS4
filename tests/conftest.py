@@ -9,7 +9,7 @@ import sys
 import io
 import ctypes
 from datetime import datetime
-from typing import Generator, Dict, List
+from typing import Generator, Dict, List, Optional
 
 # 解决Windows控制台GBK编码问题（全局只执行一次）
 if sys.platform == 'win32':
@@ -23,6 +23,71 @@ if sys.platform == 'win32':
 
 # 添加项目根目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ==================== PyInstaller打包后的Playwright Fixtures ====================
+# PyInstaller打包后，pytest-playwright插件无法通过entry_points自动加载
+# 因此在这里直接定义必要的fixtures
+
+from playwright.sync_api import Page, Browser, BrowserContext, Playwright, sync_playwright
+
+
+@pytest.fixture(scope="session")
+def playwright() -> Generator[Playwright, None, None]:
+    """Playwright实例"""
+    pw = sync_playwright().start()
+    yield pw
+    pw.stop()
+
+
+@pytest.fixture(scope="session")
+def browser_name() -> str:
+    """浏览器名称"""
+    return "chromium"
+
+
+@pytest.fixture(scope="session")
+def browser_type(playwright: Playwright, browser_name: str):
+    """浏览器类型"""
+    return getattr(playwright, browser_name)
+
+
+@pytest.fixture(scope="session")
+def browser_type_launch_args() -> Dict:
+    """浏览器启动参数"""
+    # 检查环境变量决定是否使用headless模式
+    headless = os.environ.get("HEADLESS", "true").lower() == "true"
+    return {"headless": headless}
+
+
+@pytest.fixture(scope="session")
+def browser(browser_type, browser_type_launch_args: Dict) -> Generator[Browser, None, None]:
+    """浏览器实例"""
+    browser = browser_type.launch(**browser_type_launch_args)
+    yield browser
+    browser.close()
+
+
+@pytest.fixture(scope="session")
+def browser_context_args() -> Dict:
+    """浏览器上下文参数"""
+    return {}
+
+
+@pytest.fixture(scope="function")
+def context(browser: Browser, browser_context_args: Dict) -> Generator[BrowserContext, None, None]:
+    """浏览器上下文"""
+    context = browser.new_context(**browser_context_args)
+    yield context
+    context.close()
+
+
+@pytest.fixture(scope="function")
+def page(context: BrowserContext) -> Generator[Page, None, None]:
+    """页面实例"""
+    page = context.new_page()
+    yield page
+    page.close()
 
 from playwright.sync_api import Page, Browser, BrowserContext
 from config.config import get_config, get_config_with_env, Config

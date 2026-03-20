@@ -4,9 +4,48 @@
 管理设备连接、浏览器、测试等配置
 """
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 import yaml
+
+
+def get_base_path() -> str:
+    """获取基础路径（兼容PyInstaller打包和源码运行）
+
+    PyInstaller打包后，资源文件在临时目录_MEIPASS中
+    用户数据（配置、报告等）在exe所在目录或AppData目录
+    """
+    if getattr(sys, 'frozen', False):
+        # PyInstaller打包后运行
+        # _MEIPASS是内置资源的临时解压目录
+        return sys._MEIPASS
+    else:
+        # 源码运行
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def get_user_data_path() -> str:
+    """获取用户数据目录（配置、报告等）
+
+    打包后使用exe所在目录，源码运行使用项目根目录
+    """
+    if getattr(sys, 'frozen', False):
+        # PyInstaller打包后，使用exe所在目录
+        return os.path.dirname(sys.executable)
+    else:
+        # 源码运行，使用项目根目录
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def get_config_path() -> str:
+    """获取配置文件路径"""
+    # 优先使用用户数据目录的配置（可修改）
+    user_config = os.path.join(get_user_data_path(), 'config', 'settings.yaml')
+    if os.path.exists(user_config):
+        return user_config
+    # 其次使用内置默认配置
+    return os.path.join(get_base_path(), 'config', 'settings.yaml')
 
 
 @dataclass
@@ -255,7 +294,7 @@ def get_config() -> Config:
     """获取全局配置实例"""
     global _config
     if _config is None:
-        config_path = os.path.join(os.path.dirname(__file__), "settings.yaml")
+        config_path = get_config_path()
         _config = Config.from_yaml(config_path)
     return _config
 
@@ -270,7 +309,7 @@ def reload_config(config_path: str = None):
     """重新加载配置"""
     global _config
     if config_path is None:
-        config_path = os.path.join(os.path.dirname(__file__), "settings.yaml")
+        config_path = get_config_path()
     _config = Config.from_yaml(config_path)
     return _config
 

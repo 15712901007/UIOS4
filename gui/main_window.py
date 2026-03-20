@@ -56,9 +56,19 @@ class ConnectionTestWorker(QThread):
         self._log("INFO", "正在测试Web UI连接...")
         try:
             from playwright.sync_api import sync_playwright
+            import sys
 
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+                # PyInstaller打包后需要设置浏览器路径
+                launch_args = {"headless": True}
+                if getattr(sys, 'frozen', False):
+                    # 打包后使用内置的chromium
+                    import os
+                    browser_path = os.path.join(sys._MEIPASS, 'playwright', 'chromium-1208', 'chrome-win64', 'chrome.exe')
+                    if os.path.exists(browser_path):
+                        launch_args["executable_path"] = browser_path
+
+                browser = p.chromium.launch(**launch_args)
                 page = browser.new_page()
                 page.goto(f"http://{self.device_config.ip}", timeout=10000)
                 result['web_title'] = page.title()
