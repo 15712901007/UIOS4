@@ -248,8 +248,19 @@ class StaticRoutePage(IkuaiTablePage):
         return 0
 
     def switch_route_table_protocol(self, protocol: str = "IPv4"):
-        """切换当前路由表的协议显示（IPv4/IPv6）"""
+        """切换当前路由表的协议显示（IPv4/IPv6）
+
+        Ant Design的segmented control需要点击label包装器，不能直接点击radio
+        """
         try:
+            # 方法1: 点击label包装器（更可靠）
+            label = self.page.locator('label').filter(has_text=protocol)
+            if label.count() > 0:
+                label.first.click()
+                self.page.wait_for_timeout(500)
+                return self
+
+            # 方法2: 备用 - 直接点击radio
             radio = self.page.get_by_role("radio", name=protocol)
             if radio.count() > 0:
                 radio.click()
