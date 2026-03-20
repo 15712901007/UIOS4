@@ -52,11 +52,12 @@ class FullChainResult:
 
 
 class SSHClient:
-    """SSH连接管理器"""
+    """SSH连接管理器（支持控制台菜单自动登录）"""
 
     def __init__(self, host_config: SSHHostConfig):
         self._config = host_config
         self._client: Optional[paramiko.SSHClient] = None
+        self._console_logged_in = False  # 控制台登录状态
 
     def connect(self):
         if self._client is not None:
@@ -66,10 +67,12 @@ class SSHClient:
                 if transport is None or not transport.is_active():
                     logger.info(f"SSH connection lost, reconnecting: {self._config.host}")
                     self._client = None
+                    self._console_logged_in = False
                 else:
                     return
             except Exception:
                 self._client = None
+                self._console_logged_in = False
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self._client.connect(
@@ -80,6 +83,237 @@ class SSHClient:
             timeout=10,
         )
         logger.info(f"SSH connected: {self._config.username}@{self._config.host}")
+
+        # 检测是否需要控制台登录
+        self._check_and_login_console()
+
+    def _check_and_login_console(self):
+        """检测是否进入交互式菜单，如果是则自动登录"""
+        # 如果已登录过，跳过
+        if self._console_logged_in:
+            return
+
+        # 尝试执行简单命令检测是否需要控制台登录
+        try:
+            # 设置较短超时，快速检测
+            _, stdout, _ = self._client.exec_command("echo __CONSOLE_CHECK__", timeout=3)
+            output = stdout.read().decode("utf-8", errors="replace").strip()
+            if "__CONSOLE_CHECK__" in output:
+                # exec_command正常工作，不需要控制台登录
+                self._console_logged_in = True
+                return
+        except Exception:
+            # exec_command超时或失败，可能进入了交互式菜单
+            pass
+
+        # 检查是否配置了控制台凭据
+        if not self._config.console_username or not self._config.console_password:
+            logger.warning("SSH可能进入交互式菜单，但未配置控制台凭据(console_username/console_password)")
+            return
+
+        # 执行控制台登录
+        self._login_console()
+
+    def _login_console(self) -> bool:
+        """通过交互式shell登录控制台
+
+        iKuai控制台登录流程（控制台密码开启时）：
+        1. SSH连接后显示菜单，提示"请输入菜单编号"
+        2. 输入用户名回车 → 菜单刷新（不显示密码提示）
+        3. 输入密码回车 → 进入bash
+
+        注意：密码提示不会显示，这是正常行为
+
+        Returns:
+            bool: 登录是否成功
+        """
+        channel = None
+        try:
+            # 创建交互式shell
+            channel = self._client.invoke_shell(term='xterm', width=80, height=24)
+            channel.settimeout(10)
+
+            def recv_until(pattern: str, timeout: float = 5.0) -> str:
+                """接收数据直到匹配pattern或超时"""
+                import time
+                buffer = ""
+                start = time.time()
+                while time.time() - start < timeout:
+                    if channel.recv_ready():
+                        data = channel.recv(4096).decode("utf-8", errors="replace")
+                        buffer += data
+                        if pattern in buffer:
+                            return buffer
+                    time.sleep(0.1)
+                return buffer
+
+            def recv_all(timeout: float = 2.0) -> str:
+                """接收所有可用数据"""
+                import time
+                buffer = ""
+                start = time.time()
+                while time.time() - start < timeout:
+                    if channel.recv_ready():
+                        data = channel.recv(4096).decode("utf-8", errors="replace")
+                        buffer += data
+                        start = time.time()  # 重置计时器
+                    else:
+                        time.sleep(0.1)
+                return buffer
+
+            # 等待菜单显示（"请输入菜单编号" 或 "爱快路由"）
+            output = recv_until("菜单编号", timeout=5)
+            logger.debug(f"Console menu displayed: {len(output)} bytes")
+
+            # Step 1: 发送用户名
+            logger.debug(f"Sending username: {self._config.console_username}")
+            channel.send(f"{self._config.console_username}\n")
+            time.sleep(0.8)
+
+            # Step 2: 等待菜单刷新（不等待密码提示，因为不会显示）
+            output = recv_until("菜单编号", timeout=3)
+            logger.debug(f"Menu refreshed after username: {len(output)} bytes")
+
+            # Step 3: 发送密码
+            logger.debug(f"Sending password: ***")
+            channel.send(f"{self._config.console_password}\n")
+            time.sleep(1.5)
+
+            # Step 4: 读取登录结果
+            login_output = recv_all(timeout=2.0)
+            logger.debug(f"Login output: {login_output[:200]}")
+
+            # Step 5: 验证登录是否成功 - 发送测试命令
+            VERIFY_MARKER = "__IKUAI_CONSOLE_LOGIN_VERIFY__"
+            channel.send(f"echo {VERIFY_MARKER}\n")
+            time.sleep(1.0)
+
+            # 读取验证结果
+            verify_output = recv_all(timeout=2.0)
+            logger.debug(f"Verify output: {verify_output[:200]}")
+
+            # Step 6: 断言检查
+            if VERIFY_MARKER not in verify_output:
+                # 检查是否还在菜单中（密码错误）
+                if "菜单编号" in verify_output or "请输入" in verify_output:
+                    error_msg = "控制台登录失败：密码错误，仍在菜单中"
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+                else:
+                    error_msg = f"控制台登录失败：未检测到验证标记，输出: {verify_output[:100]}"
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+            # 检查bash提示符（可选的额外验证）
+            if "@" in verify_output and ("$" in verify_output or "#" in verify_output):
+                logger.debug(f"检测到bash提示符，确认进入shell")
+
+            # 关键步骤：通过交互式shell修复/etc/passwd，让后续exec_command能正常工作
+            # 当控制台密码开启时，sshd的shell是/etc/setup/rc，每次exec_command都会进入菜单
+            # 必须修改/etc/passwd把shell改为/bin/bash
+            logger.debug("通过交互式shell修复sshd shell...")
+            fix_cmd = "sed -i 's|^sshd:x:0:0:sshd:/root:.*|sshd:x:0:0:sshd:/root:/bin/bash|' /etc/passwd"
+            channel.send(f"{fix_cmd}\n")
+            time.sleep(1.0)
+            fix_output = recv_all(timeout=2.0)
+            logger.debug(f"Fix command output: {fix_output[:100]}")
+
+            # 验证修复是否成功
+            channel.send("cat /etc/passwd | grep sshd\n")
+            time.sleep(1.0)
+            passwd_output = recv_all(timeout=2.0)
+            if "/bin/bash" in passwd_output:
+                logger.info("sshd shell已修复为/bin/bash")
+            else:
+                logger.warning(f"sshd shell修复可能失败: {passwd_output[:100]}")
+
+            # 关闭交互式channel
+            channel.close()
+            channel = None
+
+            # 重要：必须关闭当前SSH连接并重新连接，新的连接才会使用/bin/bash
+            logger.debug("关闭当前连接，准备重连...")
+            self._client.close()
+            self._client = None
+
+            # 重新连接（这次shell已经是/bin/bash，不需要控制台登录）
+            self._client = paramiko.SSHClient()
+            self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self._client.connect(
+                hostname=self._config.host,
+                port=self._config.port,
+                username=self._config.username,
+                password=self._config.password,
+                timeout=10,
+            )
+            logger.info(f"SSH reconnected: {self._config.username}@{self._config.host}")
+
+            self._console_logged_in = True
+            logger.info(f"[OK] 控制台登录成功: {self._config.console_username}@{self._config.host}")
+
+            # 部署防重置脚本（现在exec_command应该能工作了）
+            self._deploy_fix_script()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[FAIL] 控制台登录失败: {e}")
+            self._console_logged_in = False
+            raise  # 重新抛出异常，让调用方知道登录失败
+
+        finally:
+            # 确保channel被关闭
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+
+    def _deploy_fix_script(self):
+        """部署SSH shell防重置脚本（持久分区，升级不丢失）"""
+        try:
+            # 检查是否已部署
+            check_cmd = "test -f /etc/mnt/ikuai/fix_sshd_shell.sh && echo EXISTS || echo NOT_EXISTS"
+            _, stdout, _ = self._client.exec_command(check_cmd, timeout=5)
+            if "EXISTS" in stdout.read().decode():
+                logger.debug("防重置脚本已存在，跳过部署")
+                return
+
+            # 创建修复脚本
+            script_content = '''#!/bin/bash
+# SSH Shell自动修复脚本
+# 解决固件升级或系统重置后sshd shell被改为/etc/setup/rc的问题
+
+PASSWD_FILE="/etc/passwd"
+MARKER_FILE="/tmp/.sshd_shell_fixed"
+
+current_shell=$(grep "^sshd:" $PASSWD_FILE | cut -d: -f7)
+
+if [ "$current_shell" != "/bin/bash" ]; then
+    echo "[$(date)] 检测到sshd shell为 $current_shell，正在修复..."
+    sed -i 's|^sshd:x:0:0:sshd:/root:.*|sshd:x:0:0:sshd:/root:/bin/bash|' $PASSWD_FILE
+    echo "[$(date)] 已修复sshd shell为/bin/bash"
+fi
+
+touch $MARKER_FILE
+'''
+            # 写入脚本
+            write_cmd = f'''cat > /etc/mnt/ikuai/fix_sshd_shell.sh << 'FIXSCRIPT'
+{script_content}FIXSCRIPT
+chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
+            self._client.exec_command(write_cmd, timeout=10)
+
+            # 添加cron任务
+            cron_cmd = '''(crontab -l 2>/dev/null | grep -v fix_sshd_shell; echo "* * * * * /etc/mnt/ikuai/fix_sshd_shell.sh >> /tmp/sshd_fix.log 2>&1") | crontab -'''
+            self._client.exec_command(cron_cmd, timeout=5)
+
+            # 立即执行一次
+            self._client.exec_command("/etc/mnt/ikuai/fix_sshd_shell.sh", timeout=5)
+
+            logger.info("SSH防重置脚本部署成功")
+
+        except Exception as e:
+            logger.warning(f"部署防重置脚本失败: {e}")
 
     def exec(self, command: str, timeout: int = 30) -> str:
         """执行命令并返回stdout，连接断开时自动重连一次"""

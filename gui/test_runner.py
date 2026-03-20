@@ -89,6 +89,9 @@ class TestRunner(QThread):
                 env["SSH_ROUTER_USERNAME"] = self.config.ssh.router.username or ""
                 env["SSH_ROUTER_PASSWORD"] = self.config.ssh.router.password or ""
                 env["SSH_ROUTER_PORT"] = str(self.config.ssh.router.port)
+                # SSH控制台登录凭据（当控制台密码开启时使用）
+                env["SSH_CONSOLE_USERNAME"] = getattr(self.config.ssh.router, 'console_username', '') or ""
+                env["SSH_CONSOLE_PASSWORD"] = getattr(self.config.ssh.router, 'console_password', '') or ""
                 env["SSH_CLIENT_HOST"] = self.config.ssh.client.host or ""
                 env["SSH_CLIENT_USERNAME"] = self.config.ssh.client.username or ""
                 env["SSH_CLIENT_PASSWORD"] = self.config.ssh.client.password or ""

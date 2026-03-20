@@ -32,6 +32,10 @@ ssh:
     username: "sshd"
     password: "ikuai8.com"
     port: 22
+    # 控制台登录凭据（当SSH进入交互式菜单时自动登录）
+    # 注意：请配置您的实际控制台账号密码，此文件不应提交到公开仓库
+    console_username: ""  # 填写控制台账号
+    console_password: ""  # 填写控制台密码
   # Ubuntu测试客户端SSH
   client:
     host: "10.66.0.18"

@@ -25,7 +25,7 @@ if sys.platform == 'win32':
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from playwright.sync_api import Page, Browser, BrowserContext
-from config.config import get_config, Config
+from config.config import get_config, get_config_with_env, Config
 from pages.login_page import LoginPage
 from pages.network.vlan_page import VlanPage
 from pages.network.ip_rate_limit_page import IpRateLimitPage
@@ -120,12 +120,14 @@ def _get_chinese_test_name(test_name: str) -> str:
 @pytest.fixture(scope="session")
 def config() -> Config:
     """
-    获取全局配置
+    获取全局配置（支持环境变量覆盖，用于GUI传参）
+
+    环境变量优先级高于settings.yaml，GUI修改的参数会通过环境变量传递
 
     Returns:
         Config对象
     """
-    return get_config()
+    return get_config_with_env()
 
 
 # ==================== 浏览器配置fixtures ====================

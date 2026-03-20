@@ -233,6 +233,16 @@ class ConfigDialog(QDialog):
         self.ssh_router_port.setValue(22)
         form_layout.addRow("端口:", self.ssh_router_port)
 
+        # 控制台登录凭据（当控制台密码开启时使用）
+        self.ssh_router_console_username = QLineEdit()
+        self.ssh_router_console_username.setPlaceholderText("控制台登录账号（可选）")
+        form_layout.addRow("控制台账号:", self.ssh_router_console_username)
+
+        self.ssh_router_console_password = QLineEdit()
+        self.ssh_router_console_password.setEchoMode(QLineEdit.Password)
+        self.ssh_router_console_password.setPlaceholderText("控制台登录密码（可选）")
+        form_layout.addRow("控制台密码:", self.ssh_router_console_password)
+
         layout.addWidget(router_group)
 
         # 测试客户端SSH配置
@@ -372,6 +382,8 @@ class ConfigDialog(QDialog):
         self.ssh_router_username.setText(self.config.ssh.router.username)
         self.ssh_router_password.setText(self.config.ssh.router.password)
         self.ssh_router_port.setValue(self.config.ssh.router.port)
+        self.ssh_router_console_username.setText(getattr(self.config.ssh.router, 'console_username', ''))
+        self.ssh_router_console_password.setText(getattr(self.config.ssh.router, 'console_password', ''))
 
         self.ssh_client_host.setText(self.config.ssh.client.host)
         self.ssh_client_username.setText(self.config.ssh.client.username)
@@ -409,6 +421,8 @@ class ConfigDialog(QDialog):
         self.config.ssh.router.username = self.ssh_router_username.text()
         self.config.ssh.router.password = self.ssh_router_password.text()
         self.config.ssh.router.port = self.ssh_router_port.value()
+        self.config.ssh.router.console_username = self.ssh_router_console_username.text()
+        self.config.ssh.router.console_password = self.ssh_router_console_password.text()
 
         self.config.ssh.client.host = self.ssh_client_host.text()
         self.config.ssh.client.username = self.ssh_client_username.text()

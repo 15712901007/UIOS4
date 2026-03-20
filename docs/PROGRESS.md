@@ -133,6 +133,12 @@
   - [x] 持久化修复脚本 /etc/mnt/ikuai/fix_sshd_shell.sh
   - [x] Cron每分钟自动检查+修复（固件升级后最多1分钟恢复）
   - [x] BackendVerifier SSH自动重连 + exec重试机制
+- [x] **SSH控制台智能登录** (2026-03-18)
+  - [x] 自动检测控制台密码是否开启（exec_command 3秒超时检测）
+  - [x] 交互式菜单自动登录（用户名→菜单刷新→密码→bash）
+  - [x] 断言机制：验证标记确认登录成功，密码错误抛出RuntimeError
+  - [x] 通过交互式shell修复/etc/passwd，重连后exec_command正常工作
+  - [x] 双模式测试验证：控制台开启/关闭均正常工作
 
 ## Phase 9: 全链路测试 [80%]
 

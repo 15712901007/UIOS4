@@ -84,6 +84,9 @@ class SSHHostConfig:
     username: str = ""
     password: str = ""
     port: int = 22
+    # 控制台登录凭据（用于交互式菜单登录）
+    console_username: str = ""
+    console_password: str = ""
 
 
 @dataclass
@@ -216,6 +219,8 @@ class Config:
                     "username": self.ssh.router.username,
                     "password": self.ssh.router.password,
                     "port": self.ssh.router.port,
+                    "console_username": self.ssh.router.console_username,
+                    "console_password": self.ssh.router.console_password,
                 },
                 "client": {
                     "host": self.ssh.client.host,
@@ -273,3 +278,53 @@ def reload_config(config_path: str = None):
 def get_test_data_config() -> TestDataConfig:
     """获取测试数据配置"""
     return get_config().test_data
+
+
+def apply_env_overrides(config: Config) -> Config:
+    """用环境变量覆盖配置（支持GUI传参）
+
+    环境变量映射:
+    - DEVICE_IP / DEVICE_USERNAME / DEVICE_PASSWORD / DEVICE_PORT: 设备配置
+    - SSH_ROUTER_HOST / SSH_ROUTER_USERNAME / SSH_ROUTER_PASSWORD / SSH_ROUTER_PORT: SSH路由器配置
+    - SSH_CONSOLE_USERNAME / SSH_CONSOLE_PASSWORD: 控制台登录凭据
+    - TESTER / TEST_VERSION: 报告配置
+    """
+    # 设备配置覆盖
+    if os.environ.get("DEVICE_IP"):
+        config.device.ip = os.environ["DEVICE_IP"]
+    if os.environ.get("DEVICE_USERNAME"):
+        config.device.username = os.environ["DEVICE_USERNAME"]
+    if os.environ.get("DEVICE_PASSWORD"):
+        config.device.password = os.environ["DEVICE_PASSWORD"]
+    if os.environ.get("DEVICE_PORT"):
+        config.device.port = int(os.environ["DEVICE_PORT"])
+
+    # SSH路由器配置覆盖
+    if os.environ.get("SSH_ROUTER_HOST"):
+        config.ssh.router.host = os.environ["SSH_ROUTER_HOST"]
+    if os.environ.get("SSH_ROUTER_USERNAME"):
+        config.ssh.router.username = os.environ["SSH_ROUTER_USERNAME"]
+    if os.environ.get("SSH_ROUTER_PASSWORD"):
+        config.ssh.router.password = os.environ["SSH_ROUTER_PASSWORD"]
+    if os.environ.get("SSH_ROUTER_PORT"):
+        config.ssh.router.port = int(os.environ["SSH_ROUTER_PORT"])
+
+    # 控制台登录凭据覆盖
+    if os.environ.get("SSH_CONSOLE_USERNAME"):
+        config.ssh.router.console_username = os.environ["SSH_CONSOLE_USERNAME"]
+    if os.environ.get("SSH_CONSOLE_PASSWORD"):
+        config.ssh.router.console_password = os.environ["SSH_CONSOLE_PASSWORD"]
+
+    # 报告配置覆盖
+    if os.environ.get("TESTER"):
+        config.report.tester = os.environ["TESTER"]
+    if os.environ.get("TEST_VERSION"):
+        config.report.version = os.environ["TEST_VERSION"]
+
+    return config
+
+
+def get_config_with_env() -> Config:
+    """获取配置并应用环境变量覆盖"""
+    config = get_config()
+    return apply_env_overrides(config)
