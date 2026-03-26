@@ -96,4 +96,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=os.path.join(project_root, 'dist', '爱快logo.ico'),  # 爱快官方logo
 )

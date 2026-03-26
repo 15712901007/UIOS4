@@ -180,8 +180,8 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 1400, 900)
         self.setMinimumSize(1200, 800)
 
-        # 设置窗口图标（如果有）
-        # self.setWindowIcon(QIcon("gui/resources/icon.png"))
+        # 设置窗口图标（任务栏和窗口左上角）
+        self._set_window_icon()
 
         # 初始化菜单栏
         self._init_menubar()
@@ -194,6 +194,36 @@ class MainWindow(QMainWindow):
 
         # 初始化状态栏
         self._init_statusbar()
+
+    def _set_window_icon(self):
+        """设置窗口图标（任务栏和窗口左上角）"""
+        from PySide6.QtGui import QIcon
+        import sys
+        import os
+
+        # 查找图标文件路径
+        icon_paths = []
+
+        if getattr(sys, 'frozen', False):
+            # 打包后：在_MEIPASS目录中查找
+            base_dir = sys._MEIPASS
+            icon_paths.extend([
+                os.path.join(base_dir, 'gui', 'gui_resources', '爱快logo.png'),
+                os.path.join(base_dir, 'gui', 'gui_resources', '爱快logo.ico'),
+            ])
+        else:
+            # 源码模式：在项目目录中查找
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            icon_paths.extend([
+                os.path.join(base_dir, 'gui', 'gui_resources', '爱快logo.png'),
+                os.path.join(base_dir, 'gui', 'gui_resources', '爱快logo.ico'),
+            ])
+
+        # 尝试加载图标
+        for icon_path in icon_paths:
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+                return
 
     def _init_menubar(self):
         """初始化菜单栏"""
