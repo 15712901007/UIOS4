@@ -7,6 +7,10 @@ import os
 import sys
 import subprocess
 import re
+import threading
+import queue
+import time
+import io
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -29,6 +33,113 @@ def get_python_executable() -> str:
 def is_frozen() -> bool:
     """检查是否在PyInstaller打包环境中运行"""
     return getattr(sys, 'frozen', False)
+
+
+class RealtimeStdoutCapture:
+    """实时stdout捕获器
+
+    用于在GUI线程中直接运行pytest时，捕获输出并实时发送到GUI
+    """
+    def __init__(self, log_callback, parse_callback=None):
+        """
+        Args:
+            log_callback: 日志回调函数，接收(level, message)参数
+            parse_callback: 可选的解析回调函数，接收(line)参数
+        """
+        self.log_callback = log_callback
+        self.parse_callback = parse_callback
+        self._original_stdout = None
+        self._original_stderr = None
+        self._buffer = io.StringIO()
+        self._encoding = 'utf-8'
+        self._closed = False
+
+    def write(self, text):
+        """写入文本并实时回调"""
+        if self._closed or not text:
+            return 0
+        # 同时写入缓冲区
+        self._buffer.write(text)
+        # 实时发送到GUI
+        text_stripped = text.rstrip('\n\r')
+        if text_stripped:
+            self.log_callback("INFO", text_stripped)
+            if self.parse_callback:
+                self.parse_callback(text_stripped)
+        return len(text)
+
+    def flush(self):
+        """刷新缓冲区"""
+        if self._original_stdout and not self._original_stdout.closed:
+            self._original_stdout.flush()
+
+    def fileno(self):
+        """返回文件描述符（兼容性）"""
+        if self._original_stdout and not self._original_stdout.closed:
+            return self._original_stdout.fileno()
+        return 1
+
+    def isatty(self):
+        """返回False，因为这不是真正的终端"""
+        return False
+
+    def readable(self):
+        """不可读"""
+        return False
+
+    def writable(self):
+        """可写"""
+        return True
+
+    def seekable(self):
+        """不可seek"""
+        return False
+
+    @property
+    def encoding(self):
+        """返回编码"""
+        return self._encoding
+
+    @property
+    def closed(self):
+        """返回是否已关闭"""
+        return self._closed
+
+    def close(self):
+        """关闭流"""
+        self._closed = True
+
+    def __enter__(self):
+        """进入上下文，替换sys.stdout/stderr"""
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        sys.stdout = self
+        sys.stderr = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出上下文，恢复sys.stdout/stderr"""
+        sys.stdout = self._original_stdout
+        sys.stderr = self._original_stderr
+        return False
+
+    def get_output(self):
+        """获取所有捕获的输出"""
+        return self._buffer.getvalue()
+
+
+def _read_output_stream(stream, output_queue):
+    """线程函数：从输出流读取数据并放入队列"""
+    try:
+        for line in iter(stream.readline, ''):
+            if line:
+                output_queue.put(line)
+            else:
+                break
+    except Exception:
+        pass
+    finally:
+        stream.close()
 
 
 class TestRunner(QThread):
@@ -76,96 +187,181 @@ class TestRunner(QThread):
             report_dir = os.path.join(project_root, report_dir)
         os.makedirs(report_dir, exist_ok=True)
 
-        # 构建pytest命令（不生成pytest-html，使用conftest.py中的自定义Jinja2报告）
-        pytest_cmd = self._build_pytest_command()
-
-        self.log_signal.emit("INFO", f"执行命令: {' '.join(pytest_cmd)}")
-
         try:
             # 设置环境变量
-            env = os.environ.copy()
-            env["DEVICE_IP"] = self.config.device.ip
-            env["DEVICE_USERNAME"] = self.config.device.username
-            env["DEVICE_PASSWORD"] = self.config.device.password
-            env["HEADLESS"] = "true" if self.config.browser.headless else "false"
-            # 传递测试人员和版本信息
-            env["TESTER"] = getattr(self.config.report, 'tester', '自动化测试')
-            env["TEST_VERSION"] = getattr(self.config.report, 'version', 'v4.0')
-            # 传递浏览器分辨率（仅在非自适应模式下使用）
-            env["VIEWPORT_WIDTH"] = str(getattr(self.config.browser, 'viewport_width', 1400))
-            env["VIEWPORT_HEIGHT"] = str(getattr(self.config.browser, 'viewport_height', 850))
-            # 自适应屏幕模式（让浏览器像原生浏览器一样自动适应屏幕大小和DPI缩放）
-            auto_adapt = getattr(self.config.browser, 'auto_adapt_screen', True)
-            env["AUTO_ADAPT_SCREEN"] = "true" if auto_adapt else "false"
-            # SSH配置（供后台验证使用）
-            if hasattr(self.config, 'ssh') and self.config.ssh:
-                env["SSH_ROUTER_HOST"] = self.config.ssh.router.host or ""
-                env["SSH_ROUTER_USERNAME"] = self.config.ssh.router.username or ""
-                env["SSH_ROUTER_PASSWORD"] = self.config.ssh.router.password or ""
-                env["SSH_ROUTER_PORT"] = str(self.config.ssh.router.port)
-                # SSH控制台登录凭据（当控制台密码开启时使用）
-                env["SSH_CONSOLE_USERNAME"] = getattr(self.config.ssh.router, 'console_username', '') or ""
-                env["SSH_CONSOLE_PASSWORD"] = getattr(self.config.ssh.router, 'console_password', '') or ""
-                env["SSH_CLIENT_HOST"] = self.config.ssh.client.host or ""
-                env["SSH_CLIENT_USERNAME"] = self.config.ssh.client.username or ""
-                env["SSH_CLIENT_PASSWORD"] = self.config.ssh.client.password or ""
-                env["SSH_CLIENT_PORT"] = str(self.config.ssh.client.port)
-                env["IPERF3_SERVER"] = self.config.ssh.iperf3_server or ""
-                env["IPERF3_DURATION"] = str(self.config.ssh.iperf3_duration)
-                env["IPERF3_TOLERANCE"] = str(self.config.ssh.iperf3_tolerance)
-            # 设置Python输出编码为UTF-8，解决中文乱码问题
-            env["PYTHONIOENCODING"] = "utf-8"
-            # 设置控制台代码页为UTF-8（Windows）
-            env["PYTHONUTF8"] = "1"
-            # 禁用Python输出缓冲，实现实时日志显示
-            env["PYTHONUNBUFFERED"] = "1"
+            self._setup_env_variables()
 
-            # 执行pytest
-            # 设置工作目录：打包后使用exe所在目录，源码运行使用项目根目录
+            # PyInstaller打包后：直接在当前进程中运行pytest（解决实时日志问题）
+            # 源码模式：使用subprocess运行pytest
             if is_frozen():
-                work_dir = os.path.dirname(sys.executable)
+                self._run_pytest_in_process(report_dir)
             else:
-                work_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                self._run_pytest_subprocess(report_dir)
 
-            process = subprocess.Popen(
-                pytest_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=work_dir,
-                env=env,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,  # 行缓冲，实现实时输出
-            )
+        except Exception as e:
+            self.log_signal.emit("ERROR", f"执行测试时发生错误: {str(e)}")
+            self.error_signal.emit(str(e))
 
-            # 实时读取输出
-            for line in process.stdout:
-                if not self._is_running:
-                    process.terminate()
-                    self.log_signal.emit("WARNING", "测试被用户终止")
-                    break
+    def _setup_env_variables(self):
+        """设置环境变量"""
+        env = os.environ
+        env["DEVICE_IP"] = self.config.device.ip
+        env["DEVICE_USERNAME"] = self.config.device.username
+        env["DEVICE_PASSWORD"] = self.config.device.password
+        env["HEADLESS"] = "true" if self.config.browser.headless else "false"
+        # 传递测试人员和版本信息
+        env["TESTER"] = getattr(self.config.report, 'tester', '自动化测试')
+        env["TEST_VERSION"] = getattr(self.config.report, 'version', 'v4.0')
+        # 传递浏览器分辨率（仅在非自适应模式下使用）
+        env["VIEWPORT_WIDTH"] = str(getattr(self.config.browser, 'viewport_width', 1400))
+        env["VIEWPORT_HEIGHT"] = str(getattr(self.config.browser, 'viewport_height', 850))
+        # 自适应屏幕模式（让浏览器像原生浏览器一样自动适应屏幕大小和DPI缩放）
+        auto_adapt = getattr(self.config.browser, 'auto_adapt_screen', True)
+        env["AUTO_ADAPT_SCREEN"] = "true" if auto_adapt else "false"
+        # SSH配置（供后台验证使用）
+        if hasattr(self.config, 'ssh') and self.config.ssh:
+            env["SSH_ROUTER_HOST"] = self.config.ssh.router.host or ""
+            env["SSH_ROUTER_USERNAME"] = self.config.ssh.router.username or ""
+            env["SSH_ROUTER_PASSWORD"] = self.config.ssh.router.password or ""
+            env["SSH_ROUTER_PORT"] = str(self.config.ssh.router.port)
+            # SSH控制台登录凭据（当控制台密码开启时使用）
+            env["SSH_CONSOLE_USERNAME"] = getattr(self.config.ssh.router, 'console_username', '') or ""
+            env["SSH_CONSOLE_PASSWORD"] = getattr(self.config.ssh.router, 'console_password', '') or ""
+            env["SSH_CLIENT_HOST"] = self.config.ssh.client.host or ""
+            env["SSH_CLIENT_USERNAME"] = self.config.ssh.client.username or ""
+            env["SSH_CLIENT_PASSWORD"] = self.config.ssh.client.password or ""
+            env["SSH_CLIENT_PORT"] = str(self.config.ssh.client.port)
+            env["IPERF3_SERVER"] = self.config.ssh.iperf3_server or ""
+            env["IPERF3_DURATION"] = str(self.config.ssh.iperf3_duration)
+            env["IPERF3_TOLERANCE"] = str(self.config.ssh.iperf3_tolerance)
+        # 设置Python输出编码为UTF-8，解决中文乱码问题
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
 
-                line = line.strip()
-                if line:
-                    self._parse_output(line)
-                    self.log_signal.emit("INFO", line)
+    def _run_pytest_in_process(self, report_dir: str):
+        """在当前进程中直接运行pytest（打包模式）
 
-            process.wait()
+        通过直接调用pytest.main()并捕获stdout/stderr来实时显示日志
+        """
+        import pytest
+
+        # 构建pytest参数
+        pytest_args = self._build_pytest_args()
+
+        self.log_signal.emit("INFO", f"直接运行pytest: {' '.join(pytest_args)}")
+
+        # 创建实时stdout捕获器
+        def log_callback(level, message):
+            self.log_signal.emit(level, message)
+
+        def parse_callback(line):
+            self._parse_output(line)
+
+        capture = RealtimeStdoutCapture(log_callback, parse_callback)
+
+        # 保存原始sys.argv
+        original_argv = sys.argv.copy()
+
+        try:
+            # 设置sys.argv供pytest使用
+            sys.argv = ['pytest'] + pytest_args
+
+            # 使用捕获器运行pytest
+            with capture:
+                exit_code = pytest.main(pytest_args)
 
             # 测试完成
             if self._is_running:
                 duration = datetime.now() - self.start_time
                 self.log_signal.emit("INFO", f"测试执行完成，用时: {duration}")
                 self.log_signal.emit("INFO", f"总计: {self.total}, 通过: {self.passed}, 失败: {self.failed}, 跳过: {self.skipped}")
-                # 传递报告目录，让GUI自动查找最新报告
                 self.finished_signal.emit(report_dir)
             else:
                 self.error_signal.emit("测试被用户终止")
 
-        except Exception as e:
-            self.log_signal.emit("ERROR", f"执行测试时发生错误: {str(e)}")
-            self.error_signal.emit(str(e))
+        finally:
+            # 恢复sys.argv
+            sys.argv = original_argv
+
+    def _run_pytest_subprocess(self, report_dir: str):
+        """使用subprocess运行pytest（源码模式）"""
+        # 构建pytest命令
+        pytest_cmd = self._build_pytest_command()
+
+        self.log_signal.emit("INFO", f"执行命令: {' '.join(pytest_cmd)}")
+
+        # 设置工作目录
+        work_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # 使用PIPE读取输出
+        process = subprocess.Popen(
+            pytest_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=work_dir,
+            env=os.environ.copy(),
+        )
+
+        # 使用阻塞readline()在线程中读取
+        def read_process_output(stream, log_signal, parse_func):
+            try:
+                while True:
+                    line_bytes = stream.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode('utf-8', errors='replace').rstrip('\n\r')
+                    if line:
+                        parse_func(line)
+                        log_signal.emit("INFO", line)
+            except Exception:
+                pass
+            finally:
+                stream.close()
+
+        reader_thread = threading.Thread(
+            target=read_process_output,
+            args=(process.stdout, self.log_signal, self._parse_output),
+            daemon=True
+        )
+        reader_thread.start()
+
+        process.wait()
+        reader_thread.join(timeout=3)
+
+        if self._is_running:
+            duration = datetime.now() - self.start_time
+            self.log_signal.emit("INFO", f"测试执行完成，用时: {duration}")
+            self.log_signal.emit("INFO", f"总计: {self.total}, 通过: {self.passed}, 失败: {self.failed}, 跳过: {self.skipped}")
+            self.finished_signal.emit(report_dir)
+        else:
+            self.error_signal.emit("测试被用户终止")
+
+    def _build_pytest_args(self) -> List[str]:
+        """构建pytest参数列表（用于直接调用pytest.main）"""
+        args = [
+            "-v",  # 详细输出
+            "-s",  # 显示print输出
+            "--tb=short",  # 简短的traceback
+            "--capture=no",  # 禁用pytest输出捕获
+            "-p", "no:allure",  # 禁用allure插件
+            "-o", "addopts=",  # 覆盖pytest.ini中的addopts
+        ]
+
+        # 获取测试文件根目录
+        if is_frozen():
+            tests_root = sys._MEIPASS
+        else:
+            tests_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # 添加测试用例
+        for tc in self.testcases:
+            if ".py::" in tc:
+                args.append(os.path.join(tests_root, "tests", "network", tc))
+            else:
+                args.append(os.path.join(tests_root, "tests", "network", f"test_vlan.py::{tc}"))
+
+        return args
 
     def _build_pytest_command(self) -> List[str]:
         """构建pytest命令

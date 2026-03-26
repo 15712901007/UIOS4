@@ -125,43 +125,67 @@ def page(context: BrowserContext) -> Generator[Page, None, None]:
 (os.path.join(playwright_browsers_path, 'chromium_headless_shell-1208'), 'playwright/chromium_headless_shell-1208'),
 ```
 
-### 问题3：点击"开始测试"打开新GUI窗口
+### 问题3：实时日志不显示（已解决）
 
-**原因**：`sys.executable`在打包后指向exe本身，`subprocess`调用会启动新GUI。
+**原因**：PyInstaller打包后，通过subprocess启动子进程时，stdout管道的缓冲行为与源码模式不同，导致日志被缓冲无法实时显示。
 
-**解决方案**：在`main.py`中添加`--run-tests`入口点：
+**解决方案**：放弃subprocess，在打包模式下直接在GUI线程中调用`pytest.main()`：
 
 ```python
-def run_pytest_mode():
-    """PyInstaller打包后的pytest运行模式"""
+# gui/test_runner.py
+
+class RealtimeStdoutCapture:
+    """实时stdout捕获器 - 捕获输出并通过Qt信号实时发送到GUI"""
+
+    def __init__(self, log_callback, parse_callback=None):
+        self.log_callback = log_callback
+        self.parse_callback = parse_callback
+        self._buffer = io.StringIO()
+        self._encoding = 'utf-8'
+        self._closed = False
+
+    def write(self, text):
+        if self._closed or not text:
+            return 0
+        self._buffer.write(text)
+        text_stripped = text.rstrip('\n\r')
+        if text_stripped:
+            self.log_callback("INFO", text_stripped)
+            if self.parse_callback:
+                self.parse_callback(text_stripped)
+        return len(text)
+
+    def isatty(self):
+        return False  # 关键：pytest会检查此方法
+
+    def readable(self): return False
+    def writable(self): return True
+    def seekable(self): return False
+
+    @property
+    def encoding(self): return self._encoding
+
+    @property
+    def closed(self): return self._closed
+
+
+def _run_pytest_in_process(self, report_dir: str):
+    """在当前进程中直接运行pytest（打包模式）"""
     import pytest
 
-    # 修复I/O问题
-    if sys.stdout is None or sys.stdout.closed:
-        sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+    capture = RealtimeStdoutCapture(
+        log_callback=lambda level, msg: self.log_signal.emit(level, msg),
+        parse_callback=self._parse_output
+    )
 
-    # 设置测试目录
-    if getattr(sys, 'frozen', False):
-        sys.path.insert(0, sys._MEIPASS)
-        pytest_args.append(os.path.join(sys._MEIPASS, 'tests'))
-
-    pytest_args.extend(['--capture=no', '-p', 'no:allure', '-o', 'addopts='])
-    sys.exit(pytest.main(pytest_args))
-
-def main():
-    if '--run-tests' in sys.argv:
-        run_pytest_mode()
-        return
-    # ... 正常GUI启动
+    with capture:
+        pytest.main(self._build_pytest_args())
 ```
 
-在`gui/test_runner.py`中使用：
-```python
-if is_frozen():
-    cmd = [sys.executable, "--run-tests", "-v", "-s", "--tb=short", ...]
-else:
-    cmd = [sys.executable, "-m", "pytest", "-v", "-s", ...]
-```
+**关键点**：
+- `RealtimeStdoutCapture` 必须实现 `isatty()` 方法，否则pytest会报错
+- 使用上下文管理器临时替换 `sys.stdout` 和 `sys.stderr`
+- 源码模式仍使用subprocess（避免潜在问题）
 
 ### 问题4：Playwright浏览器路径
 
@@ -211,8 +235,8 @@ pytest_args.extend(['-p', 'no:allure', '-o', 'addopts='])
 | `Executable doesn't exist` | 浏览器路径错误 | 打包完整chromium |
 | `I/O operation on closed file` | console=False | 设置console=True |
 | `ModuleNotFoundError: No module named 'pages'` | _MEIPASS未加入sys.path | 在main.py开头添加 |
-| 打开新GUI窗口 | subprocess调用exe | 使用--run-tests入口点 |
 | GUI测试连接失败 | GUI未设置浏览器路径 | 在launch时指定executable_path |
+| `'RealtimeStdoutCapture' object has no attribute 'isatty'` | 缺少isatty方法 | 添加isatty()方法返回False |
 
 ## GUI测试连接浏览器修复
 
@@ -230,32 +254,27 @@ if getattr(sys, 'frozen', False):
 browser = p.chromium.launch(**launch_args)
 ```
 
-## 实时日志显示
+## 实时日志显示（已解决）
 
-subprocess需要设置`bufsize=1`（行缓冲）才能实时显示输出：
+打包模式下使用`RealtimeStdoutCapture`类直接捕获pytest输出，通过Qt信号实时发送到GUI：
 
 ```python
-process = subprocess.Popen(
-    pytest_cmd,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True,
-    bufsize=1,  # 行缓冲，实现实时输出
-    env=env,
-)
+# 打包模式：直接在GUI线程中运行pytest
+if is_frozen():
+    self._run_pytest_in_process(report_dir)
+else:
+    self._run_pytest_subprocess(report_dir)
 ```
 
-**注意**: 即使设置了`bufsize=1`和`PYTHONUNBUFFERED=1`，打包后日志仍可能批量显示而非逐行实时显示。这可能是pytest内部缓冲或Windows管道特性导致，待进一步调查。
+**技术原理**：通过替换`sys.stdout`和`sys.stderr`，每次pytest输出时立即通过Qt信号发送到GUI，完全绕过PyInstaller的stdout管道缓冲问题。
 
 ## 预期行为（非问题）
 
 | 现象 | 原因 | 说明 |
 |------|------|------|
 | 启动慢（10-20秒） | 单文件模式解压 | PyInstaller需要将266MB解压到临时目录，首次启动较慢 |
-| 日志批量显示 | pytest设计特性 | pytest运行时收集输出，测试结束后统一显示 |
-
-如果需要更快的启动速度，可以使用文件夹模式（onedir），但需要分发整个文件夹。
+| 日志实时显示 | 进程内pytest调用 | 已解决，操作和日志同步显示 |
 
 ---
-版本: 1.0.0
-更新日期: 2026-03-20
+版本: 1.1.0
+更新日期: 2026-03-26
