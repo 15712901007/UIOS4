@@ -21,6 +21,9 @@ apscheduler>=3.10.0
 # 配置管理
 pyyaml>=6.0.0
 
+# SSH后台验证
+paramiko>=3.0.0
+
 # 数据处理
 pandas>=2.1.0
 

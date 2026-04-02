@@ -18,7 +18,7 @@ from typing import Optional, Dict, List, Any
 
 import paramiko
 
-from config.config import get_config, SSHConfig, SSHHostConfig
+from config.config import get_config, get_config_with_env, SSHConfig, SSHHostConfig
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -83,6 +83,10 @@ class SSHClient:
             password=self._config.password,
             timeout=10,
         )
+        # 设置keepalive防止长时间空闲断连（每30秒发送一次心跳）
+        transport = self._client.get_transport()
+        if transport:
+            transport.set_keepalive(30)
         logger.info(f"SSH connected: {self._config.username}@{self._config.host}")
 
         # 检测是否需要控制台登录
@@ -416,7 +420,7 @@ class BackendVerifier:
 
     def __init__(self, ssh_config: SSHConfig = None):
         if ssh_config is None:
-            ssh_config = get_config().ssh
+            ssh_config = get_config_with_env().ssh
         self._ssh_config = ssh_config
         self._router: Optional[SSHClient] = None
         self._client: Optional[SSHClient] = None
@@ -505,11 +509,14 @@ class BackendVerifier:
         """
         rule = self.find_qos_rule(qos_type, **filters)
         if rule is None:
+            all_rules = self.query_qos_rules(qos_type)
+            existing_names = [r.get("tagname", "?") for r in all_rules]
+            logger.debug(f"QoS rule not found: {filters}, existing: {existing_names}")
             return VerifyResult(
                 level="L1-数据库",
                 passed=False,
                 message=f"规则未找到: {filters}",
-                raw_output=str(self.query_qos_rules(qos_type)[:3]),
+                raw_output=f"数据库中现有规则: {existing_names}",
             )
 
         # 校验字段
@@ -852,10 +859,13 @@ class BackendVerifier:
     def query_vlan_rules(self) -> List[Dict]:
         """查询所有VLAN规则"""
         self.connect_router()
-        output = self._router.exec("/usr/ikuai/function/vlan show")
+        output = self._router.exec("/usr/ikuai/function/vlan show limit=0,500 TYPE=total,data")
+        logger.info(f"VLAN query raw ({len(output)} chars): {output[:300]}")
         try:
             parsed = json.loads(output)
-            return parsed.get("data", [])
+            data = parsed.get("data", [])
+            logger.info(f"VLAN query returned {len(data)} rules")
+            return data
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse vlan output: {output[:200]}")
             return []
@@ -879,11 +889,14 @@ class BackendVerifier:
         """
         rule = self.find_vlan_rule(tagname=vlan_name)
         if rule is None:
+            all_rules = self.query_vlan_rules()
+            existing_names = [r.get("tagname", "?") for r in all_rules]
+            logger.debug(f"VLAN未找到: {vlan_name}, 数据库中现有tagname: {existing_names}")
             return VerifyResult(
                 level="L1-数据库",
                 passed=False,
                 message=f"VLAN未找到: tagname={vlan_name}",
-                raw_output=str(self.query_vlan_rules()[:3]),
+                raw_output=f"数据库中现有VLAN: {existing_names}",
             )
 
         mismatches = {}
@@ -915,60 +928,61 @@ class BackendVerifier:
         """
         L2: 验证VLAN网络接口存在且状态正确
 
-        iKuai VLAN网络结构:
-          _{name}@lan1  (802.1Q VLAN接口, slave of bridge)
-          {name}        (bridge接口, IP分配在此)
+        iKuai VLAN网络结构（两种命名规则）:
+          规则A: _{name}@lan1  (802.1Q VLAN接口) + {name} (bridge接口)
+          规则B: {name}@lan1   (部分固件版本无下划线前缀)
 
         Args:
             vlan_name: VLAN名称
             expected_state: 期望的接口状态 "UP" 或 "DOWN"
         """
         self.connect_router()
-        # 检查802.1Q VLAN接口
-        vlan_iface = f"_{vlan_name}"
-        output = self._router.exec(f"ip link show {vlan_iface} 2>/dev/null")
+        # 自适应两种命名规则：先试带下划线，再试不带下划线
+        for prefix in ("_", ""):
+            vlan_iface = f"{prefix}{vlan_name}"
+            output = self._router.exec(f"ip link show {vlan_iface} 2>/dev/null")
+            if output.strip() and "does not exist" not in output:
+                # 找到了VLAN接口
+                # 检查bridge接口
+                bridge_iface = vlan_name
+                bridge_output = self._router.exec(f"ip link show {bridge_iface} 2>/dev/null")
+                has_bridge = bridge_output.strip() and "does not exist" not in bridge_output
 
-        if not output.strip() or "does not exist" in output:
-            return VerifyResult(
-                level="L2-网络接口",
-                passed=False,
-                message=f"VLAN接口 {vlan_iface} 不存在",
-                raw_output=output,
-            )
+                # 检查接口状态
+                iface_up = expected_state in output
+                bridge_up = expected_state in bridge_output if has_bridge else False
 
-        # 检查bridge接口
-        bridge_iface = vlan_name
-        bridge_output = self._router.exec(f"ip link show {bridge_iface} 2>/dev/null")
+                if expected_state == "UP" and iface_up:
+                    return VerifyResult(
+                        level="L2-网络接口",
+                        passed=True,
+                        message=f"VLAN接口 {vlan_iface} 状态UP, bridge={has_bridge and bridge_up}",
+                        details={"vlan_iface": vlan_iface, "bridge": bridge_iface, "bridge_exists": has_bridge},
+                        raw_output=output[:300],
+                    )
+                elif expected_state == "DOWN" and not iface_up:
+                    return VerifyResult(
+                        level="L2-网络接口",
+                        passed=True,
+                        message=f"VLAN接口 {vlan_iface} 已停用(DOWN)",
+                        details={"vlan_iface": vlan_iface},
+                        raw_output=output[:300],
+                    )
+                else:
+                    return VerifyResult(
+                        level="L2-网络接口",
+                        passed=False,
+                        message=f"VLAN接口 {vlan_iface} 期望{expected_state}但实际不匹配",
+                        raw_output=output[:300],
+                    )
 
-        has_bridge = bridge_output.strip() and "does not exist" not in bridge_output
-
-        # 检查接口状态
-        iface_up = expected_state in output
-        bridge_up = expected_state in bridge_output if has_bridge else False
-
-        if expected_state == "UP" and iface_up:
-            return VerifyResult(
-                level="L2-网络接口",
-                passed=True,
-                message=f"VLAN接口 {vlan_iface} 状态UP, bridge={has_bridge and bridge_up}",
-                details={"vlan_iface": vlan_iface, "bridge": bridge_iface, "bridge_exists": has_bridge},
-                raw_output=output[:300],
-            )
-        elif expected_state == "DOWN" and not iface_up:
-            return VerifyResult(
-                level="L2-网络接口",
-                passed=True,
-                message=f"VLAN接口 {vlan_iface} 已停用(DOWN)",
-                details={"vlan_iface": vlan_iface},
-                raw_output=output[:300],
-            )
-        else:
-            return VerifyResult(
-                level="L2-网络接口",
-                passed=False,
-                message=f"VLAN接口 {vlan_iface} 期望{expected_state}但实际不匹配",
-                raw_output=output[:300],
-            )
+        # 两种命名都未找到
+        return VerifyResult(
+            level="L2-网络接口",
+            passed=False,
+            message=f"VLAN接口 _{vlan_name} 和 {vlan_name} 均不存在",
+            raw_output=output,
+        )
 
     def verify_vlan_proc(self, vlan_name: str,
                          expected_vlan_id: str = None) -> VerifyResult:
@@ -982,18 +996,24 @@ class BackendVerifier:
         self.connect_router()
         output = self._router.exec("cat /proc/net/vlan/config 2>/dev/null")
 
-        vlan_iface = f"_{vlan_name}"
-        if vlan_iface not in output:
+        # 自适应两种命名规则：先试带下划线，再试不带下划线
+        vlan_iface = None
+        for prefix in ("_", ""):
+            candidate = f"{prefix}{vlan_name}"
+            if candidate in output:
+                vlan_iface = candidate
+                break
+
+        if vlan_iface is None:
             return VerifyResult(
                 level="L3-proc",
                 passed=False,
-                message=f"VLAN接口 {vlan_iface} 未在/proc/net/vlan/config中找到",
+                message=f"VLAN接口 _{vlan_name} 和 {vlan_name} 均未在/proc/net/vlan/config中找到",
                 raw_output=output,
             )
 
         # 检查VLAN ID是否匹配
         if expected_vlan_id:
-            # 格式: _vlan_min_100  | 100  | lan1
             for line in output.split("\n"):
                 if vlan_iface in line:
                     parts = [p.strip() for p in line.split("|")]
@@ -1087,10 +1107,13 @@ class BackendVerifier:
     def query_static_routes(self) -> List[Dict]:
         """查询静态路由规则列表"""
         self.connect_router()
-        output = self._router.exec("/usr/ikuai/function/static_rt show")
+        output = self._router.exec("/usr/ikuai/function/static_rt show limit=0,500 TYPE=total,data")
+        logger.debug(f"Static route query raw output ({len(output)} chars): {output[:500]}")
         try:
             parsed = json.loads(output)
-            return parsed.get("data", [])
+            data = parsed.get("data", [])
+            logger.debug(f"Static route query returned {len(data)} rules")
+            return data
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse static_rt output: {output[:200]}")
             return []
@@ -1127,11 +1150,14 @@ class BackendVerifier:
         """
         rule = self.find_static_route(tagname=tagname)
         if rule is None:
+            all_rules = self.query_static_routes()
+            existing_names = [r.get("tagname", "?") for r in all_rules]
+            logger.debug(f"Static route not found: {tagname}, existing: {existing_names}")
             return VerifyResult(
                 level="L1-数据库",
                 passed=False,
                 message=f"静态路由未找到: tagname={tagname}",
-                raw_output=str(self.query_static_routes()[:3]),
+                raw_output=f"数据库中现有路由: {existing_names}",
             )
 
         mismatches = {}

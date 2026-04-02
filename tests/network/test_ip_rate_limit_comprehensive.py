@@ -63,6 +63,10 @@ class TestIpRateLimitComprehensive:
                 status = '通过' if result.passed else '失败'
                 print(f"    SSH-{label}: {status} - {result.message}")
                 rec.add_detail(f"    SSH-{label}: {'✓' if result.passed else '✗'} {result.message}")
+                # 显示SSH后台查询的原始内容
+                if result.raw_output:
+                    print(f"      SSH数据: {result.raw_output}")
+                    rec.add_detail(f"      SSH数据: {result.raw_output}")
                 if must_pass and not result.passed:
                     ssh_failures.append(f"SSH-{label}: {result.message}")
                 return result

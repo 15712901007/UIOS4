@@ -62,6 +62,10 @@ class TestMacRateLimitComprehensive:
                 status = '通过' if result.passed else '失败'
                 print(f"    SSH-{label}: {status} - {result.message}")
                 rec.add_detail(f"    SSH-{label}: {'✓' if result.passed else '✗'} {result.message}")
+                # 显示SSH后台查询的原始内容
+                if result.raw_output:
+                    print(f"      SSH数据: {result.raw_output}")
+                    rec.add_detail(f"      SSH数据: {result.raw_output}")
                 if must_pass and not result.passed:
                     ssh_failures.append(f"SSH-{label}: {result.message}")
                 return result
@@ -546,31 +550,48 @@ class TestMacRateLimitComprehensive:
                         rec.add_detail(f"      数据库({qos_type_found}): id={rule_id}, upload={db_rule.get('upload')}, download={db_rule.get('download')}, enabled={db_rule.get('enabled')}")
 
                         # L2: iptables验证 - MAC_QOS链
-                        # 无MAC地址的规则不创建iptables规则（与IP限速中无IP规则逻辑一致）
-                        # 时间计划规则(23:11-23:12)不在生效时间内，iptables中也无规则
-                        has_mac = rule.get("mac") is not None or rule.get("batch_macs") is not None or rule.get("mac_group") is not None
-                        l2_must_pass = has_mac and "time_plan" not in rule
+                        # iKuai行为: 只为mac_addr中有实际MAC地址的规则创建iptables规则
+                        # 无MAC地址(如仅选线路/协议栈的规则、MAC组引用为空的规则)不会创建iptables条目
+                        # 时间计划规则在非生效时间段内也不会创建iptables规则
+                        db_mac_addr = db_rule.get("mac_addr", {})
+                        db_has_mac = False
+                        mac_addr_detail = ""
+                        if isinstance(db_mac_addr, dict):
+                            custom = db_mac_addr.get("custom", {})
+                            obj = db_mac_addr.get("object", {})
+                            db_has_mac = bool(custom) or bool(obj)
+                            mac_addr_detail = f"custom={custom}, object={obj}"
+                        elif isinstance(db_mac_addr, str) and db_mac_addr.strip():
+                            db_has_mac = True
+                            mac_addr_detail = db_mac_addr
+                        else:
+                            mac_addr_detail = str(db_mac_addr)
+                        l2_must_pass = db_has_mac and "time_plan" not in rule
                         set_prefix = "mac_qos" if qos_type_found == "mac_qos" else "dt_mac_qos"
-                        if rule["upload"] > 0:
-                            ssh_verify(
-                                f"L2-iptables-上行({rule_name})",
-                                backend_verifier.verify_iptables_rule,
-                                "MAC_QOS",
-                                must_pass=l2_must_pass,
-                                rule_id=rule_id,
-                                expected_speed_kbps=rule["upload"],
-                                set_prefix=set_prefix,
-                            )
-                        if rule["download"] > 0:
-                            ssh_verify(
-                                f"L2-iptables-下行({rule_name})",
-                                backend_verifier.verify_iptables_rule,
-                                "MAC_QOS",
-                                must_pass=l2_must_pass,
-                                rule_id=rule_id,
-                                expected_speed_kbps=rule["download"],
-                                set_prefix=set_prefix,
-                            )
+                        if not db_has_mac:
+                            rec.add_detail(f"      L2跳过: mac_addr为空({mac_addr_detail}), iKuai只为有实际MAC地址的规则创建iptables条目")
+                            print(f"      L2跳过: {rule_name} 无实际MAC地址, iKuai不创建iptables规则")
+                        else:
+                            if rule["upload"] > 0:
+                                ssh_verify(
+                                    f"L2-iptables-上行({rule_name})",
+                                    backend_verifier.verify_iptables_rule,
+                                    "MAC_QOS",
+                                    must_pass=l2_must_pass,
+                                    rule_id=rule_id,
+                                    expected_speed_kbps=rule["upload"],
+                                    set_prefix=set_prefix,
+                                )
+                            if rule["download"] > 0:
+                                ssh_verify(
+                                    f"L2-iptables-下行({rule_name})",
+                                    backend_verifier.verify_iptables_rule,
+                                    "MAC_QOS",
+                                    must_pass=l2_must_pass,
+                                    rule_id=rule_id,
+                                    expected_speed_kbps=rule["download"],
+                                    set_prefix=set_prefix,
+                                )
 
                         verify_passed += 1
                     elif l1 is None:

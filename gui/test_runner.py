@@ -219,8 +219,10 @@ class TestRunner(QThread):
         auto_adapt = getattr(self.config.browser, 'auto_adapt_screen', True)
         env["AUTO_ADAPT_SCREEN"] = "true" if auto_adapt else "false"
         # SSH配置（供后台验证使用）
+        # 同步设备IP到SSH路由器地址（确保SSH验证连接的是同一台设备）
         if hasattr(self.config, 'ssh') and self.config.ssh:
-            env["SSH_ROUTER_HOST"] = self.config.ssh.router.host or ""
+            ssh_router_host = self.config.device.ip or self.config.ssh.router.host
+            env["SSH_ROUTER_HOST"] = ssh_router_host
             env["SSH_ROUTER_USERNAME"] = self.config.ssh.router.username or ""
             env["SSH_ROUTER_PASSWORD"] = self.config.ssh.router.password or ""
             env["SSH_ROUTER_PORT"] = str(self.config.ssh.router.port)
