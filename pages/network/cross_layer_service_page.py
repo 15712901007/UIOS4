@@ -297,6 +297,161 @@ class CrossLayerServicePage(IkuaiTablePage):
             print(f"[DEBUG] fill_remark error: {e}")
         return self
 
+    # ==================== IP分组 ====================
+    def _find_group_in_dialog(self, name: str, max_attempts: int = 5, interval: int = 1000):
+        """在选择弹窗中查找已存在的分组（带轮询重试，支持截断名称匹配）
+
+        UI会将长分组名截断显示（如 snmp_ipgroup_test → snmp_ipgroup_te），
+        因此使用JavaScript直接匹配textContent，支持前缀匹配。
+
+        Returns:
+            Locator or None
+        """
+        for attempt in range(max_attempts):
+            # 使用JS直接在弹窗中查找匹配的checkbox项
+            found_index = self.page.evaluate("""(name) => {
+                const wrappers = document.querySelectorAll('.ant-modal-wrap:not([style*="display: none"]) .ant-checkbox-wrapper');
+                for (let i = 0; i < wrappers.length; i++) {
+                    const text = wrappers[i].textContent.trim();
+                    // 匹配策略：完全相等 / 名称是文本的前缀 / 文本是名称的前缀
+                    if (text === name || name.startsWith(text) || text.startsWith(name)) {
+                        return i;
+                    }
+                }
+                return -1;
+            }""", name)
+
+            if found_index >= 0:
+                # 找到了，返回对应的Locator
+                target = self.page.locator('.ant-modal-wrap:not([style*="display: none"]) .ant-checkbox-wrapper').nth(found_index)
+                print(f"[DEBUG] _find_group_in_dialog: 找到分组 '{name}' (第{found_index}项)")
+                return target
+
+            if attempt < max_attempts - 1:
+                print(f"[DEBUG] _find_group_in_dialog: 第{attempt+1}次未找到 '{name}'，等待重试...")
+                self.page.wait_for_timeout(interval)
+
+        return None
+
+    def _close_topmost_modal(self):
+        """关闭最上层的弹窗（按Escape或点击取消/关闭按钮）"""
+        try:
+            # 尝试点击"取消"按钮（最后一个弹窗的）
+            cancel_btn = self.page.locator('.ant-modal-root button:has-text("取消")')
+            if cancel_btn.count() > 0:
+                cancel_btn.last.click()
+                self.page.wait_for_timeout(300)
+                return
+            # 回退: 按Escape
+            self.page.keyboard.press("Escape")
+            self.page.wait_for_timeout(300)
+        except Exception:
+            self.page.keyboard.press("Escape")
+            self.page.wait_for_timeout(300)
+
+    def create_and_select_ip_group(self, name: str, ips: str) -> bool:
+        """在添加表单中创建或选择IP分组（完整流程，支持重复检测和错误恢复）
+
+        流程: 点击IP分组combobox → 弹出选择弹窗 →
+          如果分组已存在 → 直接勾选 → 确定
+          如果分组不存在 → 点击"创建分组" → 填写名称+IP列表 → 确定 → 勾选分组 → 确定
+
+        Args:
+            name: 分组名称
+            ips: IP列表，换行分隔（如 "10.66.0.1\\n10.66.0.5"）
+        """
+        try:
+            # 1. 点击IP分组combobox区域打开选择弹窗
+            ip_group_label = self.page.locator('text=IP分组')
+            if ip_group_label.count() > 0:
+                ip_group_box = ip_group_label.first.locator('xpath=ancestor::div[1]/following-sibling::div')
+                if ip_group_box.count() > 0:
+                    ip_group_box.click()
+                    self.page.wait_for_timeout(2000)
+
+            # 2. 轮询查找已存在的分组（等待列表加载，最多5次，每次1秒）
+            existing_group = self._find_group_in_dialog(name, max_attempts=5, interval=1000)
+
+            if existing_group is not None:
+                # 分组已存在，直接勾选
+                print(f"[DEBUG] IP分组 '{name}' 已存在，直接选择")
+                existing_group.click()
+                self.page.wait_for_timeout(300)
+            else:
+                # 3. 分组不存在，尝试创建新分组
+                print(f"[DEBUG] IP分组 '{name}' 不存在，开始创建")
+                self._create_group_in_dialog(name, ips)
+
+                # 创建后重新查找并勾选（也处理创建失败"名称已存在"的情况）
+                self.page.wait_for_timeout(800)
+                group_after = self._find_group_in_dialog(name, max_attempts=3, interval=500)
+                if group_after is not None:
+                    group_after.click()
+                    self.page.wait_for_timeout(300)
+                else:
+                    print(f"[DEBUG] IP分组 '{name}' 创建后仍未找到，可能创建失败")
+
+            # 4. 点击确定（选择弹窗）
+            select_dialog = self.page.get_by_label('请选择')
+            if select_dialog.count() > 0:
+                select_confirm = select_dialog.get_by_role('button', name='确定')
+                if select_confirm.count() > 0:
+                    select_confirm.click()
+                    self.page.wait_for_timeout(500)
+
+            print(f"[DEBUG] create_and_select_ip_group: SUCCESS - {name}")
+            return True
+
+        except Exception as e:
+            print(f"[DEBUG] create_and_select_ip_group error: {e}")
+            # 确保关闭所有弹窗
+            self._close_all_modals()
+            return False
+
+    def _create_group_in_dialog(self, name: str, ips: str):
+        """在选择弹窗中创建新分组（内部方法）"""
+        # 点击"创建分组"按钮
+        create_btn = self.page.get_by_role('button', name='创建分组')
+        if create_btn.count() > 0:
+            create_btn.click()
+            self.page.wait_for_timeout(1000)
+
+        # 填写分组名称
+        name_input = self.page.get_by_placeholder('请输入分组名称')
+        if name_input.count() > 0:
+            name_input.fill(name)
+            self.page.wait_for_timeout(300)
+
+        # 填写IP列表（textarea）
+        ip_textarea = self.page.locator('.ant-modal-root').last.locator('textarea')
+        if ip_textarea.count() > 0:
+            ip_textarea.fill(ips)
+            self.page.wait_for_timeout(300)
+
+        # 点击确定（创建弹窗）
+        create_modal = self.page.locator('.ant-modal-root').last
+        confirm_btn = create_modal.locator('button:has-text("确定")')
+        if confirm_btn.count() > 0:
+            confirm_btn.last.click()
+            self.page.wait_for_timeout(1000)
+
+        # 检查创建是否成功（是否有"名称已存在"错误）
+        error_el = self.page.locator('.ant-form-item-explain-error:has-text("已存在")')
+        if error_el.count() > 0:
+            # 创建失败：名称已存在 → 关闭创建弹窗，回到选择弹窗重新查找
+            print(f"[DEBUG] 创建分组失败: 名称已存在，关闭创建弹窗重新选择")
+            self._close_topmost_modal()
+            self.page.wait_for_timeout(500)
+
+    def _close_all_modals(self):
+        """关闭所有打开的弹窗"""
+        for _ in range(3):
+            modal = self.page.locator('.ant-modal-wrap:not([style*="display: none"])')
+            if modal.count() > 0:
+                self._close_topmost_modal()
+            else:
+                break
+
     # ==================== 访问频率 ====================
     def set_frequency(self, seconds: int = 0):
         """设置访问频率"""
@@ -409,7 +564,8 @@ class CrossLayerServicePage(IkuaiTablePage):
                  snmp_version: str = "V2", community: str = "public",
                  remark: str = None,
                  v3_username: str = None, v3_auth_proto: str = "MD5",
-                 v3_auth_pass: str = None, v3_security: str = None) -> bool:
+                 v3_auth_pass: str = None, v3_security: str = None,
+                 ip_group: dict = None) -> bool:
         """
         添加跨三层服务规则
 
@@ -425,6 +581,7 @@ class CrossLayerServicePage(IkuaiTablePage):
             v3_auth_proto: V3认证协议 (MD5/SHA)
             v3_auth_pass: V3认证密码
             v3_security: V3安全级别 (noAuthNoPriv/authNoPriv/authPriv)
+            ip_group: IP分组 {"name": "分组名", "ips": "IP列表换行分隔"}
         """
         try:
             # 1. 点击添加
@@ -435,8 +592,11 @@ class CrossLayerServicePage(IkuaiTablePage):
             self.fill_name(name)
             self.fill_snmp_server_ip(snmp_server_ip)
 
-            # 3. 添加IP地址
-            if ips:
+            # 3. 添加IP地址（手动添加 或 使用IP分组）
+            if ip_group:
+                # 使用IP分组：创建分组并选择
+                self.create_and_select_ip_group(ip_group["name"], ip_group["ips"])
+            elif ips:
                 for ip in ips:
                     self.add_ip_address(ip)
 

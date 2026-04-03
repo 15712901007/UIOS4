@@ -94,6 +94,8 @@ class TestCrossLayerServiceComprehensive:
             {"name": "snmp_test_007", "snmp_server_ip": "10.66.0.46", "ips": ["192.168.1.200"], "port": "161", "snmp_version": "V2", "community": "public", "remark": "备注测试-特殊字符"},
             # 规则8: V3 + authNoPriv + SHA (认证不加密 + SHA)
             {"name": "snmp_test_008", "snmp_server_ip": "10.66.0.47", "ips": ["192.168.2.1-192.168.2.50"], "port": "161", "snmp_version": "V3", "community": "snmp_v3_sha", "remark": "V3认证不加密-SHA", "v3_username": "snmp_user_008", "v3_security": "authNoPriv", "v3_auth_proto": "SHA", "v3_auth_pass": "authPass008"},
+            # 规则9: V2 + IP分组（通过IP分组方式指定作用IP段）
+            {"name": "snmp_test_009", "snmp_server_ip": "10.66.0.48", "port": "161", "snmp_version": "V2", "community": "public", "remark": "V2-IP分组测试", "ip_group": {"name": "snmp_ipgroup_test", "ips": "10.66.0.1\n10.66.0.5\n10.66.0.10"}},
         ]
 
         print("\n" + "=" * 60)
@@ -157,7 +159,7 @@ class TestCrossLayerServiceComprehensive:
         with rec.step("步骤4: 批量添加规则", f"添加8条跨三层服务规则，覆盖V2/V3全部安全组合"):
             print(f"\n[步骤4] 批量添加{len(test_rules)}条规则...")
             rec.add_detail(f"【添加计划】共 {len(test_rules)} 条规则")
-            rec.add_detail(f"  场景覆盖: V2×5条, V3×3条(authNoPriv+MD5, authPriv+SHA, authPriv+MD5, authNoPriv+SHA)")
+            rec.add_detail(f"  场景覆盖: V2×5条, V3×3条(authNoPriv+MD5, authPriv+SHA, authPriv+MD5, authNoPriv+SHA), IP分组×1条")
             rec.add_detail(f"  IP格式: 单IP/IP段/批量IP, 每条规则SNMP服务器IP唯一")
 
             added_count = 0
@@ -169,6 +171,8 @@ class TestCrossLayerServiceComprehensive:
                 rec.add_detail(f"  协议版本: {rule.get('snmp_version', 'V2')}")
                 rec.add_detail(f"  团体名: {rule.get('community', 'public')}")
                 rec.add_detail(f"  备注: {rule.get('remark', '')}")
+                if rule.get("ip_group"):
+                    rec.add_detail(f"  IP分组: {rule['ip_group']['name']} (IP列表: {rule['ip_group']['ips']})")
 
                 success = page.add_rule(
                     name=rule["name"],
@@ -182,6 +186,7 @@ class TestCrossLayerServiceComprehensive:
                     v3_security=rule.get("v3_security"),
                     v3_auth_proto=rule.get("v3_auth_proto", "MD5"),
                     v3_auth_pass=rule.get("v3_auth_pass"),
+                    ip_group=rule.get("ip_group"),
                 )
                 if success:
                     print(f"  + 已添加: {rule['name']} - {rule.get('remark', '')}")
@@ -862,6 +867,46 @@ class TestCrossLayerServiceComprehensive:
             else:
                 print(f"  [OK] 数据已干净")
                 rec.add_detail(f"  数据已干净")
+
+            # 清理IP分组残留（路由对象页面）
+            rec.add_detail(f"  【清理IP分组】")
+            try:
+                page.page.goto(f"{page.base_url}/login#/networkConfiguration/routingObject")
+                page.page.wait_for_load_state("networkidle")
+                page.page.wait_for_timeout(500)
+
+                # 确保在IP分组tab
+                ip_group_tab = page.page.get_by_role("tab", name="IP分组")
+                if ip_group_tab.count() > 0:
+                    ip_group_tab.click()
+                    page.page.wait_for_timeout(500)
+
+                # 查找并删除测试创建的IP分组
+                for rule in test_rules:
+                    ig = rule.get("ip_group")
+                    if ig:
+                        group_name = ig["name"]
+                        group_row = page.page.locator(f'td:has-text("{group_name}")')
+                        if group_row.count() > 0:
+                            # 找到分组行，点击删除按钮
+                            row = group_row.first.locator('xpath=ancestor::tr')
+                            if row.count() > 0:
+                                delete_btn = row.locator('a:has-text("删除"), button:has-text("删除")')
+                                if delete_btn.count() > 0:
+                                    delete_btn.first.click()
+                                    page.page.wait_for_timeout(500)
+                                    # 确认删除
+                                    confirm = page.page.get_by_role('button', name='确定')
+                                    if confirm.count() > 0:
+                                        confirm.last.click()
+                                        page.page.wait_for_timeout(500)
+                                    print(f"  [OK] 已删除IP分组: {group_name}")
+                                    rec.add_detail(f"  已删除IP分组: {group_name}")
+                        else:
+                            rec.add_detail(f"  IP分组 {group_name} 不存在，无需清理")
+            except Exception as e:
+                print(f"  [INFO] IP分组清理跳过: {str(e)[:60]}")
+                rec.add_detail(f"  IP分组清理跳过: {str(e)[:60]}")
 
         # ========== SSH后台验证汇总断言 ==========
         if ssh_failures:
