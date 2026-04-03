@@ -1304,3 +1304,72 @@ class BackendVerifier:
             return binary.count("1")
         except (ValueError, AttributeError):
             return 24  # 默认/24
+
+    # ==================== 跨三层服务(SNMP)验证 ====================
+
+    def query_netsnmpc_rules(self) -> List[Dict]:
+        """查询跨三层服务(netsnmpc)规则列表"""
+        self.connect_router()
+        output = self._router.exec("/usr/ikuai/function/netsnmpc show limit=0,500 TYPE=total,data")
+        logger.info(f"netsnmpc query raw ({len(output)} chars): {output[:300]}")
+        try:
+            parsed = json.loads(output)
+            data = parsed.get("data", [])
+            logger.info(f"netsnmpc query returned {len(data)} rules")
+            return data
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse netsnmpc output: {output[:200]}")
+            return []
+
+    def find_netsnmpc_rule(self, **filters) -> Optional[Dict]:
+        """按条件查找单条跨三层服务规则"""
+        rules = self.query_netsnmpc_rules()
+        for rule in rules:
+            if all(str(rule.get(k)) == str(v) for k, v in filters.items()):
+                return rule
+        return None
+
+    def verify_netsnmpc_database(self, tagname: str,
+                                  expected_fields: Dict = None) -> VerifyResult:
+        """
+        L1: 验证跨三层服务规则在数据库中存在且字段正确
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望的字段值，如 {"snmp_ip": "10.66.0.40", "port": "161", "version": "V2"}
+        """
+        rule = self.find_netsnmpc_rule(tagname=tagname)
+        if rule is None:
+            all_rules = self.query_netsnmpc_rules()
+            existing_names = [r.get("tagname", "?") for r in all_rules]
+            logger.debug(f"netsnmpc rule not found: {tagname}, existing: {existing_names}")
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"跨三层服务规则未找到: tagname={tagname}",
+                raw_output=f"数据库中现有规则: {existing_names}",
+            )
+
+        mismatches = {}
+        if expected_fields:
+            for key, expected in expected_fields.items():
+                actual = str(rule.get(key, ""))
+                if actual != str(expected):
+                    mismatches[key] = {"expected": str(expected), "actual": actual}
+
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"字段不匹配: {mismatches}",
+                details={"rule": rule, "mismatches": mismatches},
+                raw_output=json.dumps(rule, ensure_ascii=False),
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"跨三层服务规则存在且字段正确 (id={rule.get('id')}, snmp_ip={rule.get('snmp_ip')}, version={rule.get('version')})",
+            details={"rule": rule},
+            raw_output=json.dumps(rule, ensure_ascii=False),
+        )

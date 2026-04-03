@@ -1,0 +1,8 @@
+id,enabled,tagname,comment,server_ip,listen_port,oid,mibtype,version,community,username,security,auth_proto,auth_pass,priv_proto,priv_pass,src_addr
+1,"yes","snmp_test_001","基础场景-V2协议测试","10.66.0.99",161,".1.3.6.1.2.1.4.22","table",2,"public","","","","","","","{""custom"":[""192.168.1.100""],""object"":{}}"
+2,"yes","snmp_test_002","V2-IP段","10.66.0.41",161,".1.3.6.1.2.1.4.22","table",2,"public","","","","","","","{""custom"":[""192.168.1.1-192.168.1.50""],""object"":{}}"
+4,"yes","snmp_test_004","V2-批量IP","10.66.0.43",161,".1.3.6.1.2.1.4.22","table",2,"public","","","","","","","{""custom"":[""10.66.0.1"",""10.66.0.5"",""10.66.0.10""],""object"":{}}"
+5,"yes","snmp_test_005","V3认证且加密-SHA","10.66.0.44",161,".1.3.6.1.2.1.4.22","table",3,"","snmp_user_005","authNoPriv","SHA","authPass005","","","{""custom"":[""172.16.0.50""],""object"":{}}"
+6,"yes","snmp_test_006","V3认证且加密-MD5","10.66.0.45",161,".1.3.6.1.2.1.4.22","table",3,"","snmp_user_006","authNoPriv","MD5","authPass006","","","{""custom"":[""172.16.0.100""],""object"":{}}"
+7,"yes","snmp_test_007","备注测试-特殊字符","10.66.0.46",161,".1.3.6.1.2.1.4.22","table",2,"public","","","","","","","{""custom"":[""192.168.1.200""],""object"":{}}"
+8,"yes","snmp_test_008","V3认证不加密-SHA","10.66.0.47",161,".1.3.6.1.2.1.4.22","table",3,"","snmp_user_008","authNoPriv","SHA","authPass008","","","{""custom"":[""192.168.2.1-192.168.2.50""],""object"":{}}"

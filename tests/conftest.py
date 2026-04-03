@@ -96,6 +96,7 @@ from pages.network.vlan_page import VlanPage
 from pages.network.ip_rate_limit_page import IpRateLimitPage
 from pages.network.mac_rate_limit_page import MacRateLimitPage
 from pages.network.static_route_page import StaticRoutePage
+from pages.network.cross_layer_service_page import CrossLayerServicePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -149,6 +150,7 @@ TEST_NAME_MAPPING = {
     'test_ip_rate_limit_comprehensive': 'IP限速综合测试',
     'test_mac_rate_limit_comprehensive': 'MAC限速综合测试',
     'test_static_route_comprehensive': '静态路由综合测试',
+    'test_cross_layer_service_comprehensive': '跨三层服务综合测试',
 }
 
 
@@ -409,6 +411,20 @@ def static_route_page_logged_in(logged_in_page: Page, config: Config) -> StaticR
     return sr_page
 
 
+@pytest.fixture(scope="function")
+def cross_layer_service_page(page: Page, config: Config) -> CrossLayerServicePage:
+    """创建跨三层服务页面实例"""
+    return CrossLayerServicePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def cross_layer_page_logged_in(logged_in_page: Page, config: Config) -> CrossLayerServicePage:
+    """已登录并导航到跨三层服务页面的实例"""
+    cls_page = CrossLayerServicePage(logged_in_page, config.get_base_url())
+    cls_page.navigate_to_cross_layer_service()
+    return cls_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -573,6 +589,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "static_route: 静态路由模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "cross_layer_service: 跨三层服务模块测试"
     )
     config.addinivalue_line(
         "markers", "network: 网络配置模块测试"

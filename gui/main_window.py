@@ -711,6 +711,17 @@ class MainWindow(QMainWindow):
                             ],
                         }
                     },
+                    "跨三层服务": {
+                        "testcases": [
+                            # 跨三层服务综合测试（21步：添加8条(V2/V3)+编辑+停用+启用+删除+搜索+排序+导出+异常+批量操作+导入+频率+帮助+SSH验证）
+                            "test_cross_layer_service_comprehensive.py::TestCrossLayerServiceComprehensive::test_cross_layer_service_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "test_cross_layer_service_comprehensive.py::TestCrossLayerServiceComprehensive::test_cross_layer_service_comprehensive",
+                            ],
+                        }
+                    },
                     "内外网设置": {
                         "testcases": []
                     },
