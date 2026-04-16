@@ -722,6 +722,20 @@ class MainWindow(QMainWindow):
                             ],
                         }
                     },
+                    "分流策略": {
+                        "children": {
+                            "多线负载": {
+                                "testcases": [
+                                    "test_multi_wan_lb_comprehensive.py::TestMultiWanLbComprehensive::test_multi_wan_lb_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_multi_wan_lb_comprehensive.py::TestMultiWanLbComprehensive::test_multi_wan_lb_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
                     "内外网设置": {
                         "testcases": []
                     },

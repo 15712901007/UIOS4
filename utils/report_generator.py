@@ -24,7 +24,7 @@ class ReportGenerator:
             template_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reports", "templates")
 
         self.template_dir = template_dir
-        self.env = Environment(loader=FileSystemLoader(template_dir))
+        self.env = Environment(loader=FileSystemLoader(template_dir), autoescape=True)
 
     def generate_report(
         self,

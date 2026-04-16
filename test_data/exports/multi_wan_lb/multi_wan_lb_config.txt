@@ -1,0 +1,6 @@
+id=1 enabled=yes tagname=lb_m0_edit comment= interface=wan1,wan2,wan3 weight=1,1,1 mode=0 isp_name=all
+id=2 enabled=yes tagname=lb_m1_srcdst comment= interface=wan1,wan2,wan3 weight=1,1,1 mode=1 isp_name=all
+id=4 enabled=yes tagname=lb_m3_traffic comment= interface=wan1,wan2,wan3 weight=3,2,1 mode=3 isp_name=all
+id=5 enabled=yes tagname=lb_m4_conn comment=实时连接数测试备注 interface=wan1,wan2,wan3 weight=1,1,1 mode=4 isp_name=all
+id=6 enabled=yes tagname=lb_m5_srcip comment= interface=wan1,wan2,wan3 weight=1,1,1 mode=6 isp_name=chinaunicom
+id=7 enabled=yes tagname=lb_m6_srcport comment=完整配置测试 interface=wan1,wan2,wan3 weight=5,3,2 mode=7 isp_name=chinamobile

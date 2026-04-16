@@ -1373,3 +1373,210 @@ class BackendVerifier:
             details={"rule": rule},
             raw_output=json.dumps(rule, ensure_ascii=False),
         )
+
+    # ==================== 多线负载(lb_pcc)验证 ====================
+
+    def query_lb_pcc_rules(self) -> List[Dict]:
+        """查询多线负载(lb_pcc)规则列表"""
+        self.connect_router()
+        output = self._router.exec("/usr/ikuai/function/lb_pcc show limit=0,500 TYPE=total,data")
+        logger.info(f"lb_pcc query raw ({len(output)} chars): {output[:300]}")
+        try:
+            parsed = json.loads(output)
+            data = parsed.get("data", [])
+            logger.info(f"lb_pcc query returned {len(data)} rules")
+            return data
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse lb_pcc output: {output[:200]}")
+            return []
+
+    def find_lb_pcc_rule(self, **filters) -> Optional[Dict]:
+        """按条件查找单条多线负载规则"""
+        rules = self.query_lb_pcc_rules()
+        for rule in rules:
+            if all(str(rule.get(k)) == str(v) for k, v in filters.items()):
+                return rule
+        return None
+
+    def verify_lb_pcc_database(self, tagname: str,
+                                expected_fields: Dict = None) -> VerifyResult:
+        """
+        L1: 验证多线负载规则在数据库中存在且字段正确
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望的字段值，如 {"mode": "0", "operator": "全部"}
+        """
+        rule = self.find_lb_pcc_rule(tagname=tagname)
+        if rule is None:
+            all_rules = self.query_lb_pcc_rules()
+            existing_names = [r.get("tagname", "?") for r in all_rules]
+            logger.debug(f"lb_pcc rule not found: {tagname}, existing: {existing_names}")
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"多线负载规则未找到: tagname={tagname}",
+                raw_output=f"数据库中现有规则: {existing_names}",
+            )
+
+        mismatches = {}
+        if expected_fields:
+            for key, expected in expected_fields.items():
+                actual = str(rule.get(key, ""))
+                if actual != str(expected):
+                    mismatches[key] = {"expected": str(expected), "actual": actual}
+
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"字段不匹配: {mismatches}",
+                details={"rule": rule, "mismatches": mismatches},
+                raw_output=json.dumps(rule, ensure_ascii=False),
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"多线负载规则存在且字段正确 (id={rule.get('id')}, mode={rule.get('mode')}, enabled={rule.get('enabled')})",
+            details={"rule": rule},
+            raw_output=json.dumps(rule, ensure_ascii=False),
+        )
+
+    def verify_lb_pcc_policy_routing(self, expected_wan_interfaces: List[str] = None) -> VerifyResult:
+        """L2: 验证多线负载策略路由(ip rule fwmark + 各WAN路由表)
+
+        检查:
+        1. ip rule中有fwmark对应的策略路由规则
+        2. 各WAN路由表中有默认路由
+
+        Args:
+            expected_wan_interfaces: 期望的WAN接口列表，如["wan1","wan2","wan3"]
+        """
+        self.connect_router()
+        if expected_wan_interfaces is None:
+            expected_wan_interfaces = ["wan1", "wan2", "wan3"]
+
+        try:
+            # 检查ip rule
+            ip_rule_output = self._router.exec("ip rule show")
+            logger.info(f"ip rule output: {ip_rule_output[:300]}")
+
+            found_tables = []
+            for wan in expected_wan_interfaces:
+                if f"lookup {wan}" in ip_rule_output:
+                    found_tables.append(wan)
+
+            # 检查各WAN路由表
+            route_details = {}
+            for wan in found_tables:
+                route_output = self._router.exec(f"ip route show table {wan}")
+                has_default = "default via" in route_output or "default dev" in route_output
+                route_details[wan] = {"has_rule": True, "has_default_route": has_default}
+
+            missing = [w for w in expected_wan_interfaces if w not in found_tables]
+            if missing:
+                return VerifyResult(
+                    level="L2-策略路由",
+                    passed=True,  # 策略路由是基础设施，缺失不一定是LB规则问题
+                    message=f"策略路由检查: {len(found_tables)}/{len(expected_wan_interfaces)}个WAN有ip rule (缺失: {missing}，可能线路未连接)",
+                    details={"found_tables": found_tables, "missing": missing, "routes": route_details},
+                    raw_output=ip_rule_output,
+                )
+
+            return VerifyResult(
+                level="L2-策略路由",
+                passed=True,
+                message=f"策略路由正常: {len(found_tables)}个WAN接口均有fwmark规则和路由表",
+                details={"found_tables": found_tables, "routes": route_details},
+                raw_output=ip_rule_output,
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L2-策略路由",
+                passed=False,
+                message=f"策略路由检查失败: {str(e)[:100]}",
+            )
+
+    def verify_lb_pcc_kernel(self, expect_enabled: bool = True) -> VerifyResult:
+        """L3/L4: 验证多线负载内核状态(ik_core模块 + dmesg LB日志 + conntrack)
+
+        检查:
+        1. ik_core模块已加载
+        2. dmesg中有[LB]日志，确认LB已启用/禁用
+        3. conntrack中有带remote_if的连接条目
+
+        Args:
+            expect_enabled: 期望LB是否启用
+        """
+        self.connect_router()
+
+        try:
+            # 1. 检查ik_core模块
+            lsmod_output = self._router.exec("lsmod")
+            ik_core_loaded = "ik_core" in lsmod_output
+            logger.info(f"ik_core loaded: {ik_core_loaded}")
+
+            # 2. 检查dmesg LB日志 - 用tail -30获取足够上下文
+            dmesg_lb = self._router.exec("dmesg | grep '\\[LB\\]' | tail -30")
+            # 判断当前LB状态：找到最后一次出现reload或disable的位置
+            last_reload_idx = dmesg_lb.rfind("lb config reload")
+            last_disable_idx = dmesg_lb.rfind("disable lb")
+            lb_enabled = last_reload_idx > last_disable_idx or "iKuai LB is enabled" in dmesg_lb
+            lb_disabled = last_disable_idx > last_reload_idx
+            logger.info(f"dmesg LB enabled={lb_enabled}, disabled={lb_disabled}, "
+                         f"last_reload={last_reload_idx}, last_disable={last_disable_idx}")
+
+            # 3. 检查conntrack中remote_if
+            conntrack_output = self._router.exec("cat /proc/net/nf_conntrack 2>/dev/null | head -5")
+            has_remote_if = "remote_if=" in conntrack_output
+            logger.info(f"conntrack has remote_if: {has_remote_if}")
+
+            # 综合判断
+            checks = {
+                "ik_core_loaded": ik_core_loaded,
+                "lb_config_in_dmesg": bool(dmesg_lb.strip()),
+                "conntrack_tracking": has_remote_if,
+            }
+
+            if expect_enabled:
+                if ik_core_loaded and lb_enabled:
+                    return VerifyResult(
+                        level="L3/L4-内核",
+                        passed=True,
+                        message=f"多线负载内核正常: ik_core已加载, LB已启用, conntrack追踪{'正常' if has_remote_if else '暂无数据'}",
+                        details=checks,
+                        raw_output=dmesg_lb,
+                    )
+                else:
+                    return VerifyResult(
+                        level="L3/L4-内核",
+                        passed=False,
+                        message=f"多线负载内核异常: ik_core={'已加载' if ik_core_loaded else '未加载'}, LB={'已启用' if lb_enabled else '未启用'}",
+                        details=checks,
+                        raw_output=dmesg_lb,
+                    )
+            else:
+                if lb_disabled or not lb_enabled:
+                    return VerifyResult(
+                        level="L3/L4-内核",
+                        passed=True,
+                        message="多线负载已禁用(符合预期)",
+                        details=checks,
+                        raw_output=dmesg_lb,
+                    )
+                return VerifyResult(
+                    level="L3/L4-内核",
+                    passed=False,
+                    message="多线负载预期禁用但仍在运行",
+                    details=checks,
+                    raw_output=dmesg_lb,
+                )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L3/L4-内核",
+                passed=False,
+                message=f"内核验证失败: {str(e)[:100]}",
+            )

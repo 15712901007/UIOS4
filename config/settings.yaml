@@ -67,6 +67,9 @@ test_data:
     static_route:
       export_filename: "static_route_config.csv"
       import_filename: "static_route_import.csv"
+    multi_wan_lb:
+      export_filename: "multi_wan_lb_config.csv"
+      import_filename: "multi_wan_lb_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"
