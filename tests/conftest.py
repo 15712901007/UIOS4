@@ -98,6 +98,7 @@ from pages.network.mac_rate_limit_page import MacRateLimitPage
 from pages.network.static_route_page import StaticRoutePage
 from pages.network.cross_layer_service_page import CrossLayerServicePage
 from pages.network.multi_wan_lb_page import MultiWanLbPage
+from pages.network.protocol_route_page import ProtocolRoutePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -153,6 +154,7 @@ TEST_NAME_MAPPING = {
     'test_static_route_comprehensive': '静态路由综合测试',
     'test_cross_layer_service_comprehensive': '跨三层服务综合测试',
     'test_multi_wan_lb_comprehensive': '多线负载综合测试',
+    'test_protocol_route_comprehensive': '协议分流综合测试',
 }
 
 
@@ -441,6 +443,20 @@ def multi_wan_lb_page_logged_in(logged_in_page: Page, config: Config) -> MultiWa
     return lb_page
 
 
+@pytest.fixture(scope="function")
+def protocol_route_page(page: Page, config: Config) -> ProtocolRoutePage:
+    """创建协议分流页面实例"""
+    return ProtocolRoutePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def protocol_route_page_logged_in(logged_in_page: Page, config: Config) -> ProtocolRoutePage:
+    """已登录并导航到协议分流页面的实例"""
+    pr_page = ProtocolRoutePage(logged_in_page, config.get_base_url())
+    pr_page.navigate_to_protocol_route()
+    return pr_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -626,6 +642,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "multi_wan_lb: 多线负载模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "protocol_route: 协议分流模块测试"
     )
 
     # 记录开始时间

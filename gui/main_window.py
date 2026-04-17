@@ -734,6 +734,16 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "协议分流": {
+                                "testcases": [
+                                    "test_protocol_route_comprehensive.py::TestProtocolRouteComprehensive::test_protocol_route_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_protocol_route_comprehensive.py::TestProtocolRouteComprehensive::test_protocol_route_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "内外网设置": {

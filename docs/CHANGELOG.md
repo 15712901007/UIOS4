@@ -1,5 +1,131 @@
 # 开发日志
 
+## 2026-04-17 协议分流5项扩展功能（线路绑定/生效时间/IP分组/复制/协议分组）
+
+### 新增功能
+- [x] **线路绑定** — 修复选择器为精确的`checkbox "线路绑定 启用"`，避免匹配其他checkbox
+- [x] **生效时间** — 新增`set_time_by_week()`/`set_time_plan()`/`set_time_range()`三个方法，支持按周循环/时间计划/时间段三种模式
+- [x] **IP/MAC分组** — 重写`select_ip_mac_group()`为dialog对话框选择模式（checkbox+确定按钮），支持segmented control过滤
+- [x] **复制功能** — 新增`copy_rule()`方法，使用基类`_click_rule_button()`点击复制按钮
+- [x] **协议分组** — 重写`select_proto_group()`为dialog对话框选择模式（与IP/MAC分组相同机制）
+- [x] **add_rule扩展** — 添加`time_mode`/`time_days`/`time_start`/`time_end`/`time_plan`参数
+
+### Bug修复
+- [x] **reload后tab重置** — `page.reload()`后协议分流tab丢失，默认显示多线负载tab。所有reload后添加`navigate_to_protocol_route()`（13处修改）
+- [x] **toggle_line_binding选择器** — 从通用`name='启用'`改为精确`name='线路绑定 启用'`
+
+### 测试扩展
+- 测试规则从6条扩展到8条（新增：pr_bind_time线路绑定+生效时间、pr_ipgroup IP/MAC分组引用）
+- 新增步骤5.5：复制规则测试（复制→修改名称→保存→SSH验证）
+- SSH验证扩展：`iface_band`字段验证（线路绑定）、`time`字段验证（生效时间）、`src_addr`字段检查（IP/MAC分组）
+
+### Playwright UI探索发现
+- 协议分组/IP/MAC分组：打开dialog对话框（非简单dropdown），内含checkbox列表+搜索+创建分组按钮
+- IP/MAC分组额外功能：segmented control（全部/IP/MAC）过滤 + 现有分组列表
+- 生效时间三模式：按周循环（星期标签+时间输入）/ 时间计划（combobox选择预设）/ 时间段（日期时间选择器）
+- 线路绑定：`checkbox "线路绑定 启用"`，独立于其他checkbox
+
+### 测试结果
+- **协议分流综合测试**: PASSED (649.93s / 10:49)
+- 8条规则全部添加成功（含线路绑定+生效时间+IP/MAC分组）
+- 20步全部通过（含新增步骤5.5复制测试）
+- SSH验证：L1数据库 8/8 + L2 iptables + L3策略路由 + L4内核模块
+
+### 文件变更
+```
+修改:
+  pages/network/protocol_route_page.py              # 5项功能方法+add_rule扩展
+  tests/network/test_protocol_route_comprehensive.py # 8条规则+20步+reload修复
+```
+
+---
+
+## 2026-04-17 协议分流模块初始实现 + SSH后台L1-L4验证
+
+### 新增功能
+- [x] **协议分流Page Object** (`pages/network/protocol_route_page.py`)
+  - 完整CRUD操作、协议树选择、3种负载模式、排序
+  - 非连续mode值映射：新建连接数=0, 源IP=1, 源IP+目的IP=3
+- [x] **19步综合测试** (`tests/network/test_protocol_route_comprehensive.py`)
+  - 6条规则覆盖3种负载模式+不同优先级+不同线路+不同协议
+  - 添加/编辑/停用/启用/删除/搜索/排序/导出/异常输入/批量操作/导入/帮助
+- [x] **SSH后台验证（4层）**
+  - L1: 数据库验证（stream_layer7 show）
+  - L2: iptables验证（mangle/STREAM_LAYER7_NEW链，含停用消失/启用恢复验证）
+  - L3: 策略路由验证（ip rule fwmark + per-WAN路由表）
+  - L4: 内核验证（ik_core模块 + dmesg [LB]消息）
+- [x] **协议树选择机制** — 逐个Playwright展开树节点，JS click选择叶节点checkbox
+
+### 关键修复
+- [x] Mode映射修正："源IP+目的IP"从mode=2修正为mode=3（实测确认）
+- [x] 清理步骤修复：每次cleanup后重新navigate_to_protocol_route()（reload重置tab）
+- [x] iptables验证修正：UI停用/启用/删除操作会触发iptables重载，CLI直接edit不会
+
+### 文件变更
+```
+新增:
+  pages/network/protocol_route_page.py              # 协议分流页面类
+  tests/network/test_protocol_route_comprehensive.py # 19步综合测试
+  test_data/exports/protocol_route/                  # 导出数据目录
+
+修改:
+  utils/backend_verifier.py                         # 新增stream_layer7 L1-L4验证方法
+```
+
+---
+
+## 2026-04-15 多线负载模块（7种负载模式+自定义运营商+SSH L1-L4验证）
+
+### 新增功能
+- [x] **多线负载Page Object** (`pages/network/multi_wan_lb_page.py`)
+  - 7种负载模式全覆盖（mode 0-4,6,7，mode=5已废弃）
+  - 自定义运营商功能（添加+删除，CIDR格式验证）
+  - 15字符名称限制适配
+  - 非标准DOM表格适配（div.ant-table-row结构）
+- [x] **19步综合测试** (`tests/network/test_multi_wan_lb_comprehensive.py`)
+  - 7条规则覆盖全部7种负载模式
+  - 添加/编辑/停用/启用/删除/搜索/排序/导出/异常输入/批量操作/导入/帮助
+- [x] **SSH后台验证（4层）**
+  - L1: 数据库（lb_pcc show）
+  - L2: 策略路由（ip rule fwmark + per-WAN路由表）
+  - L3/L4: 内核模块（ik_core + dmesg [LB]消息 + conntrack remote_if）
+
+### 文件变更
+```
+新增:
+  pages/network/multi_wan_lb_page.py
+  tests/network/test_multi_wan_lb_comprehensive.py
+  test_data/exports/multi_wan_lb/
+
+修改:
+  utils/backend_verifier.py                         # 新增lb_pcc L1-L4验证方法
+```
+
+---
+
+## 2026-04-03 跨三层服务模块（V2/V3全场景+IP分组+21步综合测试）
+
+### 新增功能
+- [x] **跨三层服务Page Object** (`pages/network/cross_layer_service_page.py`)
+  - V2/V3双版本规则添加
+  - IP分组功能（截断名称匹配+重复检测）
+  - 频率设置与异常值测试
+  - 批量删除重试机制（最多3次+实际计数验证）
+- [x] **21步综合测试** (`tests/network/test_cross_layer_service_comprehensive.py`)
+  - V2/V3规则+频率异常值+批量操作
+- [x] **SSH后台验证（L1数据库+L4内核）**
+
+### 文件变更
+```
+新增:
+  pages/network/cross_layer_service_page.py
+  tests/network/test_cross_layer_service_comprehensive.py
+  test_data/exports/cross_layer_service/
+
+修改:
+  utils/backend_verifier.py                         # 新增netsnmpc L1+L4验证方法
+```
+
 ## 2026-03-17 MAC限速线路选择修复（第四次修复 - 最终版）
 
 ### 问题描述

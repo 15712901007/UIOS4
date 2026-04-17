@@ -1580,3 +1580,322 @@ class BackendVerifier:
                 passed=False,
                 message=f"内核验证失败: {str(e)[:100]}",
             )
+
+    # ==================== 协议分流(stream_layer7)验证 ====================
+
+    def query_stream_layer7_rules(self) -> List[Dict]:
+        """查询协议分流(stream_layer7)规则列表"""
+        self.connect_router()
+        output = self._router.exec("/usr/ikuai/function/stream_layer7 show limit=0,500 TYPE=total,data")
+        logger.info(f"stream_layer7 query raw ({len(output)} chars): {output[:300]}")
+        try:
+            parsed = json.loads(output)
+            data = parsed.get("data", [])
+            logger.info(f"stream_layer7 query returned {len(data)} rules")
+            return data
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse stream_layer7 output: {output[:200]}")
+            return []
+
+    def find_stream_layer7_rule(self, **filters) -> Optional[Dict]:
+        """按条件查找单条协议分流规则
+
+        Args:
+            **filters: 过滤条件，如 tagname="xxx", interface="wan1"
+
+        Returns:
+            匹配的规则，或None
+        """
+        rules = self.query_stream_layer7_rules()
+        for rule in rules:
+            if all(str(rule.get(k)) == str(v) for k, v in filters.items()):
+                return rule
+        return None
+
+    def verify_stream_layer7_database(self, tagname: str,
+                                       expected_fields: Dict = None) -> VerifyResult:
+        """
+        L1: 验证协议分流规则在数据库中存在且字段正确
+
+        数据库字段映射:
+        - tagname: 规则名称
+        - interface: 逗号分隔的线路
+        - prio: 优先级(0-63)
+        - mode: 负载模式(0/1/3)
+        - enabled: "yes"/"no"
+        - comment: 备注
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望的字段值，如 {"mode": "0", "prio": "10", "interface": "wan1"}
+        """
+        rule = self.find_stream_layer7_rule(tagname=tagname)
+        if rule is None:
+            all_rules = self.query_stream_layer7_rules()
+            existing_names = [r.get("tagname", "?") for r in all_rules]
+            logger.debug(f"stream_layer7 rule not found: {tagname}, existing: {existing_names}")
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"协议分流规则未找到: tagname={tagname}",
+                raw_output=f"数据库中现有规则: {existing_names}",
+            )
+
+        mismatches = {}
+        if expected_fields:
+            for key, expected in expected_fields.items():
+                actual = str(rule.get(key, ""))
+                if actual != str(expected):
+                    mismatches[key] = {"expected": str(expected), "actual": actual}
+
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"字段不匹配: {mismatches}",
+                details={"rule": rule, "mismatches": mismatches},
+                raw_output=json.dumps(rule, ensure_ascii=False),
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"协议分流规则存在且字段正确 (id={rule.get('id')}, mode={rule.get('mode')}, enabled={rule.get('enabled')})",
+            details={"rule": rule},
+            raw_output=json.dumps(rule, ensure_ascii=False),
+        )
+
+    def query_stream_layer7_iptables(self) -> List[Dict]:
+        """查询iptables mangle表STREAM_LAYER7_NEW链中的规则
+
+        返回解析后的规则列表, 每条规则包含:
+        - rule_id: 规则ID (对应数据库id, 从注释 /* N */ 中提取)
+        - ifname: 线路 (如 wan1, wan1,wan2)
+        - mode: 负载模式 (0/1/3)
+        - mark: fwmark值
+        - timeset: 时间集名称 (如 slayer7_time_1)
+        - appset: 应用集名称 (如 slayer7_app_1)
+        """
+        self.connect_router()
+        output = self._router.exec(
+            "iptables -t mangle -L STREAM_LAYER7_NEW -n -v 2>/dev/null"
+        )
+        rules = []
+        for line in output.split("\n"):
+            if "NTH_CONNMARK" not in line:
+                continue
+            import re
+            rule = {}
+
+            m = re.search(r"/\*\s*(\d+)\s*\*/", line)
+            rule["rule_id"] = int(m.group(1)) if m else None
+
+            m = re.search(r"set-ifname\s+(\S+)", line)
+            rule["ifname"] = m.group(1) if m else ""
+
+            m = re.search(r"set-mode\s+(\d+)", line)
+            rule["mode"] = int(m.group(1)) if m else None
+
+            m = re.search(r"set-mark\s+(\S+)", line)
+            rule["mark"] = m.group(1) if m else ""
+
+            m = re.search(r"timeset\s+(\S+)", line)
+            rule["timeset"] = m.group(1) if m else ""
+
+            m = re.search(r"appset\s+(\S+)", line)
+            rule["appset"] = m.group(1) if m else ""
+
+            rules.append(rule)
+        logger.info(f"STREAM_LAYER7_NEW chain: {len(rules)} iptables rules")
+        return rules
+
+    def verify_stream_layer7_iptables(self, rule_id: int,
+                                       expected_ifname: str = None,
+                                       expected_mode: int = None,
+                                       should_exist: bool = True) -> VerifyResult:
+        """L2: 验证协议分流规则在iptables mangle表STREAM_LAYER7_NEW链中
+
+        协议分流在iptables中的实现:
+        - mangle表PREROUTING链 → STREAM_LAYER7_NEW链
+        - 每条规则匹配: timeset(时间) + appset(协议) + ctstate NEW
+        - 命中后通过NTH_CONNMARK target打fwmark并指定出接口
+        - --set-ifname 对应线路
+        - --set-mode 对应负载模式(0=新建连接数, 1=源IP, 3=源IP+目的IP)
+
+        注意: 通过UI停用/删除规则后iptables规则都会被移除(配置重载)。
+              should_exist=False 用于验证停用/删除后规则确实消失。
+
+        Args:
+            rule_id: 数据库规则ID
+            expected_ifname: 期望的线路名称
+            expected_mode: 期望的负载模式值
+            should_exist: True=验证规则存在, False=验证规则已删除
+        """
+        self.connect_router()
+        try:
+            iptables_rules = self.query_stream_layer7_iptables()
+
+            found = None
+            for r in iptables_rules:
+                if r["rule_id"] == rule_id:
+                    found = r
+                    break
+
+            if should_exist:
+                if found is None:
+                    return VerifyResult(
+                        level="L2-iptables",
+                        passed=False,
+                        message=f"iptables规则未找到: rule_id={rule_id}",
+                        raw_output=f"现有规则IDs: {[r['rule_id'] for r in iptables_rules]}",
+                    )
+
+                mismatches = []
+                if expected_ifname and found["ifname"] != expected_ifname:
+                    mismatches.append(f"ifname: 期望={expected_ifname}, 实际={found['ifname']}")
+                if expected_mode is not None and found["mode"] != expected_mode:
+                    mismatches.append(f"mode: 期望={expected_mode}, 实际={found['mode']}")
+
+                if mismatches:
+                    return VerifyResult(
+                        level="L2-iptables",
+                        passed=False,
+                        message=f"iptables规则字段不匹配: {', '.join(mismatches)}",
+                        details={"found": found},
+                        raw_output=str(found),
+                    )
+
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=True,
+                    message=f"iptables规则存在且正确 (id={rule_id}, ifname={found['ifname']}, mode={found['mode']})",
+                    details={"found": found},
+                    raw_output=str(found),
+                )
+            else:
+                if found is not None:
+                    return VerifyResult(
+                        level="L2-iptables",
+                        passed=False,
+                        message=f"iptables规则仍存在(应已删除): rule_id={rule_id}",
+                        details={"found": found},
+                    )
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=True,
+                    message=f"iptables规则已删除: rule_id={rule_id}",
+                )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L2-iptables",
+                passed=False,
+                message=f"iptables检查失败: {str(e)[:100]}",
+            )
+
+    def verify_stream_layer7_policy_routing(self,
+                                             expected_wan_interfaces: List[str] = None) -> VerifyResult:
+        """L3: 验证协议分流策略路由(ip rule fwmark + per-WAN路由表)
+
+        协议分流通过fwmark标记 → ip rule策略路由 → per-WAN路由表实现选路。
+        此验证检查策略路由基础设施是否就绪。
+
+        Args:
+            expected_wan_interfaces: 期望有策略路由的WAN接口列表
+        """
+        self.connect_router()
+        if expected_wan_interfaces is None:
+            expected_wan_interfaces = ["wan1", "wan2", "wan3"]
+
+        try:
+            ip_rule_output = self._router.exec("ip rule show")
+            logger.info(f"ip rule output: {ip_rule_output[:300]}")
+
+            found_tables = []
+            for wan in expected_wan_interfaces:
+                if f"lookup {wan}" in ip_rule_output:
+                    found_tables.append(wan)
+
+            # 检查各WAN路由表
+            route_details = {}
+            for wan in found_tables:
+                route_output = self._router.exec(f"ip route show table {wan}")
+                has_default = "default via" in route_output or "default dev" in route_output
+                route_details[wan] = {"has_rule": True, "has_default_route": has_default}
+
+            missing = [w for w in expected_wan_interfaces if w not in found_tables]
+            if missing:
+                return VerifyResult(
+                    level="L3-策略路由",
+                    passed=True,
+                    message=f"策略路由: {len(found_tables)}/{len(expected_wan_interfaces)}个WAN就绪 (缺失: {missing}, 可能线路未连接)",
+                    details={"found_tables": found_tables, "missing": missing, "routes": route_details},
+                    raw_output=ip_rule_output,
+                )
+
+            return VerifyResult(
+                level="L3-策略路由",
+                passed=True,
+                message=f"策略路由正常: {len(found_tables)}个WAN接口均有fwmark规则和路由表",
+                details={"found_tables": found_tables, "routes": route_details},
+                raw_output=ip_rule_output,
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L3-策略路由",
+                passed=False,
+                message=f"策略路由检查失败: {str(e)[:100]}",
+            )
+
+    def verify_stream_layer7_kernel(self) -> VerifyResult:
+        """L4: 验证协议分流内核状态(ik_core模块)
+
+        协议分流依赖ik_core内核模块实现:
+        - 协议识别(appset参数)
+        - 时间匹配(timeset参数)
+        - fwmark打标(NTH_CONNMARK target)
+        - 负载均衡(mode: 新建连接数轮询/源IP哈希/源IP+目的IP哈希)
+
+        Returns:
+            VerifyResult包含ik_core加载状态
+        """
+        self.connect_router()
+        try:
+            lsmod_output = self._router.exec("lsmod")
+            ik_core_loaded = "ik_core" in lsmod_output
+            logger.info(f"ik_core loaded: {ik_core_loaded}")
+
+            if not ik_core_loaded:
+                return VerifyResult(
+                    level="L4-内核",
+                    passed=False,
+                    message="ik_core内核模块未加载",
+                )
+
+            # 检查STREAM_LAYER7_NEW链是否有流量
+            iptables_output = self._router.exec(
+                "iptables -t mangle -L STREAM_LAYER7_NEW -n -v 2>/dev/null"
+            )
+            has_rules = "NTH_CONNMARK" in iptables_output
+            logger.info(f"STREAM_LAYER7_NEW has rules: {has_rules}")
+
+            details = {
+                "ik_core_loaded": ik_core_loaded,
+                "has_iptables_rules": has_rules,
+            }
+
+            return VerifyResult(
+                level="L4-内核",
+                passed=True,
+                message=f"ik_core模块已加载, STREAM_LAYER7_NEW链{'有' if has_rules else '无'}规则",
+                details=details,
+                raw_output=f"ik_core: loaded={ik_core_loaded}, rules={has_rules}",
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L4-内核",
+                passed=False,
+                message=f"内核检查失败: {str(e)[:100]}",
+            )

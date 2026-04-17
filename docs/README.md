@@ -15,7 +15,11 @@
 │   └── network/               # 网络配置模块
 │       ├── vlan_page.py       # VLAN设置页面
 │       ├── ip_rate_limit_page.py   # IP限速页面
-│       └── mac_rate_limit_page.py  # MAC限速页面
+│       ├── mac_rate_limit_page.py  # MAC限速页面
+│       ├── static_route_page.py    # 静态路由页面
+│       ├── cross_layer_service_page.py  # 跨三层服务页面
+│       ├── multi_wan_lb_page.py    # 多线负载页面
+│       └── protocol_route_page.py  # 协议分流页面
 ├── tests/                      # 测试用例
 │   ├── conftest.py            # pytest fixtures（登录、SSH、报告、步骤记录）
 │   └── network/               # 网络配置测试
@@ -23,7 +27,11 @@
 │       ├── test_vlan_comprehensive.py      # VLAN综合测试（16步）
 │       ├── test_ip_rate_limit_comprehensive.py   # IP限速综合测试（18步+SSH验证）
 │       ├── test_ip_rate_limit_full_chain.py      # IP限速全链路测试（UI+SSH+iperf3）
-│       └── test_mac_rate_limit_comprehensive.py  # MAC限速综合测试（18步+SSH验证）
+│       ├── test_mac_rate_limit_comprehensive.py  # MAC限速综合测试（18步+SSH验证）
+│       ├── test_static_route_comprehensive.py    # 静态路由综合测试（19步+SSH验证）
+│       ├── test_cross_layer_service_comprehensive.py  # 跨三层服务综合测试（21步+SSH验证）
+│       ├── test_multi_wan_lb_comprehensive.py    # 多线负载综合测试（19步+SSH验证）
+│       └── test_protocol_route_comprehensive.py  # 协议分流综合测试（20步+SSH验证）
 ├── utils/                      # 工具类
 │   ├── backend_verifier.py    # SSH后台验证器（L1-L5多层验证）
 │   ├── step_recorder.py       # 测试步骤记录器
@@ -40,7 +48,10 @@
 │   ├── exports/               # 导出文件
 │   │   ├── vlan/              # VLAN导出(CSV/TXT)
 │   │   ├── ip_rate_limit/     # IP限速导出(CSV/TXT)
-│   │   └── mac_rate_limit/    # MAC限速导出(CSV/TXT)
+│   │   ├── mac_rate_limit/    # MAC限速导出(CSV/TXT)
+│   │   ├── cross_layer_service/  # 跨三层服务导出(CSV/TXT)
+│   │   ├── multi_wan_lb/      # 多线负载导出(CSV/TXT)
+│   │   └── protocol_route/    # 协议分流导出(CSV/TXT)
 │   └── vlan/                  # VLAN导入数据
 ├── reports/                    # 测试报告
 │   ├── templates/
@@ -140,6 +151,34 @@ python main.py
 ### IP限速全链路 (test_ip_rate_limit_full_chain.py)
 前端UI + SSH后台 + iperf3实测的端到端验证
 
+### 静态路由 (test_static_route_comprehensive.py)
+19步综合测试 + SSH后台验证：
+- 添加8条路由（覆盖不同协议栈/线路/子网掩码/网关组合）
+- 复制功能测试
+- SSH两级验证：L1数据库(`static_rt show`) + L2内核路由(`ip route show`)
+
+### 跨三层服务 (test_cross_layer_service_comprehensive.py)
+21步综合测试 + SSH后台验证：
+- V2/V3双版本SNMP规则全覆盖
+- 频率设置与异常值测试（字母/负数/小数/超大值）
+- IP分组功能（创建+引用+截断名称匹配）
+- 批量删除重试机制
+- SSH验证：L1数据库(`netsnmpc show`) + L4内核模块
+
+### 多线负载 (test_multi_wan_lb_comprehensive.py)
+19步综合测试 + SSH后台验证：
+- 全部7种负载模式（新建连接数/源IP/源IP+目的IP/按比例/备用/源地址/目的地址）
+- 自定义运营商功能（添加+删除+CIDR格式验证）
+- SSH四级验证：L1数据库(`lb_pcc show`) + L2策略路由(`ip rule`) + L3/L4内核模块
+
+### 协议分流 (test_protocol_route_comprehensive.py)
+20步综合测试 + SSH后台验证：
+- 8条规则覆盖3种负载模式 + 线路绑定 + 生效时间 + IP/MAC分组
+- 复制功能测试
+- 5项扩展功能：线路绑定/生效时间(3种模式)/IP/MAC分组/复制/协议分组
+- SSH四级验证：L1数据库(`stream_layer7 show`) + L2 iptables(mangle链) + L3策略路由 + L4内核
+- 扩展字段验证：`iface_band`(线路绑定)、`time`(生效时间)、`src_addr`(IP/MAC分组)
+
 ## SSH后台验证架构
 
 ```
@@ -154,9 +193,25 @@ BackendVerifier (utils/backend_verifier.py)
 │   ├── L1: verify_vlan_database()     # 数据库字段验证(vlan show)
 │   ├── L2: verify_vlan_interface()    # 网络接口验证(ip link show)
 │   └── L3: verify_vlan_proc()         # proc验证(/proc/net/vlan/config)
+├── 静态路由验证
+│   ├── L1: verify_static_route_database()  # 数据库字段验证(static_rt show)
+│   └── L2: verify_static_route_kernel()    # 内核路由验证(ip route show)
+├── 跨三层服务验证
+│   ├── L1: verify_netsnmpc_database()      # 数据库字段验证(netsnmpc show)
+│   └── L4: verify_netsnmpc_kernel()        # 内核模块验证(ik_core+dmesg)
+├── 多线负载验证
+│   ├── L1: verify_lb_pcc_database()        # 数据库字段验证(lb_pcc show)
+│   ├── L2: verify_lb_policy_routing()      # 策略路由验证(ip rule fwmark)
+│   └── L3/L4: verify_lb_kernel()           # 内核验证(ik_core+dmesg [LB])
+├── 协议分流验证
+│   ├── L1: verify_stream_layer7_database()       # 数据库字段验证(stream_layer7 show)
+│   ├── L2: verify_stream_layer7_iptables()       # iptables验证(mangle/STREAM_LAYER7_NEW链)
+│   ├── L3: verify_stream_layer7_policy_routing()  # 策略路由验证(ip rule fwmark)
+│   └── L4: verify_stream_layer7_kernel()          # 内核验证(ik_core模块)
 └── SSH连接管理
     ├── 自动重连(transport.is_active()检查)
-    └── exec重试(失败重连后重试一次)
+    ├── exec重试(失败重连后重试一次)
+    └── 控制台密码智能登录(交互式菜单自动登录)
 ```
 
 设计原则：
@@ -164,7 +219,7 @@ BackendVerifier (utils/backend_verifier.py)
 - **选择性断言**：关键验证点（L1数据库、L4内核、停用/启用/删除/批量操作）使用`must_pass=True`，失败收集到`ssh_failures`列表，测试末尾统一`assert`
 - **不中断UI流程**：SSH验证失败不会中断测试执行，所有UI步骤完成后再统一判定
 - **动态fixture注入**：`request.getfixturevalue('backend_verifier')` 按需获取
-- **三模块统一SSH验证**：VLAN、IP限速、MAC限速使用相同的SSH验证模式
+- **三模块统一SSH验证**：VLAN、IP限速、MAC限速、静态路由、跨三层服务、多线负载、协议分流共7个模块使用相同的SSH验证模式
 
 ### SSH注意事项
 
@@ -195,28 +250,35 @@ BackendVerifier (utils/backend_verifier.py)
 
 ### 添加新模块测试
 
-1. 在 `pages/network/` 下创建Page Object类，继承 `BasePage`
-2. 在 `tests/network/` 下创建综合测试文件，参考14步测试模式
+1. 在 `pages/network/` 下创建Page Object类，继承 `IkuaiTablePage`
+2. 在 `tests/network/` 下创建综合测试文件，参考20步测试模式
 3. 在 `test_data/exports/<module>/` 下准备导入导出测试数据
 4. （可选）在测试中集成SSH后台验证
+5. 在 `utils/backend_verifier.py` 中添加对应模块的验证方法
 
-### 14步综合测试模式
+### 20步综合测试模式
 
 ```
-Step 1-8:  新增8条规则（不同参数组合覆盖）
-Step 9:    编辑规则
-Step 10:   停用规则
-Step 11:   启用规则
-Step 12:   删除单条
-Step 13:   搜索测试
-Step 14:   排序测试
-Step 15:   导出测试（CSV/TXT）
-Step 16:   异常输入测试
-Step 17:   批量停用
-Step 18:   批量启用
-Step 19:   批量删除
-Step 20:   导入测试（CSV/TXT）
-Step 21:   帮助功能
+Step 1:    检查并清理环境
+Step 2:    二次检查测试数据
+Step 3:    批量添加规则（覆盖各种参数组合）
+Step 4:    SSH后台数据验证（L1+L2+L3+L4）
+Step 5:    编辑规则
+Step 5.5:  复制规则（部分模块）
+Step 6:    停用规则
+Step 7:    启用规则
+Step 8:    删除规则
+Step 9:    搜索测试
+Step 10:   导出测试（CSV/TXT）
+Step 11:   异常输入测试
+Step 12:   排序测试
+Step 13:   批量停用
+Step 14:   批量启用
+Step 15:   批量删除
+Step 16:   导入测试（追加）
+Step 17:   导入测试（清空现有）
+Step 18:   清理环境
+Step 19:   帮助功能
 ```
 
 ## 技术栈

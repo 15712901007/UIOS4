@@ -16,7 +16,16 @@
       "mcp__playwright__browser_network_requests",
       "mcp__playwright__browser_console_messages",
       "mcp__playwright__browser_take_screenshot",
-      "mcp__playwright__browser_run_code"
+      "mcp__playwright__browser_run_code",
+      "mcp__ssh__ssh_connect",
+      "mcp__ssh__ssh_exec",
+      "mcp__ssh__ssh_disconnect",
+      "mcp__ssh__ssh_list_sessions",
+      "mcp__ssh__sftp_list",
+      "mcp__zread__get_repo_structure"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\51355\\.claude\\projects\\c--Users-51355-Desktop-4-0--UI-----\\memory"
     ]
   }
 }
