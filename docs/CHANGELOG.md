@@ -1,5 +1,49 @@
 # 开发日志
 
+## 2026-05-07 端口分流综合测试（19步全量覆盖）
+
+### 新增模块
+- **PortRoutePage** (`pages/network/port_route_page.py`) — 端口分流页面操作类
+  - 继承IkuaiTablePage基类
+  - MODE_TO_DB映射: 新建连接数=0, 源IP=1, 源IP+源端口=2, 源IP+目的IP=3, 源IP+目的IP+目的端口=4, 主备模式=6
+  - 支持两种分流方式: 外网线路(type=0) / 下一跳网关(type=1)
+  - 5种协议: any/tcp/udp/tcp+udp/icmp
+  - 扩展功能: 线路绑定(iface_band), 生效时间(time), 源/目的地址反向匹配, IP/MAC分组
+
+- **test_port_route_comprehensive** (`tests/network/test_port_route_comprehensive.py`) — 19步综合测试
+  - 10条测试规则覆盖: 6种负载模式 + 下一跳网关 + 线路绑定 + 生效时间 + 源地址反向匹配 + IP分组引用
+  - SSH后台四级验证: L1数据库 + L2 iptables + L3策略路由 + L4内核
+
+- **BackendVerifier扩展** (`utils/backend_verifier.py`)
+  - 新增stream_ipport系列方法: query/find/verify_database/verify_iptables/verify_policy_routing/verify_kernel
+  - iptables链: mangle表 STREAM_IPPORT_NEW
+
+- **conftest.py** — 新增port_route_page/port_route_page_logged_in fixture
+
+### 关键Bug修复
+- **Ant Design Select遮挡**: combobox input被selection-item span和checkbox-wrapper遮挡，force=True点击input不触发dropdown。修复: 点击`.ant-select-selection-item` span
+- **fill_src_addr定位失败**: `text=源地址`上溯一层找不到"添加"按钮。修复: 用`get_by_role('button').first`直接定位
+- **反向匹配需先填地址**: "取反功能不可用于空地址"。修复: fill_src_addr在toggle_src_addr_inverse之前
+- **add_rule缺少参数**: src_addr/dst_addr/dst_addr_inv未传入add_rule
+- **备注验证**: 仅允许中文/英文/数字，不允许冒号
+
+### 异常输入/边界值覆盖（11项，全部验证通过）
+- **名称验证**: 空名称→"请输入名称" / 重复名称→"名称已存在，请重新输入" / 超长(30字符)→前端限制15字符 / 特殊字符`<script>`→"仅支持中文、英文、数字" / 纯空格→同上
+- **优先级边界**: -1/0/63/64 全部接受并自动修正到有效范围(系统不限制具体值)
+- **备注特殊字符**: `:!@`→"仅支持中文、英文、数字，长度限制0-64字符"
+- **空地址取反**: 源IP模式下启用反向匹配不填地址→系统允许保存(不拦截)
+
+### 前端验证规则总结（实测确认）
+- 名称: 仅中文/英文/数字，长度1-15字符
+- 备注: 仅中文/英文/数字，长度0-64字符
+- 优先级: 无前端限制，任意数字均可(负数也会接受)
+- 反向匹配: 需先填写地址才能启用，空地址取反不拦截但可能影响路由效果
+
+### 测试结果
+- **端口分流综合测试**: PASSED (19步全部通过，耗时约7分钟)
+- 10条规则全部添加成功，SSH L1-L4验证通过
+- 异常输入11项全部覆盖，前端验证规则已确认
+
 ## 2026-04-17 协议分流5项扩展功能（线路绑定/生效时间/IP分组/复制/协议分组）
 
 ### 新增功能

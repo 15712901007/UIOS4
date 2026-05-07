@@ -99,6 +99,7 @@ from pages.network.static_route_page import StaticRoutePage
 from pages.network.cross_layer_service_page import CrossLayerServicePage
 from pages.network.multi_wan_lb_page import MultiWanLbPage
 from pages.network.protocol_route_page import ProtocolRoutePage
+from pages.network.port_route_page import PortRoutePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -155,6 +156,7 @@ TEST_NAME_MAPPING = {
     'test_cross_layer_service_comprehensive': '跨三层服务综合测试',
     'test_multi_wan_lb_comprehensive': '多线负载综合测试',
     'test_protocol_route_comprehensive': '协议分流综合测试',
+    'test_port_route_comprehensive': '端口分流综合测试',
 }
 
 
@@ -457,6 +459,20 @@ def protocol_route_page_logged_in(logged_in_page: Page, config: Config) -> Proto
     return pr_page
 
 
+@pytest.fixture(scope="function")
+def port_route_page(page: Page, config: Config) -> PortRoutePage:
+    """创建端口分流页面实例"""
+    return PortRoutePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def port_route_page_logged_in(logged_in_page: Page, config: Config) -> PortRoutePage:
+    """已登录并导航到端口分流页面的实例"""
+    pt_page = PortRoutePage(logged_in_page, config.get_base_url())
+    pt_page.navigate_to_port_route()
+    return pt_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -645,6 +661,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "protocol_route: 协议分流模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "port_route: 端口分流模块测试"
     )
 
     # 记录开始时间

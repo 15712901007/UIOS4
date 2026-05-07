@@ -6,3 +6,4 @@ id,enabled,tagname,comment,server_ip,listen_port,oid,mibtype,version,community,u
 6,"yes","snmp_test_006","V3认证且加密-MD5","10.66.0.45",161,".1.3.6.1.2.1.4.22","table",3,"","snmp_user_006","authNoPriv","MD5","authPass006","","","{""custom"":[""172.16.0.100""],""object"":{}}"
 7,"yes","snmp_test_007","备注测试-特殊字符","10.66.0.46",161,".1.3.6.1.2.1.4.22","table",2,"public","","","","","","","{""custom"":[""192.168.1.200""],""object"":{}}"
 8,"yes","snmp_test_008","V3认证不加密-SHA","10.66.0.47",161,".1.3.6.1.2.1.4.22","table",3,"","snmp_user_008","authNoPriv","SHA","authPass008","","","{""custom"":[""192.168.2.1-192.168.2.50""],""object"":{}}"
+9,"yes","snmp_test_009","V2-IP分组测试","10.66.0.48",161,".1.3.6.1.2.1.4.22","table",2,"public","","","","","","","{""custom"":{},""object"":[{""gid"":""IPGP5"",""gp_name"":""snmp_ipgroup_te"",""type"":0,""gp_value"":{}}]}"
