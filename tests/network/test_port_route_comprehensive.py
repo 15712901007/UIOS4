@@ -651,8 +651,14 @@ class TestPortRouteComprehensive:
             print("\n[步骤11] 异常输入测试...")
             rec.add_detail("[异常输入测试]")
 
+            # 辅助函数: 确保在端口分流tab
+            def ensure_port_route_tab():
+                page.navigate_to_port_route()
+                page.page.wait_for_timeout(300)
+
             # 11.1 空名称
             rec.add_detail("  空名称:")
+            ensure_port_route_tab()
             result = page.try_add_rule_invalid(name="")
             if result["success"]:
                 print(f"    [OK] 拦截: {result.get('error_message', '')}")
@@ -664,6 +670,7 @@ class TestPortRouteComprehensive:
             # 11.2 重复名称
             rec.add_detail("  重复名称:")
             existing = test_rules[0]["name"]
+            ensure_port_route_tab()
             try:
                 page.click_add_button()
                 page.page.wait_for_timeout(1000)
@@ -690,12 +697,6 @@ class TestPortRouteComprehensive:
                 elif page.wait_for_success_message(timeout=2000):
                     print(f"    [WARN] 重复名称未被拦截")
                     rec.add_detail(f"    [WARN] 重复名称未被拦截")
-                    page.page.wait_for_timeout(500)
-                    page.navigate_back_to_list()
-                    page.page.wait_for_timeout(500)
-                else:
-                    print(f"    [INFO] 重复名称: 无明确提示")
-                    rec.add_detail(f"    [INFO] 无明确提示")
                 page.click_cancel()
                 page.page.wait_for_timeout(300)
                 if "portFlow" in page.page.url:
@@ -712,6 +713,7 @@ class TestPortRouteComprehensive:
             # 11.3 超长名称
             rec.add_detail("  超长名称(30字符):")
             long_name = "a" * 30
+            ensure_port_route_tab()
             try:
                 page.click_add_button()
                 page.page.wait_for_timeout(1000)
@@ -738,8 +740,12 @@ class TestPortRouteComprehensive:
                     page.page.wait_for_timeout(500)
                     page.navigate_back_to_list()
                     page.page.wait_for_timeout(500)
-                    page.delete_rule(truncated)
-                    page.page.wait_for_timeout(500)
+                    # 使用更可靠的删除方式
+                    try:
+                        page.delete_rule(truncated)
+                    except Exception:
+                        print(f"    [DEBUG] 清理超长规则失败，继续测试")
+                    page.page.wait_for_timeout(300)
                 else:
                     print(f"    [INFO] 超长名称: 无明确拦截提示")
                     rec.add_detail(f"    [INFO] 超长名称: 无明确拦截提示")
@@ -757,6 +763,7 @@ class TestPortRouteComprehensive:
 
             # 11.4 特殊字符
             rec.add_detail("  特殊字符:")
+            ensure_port_route_tab()
             result = page.try_add_rule_invalid(name="<script>alert(1)</script>")
             if result["success"]:
                 print(f"    [OK] 拦截: {result.get('error_message', '')}")
@@ -767,6 +774,7 @@ class TestPortRouteComprehensive:
 
             # 11.5 纯空格
             rec.add_detail("  纯空格:")
+            ensure_port_route_tab()
             result = page.try_add_rule_invalid(name="   ")
             if result["success"]:
                 print(f"    [OK] 拦截: {result.get('error_message', '')}")
@@ -781,12 +789,12 @@ class TestPortRouteComprehensive:
             for prio_val, desc in [(-1, "负数"), (64, "超出上限"), (0, "最小值0"), (63, "最大值63")]:
                 prio_idx += 1
                 rule_name = f"prio_test_{prio_idx}"
+                ensure_port_route_tab()
                 try:
                     page.click_add_button()
                     page.page.wait_for_timeout(1000)
                     page.fill_name(rule_name)
                     page.set_priority(prio_val)
-                    # 用wan3避免与其他测试数据重复
                     page.select_line("wan3")
                     page.page.wait_for_timeout(300)
                     page.click_save()
@@ -814,7 +822,10 @@ class TestPortRouteComprehensive:
                         page.page.wait_for_timeout(500)
                         page.navigate_back_to_list()
                         page.page.wait_for_timeout(500)
-                        page.delete_rule(rule_name)
+                        try:
+                            page.delete_rule(rule_name)
+                        except Exception:
+                            pass
                         page.page.wait_for_timeout(300)
                     else:
                         print(f"    [INFO] 优先级{desc}({prio_val}): 无明确提示")
@@ -837,6 +848,7 @@ class TestPortRouteComprehensive:
             remark_idx = 0
             for char, label in [(":", "冒号"), ("!", "感叹号"), ("@", "at符号")]:
                 remark_idx += 1
+                ensure_port_route_tab()
                 try:
                     page.click_add_button()
                     page.page.wait_for_timeout(1000)
@@ -869,7 +881,10 @@ class TestPortRouteComprehensive:
                         page.page.wait_for_timeout(500)
                         page.navigate_back_to_list()
                         page.page.wait_for_timeout(500)
-                        page.delete_rule(f"test_remark_{remark_idx}")
+                        try:
+                            page.delete_rule(f"test_remark_{remark_idx}")
+                        except Exception:
+                            pass
                         page.page.wait_for_timeout(300)
                     else:
                         print(f"    [INFO] 备注{label}: 无明确提示")
@@ -889,11 +904,11 @@ class TestPortRouteComprehensive:
 
             # 11.8 反向匹配无地址(空地址取反)
             rec.add_detail("  反向匹配无地址:")
+            ensure_port_route_tab()
             try:
                 page.click_add_button()
                 page.page.wait_for_timeout(1000)
                 page.fill_name("test_inv_noaddr")
-                # 切换到"源IP"模式才会显示源地址字段
                 page.select_load_mode("源IP")
                 page.page.wait_for_timeout(500)
                 page.select_line("wan2")
@@ -1075,19 +1090,20 @@ class TestPortRouteComprehensive:
                 print(f"  [WARN] CSV文件不存在")
                 rec.add_detail(f"  CSV文件不存在")
 
-        # ========== 步骤17: 导入测试(清空现有数据) ==========
-        with rec.step("步骤17: 导入配置(清空现有)", "勾选清空现有数据后导入"):
-            print("\n[步骤17] 导入配置(清空现有数据)...")
-            rec.add_detail("[导入测试-清空现有]")
+        # ========== 步骤17: 导入测试(TXT清空现有) ==========
+        with rec.step("步骤17: 导入配置(清空现有)", "使用导出的TXT清空现有后导入"):
+            print("\n[步骤17] 导入配置(清空现有数据-TXT)...")
+            rec.add_detail("[导入测试-清空现有-TXT]")
 
-            if os.path.exists(export_file_csv):
+            if os.path.exists(export_file_txt):
                 page.add_rule(name="extra_pt_before", diversion_type="外网线路",
                               line="wan1", priority=50, protocol="any")
                 page.page.wait_for_timeout(500)
                 count_before = page.get_rule_count()
+                rec.add_detail(f"  文件: {os.path.basename(export_file_txt)}")
                 rec.add_detail(f"  导入前: {count_before} 条(含额外规则 extra_pt_before)")
 
-                result = page.import_rules(export_file_csv, clear_existing=True)
+                result = page.import_rules(export_file_txt, clear_existing=True)
                 page.page.reload()
                 page.page.wait_for_timeout(1000)
                 page.navigate_to_port_route()
@@ -1106,8 +1122,8 @@ class TestPortRouteComprehensive:
                     print(f"  [OK] 重新导入 {count_after} 条")
                     rec.add_detail(f"  [OK] 重新导入 {count_after} 条")
             else:
-                print(f"  [WARN] CSV文件不存在")
-                rec.add_detail(f"  CSV文件不存在")
+                print(f"  [WARN] TXT文件不存在")
+                rec.add_detail(f"  TXT文件不存在")
 
         # ========== 步骤18: 清理环境 ==========
         with rec.step("步骤18: 清理环境", "清理所有残留数据"):

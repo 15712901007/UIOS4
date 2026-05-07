@@ -73,6 +73,9 @@ test_data:
     protocol_route:
       export_filename: "protocol_route_config.csv"
       import_filename: "protocol_route_import.csv"
+    port_route:
+      export_filename: "port_route_config.csv"
+      import_filename: "port_route_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"
