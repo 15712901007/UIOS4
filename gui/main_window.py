@@ -744,6 +744,16 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "端口分流": {
+                                "testcases": [
+                                    "test_port_route_comprehensive.py::TestPortRouteComprehensive::test_port_route_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_port_route_comprehensive.py::TestPortRouteComprehensive::test_port_route_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "内外网设置": {
