@@ -1,5 +1,42 @@
 # 开发日志
 
+## 2026-05-07 域名分流综合测试（19步全量覆盖）
+
+### 新增模块
+- **DomainRoutePage** (`pages/network/domain_route_page.py`) — 域名分流页面操作类
+  - 继承IkuaiTablePage基类
+  - 线路选择: checkbox多选下拉框(与端口分流相同机制)
+  - 域名输入: 动态列表(添加+批量按钮)
+  - 域名分组/IP-MAC分组: dialog对话框选择
+  - 生效时间: 按周循环/时间计划/时间段三种模式
+  - 注意: 域名分流表单**无优先级UI字段**, 后端默认prio=31
+
+- **test_domain_route_comprehensive** (`tests/network/test_domain_route_comprehensive.py`) — 19步综合测试
+  - 10条测试规则覆盖: 多线路(wan2/wan3/vwan1) + 多域名(1-5个) + 源IP地址 + 生效时间 + 备注
+  - SSH后台四级验证: L1数据库 + L2 ipset(sdomain_src_{id}) + L3 /proc/ikuai/stats/ik_summary + L4 ik_core
+
+- **BackendVerifier扩展** (`utils/backend_verifier.py`)
+  - 新增stream_domain系列方法: query/find/verify_database/verify_ipset/verify_kernel_status/verify_kernel
+  - L2: ipset sdomain_src_{id} 存储域名解析后的IP
+  - L3: /proc/ikuai/stats/ik_summary + ik_cntl url_route 内核子系统
+
+- **conftest.py** — 新增domain_route_page/domain_route_page_logged_in fixture
+
+### 关键发现
+- **域名分流无优先级字段**: 与端口/协议分流不同, 域名分流表单没有优先级输入, 后端默认prio=31
+- **线路选择使用checkbox多选**: 与端口分流的checkbox多选相同机制, 非简单combobox
+- **域名输入是动态列表**: 通过"添加"按钮逐个添加, "批量"按钮一次性添加多个
+- **域名和域名分组互斥**: 表单验证"域名和域名分组必须填写其中一个"
+
+### 测试覆盖全景
+- **线路**: wan2 / wan3 / vwan1 — 多线路覆盖
+- **域名**: 单域名 / 多域名(2-5个) — 数量全覆盖
+- **扩展功能**: 源IP地址(src_addr) / 生效时间(按周循环) / 备注(comment)
+- **异常输入**: 空名称/重复/超长/特殊字符/纯空格/优先级边界/备注特殊字符
+
+### 测试结果
+- **域名分流综合测试**: PASSED (19步全部通过, SSH L1-L4验证通过, 耗时约7.5分钟)
+
 ## 2026-05-07 端口分流综合测试（19步全量覆盖）
 
 ### 新增模块

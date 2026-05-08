@@ -754,6 +754,16 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "域名分流": {
+                                "testcases": [
+                                    "test_domain_route_comprehensive.py::TestDomainRouteComprehensive::test_domain_route_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_domain_route_comprehensive.py::TestDomainRouteComprehensive::test_domain_route_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "内外网设置": {

@@ -100,6 +100,7 @@ from pages.network.cross_layer_service_page import CrossLayerServicePage
 from pages.network.multi_wan_lb_page import MultiWanLbPage
 from pages.network.protocol_route_page import ProtocolRoutePage
 from pages.network.port_route_page import PortRoutePage
+from pages.network.domain_route_page import DomainRoutePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -157,6 +158,7 @@ TEST_NAME_MAPPING = {
     'test_multi_wan_lb_comprehensive': '多线负载综合测试',
     'test_protocol_route_comprehensive': '协议分流综合测试',
     'test_port_route_comprehensive': '端口分流综合测试',
+    'test_domain_route_comprehensive': '域名分流综合测试',
 }
 
 
@@ -473,6 +475,22 @@ def port_route_page_logged_in(logged_in_page: Page, config: Config) -> PortRoute
     return pt_page
 
 
+# ==================== 域名分流 fixtures ====================
+
+@pytest.fixture(scope="function")
+def domain_route_page(page: Page, config: Config) -> DomainRoutePage:
+    """创建域名分流页面实例"""
+    return DomainRoutePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def domain_route_page_logged_in(logged_in_page: Page, config: Config) -> DomainRoutePage:
+    """已登录并导航到域名分流页面的实例"""
+    dr_page = DomainRoutePage(logged_in_page, config.get_base_url())
+    dr_page.navigate_to_domain_route()
+    return dr_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -664,6 +682,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "port_route: 端口分流模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "domain_route: 域名分流模块测试"
     )
 
     # 记录开始时间

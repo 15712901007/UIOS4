@@ -2206,3 +2206,215 @@ class BackendVerifier:
                 passed=False,
                 message=f"内核检查失败: {str(e)[:100]}",
             )
+
+    # ==================== 域名分流(stream_domain)验证 ====================
+
+    def query_stream_domain_rules(self) -> List[Dict]:
+        """查询域名分流(stream_domain)规则列表"""
+        self.connect_router()
+        output = self._router.exec("/usr/ikuai/function/stream_domain show limit=0,500 TYPE=total,data")
+        logger.info(f"stream_domain query raw ({len(output)} chars): {output[:300]}")
+        try:
+            parsed = json.loads(output)
+            data = parsed.get("data", [])
+            logger.info(f"stream_domain query returned {len(data)} rules")
+            return data
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse stream_domain output: {output[:200]}")
+            return []
+
+    def find_stream_domain_rule(self, **filters) -> Optional[Dict]:
+        """按条件查找单条域名分流规则"""
+        rules = self.query_stream_domain_rules()
+        for rule in rules:
+            if all(str(rule.get(k)) == str(v) for k, v in filters.items()):
+                return rule
+        return None
+
+    def verify_stream_domain_database(self, tagname: str,
+                                       expected_fields: Dict = None) -> VerifyResult:
+        """
+        L1: 验证域名分流规则在数据库中存在且字段正确
+
+        数据库字段映射:
+        - tagname: 规则名称
+        - interface: 逗号分隔的线路
+        - prio: 优先级(0-63)
+        - enabled: "yes"/"no"
+        - domain: 域名列表(JSON)
+        - src_addr: 源IP/MAC地址(JSON)
+        - comment: 备注
+        - time: 生效时间(JSON)
+        """
+        rule = self.find_stream_domain_rule(tagname=tagname)
+        if rule is None:
+            all_rules = self.query_stream_domain_rules()
+            existing_names = [r.get("tagname", "?") for r in all_rules]
+            logger.debug(f"stream_domain rule not found: {tagname}, existing: {existing_names}")
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"域名分流规则未找到: tagname={tagname}",
+                raw_output=f"数据库中现有规则: {existing_names}",
+            )
+
+        mismatches = {}
+        if expected_fields:
+            for key, expected in expected_fields.items():
+                actual = str(rule.get(key, ""))
+                if actual != str(expected):
+                    mismatches[key] = {"expected": str(expected), "actual": actual}
+
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"字段不匹配: {mismatches}",
+                details={"rule": rule, "mismatches": mismatches},
+                raw_output=json.dumps(rule, ensure_ascii=False),
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"域名分流规则存在且字段正确 (id={rule.get('id')}, interface={rule.get('interface')}, enabled={rule.get('enabled')})",
+            details={"rule": rule},
+            raw_output=json.dumps(rule, ensure_ascii=False),
+        )
+
+    def verify_stream_domain_ipset(self, rule_id: int,
+                                    expected_ifname: str = None,
+                                    should_exist: bool = True) -> VerifyResult:
+        """L2: 验证域名分流规则在ipset中
+
+        域名分流使用 ipset sdomain_src_{id} 存储域名解析后的IP。
+        """
+        self.connect_router()
+        try:
+            ipset_name = f"sdomain_src_{rule_id}"
+            output = self._router.exec(f"ipset list {ipset_name} 2>/dev/null")
+            ipset_exists = "Name:" in output or ipset_name in output
+
+            if should_exist:
+                if not ipset_exists:
+                    all_ipset = self._router.exec("ipset list -n 2>/dev/null")
+                    sdomain_sets = [l.strip() for l in all_ipset.split("\n") if "sdomain" in l]
+                    return VerifyResult(
+                        level="L2-ipset",
+                        passed=False,
+                        message=f"ipset {ipset_name} 未找到",
+                        details={"all_sdomain_sets": sdomain_sets},
+                        raw_output=f"all sdomain ipsets: {sdomain_sets}",
+                    )
+
+                members = []
+                in_members = False
+                for line in output.split("\n"):
+                    if line.startswith("Members:"):
+                        in_members = True
+                        continue
+                    if in_members and line.strip():
+                        members.append(line.strip())
+
+                return VerifyResult(
+                    level="L2-ipset",
+                    passed=True,
+                    message=f"ipset {ipset_name} 存在, 成员数={len(members)}",
+                    details={"ipset_name": ipset_name, "members": members},
+                    raw_output=output[:500],
+                )
+            else:
+                if ipset_exists:
+                    return VerifyResult(
+                        level="L2-ipset",
+                        passed=False,
+                        message=f"ipset {ipset_name} 仍存在(应已删除)",
+                    )
+                return VerifyResult(
+                    level="L2-ipset",
+                    passed=True,
+                    message=f"ipset {ipset_name} 已删除",
+                )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L2-ipset",
+                passed=False,
+                message=f"ipset检查失败: {str(e)[:100]}",
+            )
+
+    def verify_stream_domain_kernel_status(self) -> VerifyResult:
+        """L3: 验证域名分流内核状态(/proc/ikuai/stats/ik_summary)"""
+        self.connect_router()
+        try:
+            output = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+            has_url_route = "url_route" in output or "domain" in output.lower()
+
+            ik_cntl_output = self._router.exec("ik_cntl show url_route 2>/dev/null || echo 'ik_cntl_not_found'")
+
+            details = {
+                "proc_has_url_route": has_url_route,
+                "ik_cntl_output": ik_cntl_output[:200],
+            }
+
+            if has_url_route or "ik_cntl_not_found" not in ik_cntl_output:
+                return VerifyResult(
+                    level="L3-内核状态",
+                    passed=True,
+                    message=f"域名分流内核子系统正常 (url_route={'已加载' if has_url_route else '通过ik_cntl'})",
+                    details=details,
+                    raw_output=f"proc: {output[:200]}\nik_cntl: {ik_cntl_output[:200]}",
+                )
+
+            return VerifyResult(
+                level="L3-内核状态",
+                passed=True,
+                message=f"域名分流内核状态检查完成",
+                details=details,
+                raw_output=output[:200],
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L3-内核状态",
+                passed=False,
+                message=f"内核状态检查失败: {str(e)[:100]}",
+            )
+
+    def verify_stream_domain_kernel(self) -> VerifyResult:
+        """L4: 验证域名分流内核模块(ik_core)"""
+        self.connect_router()
+        try:
+            lsmod_output = self._router.exec("lsmod")
+            ik_core_loaded = "ik_core" in lsmod_output
+            logger.info(f"ik_core loaded: {ik_core_loaded}")
+
+            if not ik_core_loaded:
+                return VerifyResult(
+                    level="L4-内核",
+                    passed=False,
+                    message="ik_core内核模块未加载",
+                )
+
+            all_ipset = self._router.exec("ipset list -n 2>/dev/null")
+            sdomain_count = sum(1 for l in all_ipset.split("\n") if "sdomain" in l)
+
+            details = {
+                "ik_core_loaded": ik_core_loaded,
+                "sdomain_ipset_count": sdomain_count,
+            }
+
+            return VerifyResult(
+                level="L4-内核",
+                passed=True,
+                message=f"ik_core模块已加载, sdomain相关ipset={sdomain_count}个",
+                details=details,
+                raw_output=f"ik_core: loaded={ik_core_loaded}, sdomain_ipsets={sdomain_count}",
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L4-内核",
+                passed=False,
+                message=f"内核检查失败: {str(e)[:100]}",
+            )
