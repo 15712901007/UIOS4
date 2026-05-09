@@ -764,6 +764,16 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "上下行分离": {
+                                "testcases": [
+                                    "test_updown_route_comprehensive.py::TestUpdownRouteComprehensive::test_updown_route_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_updown_route_comprehensive.py::TestUpdownRouteComprehensive::test_updown_route_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "内外网设置": {

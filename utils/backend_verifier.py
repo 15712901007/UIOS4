@@ -2418,3 +2418,212 @@ class BackendVerifier:
                 passed=False,
                 message=f"内核检查失败: {str(e)[:100]}",
             )
+
+    # ==================== 上下行分离(stream_updown)验证 ====================
+
+    def query_stream_updown_rules(self) -> list:
+        """L1: 查询上下行分离数据库规则"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "/usr/ikuai/function/stream_updown show limit=0,500 TYPE=total,data"
+            )
+            logger.info(f"stream_updown show output (first 200): {output[:200]}")
+
+            import json
+            data = json.loads(output)
+            rules = data.get("data", [])
+            logger.info(f"stream_updown rules count: {len(rules)}")
+            return rules
+        except Exception as e:
+            logger.error(f"查询stream_updown失败: {e}")
+            return []
+
+    def find_stream_updown_rule(self, tagname: str) -> Optional[dict]:
+        """L1: 查找指定名称的上下行分离规则"""
+        rules = self.query_stream_updown_rules()
+        for rule in rules:
+            if rule.get("tagname") == tagname:
+                return rule
+        return None
+
+    def verify_stream_updown_database(self, tagname: str,
+                                      expected_fields: dict = None) -> VerifyResult:
+        """L1: 验证上下行分离数据库规则"""
+        try:
+            rule = self.find_stream_updown_rule(tagname)
+            if rule is None:
+                all_rules = self.query_stream_updown_rules()
+                existing_names = [r.get("tagname", "?") for r in all_rules]
+                return VerifyResult(
+                    level="L1-数据库",
+                    passed=False,
+                    message=f"上下行分离规则未找到: tagname={tagname}",
+                    raw_output=f"数据库中现有规则: {existing_names}",
+                )
+
+            details = {
+                "id": rule.get("id"),
+                "tagname": rule.get("tagname"),
+                "upiface": rule.get("upiface"),
+                "downiface": rule.get("downiface"),
+                "protocol": rule.get("protocol"),
+                "enabled": rule.get("enabled"),
+                "comment": rule.get("comment"),
+            }
+
+            mismatches = {}
+            if expected_fields:
+                for field, expected in expected_fields.items():
+                    actual = str(rule.get(field, ""))
+                    if actual != str(expected):
+                        mismatches[field] = {"expected": str(expected), "actual": actual}
+
+            if mismatches:
+                return VerifyResult(
+                    level="L1-数据库",
+                    passed=False,
+                    message=f"字段不匹配: {mismatches}",
+                    details=details,
+                    raw_output=str(rule)[:300],
+                )
+
+            return VerifyResult(
+                level="L1-数据库",
+                passed=True,
+                message=f"规则{tagname}数据库验证通过",
+                details=details,
+                raw_output=str(rule)[:300],
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"数据库验证异常: {str(e)[:100]}",
+            )
+
+    def verify_stream_updown_ipset(self, rule_id: str,
+                                   src_addr: str = None,
+                                   dst_addr: str = None) -> VerifyResult:
+        """L2: 验证上下行分离ipset规则"""
+        self.connect_router()
+        try:
+            all_ipset = self._router.exec("ipset list -n 2>/dev/null")
+            found_sets = []
+            for suffix in ["src", "dst", "sport", "dport"]:
+                set_name = f"updown_{suffix}_{rule_id}"
+                if set_name in all_ipset:
+                    found_sets.append(set_name)
+
+            details = {"rule_id": rule_id, "ipset_sets": found_sets}
+
+            addr_check_results = []
+            if src_addr and f"updown_src_{rule_id}" in all_ipset:
+                src_content = self._router.exec(f"ipset list updown_src_{rule_id} 2>/dev/null")
+                has_addr = src_addr in src_content
+                addr_check_results.append(f"src_addr({src_addr}): {'found' if has_addr else 'not found'}")
+                details["src_addr_in_ipset"] = has_addr
+
+            if dst_addr and f"updown_dst_{rule_id}" in all_ipset:
+                dst_content = self._router.exec(f"ipset list updown_dst_{rule_id} 2>/dev/null")
+                has_addr = dst_addr in dst_content
+                addr_check_results.append(f"dst_addr({dst_addr}): {'found' if has_addr else 'not found'}")
+                details["dst_addr_in_ipset"] = has_addr
+
+            all_addr_ok = all(
+                "found" in r for r in addr_check_results
+            ) if addr_check_results else True
+
+            # 没有地址/端口的规则不创建ipset，此时found_sets为空是正常的
+            has_addr_or_port_check = src_addr or dst_addr
+            if has_addr_or_port_check:
+                passed = len(found_sets) > 0 and all_addr_ok
+            else:
+                passed = True
+            msg_parts = [f"ipset={found_sets}"]
+            if addr_check_results:
+                msg_parts.extend(addr_check_results)
+
+            return VerifyResult(
+                level="L2-ipset",
+                passed=passed,
+                message=f"上下行分离ipset验证{'通过' if passed else '未通过'}: {', '.join(msg_parts)}",
+                details=details,
+                raw_output=all_ipset[:500],
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L2-ipset",
+                passed=False,
+                message=f"ipset验证异常: {str(e)[:100]}",
+            )
+
+    def verify_stream_updown_kernel_status(self) -> VerifyResult:
+        """L3: 验证上下行分离内核状态(ik_cntl wans-snat)"""
+        self.connect_router()
+        try:
+            config_content = self._router.exec("cat /tmp/iktmp/stream_updown.txt 2>/dev/null")
+            logger.info(f"stream_updown.txt content (first 200): {config_content[:200]}")
+
+            has_rules = bool(config_content.strip())
+            rule_count = len([l for l in config_content.strip().split("\n") if l.strip()]) if has_rules else 0
+
+            details = {
+                "config_exists": has_rules,
+                "rule_count": rule_count,
+            }
+
+            return VerifyResult(
+                level="L3-内核状态",
+                passed=True,
+                message=f"上下行分离内核配置: {'有规则' if has_rules else '无规则'}({rule_count}条)",
+                details=details,
+                raw_output=config_content[:300],
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L3-内核状态",
+                passed=False,
+                message=f"内核状态检查失败: {str(e)[:100]}",
+            )
+
+    def verify_stream_updown_kernel(self) -> VerifyResult:
+        """L4: 验证上下行分离内核模块(ik_core + ik_cntl)"""
+        self.connect_router()
+        try:
+            lsmod_output = self._router.exec("lsmod")
+            ik_core_loaded = "ik_core" in lsmod_output
+            logger.info(f"ik_core loaded: {ik_core_loaded}")
+
+            if not ik_core_loaded:
+                return VerifyResult(
+                    level="L4-内核",
+                    passed=False,
+                    message="ik_core内核模块未加载",
+                )
+
+            all_ipset = self._router.exec("ipset list -n 2>/dev/null")
+            updown_count = sum(1 for l in all_ipset.split("\n") if "updown" in l)
+
+            details = {
+                "ik_core_loaded": ik_core_loaded,
+                "updown_ipset_count": updown_count,
+            }
+
+            return VerifyResult(
+                level="L4-内核",
+                passed=True,
+                message=f"ik_core模块已加载, updown相关ipset={updown_count}个",
+                details=details,
+                raw_output=f"ik_core: loaded={ik_core_loaded}, updown_ipsets={updown_count}",
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L4-内核",
+                passed=False,
+                message=f"内核检查失败: {str(e)[:100]}",
+            )

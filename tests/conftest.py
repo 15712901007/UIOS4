@@ -101,6 +101,7 @@ from pages.network.multi_wan_lb_page import MultiWanLbPage
 from pages.network.protocol_route_page import ProtocolRoutePage
 from pages.network.port_route_page import PortRoutePage
 from pages.network.domain_route_page import DomainRoutePage
+from pages.network.updown_route_page import UpdownRoutePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -159,6 +160,7 @@ TEST_NAME_MAPPING = {
     'test_protocol_route_comprehensive': '协议分流综合测试',
     'test_port_route_comprehensive': '端口分流综合测试',
     'test_domain_route_comprehensive': '域名分流综合测试',
+    'test_updown_route_comprehensive': '上下行分离综合测试',
 }
 
 
@@ -491,6 +493,22 @@ def domain_route_page_logged_in(logged_in_page: Page, config: Config) -> DomainR
     return dr_page
 
 
+# ==================== 上下行分离 fixtures ====================
+
+@pytest.fixture(scope="function")
+def updown_route_page(page: Page, config: Config) -> 'UpdownRoutePage':
+    """创建上下行分离页面实例"""
+    return UpdownRoutePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def updown_route_page_logged_in(logged_in_page: Page, config: Config) -> 'UpdownRoutePage':
+    """已登录并导航到上下行分离页面的实例"""
+    ud_page = UpdownRoutePage(logged_in_page, config.get_base_url())
+    ud_page.navigate_to_updown_route()
+    return ud_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -685,6 +703,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "domain_route: 域名分流模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "updown_route: 上下行分离模块测试"
     )
 
     # 记录开始时间

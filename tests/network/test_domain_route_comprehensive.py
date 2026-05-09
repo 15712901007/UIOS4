@@ -112,10 +112,10 @@ class TestDomainRouteComprehensive:
              "domains": ["www.jd.com"],
              "remark": "京东分流规则",
              "desc": "带备注"},
-            # Rule 10: 多线路
-            {"name": "dm_vwan1", "line": "vwan1", "priority": 55,
+            # Rule 10: wan1线路
+            {"name": "dm_wan1", "line": "wan1", "priority": 55,
              "domains": ["www.alibaba.com"],
-             "desc": "vwan1线路"},
+             "desc": "wan1线路"},
         ]
 
         print("\n" + "=" * 60)

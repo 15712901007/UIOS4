@@ -1,5 +1,47 @@
 # 开发日志
 
+## 2026-05-09 上下行分离综合测试（26步全量覆盖）+ 域名分流网卡修正
+
+### 新增模块
+- **UpdownRoutePage** (`pages/network/updown_route_page.py`) — 上下行分离页面操作类
+  - 继承IkuaiTablePage基类
+  - 上行/下行线路选择: checkbox多选下拉框
+  - 5种协议: 任意/tcp/udp/tcp+udp/icmp
+  - 源/目的地址: IP/MAC输入+分组选择
+  - 源/目的端口: 条件显示(仅tcp/udp/tcp+udp协议)
+  - 无复制功能(与其他分流模块不同)
+  - tagname 15字符限制(同多线负载)
+
+- **test_updown_route_comprehensive** (`tests/network/test_updown_route_comprehensive.py`) — 26步综合测试
+  - 10条测试规则覆盖: 单线路/不同线路/TCP+源端口/UDP+目的端口/tcp+udp/ICMP/源地址/目的地址/地址+端口/备注
+  - SSH后台四级验证: L1数据库 + L2 ipset(updown_src/dst/sport/dport_{id}) + L3 /tmp/iktmp/stream_updown.txt + L4 ik_core
+  - 完整功能覆盖: 编辑/停用/启用/搜索(精确+部分+不存在+清空)/排序/导出(CSV+TXT)/导入(追加+清空)/批量停用/启用/删除/异常输入/帮助
+
+- **BackendVerifier扩展** (`utils/backend_verifier.py`)
+  - 新增stream_updown系列方法: query/find/verify_database/verify_ipset/verify_kernel_status/verify_kernel
+  - L2: ipset updown_src/dst/sport/dport_{id}
+  - L3: /tmp/iktmp/stream_updown.txt (ik_cntl wans-snat内核子系统, 非iptables)
+  - L4: ik_core模块 + updown相关ipset计数
+
+- **conftest.py** — 新增updown_route_page/updown_route_page_logged_in fixture
+- **settings.yaml** — 新增updown_route导出配置
+- **gui/main_window.py** — 分流策略下添加"上下行分离"测试节点
+
+### 关键发现
+- **上下行分离无复制功能**: 与端口/协议分流不同, 表格行中没有复制按钮
+- **L3使用ik_cntl wans-snat**: 不走iptables, 使用独立内核子系统
+- **端口字段条件显示**: 仅tcp/udp/tcp+udp协议显示源/目的端口, icmp和任意不显示
+- **停用/启用需处理确认弹窗**: 必须使用disable_rule()/enable_rule()基类方法, 不能直接_click_rule_button()
+
+### 域名分流网卡修正
+- 修复rule 10: `vwan1` → `wan1` (网卡已更换为wan1/wan2/wan3)
+- 端口分流/协议分流已使用wan1/wan2/wan3, 无需修改
+
+### 测试结果
+- **上下行分离综合测试**: PASSED (344s, 26步全部通过, SSH L1-L4验证通过)
+- **域名分流综合测试**: PASSED (449s, 网卡修正后验证通过)
+- **端口分流综合测试**: PASSED (479s, 验证无回归)
+
 ## 2026-05-07 域名分流综合测试（19步全量覆盖）
 
 ### 新增模块
@@ -12,7 +54,7 @@
   - 注意: 域名分流表单**无优先级UI字段**, 后端默认prio=31
 
 - **test_domain_route_comprehensive** (`tests/network/test_domain_route_comprehensive.py`) — 19步综合测试
-  - 10条测试规则覆盖: 多线路(wan2/wan3/vwan1) + 多域名(1-5个) + 源IP地址 + 生效时间 + 备注
+  - 10条测试规则覆盖: 多线路(wan1/wan2/wan3) + 多域名(1-5个) + 源IP地址 + 生效时间 + 备注
   - SSH后台四级验证: L1数据库 + L2 ipset(sdomain_src_{id}) + L3 /proc/ikuai/stats/ik_summary + L4 ik_core
 
 - **BackendVerifier扩展** (`utils/backend_verifier.py`)
@@ -29,7 +71,7 @@
 - **域名和域名分组互斥**: 表单验证"域名和域名分组必须填写其中一个"
 
 ### 测试覆盖全景
-- **线路**: wan2 / wan3 / vwan1 — 多线路覆盖
+- **线路**: wan1 / wan2 / wan3 — 多线路覆盖
 - **域名**: 单域名 / 多域名(2-5个) — 数量全覆盖
 - **扩展功能**: 源IP地址(src_addr) / 生效时间(按周循环) / 备注(comment)
 - **异常输入**: 空名称/重复/超长/特殊字符/纯空格/优先级边界/备注特殊字符

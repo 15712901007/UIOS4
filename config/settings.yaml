@@ -79,6 +79,9 @@ test_data:
     domain_route:
       export_filename: "domain_route_config.csv"
       import_filename: "domain_route_import.csv"
+    updown_route:
+      export_filename: "updown_route_config.csv"
+      import_filename: "updown_route_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"
