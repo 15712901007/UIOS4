@@ -1,0 +1,6 @@
+id=1 enabled=yes tagname=upnp编辑测试 src_addr={"custom":["192.168.1.100"],"object":{}} interface=wan1 comment= 
+id=2 enabled=yes tagname=upnp多IP src_addr={"object":{},"custom":["192.168.1.101","192.168.1.102"]} interface=wan2 comment= 
+id=4 enabled=yes tagname=upnp多线路 src_addr={"custom":["192.168.3.50"],"object":{}} interface=wan1,wan2 comment= 
+id=5 enabled=yes tagname=upnp全线路 src_addr={"custom":["10.66.0.100"],"object":{}} interface=wan1,wan2,wan3 comment= 
+id=6 enabled=yes tagname=upnp带备注 src_addr={"custom":["192.168.5.10"],"object":{}} interface=wan1 comment=UPnP测试备注 
+id=7 enabled=yes tagname=upnp无备注 src_addr={"object":{},"custom":["172.16.0.5"]} interface=wan2 comment= 

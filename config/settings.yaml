@@ -82,6 +82,9 @@ test_data:
     updown_route:
       export_filename: "updown_route_config.csv"
       import_filename: "updown_route_import.csv"
+    upnp_setting:
+      export_filename: "upnp_setting_config.csv"
+      import_filename: "upnp_setting_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"

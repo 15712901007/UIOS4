@@ -2627,3 +2627,362 @@ class BackendVerifier:
                 passed=False,
                 message=f"内核检查失败: {str(e)[:100]}",
             )
+
+    # ==================== UPnP(upnpd)验证 ====================
+
+    # --- 全局配置(upnpd_conf) ---
+
+    def query_upnpd_conf(self) -> Optional[Dict]:
+        """查询UPnP全局配置(upnpd_conf表，单行)"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "/usr/ikuai/function/upnpd show TYPE=data"
+            )
+            logger.info(f"upnpd_conf raw: {output[:200]}")
+
+            if not output or "Error" in output:
+                return None
+
+            data = json.loads(output.strip())
+            if isinstance(data, dict):
+                if "data" in data:
+                    conf_data = data["data"]
+                    if isinstance(conf_data, list) and len(conf_data) > 0:
+                        return conf_data[0]
+                    elif isinstance(conf_data, dict):
+                        return conf_data
+                return data
+            return None
+        except Exception as e:
+            logger.error(f"query_upnpd_conf error: {e}")
+            return None
+
+    def verify_upnpd_conf(self, expected_fields: Dict = None) -> VerifyResult:
+        """L1: 验证UPnP全局配置"""
+        conf = self.query_upnpd_conf()
+        if conf is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message="无法查询UPnP全局配置",
+            )
+
+        details = {"config": conf}
+        mismatches = []
+
+        if expected_fields:
+            field_map = {
+                "enabled": "enabled",
+                "exclude_port": "exclude_port",
+                "lan_ip": "lan_ip",
+                "interface": "interface",
+                "check_link": "check_link",
+                "check_interval": "check_interval",
+                "rst_switch": "rst_switch",
+                "rst_week": "rst_week",
+                "rst_time": "rst_time",
+            }
+            for ui_key, db_key in field_map.items():
+                if ui_key in expected_fields:
+                    expected_val = str(expected_fields[ui_key])
+                    actual_val = str(conf.get(db_key, ""))
+                    if expected_val.isdigit() and actual_val.isdigit():
+                        if int(expected_val) != int(actual_val):
+                            mismatches.append(f"{db_key}: 期望={expected_val}, 实际={actual_val}")
+                    elif expected_val != actual_val:
+                        mismatches.append(f"{db_key}: 期望={expected_val}, 实际={actual_val}")
+
+        raw = json.dumps(conf, ensure_ascii=False)[:200]
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"UPnP配置不匹配: {'; '.join(mismatches)}",
+                details=details,
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message="UPnP全局配置验证通过",
+            details=details,
+            raw_output=raw,
+        )
+
+    # --- 接口规则(upnpd_ifconf) ---
+
+    def query_upnpd_ifconf(self) -> List[Dict]:
+        """查询UPnP接口规则(upnpd_ifconf表)"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "/usr/ikuai/function/upnpd show TYPE=ifconf_data,ifconf_total limit=0,500"
+            )
+            logger.info(f"upnpd_ifconf raw: {output[:200]}")
+
+            if not output or "Error" in output:
+                return []
+
+            data = json.loads(output.strip())
+            if isinstance(data, dict):
+                return data.get("data", [])
+            return []
+        except Exception as e:
+            logger.error(f"query_upnpd_ifconf error: {e}")
+            return []
+
+    def find_upnpd_ifconf(self, tagname: str) -> Optional[Dict]:
+        """按名称查找UPnP接口规则"""
+        rules = self.query_upnpd_ifconf()
+        for rule in rules:
+            if rule.get("tagname") == tagname:
+                return rule
+        return None
+
+    def verify_upnpd_ifconf_database(self, tagname: str,
+                                      expected_fields: Dict = None) -> VerifyResult:
+        """L1: 验证UPnP接口规则在数据库中存在且字段正确"""
+        rule = self.find_upnpd_ifconf(tagname)
+
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"UPnP规则 '{tagname}' 在数据库中不存在",
+            )
+
+        details = {"rule": rule}
+        mismatches = []
+
+        if expected_fields:
+            for key, expected_val in expected_fields.items():
+                actual_val = str(rule.get(key, ""))
+                expected_str = str(expected_val)
+                if expected_str != actual_val:
+                    mismatches.append(f"{key}: 期望={expected_str}, 实际={actual_val}")
+
+        raw = json.dumps(rule, ensure_ascii=False)[:200]
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"UPnP规则 '{tagname}' 字段不匹配: {'; '.join(mismatches)}",
+                details=details,
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"UPnP规则 '{tagname}' 数据库验证通过",
+            details=details,
+            raw_output=raw,
+        )
+
+    # --- L2: 进程+iptables ---
+
+    def verify_upnpd_process(self, expect_running: bool = True) -> VerifyResult:
+        """L2: 验证miniupnpd进程状态"""
+        self.connect_router()
+        try:
+            pid_output = self._router.exec("cat /var/run/miniupnpd.pid 2>/dev/null")
+            ps_output = self._router.exec("ps | grep miniupnpd | grep -v grep")
+            marker_output = self._router.exec("test -f /tmp/iktmp/upnpd_enabled && echo YES || echo NO")
+
+            pid_exists = bool(pid_output.strip())
+            process_running = "miniupnpd" in ps_output
+            marker_exists = marker_output.strip() == "YES"
+
+            details = {
+                "pid_exists": pid_exists,
+                "pid": pid_output.strip() if pid_exists else None,
+                "process_running": process_running,
+                "marker_exists": marker_exists,
+            }
+
+            is_running = process_running or marker_exists
+            passed = (is_running == expect_running)
+
+            if expect_running:
+                msg = f"miniupnpd运行状态: {'运行中' if is_running else '未运行'}"
+            else:
+                msg = f"miniupnpd应未运行: {'确认' if not is_running else '仍在运行'}"
+
+            raw = f"pid={pid_output.strip()}, ps={ps_output.strip()}, marker={marker_output.strip()}"
+
+            return VerifyResult(
+                level="L2-进程",
+                passed=passed,
+                message=msg,
+                details=details,
+                raw_output=raw,
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L2-进程",
+                passed=False,
+                message=f"miniupnpd进程检查失败: {str(e)[:100]}",
+            )
+
+    def verify_upnpd_iptables(self, expect_chains: bool = True) -> VerifyResult:
+        """L2: 验证UPnP iptables链"""
+        self.connect_router()
+        try:
+            nat_miniupnpd = self._router.exec("iptables -t nat -L MINIUPNPD -n 2>/dev/null | head -5")
+            nat_postrouting = self._router.exec("iptables -t nat -L MINIUPNPD-POSTROUTING -n 2>/dev/null | head -5")
+            filter_miniupnpd = self._router.exec("iptables -L MINIUPNPD -n 2>/dev/null | head -5")
+
+            has_nat = "Chain MINIUPNPD" in nat_miniupnpd
+            has_nat_post = "Chain MINIUPNPD-POSTROUTING" in nat_postrouting
+            has_filter = "Chain MINIUPNPD" in filter_miniupnpd
+
+            details = {
+                "nat_chain": has_nat,
+                "nat_postrouting_chain": has_nat_post,
+                "filter_chain": has_filter,
+            }
+
+            all_chains = has_nat and has_nat_post and has_filter
+            passed = (all_chains == expect_chains)
+
+            raw = f"nat={nat_miniupnpd[:100]}; filter={filter_miniupnpd[:100]}"
+
+            return VerifyResult(
+                level="L2-iptables",
+                passed=passed,
+                message=f"UPnP iptables链: nat={has_nat}, postrouting={has_nat_post}, filter={has_filter}",
+                details=details,
+                raw_output=raw,
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L2-iptables",
+                passed=False,
+                message=f"iptables检查失败: {str(e)[:100]}",
+            )
+
+    # --- L3: 运行时配置 ---
+
+    def verify_upnpd_runtime_config(self, expect_exists: bool = True) -> VerifyResult:
+        """L3: 验证UPnP运行时配置文件"""
+        self.connect_router()
+        try:
+            conf_output = self._router.exec("cat /tmp/iktmp/miniupnpd.conf 2>/dev/null")
+            ifname_output = self._router.exec("cat /tmp/iktmp/miniupnpd_ifname.conf 2>/dev/null")
+            marker_output = self._router.exec("test -f /tmp/iktmp/upnpd_enabled && echo YES || echo NO")
+
+            conf_exists = bool(conf_output.strip())
+            ifname_exists = bool(ifname_output.strip())
+            marker_exists = marker_output.strip() == "YES"
+
+            details = {
+                "conf_exists": conf_exists,
+                "ifname_exists": ifname_exists,
+                "marker_exists": marker_exists,
+            }
+
+            all_exist = conf_exists and ifname_exists and marker_exists
+            passed = (all_exist == expect_exists)
+
+            msg = f"运行时配置: conf={conf_exists}, ifname={ifname_exists}, marker={marker_exists}"
+
+            return VerifyResult(
+                level="L3-运行时配置",
+                passed=passed,
+                message=msg,
+                details=details,
+                raw_output=conf_output[:300] if conf_exists else "(不存在)",
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L3-运行时配置",
+                passed=False,
+                message=f"运行时配置检查失败: {str(e)[:100]}",
+            )
+
+    # --- L4: 守护进程+cron ---
+
+    def verify_upnpd_daemon(self, expect_enabled: bool = True) -> VerifyResult:
+        """L4: 验证UPnP守护进程和cron任务"""
+        self.connect_router()
+        try:
+            binary_output = self._router.exec("test -f /usr/sbin/miniupnpd && echo YES || echo NO")
+            ps_output = self._router.exec("ps | grep miniupnpd | grep -v grep")
+            cron_output = self._router.exec("crontab -l 2>/dev/null | grep -i upnp")
+
+            binary_exists = binary_output.strip() == "YES"
+            process_running = "miniupnpd" in ps_output
+            has_cron = bool(cron_output.strip())
+
+            details = {
+                "binary_exists": binary_exists,
+                "process_running": process_running,
+                "has_cron": has_cron,
+                "cron_output": cron_output.strip() if has_cron else "",
+            }
+
+            if expect_enabled:
+                passed = binary_exists and process_running
+                msg = f"miniupnpd: binary={binary_exists}, running={process_running}, cron={has_cron}"
+            else:
+                passed = not process_running
+                msg = f"miniupnpd应未运行: {'确认' if not process_running else '仍在运行'}"
+
+            raw = f"ps={ps_output.strip()}, cron={cron_output.strip()}"
+
+            return VerifyResult(
+                level="L4-守护进程",
+                passed=passed,
+                message=msg,
+                details=details,
+                raw_output=raw,
+            )
+
+        except Exception as e:
+            return VerifyResult(
+                level="L4-守护进程",
+                passed=False,
+                message=f"守护进程检查失败: {str(e)[:100]}",
+            )
+
+    # --- 全链路验证 ---
+
+    def verify_upnp_full_chain(self, tagname: str = None,
+                                expect_service_enabled: bool = True) -> FullChainResult:
+        """UPnP全链路验证: L1数据库 + L2进程/iptables + L3配置文件 + L4守护进程"""
+        results = []
+
+        # L1: 全局配置
+        conf = self.query_upnpd_conf()
+        if conf:
+            enabled = conf.get("enabled") == "yes"
+            results.append(VerifyResult(
+                level="L1-全局配置",
+                passed=(enabled == expect_service_enabled),
+                message=f"UPnP服务状态: enabled={conf.get('enabled')}",
+                details={"config": conf},
+                raw_output=json.dumps(conf, ensure_ascii=False)[:200],
+            ))
+
+        # L1: 接口规则
+        if tagname:
+            results.append(self.verify_upnpd_ifconf_database(tagname))
+
+        # L2: 进程
+        results.append(self.verify_upnpd_process(expect_running=expect_service_enabled))
+
+        # L2: iptables
+        results.append(self.verify_upnpd_iptables(expect_chains=expect_service_enabled))
+
+        # L3: 运行时配置
+        results.append(self.verify_upnpd_runtime_config(expect_exists=expect_service_enabled))
+
+        # L4: 守护进程
+        results.append(self.verify_upnpd_daemon(expect_enabled=expect_service_enabled))
+
+        return FullChainResult(results=results)

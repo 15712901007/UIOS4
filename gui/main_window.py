@@ -777,7 +777,18 @@ class MainWindow(QMainWindow):
                         }
                     },
                     "内外网设置": {
-                        "testcases": []
+                        "children": {
+                            "UPnP/NAT设置": {
+                                "testcases": [
+                                    "test_upnp_setting_comprehensive.py::TestUpnpSettingComprehensive::test_upnp_setting_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_upnp_setting_comprehensive.py::TestUpnpSettingComprehensive::test_upnp_setting_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
                     },
                     "智能流控": {
                         "testcases": []

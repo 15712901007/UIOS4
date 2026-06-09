@@ -102,6 +102,7 @@ from pages.network.protocol_route_page import ProtocolRoutePage
 from pages.network.port_route_page import PortRoutePage
 from pages.network.domain_route_page import DomainRoutePage
 from pages.network.updown_route_page import UpdownRoutePage
+from pages.network.upnp_setting_page import UpnpSettingPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -161,6 +162,7 @@ TEST_NAME_MAPPING = {
     'test_port_route_comprehensive': '端口分流综合测试',
     'test_domain_route_comprehensive': '域名分流综合测试',
     'test_updown_route_comprehensive': '上下行分离综合测试',
+    'test_upnp_setting_comprehensive': 'UPnP/NAT设置综合测试',
 }
 
 
@@ -509,6 +511,22 @@ def updown_route_page_logged_in(logged_in_page: Page, config: Config) -> 'Updown
     return ud_page
 
 
+# ==================== UPnP/NAT设置 fixtures ====================
+
+@pytest.fixture(scope="function")
+def upnp_setting_page(page: Page, config: Config) -> 'UpnpSettingPage':
+    """创建UPnP/NAT设置页面实例"""
+    return UpnpSettingPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def upnp_setting_page_logged_in(logged_in_page: Page, config: Config) -> 'UpnpSettingPage':
+    """已登录并导航到UPnP/NAT设置页面的实例"""
+    upnp_page = UpnpSettingPage(logged_in_page, config.get_base_url())
+    upnp_page.navigate_to_upnp_setting()
+    return upnp_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -706,6 +724,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "updown_route: 上下行分离模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "upnp_setting: UPnP/NAT设置模块测试"
     )
 
     # 记录开始时间

@@ -1,0 +1,7 @@
+id,enabled,tagname,interface,comment,src_addr
+1,"yes","upnp编辑测试","wan1","","{""custom"":[""192.168.1.100""],""object"":{}}"
+2,"yes","upnp多IP","wan2","","{""custom"":[""192.168.1.101"",""192.168.1.102""],""object"":{}}"
+4,"yes","upnp多线路","wan1,wan2","","{""custom"":[""192.168.3.50""],""object"":{}}"
+5,"yes","upnp全线路","wan1,wan2,wan3","","{""custom"":[""10.66.0.100""],""object"":{}}"
+6,"yes","upnp带备注","wan1","UPnP测试备注","{""custom"":[""192.168.5.10""],""object"":{}}"
+7,"yes","upnp无备注","wan2","","{""custom"":[""172.16.0.5""],""object"":{}}"
