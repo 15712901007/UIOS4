@@ -103,6 +103,9 @@ from pages.network.port_route_page import PortRoutePage
 from pages.network.domain_route_page import DomainRoutePage
 from pages.network.updown_route_page import UpdownRoutePage
 from pages.network.upnp_setting_page import UpnpSettingPage
+from pages.network.igmp_proxy_page import IgmpProxyPage
+from pages.network.iptv_page import IptvPage
+from pages.network.udp_proxy_page import UdpProxyPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -163,6 +166,8 @@ TEST_NAME_MAPPING = {
     'test_domain_route_comprehensive': '域名分流综合测试',
     'test_updown_route_comprehensive': '上下行分离综合测试',
     'test_upnp_setting_comprehensive': 'UPnP/NAT设置综合测试',
+    'test_igmp_proxy_comprehensive': 'IGMP代理综合测试',
+    'test_iptv_comprehensive': 'IPTV透传综合测试',
 }
 
 
@@ -527,6 +532,48 @@ def upnp_setting_page_logged_in(logged_in_page: Page, config: Config) -> 'UpnpSe
     return upnp_page
 
 
+@pytest.fixture(scope="function")
+def igmp_proxy_page(page: Page, config: Config) -> 'IgmpProxyPage':
+    """创建IGMP代理页面实例"""
+    return IgmpProxyPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def igmp_proxy_page_logged_in(logged_in_page: Page, config: Config) -> 'IgmpProxyPage':
+    """已登录并导航到IGMP代理页面的实例"""
+    igmp_page = IgmpProxyPage(logged_in_page, config.get_base_url())
+    igmp_page.navigate_to_igmp_proxy()
+    return igmp_page
+
+
+@pytest.fixture(scope="function")
+def iptv_page(page: Page, config: Config) -> 'IptvPage':
+    """创建IPTV透传页面实例"""
+    return IptvPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def iptv_page_logged_in(logged_in_page: Page, config: Config) -> 'IptvPage':
+    """已登录并导航到IPTV透传页面的实例"""
+    iptv_page = IptvPage(logged_in_page, config.get_base_url())
+    iptv_page.navigate_to_iptv()
+    return iptv_page
+
+
+@pytest.fixture(scope="function")
+def udp_proxy_page(page: Page, config: Config) -> 'UdpProxyPage':
+    """创建UDPXY设置页面实例"""
+    return UdpProxyPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def udp_proxy_page_logged_in(logged_in_page: Page, config: Config) -> 'UdpProxyPage':
+    """已登录并导航到UDPXY设置页面的实例"""
+    udp_page = UdpProxyPage(logged_in_page, config.get_base_url())
+    udp_page.navigate_to_udp_proxy()
+    return udp_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -727,6 +774,12 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "upnp_setting: UPnP/NAT设置模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "igmp_proxy: IGMP代理模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "iptv: IPTV透传模块测试"
     )
 
     # 记录开始时间

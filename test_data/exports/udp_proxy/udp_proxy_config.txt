@@ -1,0 +1,2 @@
+id=1 enabled=yes tagname=udpxy测试1 interface=wan2 renew_time=0 listen_port=39811 access=1
+id=2 enabled=yes tagname=udpxy测试2 interface=wan1 renew_time=60 listen_port=39802 access=0

@@ -776,15 +776,49 @@ class MainWindow(QMainWindow):
                             },
                         }
                     },
-                    "内外网设置": {
+                    "UPnP/NAT": {
                         "children": {
-                            "UPnP/NAT设置": {
+                            "UPnP设置": {
                                 "testcases": [
                                     "test_upnp_setting_comprehensive.py::TestUpnpSettingComprehensive::test_upnp_setting_comprehensive",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
                                         "test_upnp_setting_comprehensive.py::TestUpnpSettingComprehensive::test_upnp_setting_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
+                    "组播管理": {
+                        "children": {
+                            "IGMP代理": {
+                                "testcases": [
+                                    "test_igmp_proxy_comprehensive.py::TestIgmpProxyComprehensive::test_igmp_proxy_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_igmp_proxy_comprehensive.py::TestIgmpProxyComprehensive::test_igmp_proxy_comprehensive",
+                                    ],
+                                }
+                            },
+                            "IPTV透传": {
+                                "testcases": [
+                                    "test_iptv_comprehensive.py::TestIptvComprehensive::test_iptv_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_iptv_comprehensive.py::TestIptvComprehensive::test_iptv_comprehensive",
+                                    ],
+                                }
+                            },
+                            "UDPXY设置": {
+                                "testcases": [
+                                    "test_udp_proxy_comprehensive.py::TestUdpProxyComprehensive::test_udp_proxy_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_udp_proxy_comprehensive.py::TestUdpProxyComprehensive::test_udp_proxy_comprehensive",
                                     ],
                                 }
                             },

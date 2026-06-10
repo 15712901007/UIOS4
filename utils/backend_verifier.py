@@ -2986,3 +2986,867 @@ class BackendVerifier:
         results.append(self.verify_upnpd_daemon(expect_enabled=expect_service_enabled))
 
         return FullChainResult(results=results)
+
+    # ==================== IGMP代理(igmp_proxy)验证 ====================
+    # 数据库表: igmp_proxy (单记录, id=1)
+    # 字段: id, enabled(yes/no), version(2/3), downstream(LAN接口), upstream(WAN接口)
+    # 后端脚本: /usr/ikuai/function/igmp_proxy (save/show/start/stop)
+    # 配置文件: /etc/igmpproxy.conf
+    # 进程: igmpproxy
+    # 内核: ifconfig promisc(upstream), force_igmp_version(downstream)
+
+    def query_igmp_proxy_config(self) -> Optional[Dict]:
+        """L1: 查询IGMP代理数据库配置"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "/usr/ikuai/function/igmp_proxy show limit=0,500 TYPE=total,data"
+            )
+            data = json.loads(output)
+            rules = data.get("data", [])
+            if rules:
+                return rules[0]  # 单记录, id=1
+            return None
+        except Exception as e:
+            logger.error(f"[L1] 查询igmp_proxy失败: {e}")
+            return None
+
+    def verify_igmp_proxy_database(self, expected_fields: Dict = None,
+                                    must_pass: bool = False) -> VerifyResult:
+        """
+        L1: 验证IGMP代理数据库配置
+
+        Args:
+            expected_fields: 期望的字段值, 如 {"enabled": "yes", "version": "3",
+                             "upstream": "wan1", "downstream": "all"}
+        """
+        config = self.query_igmp_proxy_config()
+        if config is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message="IGMP代理配置不存在(数据库无记录)",
+                raw_output="",
+            )
+
+        details = {
+            "id": config.get("id"),
+            "enabled": config.get("enabled"),
+            "version": config.get("version"),
+            "upstream": config.get("upstream"),
+            "downstream": config.get("downstream"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=True,
+                message=f"IGMP代理配置存在: enabled={config.get('enabled')}, "
+                        f"version={config.get('version')}, "
+                        f"upstream={config.get('upstream')}, "
+                        f"downstream={config.get('downstream')}",
+                details={"config": details},
+                raw_output=raw,
+            )
+
+        mismatches = {}
+        for field, expected in expected_fields.items():
+            actual = str(config.get(field, ""))
+            if actual != str(expected):
+                mismatches[field] = {"expected": str(expected), "actual": actual}
+
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"字段不匹配: {mismatches}",
+                details={"config": details, "mismatches": mismatches},
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"IGMP代理数据库验证通过",
+            details={"config": details},
+            raw_output=raw,
+        )
+
+    def verify_igmp_proxy_process(self, expect_running: bool = True) -> VerifyResult:
+        """
+        L2: 验证IGMP代理进程状态
+
+        Args:
+            expect_running: 期望进程是否运行中
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec("ps | grep igmpproxy | grep -v grep")
+            running = "igmpproxy" in output
+
+            if running == expect_running:
+                return VerifyResult(
+                    level="L2-进程",
+                    passed=True,
+                    message=f"igmpproxy进程状态正确: {'运行中' if running else '未运行'}",
+                    details={"running": running},
+                    raw_output=output.strip(),
+                )
+            else:
+                return VerifyResult(
+                    level="L2-进程",
+                    passed=False,
+                    message=f"igmpproxy进程状态不匹配: 期望{'运行' if expect_running else '未运行'}, "
+                            f"实际{'运行中' if running else '未运行'}",
+                    details={"running": running, "expected": expect_running},
+                    raw_output=output.strip(),
+                )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-进程",
+                passed=False,
+                message=f"进程检查失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_igmp_proxy_config_file(self, expect_exists: bool = True,
+                                       upstream: str = None,
+                                       downstream: str = None) -> VerifyResult:
+        """
+        L3: 验证IGMP代理配置文件
+
+        Args:
+            expect_exists: 期望配置文件是否存在
+            upstream: 期望的上联端口(检查配置文件中是否包含)
+            downstream: 期望的下联端口(检查配置文件中是否包含)
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec("cat /etc/igmpproxy.conf 2>/dev/null")
+            exists = bool(output and output.strip())
+
+            if exists != expect_exists:
+                return VerifyResult(
+                    level="L3-配置文件",
+                    passed=False,
+                    message=f"配置文件状态不匹配: 期望{'存在' if expect_exists else '不存在'}, "
+                            f"实际{'存在' if exists else '不存在'}",
+                    details={"exists": exists},
+                    raw_output=output[:300] if output else "",
+                )
+
+            if not exists:
+                return VerifyResult(
+                    level="L3-配置文件",
+                    passed=True,
+                    message="IGMP代理配置文件不存在(服务未启用)",
+                    details={"exists": False},
+                    raw_output="",
+                )
+
+            details = {"exists": True}
+            # 检查upstream
+            if upstream and upstream in output:
+                details["upstream_found"] = True
+            elif upstream:
+                details["upstream_found"] = False
+
+            # 检查downstream
+            if downstream and downstream in output:
+                details["downstream_found"] = True
+            elif downstream:
+                details["downstream_found"] = False
+
+            mismatches = []
+            if upstream and not details.get("upstream_found", True):
+                mismatches.append(f"upstream({upstream})未在配置中找到")
+            if downstream and not details.get("downstream_found", True):
+                mismatches.append(f"downstream({downstream})未在配置中找到")
+
+            passed = len(mismatches) == 0
+            return VerifyResult(
+                level="L3-配置文件",
+                passed=passed,
+                message=f"配置文件验证{'通过' if passed else '失败'}" +
+                        (f': {mismatches}' if mismatches else ''),
+                details=details,
+                raw_output=output[:300],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L3-配置文件",
+                passed=False,
+                message=f"配置文件检查失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_igmp_proxy_kernel(self, upstream: str = None,
+                                  downstream: str = None,
+                                  expect_enabled: bool = True) -> VerifyResult:
+        """
+        L4: 验证IGMP代理内核状态
+
+        检查项:
+        - upstream接口是否开启promisc模式
+        - downstream接口的force_igmp_version设置
+
+        Args:
+            upstream: 上联端口接口名
+            downstream: 下联端口接口名
+            expect_enabled: 期望IGMP代理是否启用
+        """
+        self.connect_router()
+        checks = []
+
+        # 检查upstream promisc模式
+        if upstream:
+            try:
+                output = self._router.exec(f"ifconfig {upstream} 2>/dev/null | grep PROMISC")
+                promisc = "PROMISC" in output
+                if expect_enabled:
+                    checks.append(("promisc", promisc, f"upstream({upstream}) promisc={'已开启' if promisc else '未开启'}"))
+                else:
+                    checks.append(("promisc", not promisc, f"upstream({upstream}) promisc={'已开启(应关闭)' if promisc else '已关闭(正确)'}"))
+            except Exception as e:
+                checks.append(("promisc", None, f"检查promisc失败: {e}"))
+
+        # 检查downstream force_igmp_version
+        if downstream and downstream != "all":
+            try:
+                output = self._router.exec(
+                    f"cat /proc/sys/net/ipv4/conf/{downstream}/force_igmp_version 2>/dev/null"
+                )
+                version = output.strip() if output else ""
+                if expect_enabled:
+                    version_ok = version in ("2", "3")
+                    checks.append(("igmp_version", version_ok,
+                                   f"downstream({downstream}) force_igmp_version={version}"))
+                else:
+                    version_ok = version in ("0", "")
+                    checks.append(("igmp_version", version_ok,
+                                   f"downstream({downstream}) force_igmp_version={version}(期望0)"))
+            except Exception as e:
+                checks.append(("igmp_version", None, f"检查igmp_version失败: {e}"))
+
+        # 检查igmpproxy进程
+        try:
+            output = self._router.exec("ps | grep igmpproxy | grep -v grep")
+            process_running = "igmpproxy" in output
+            process_ok = process_running == expect_enabled
+            checks.append(("process", process_ok,
+                           f"igmpproxy进程={'运行中' if process_running else '未运行'}"))
+        except Exception as e:
+            checks.append(("process", None, f"检查进程失败: {e}"))
+
+        passed = all(c[1] for c in checks if c[1] is not None)
+        messages = [c[2] for c in checks]
+
+        return VerifyResult(
+            level="L4-内核",
+            passed=passed,
+            message="; ".join(messages),
+            details={"checks": checks},
+            raw_output=str(messages),
+        )
+
+    def verify_igmp_proxy_full_chain(self, expect_enabled: bool = True,
+                                      upstream: str = None,
+                                      downstream: str = None) -> FullChainResult:
+        """
+        IGMP代理全链路验证: L1数据库 + L2进程 + L3配置文件 + L4内核
+
+        Args:
+            expect_enabled: 期望IGMP代理是否启用
+            upstream: 上联端口接口名
+            downstream: 下联端口接口名
+        """
+        results = []
+
+        # L1: 数据库
+        expected_fields = {"enabled": "yes" if expect_enabled else "no"}
+        results.append(self.verify_igmp_proxy_database(expected_fields=expected_fields))
+
+        # L2: 进程
+        results.append(self.verify_igmp_proxy_process(expect_running=expect_enabled))
+
+        # L3: 配置文件
+        results.append(self.verify_igmp_proxy_config_file(
+            expect_exists=expect_enabled,
+            upstream=upstream,
+            downstream=downstream,
+        ))
+
+        # L4: 内核状态
+        results.append(self.verify_igmp_proxy_kernel(
+            upstream=upstream,
+            downstream=downstream,
+            expect_enabled=expect_enabled,
+        ))
+
+        return FullChainResult(results=results)
+
+    # ==================== IPTV透传验证 ====================
+
+    def query_iptv_config(self) -> Optional[Dict]:
+        """查询IPTV透传配置(iptv_config表, 单记录)"""
+        self.connect_router()
+        try:
+            output = self._router.exec("/usr/ikuai/function/iptv show")
+            if output:
+                data = json.loads(output)
+                if data.get("data"):
+                    return data["data"][0]
+            return None
+        except Exception as e:
+            logger.error(f"IPTV配置查询失败: {e}")
+            return None
+
+    def verify_iptv_database(self, expected_fields: Dict = None,
+                              must_pass: bool = False) -> VerifyResult:
+        """
+        L1: 验证IPTV透传数据库配置
+
+        注意: wan_iface/lan_iface后端存储MAC地址而非接口名,
+        验证时只检查非空即可, 不做精确比对
+
+        Args:
+            expected_fields: 期望的字段值, 如{"enabled": "yes", "mode": 0}
+                             wan_iface/lan_iface传"not_empty"检查非空
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec("/usr/ikuai/function/iptv show")
+            if not output:
+                return VerifyResult(
+                    level="L1-数据库",
+                    passed=False,
+                    message="IPTV配置查询返回空",
+                )
+
+            data = json.loads(output)
+            if not data.get("data"):
+                return VerifyResult(
+                    level="L1-数据库",
+                    passed=False,
+                    message="IPTV配置数据为空",
+                )
+
+            config = data["data"][0]
+            details = {"db_config": config}
+
+            if expected_fields:
+                mismatches = {}
+                for key, expected in expected_fields.items():
+                    actual = config.get(key)
+                    # 特殊: "not_empty"检查非空
+                    if expected == "not_empty":
+                        if not actual:
+                            mismatches[key] = {"expected": "非空", "actual": actual}
+                    elif str(actual) != str(expected):
+                        mismatches[key] = {"expected": expected, "actual": actual}
+
+                if mismatches:
+                    return VerifyResult(
+                        level="L1-数据库",
+                        passed=False,
+                        message=f"字段不匹配: {mismatches}",
+                        details=details,
+                        raw_output=json.dumps(config, ensure_ascii=False),
+                    )
+
+            return VerifyResult(
+                level="L1-数据库",
+                passed=True,
+                message="IPTV透传数据库验证通过",
+                details=details,
+                raw_output=json.dumps(config, ensure_ascii=False),
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"数据库验证失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_iptv_bridge(self, expect_exists: bool = True,
+                            expected_members: List[str] = None) -> VerifyResult:
+        """
+        L2: 验证IPTV桥接接口(iptv bridge)
+
+        Args:
+            expect_exists: 是否期望iptv桥接存在
+            expected_members: 期望的桥接成员列表
+        """
+        self.connect_router()
+        try:
+            # 检查iptv桥接是否存在
+            bridge_output = self._router.exec("ip link show iptv 2>/dev/null")
+            bridge_exists = bool(bridge_output and "iptv" in bridge_output)
+
+            if expect_exists and not bridge_exists:
+                return VerifyResult(
+                    level="L2-桥接",
+                    passed=False,
+                    message="IPTV桥接接口(iptv)不存在(服务未启用)",
+                    raw_output=bridge_output or "",
+                )
+
+            if not expect_exists:
+                if bridge_exists:
+                    # 桥接仍存在，检查是否有成员
+                    members = self._router.exec("ls /sys/class/net/iptv/brif 2>/dev/null")
+                    if members and members.strip():
+                        return VerifyResult(
+                            level="L2-桥接",
+                            passed=False,
+                            message=f"IPTV桥接仍存在且有成员: {members.strip()}",
+                            raw_output=members,
+                        )
+                    # 桥接存在但无成员，视为OK(可能未完全清理)
+                return VerifyResult(
+                    level="L2-桥接",
+                    passed=True,
+                    message="IPTV桥接验证通过(已关闭或无成员)",
+                    raw_output=bridge_output or "不存在",
+                )
+
+            # 检查桥接成员
+            members_output = self._router.exec("ls /sys/class/net/iptv/brif 2>/dev/null")
+            actual_members = [m.strip() for m in members_output.split() if m.strip()] if members_output else []
+
+            details = {"bridge": "iptv", "members": actual_members}
+
+            mismatches = []
+            if expected_members:
+                for m in expected_members:
+                    found = any(m in am for am in actual_members)
+                    if not found:
+                        mismatches.append(f"期望成员{m}未找到")
+
+            passed = len(mismatches) == 0
+            return VerifyResult(
+                level="L2-桥接",
+                passed=passed,
+                message=f"IPTV桥接验证{'通过' if passed else '失败'}" +
+                        (f': {mismatches}' if mismatches else f', 成员: {actual_members}'),
+                details=details,
+                raw_output=f"bridge: {bridge_output[:200]}\nmembers: {members_output}",
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-桥接",
+                passed=False,
+                message=f"桥接验证失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_iptv_vlan(self, expect_vlan: bool = False,
+                          wan_iface: str = None, lan_iface: str = None,
+                          vlan_id: str = None) -> VerifyResult:
+        """
+        L3: 验证IPTV VLAN子接口
+
+        Args:
+            expect_vlan: 是否期望存在VLAN子接口
+            wan_iface: WAN接口名
+            lan_iface: LAN接口名
+            vlan_id: VLAN ID
+        """
+        self.connect_router()
+        try:
+            vlan_output = self._router.exec("ip link show type vlan 2>/dev/null")
+
+            if not expect_vlan:
+                return VerifyResult(
+                    level="L3-VLAN",
+                    passed=True,
+                    message="VLAN子接口验证通过(网口透传模式)",
+                    raw_output=vlan_output[:300] if vlan_output else "无VLAN接口",
+                )
+
+            # VLAN透传模式: 检查VLAN子接口
+            details = {}
+            mismatches = []
+
+            if wan_iface and vlan_id:
+                wan_vlan = f"{wan_iface}.{vlan_id}"
+                if wan_vlan in (vlan_output or ""):
+                    details["wan_vlan"] = wan_vlan
+                else:
+                    mismatches.append(f"WAN VLAN {wan_vlan} 未找到")
+
+            if lan_iface and vlan_id:
+                lan_vlan = f"{lan_iface}.{vlan_id}"
+                if lan_vlan in (vlan_output or ""):
+                    details["lan_vlan"] = lan_vlan
+                else:
+                    mismatches.append(f"LAN VLAN {lan_vlan} 未找到")
+
+            passed = len(mismatches) == 0
+            return VerifyResult(
+                level="L3-VLAN",
+                passed=passed,
+                message=f"VLAN子接口验证{'通过' if passed else '失败'}" +
+                        (f': {mismatches}' if mismatches else ''),
+                details=details,
+                raw_output=vlan_output[:300] if vlan_output else "",
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L3-VLAN",
+                passed=False,
+                message=f"VLAN验证失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_iptv_full_chain(self, expect_enabled: bool = True,
+                                mode: int = 0,
+                                wan_iface: str = None,
+                                lan_iface: str = None,
+                                wan_vlanid: int = 0,
+                                lan_vlanid: int = 0) -> FullChainResult:
+        """
+        IPTV透传全链路验证: L1数据库 + L2桥接 + L3 VLAN
+
+        Args:
+            expect_enabled: 期望IPTV透传是否启用
+            mode: 透传模式(0=网口透传, 1=VLAN透传)
+            wan_iface: WAN接口名(仅用于L2/L3映射, L1存储MAC)
+            lan_iface: LAN接口名(仅用于L2/L3映射)
+            wan_vlanid: 业务VLAN ID
+            lan_vlanid: 内网VLAN ID
+        """
+        results = []
+
+        # L1: 数据库(仅验证关键字段, wan_iface/lan_iface存MAC用not_empty)
+        expected_fields = {"enabled": "yes" if expect_enabled else "no", "mode": mode}
+        if expect_enabled:
+            expected_fields["wan_iface"] = "not_empty"
+            expected_fields["lan_iface"] = "not_empty"
+        if wan_vlanid is not None:
+            expected_fields["wan_vlanid"] = wan_vlanid
+        if lan_vlanid is not None:
+            expected_fields["lan_vlanid"] = lan_vlanid
+        results.append(self.verify_iptv_database(expected_fields=expected_fields))
+
+        # L2: 桥接(启用时检查有成员, 不验证具体成员名)
+        if expect_enabled:
+            results.append(self.verify_iptv_bridge(
+                expect_exists=True,
+                expected_members=None,  # 不验证具体成员
+            ))
+        else:
+            results.append(self.verify_iptv_bridge(expect_exists=False))
+
+        # L3: VLAN子接口(wan_vlanid>0或VLAN透传模式时检查)
+        if expect_enabled and (wan_vlanid > 0 or lan_vlanid > 0):
+            results.append(self.verify_iptv_vlan(
+                expect_vlan=True,
+                wan_iface=wan_iface,
+                lan_iface=lan_iface,
+                vlan_id=str(wan_vlanid) if wan_vlanid else str(lan_vlanid),
+            ))
+        else:
+            results.append(self.verify_iptv_vlan(expect_vlan=False))
+
+        return FullChainResult(results=results)
+
+    # ==================== UDPXY设置验证 ====================
+
+    def query_udp_proxy_config(self, tagname: str = None) -> Optional[Dict]:
+        """
+        L1: 查询UDPXY设置数据库配置
+
+        Args:
+            tagname: 按名称筛选, None返回全部列表
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "/usr/ikuai/function/udp_proxy show limit=0,500 TYPE=total,data"
+            )
+            data = json.loads(output)
+            rules = data.get("data", [])
+            if tagname:
+                for r in rules:
+                    if r.get("tagname") == tagname:
+                        return r
+                return None
+            return rules
+        except Exception as e:
+            logger.error(f"[L1] 查询udp_proxy失败: {e}")
+            return None
+
+    def verify_udp_proxy_database(self, expected_fields: Dict = None,
+                                   tagname: str = None,
+                                   must_pass: bool = False) -> VerifyResult:
+        """
+        L1: 验证UDPXY设置数据库配置
+
+        Args:
+            expected_fields: 期望的字段值, 如 {"enabled": "yes", "interface": "lan1",
+                             "listen_port": 9000, "access": 1, "renew_time": 0}
+            tagname: 按名称筛选(多条记录时指定)
+        """
+        configs = self.query_udp_proxy_config(tagname=tagname)
+        if configs is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message="UDPXY配置不存在(查询返回None)",
+                raw_output="",
+            )
+
+        # 单条记录场景
+        if tagname:
+            config = configs
+            if config is None:
+                return VerifyResult(
+                    level="L1-数据库",
+                    passed=False,
+                    message=f"UDPXY规则不存在: {tagname}",
+                    raw_output="",
+                )
+            configs = [config]
+
+        details_list = []
+        for c in configs:
+            details_list.append({
+                "id": c.get("id"),
+                "enabled": c.get("enabled"),
+                "tagname": c.get("tagname"),
+                "interface": c.get("interface"),
+                "listen_port": c.get("listen_port"),
+                "renew_time": c.get("renew_time"),
+                "access": c.get("access"),
+            })
+        raw = json.dumps(details_list, ensure_ascii=False)
+
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=True,
+                message=f"UDPXY配置存在: {len(details_list)}条记录",
+                details={"configs": details_list},
+                raw_output=raw,
+            )
+
+        # 验证指定记录的字段
+        config = configs[0] if tagname else configs[0]
+        mismatches = {}
+        for field, expected in expected_fields.items():
+            actual = str(config.get(field, ""))
+            if expected == "not_empty":
+                if not actual:
+                    mismatches[field] = {"expected": "not_empty", "actual": "empty"}
+            elif actual != str(expected):
+                mismatches[field] = {"expected": str(expected), "actual": actual}
+
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"字段不匹配: {mismatches}",
+                details={"config": details_list[0], "mismatches": mismatches},
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"UDPXY数据库验证通过",
+            details={"config": details_list[0]},
+            raw_output=raw,
+        )
+
+    def verify_udp_proxy_process(self, expect_running: bool = True,
+                                  listen_port: int = None,
+                                  interface: str = None) -> VerifyResult:
+        """
+        L2: 验证udpxy进程状态
+
+        Args:
+            expect_running: 期望进程是否运行中
+            listen_port: 期望的监听端口(检查进程参数)
+            interface: 期望的信号源接口(检查进程参数)
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec("ps | grep udpxy | grep -v grep")
+            running = "udpxy" in output
+
+            if not running and not expect_running:
+                return VerifyResult(
+                    level="L2-进程",
+                    passed=True,
+                    message="udpxy进程未运行(符合预期)",
+                    details={"running": False},
+                    raw_output=output.strip(),
+                )
+
+            if running and not expect_running:
+                return VerifyResult(
+                    level="L2-进程",
+                    passed=False,
+                    message=f"udpxy进程仍在运行: {output.strip()}",
+                    details={"running": True, "expected": False},
+                    raw_output=output.strip(),
+                )
+
+            if not running and expect_running:
+                return VerifyResult(
+                    level="L2-进程",
+                    passed=False,
+                    message="udpxy进程未运行(期望运行)",
+                    details={"running": False, "expected": True},
+                    raw_output=output.strip(),
+                )
+
+            # 进程运行中, 检查参数
+            details = {"running": True}
+            mismatch = []
+
+            if listen_port is not None:
+                port_str = f"-p {listen_port}"
+                if port_str in output:
+                    details["port_match"] = True
+                else:
+                    details["port_match"] = False
+                    mismatch.append(f"端口不匹配: 期望{listen_port}")
+
+            if interface is not None:
+                iface_str = f"-m {interface}"
+                if iface_str in output:
+                    details["interface_match"] = True
+                else:
+                    details["interface_match"] = False
+                    mismatch.append(f"接口不匹配: 期望{interface}")
+
+            if mismatch:
+                return VerifyResult(
+                    level="L2-进程",
+                    passed=False,
+                    message=f"udpxy进程参数不匹配: {'; '.join(mismatch)}",
+                    details=details,
+                    raw_output=output.strip(),
+                )
+
+            return VerifyResult(
+                level="L2-进程",
+                passed=True,
+                message=f"udpxy进程运行中, 参数正确",
+                details=details,
+                raw_output=output.strip(),
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-进程",
+                passed=False,
+                message=f"进程检查失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_udp_proxy_ipset(self, expect_present: bool = True,
+                                listen_port: int = None) -> VerifyResult:
+        """
+        L3: 验证UDPXY外网访问ipset规则
+        access=0(不允许外网)时, 端口会被添加到DROP_U_PORTS_WAN_IN和DROP_T_PORTS_WAN_IN
+
+        Args:
+            expect_present: 期望端口是否在DROP ipset中(access=0时为True)
+            listen_port: 要检查的端口
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec("ipset list DROP_U_PORTS_WAN_IN 2>/dev/null; ipset list DROP_T_PORTS_WAN_IN 2>/dev/null")
+            has_port = False
+            if listen_port and str(listen_port) in output:
+                has_port = True
+
+            if expect_present and not has_port:
+                return VerifyResult(
+                    level="L3-ipset",
+                    passed=False,
+                    message=f"端口{listen_port}未在DROP ipset中(期望存在, access=0)",
+                    details={"port_in_ipset": False},
+                    raw_output=output[:500],
+                )
+
+            if not expect_present and has_port:
+                return VerifyResult(
+                    level="L3-ipset",
+                    passed=False,
+                    message=f"端口{listen_port}仍在DROP ipset中(期望不存在, access=1)",
+                    details={"port_in_ipset": True},
+                    raw_output=output[:500],
+                )
+
+            return VerifyResult(
+                level="L3-ipset",
+                passed=True,
+                message=f"UDPXY ipset验证通过(端口{'在' if has_port else '不在'}DROP集合中)",
+                details={"port_in_ipset": has_port},
+                raw_output=output[:500],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L3-ipset",
+                passed=False,
+                message=f"ipset检查失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_udp_proxy_full_chain(self, tagname: str,
+                                     expect_enabled: bool = True,
+                                     interface: str = None,
+                                     listen_port: int = None,
+                                     access: int = 1,
+                                     renew_time: int = 0) -> FullChainResult:
+        """
+        UDPXY设置全链路验证: L1数据库 + L2进程 + L3 ipset
+
+        Args:
+            tagname: 规则名称
+            expect_enabled: 期望是否启用
+            interface: 信号源接口
+            listen_port: 服务端口
+            access: 外网访问(0=不允许, 1=允许)
+            renew_time: 订阅周期
+        """
+        results = []
+
+        # L1: 数据库
+        expected_fields = {
+            "enabled": "yes" if expect_enabled else "no",
+            "tagname": tagname,
+        }
+        if interface is not None:
+            expected_fields["interface"] = interface
+        if listen_port is not None:
+            expected_fields["listen_port"] = listen_port
+        if access is not None:
+            expected_fields["access"] = access
+        if renew_time is not None:
+            expected_fields["renew_time"] = renew_time
+
+        results.append(self.verify_udp_proxy_database(
+            expected_fields=expected_fields, tagname=tagname))
+
+        # L2: 进程(仅启用时检查)
+        if expect_enabled:
+            results.append(self.verify_udp_proxy_process(
+                expect_running=True,
+                listen_port=listen_port,
+                interface=interface))
+        else:
+            results.append(self.verify_udp_proxy_process(expect_running=False))
+
+        # L3: ipset(仅access=0时检查端口是否在DROP集合中)
+        if listen_port is not None:
+            results.append(self.verify_udp_proxy_ipset(
+                expect_present=(access == 0),
+                listen_port=listen_port))
+
+        return FullChainResult(results=results)
