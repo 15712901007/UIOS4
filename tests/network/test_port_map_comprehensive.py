@@ -8,7 +8,7 @@
 4. 停用/启用/删除各1条
 5. segmented筛选器测试(全部/已停用/已启用 计数)
 6. 搜索测试(精确/部分/不存在/清空)
-7. 排序测试
+7. 复制规则测试(预填数据+新名称+SSH验证)
 8. 导出测试(CSV/TXT)
 9. 异常输入测试(空名称/必填校验/非法IP/非法端口/端口数量不一致/重复/超长/特殊字符)
 10. 批量停用/启用/删除
@@ -437,21 +437,43 @@ class TestPortMapComprehensive:
             print(f"  [OK] 清空搜索后: {all_count} 条")
             rec.add_detail(f"  [OK] 清空搜索后: {all_count} 条")
 
-        # ========== 步骤18: 排序测试 ==========
-        with rec.step("步骤18: 排序测试", "名称/协议/内网地址列排序"):
-            print("\n[步骤18] 排序测试...")
-            rec.add_detail("[排序测试]")
+        # ========== 步骤18: 复制规则 ==========
+        with rec.step("步骤18: 复制规则", "复制pm_tcpudp为新规则+SSH验证"):
+            print("\n[步骤18] 复制规则...")
+            rec.add_detail("[复制测试] pm_tcpudp -> pm复制副本")
 
-            for col_name in ["名称", "协议", "内网地址"]:
-                rec.add_detail(f"  排序列: {col_name}")
-                try:
-                    sorted_ok = page.sort_by_column(col_name)
-                    page.page.wait_for_timeout(500)
-                    print(f"  [OK] 排序 {col_name}: {'成功' if sorted_ok else '跳过'}")
-                    rec.add_detail(f"  [OK] 排序{col_name}: {'成功' if sorted_ok else '跳过'}")
-                except Exception as e:
-                    print(f"  [WARN] 排序 {col_name}: {e}")
-                    rec.add_detail(f"  [WARN] 排序{col_name}: {e}")
+            source = "pm_tcpudp"
+            copy_name = "pm复制副本"
+            result = page.copy_rule(source, new_name=copy_name)
+            if result:
+                # 验证新规则存在
+                page.navigate_to_port_map()
+                page.page.wait_for_timeout(500)
+                if page.rule_exists(copy_name):
+                    print(f"  [OK] 复制成功: {source} -> {copy_name}")
+                    rec.add_detail(f"  [OK] 复制成功: {copy_name} 已存在")
+
+                    # SSH验证复制的规则字段与源规则一致
+                    if backend_verifier is not None:
+                        ssh_verify(f"L1-复制后({copy_name})",
+                                   backend_verifier.verify_port_map_database,
+                                   copy_name, must_pass=True,
+                                   expected_fields={"enabled": "yes",
+                                                    "protocol": "tcp+udp",
+                                                    "lan_addr": "192.168.1.12",
+                                                    "wan_port": "9443",
+                                                    "lan_port": "443"})
+                        # 清理: 删除复制的规则, 不影响后续测试计数
+                        page.delete_rule(copy_name)
+                        page.page.wait_for_timeout(1000)
+                        page.navigate_to_port_map()
+                        page.page.wait_for_timeout(300)
+                else:
+                    print(f"  [WARN] 复制后规则 {copy_name} 未找到")
+                    rec.add_detail(f"  [WARN] 复制后规则未找到")
+            else:
+                print(f"  [WARN] 复制失败")
+                rec.add_detail(f"  [WARN] 复制失败")
 
         # ========== 步骤19: 导出测试 ==========
         export_file_csv = os.path.join(
@@ -901,7 +923,7 @@ class TestPortMapComprehensive:
         print("  - 编辑/停用/启用/删除: 各1条")
         print("  - segmented筛选器: 全部/已停用/已启用 计数+切换")
         print("  - 搜索: 精确/部分匹配/不存在/清空恢复")
-        print("  - 排序: 名称/协议/内网地址")
+        print("  - 复制: 预填数据+新名称+SSH字段一致性验证")
         print("  - 导出: CSV/TXT")
         print("  - 导入: 追加(CSV) + 清空现有数据(TXT)")
         print("  - 异常输入: 空名称/缺必填/非法IP/非法端口/端口不一致/重复/超长/特殊字符")

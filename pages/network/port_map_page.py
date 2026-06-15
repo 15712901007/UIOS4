@@ -723,6 +723,57 @@ class PortMapPage(IkuaiTablePage):
                 pass
             return False
 
+    # ==================== 复制规则 ====================
+
+    def copy_rule(self, rule_name: str, new_name: str = None) -> bool:
+        """复制规则(点击列表中的复制按钮, 进入新增页面预填数据)
+
+        复制会进入 portMapping/add 页面, 所有字段已预填, 需要修改名称后保存。
+
+        Args:
+            rule_name: 要复制的规则名称
+            new_name: 复制后的新名称(必须不同于原名, 因为tagname唯一)
+
+        Returns:
+            是否复制成功
+        """
+        try:
+            clicked = self._click_rule_button(rule_name, "复制")
+            if not clicked:
+                print(f"[WARN] 复制按钮未找到: {rule_name}")
+                return False
+
+            self.page.wait_for_timeout(1500)
+
+            # 复制进入新增页面, 字段已预填, 修改名称后保存
+            if new_name:
+                self.fill_name(new_name)
+
+            self.click_save()
+            result = self.wait_for_success_message()
+
+            if result:
+                self.page.wait_for_timeout(500)
+                if "portMapping" in self.page.url:
+                    self.navigate_back_to_list()
+            else:
+                try:
+                    self.click_cancel()
+                    self.page.wait_for_timeout(500)
+                    self.navigate_back_to_list()
+                except Exception:
+                    pass
+
+            return result
+
+        except Exception as e:
+            print(f"[ERROR] 复制规则失败: {e}")
+            try:
+                self.navigate_back_to_list()
+            except Exception:
+                pass
+            return False
+
     # ==================== 异常输入测试 ====================
 
     def try_add_rule_invalid(self, name: str = "",
