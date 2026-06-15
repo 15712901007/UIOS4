@@ -107,6 +107,7 @@ from pages.network.igmp_proxy_page import IgmpProxyPage
 from pages.network.iptv_page import IptvPage
 from pages.network.udp_proxy_page import UdpProxyPage
 from pages.network.nat_rule_page import NatRulePage
+from pages.network.port_map_page import PortMapPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -170,6 +171,7 @@ TEST_NAME_MAPPING = {
     'test_igmp_proxy_comprehensive': 'IGMP代理综合测试',
     'test_iptv_comprehensive': 'IPTV透传综合测试',
     'test_nat_rule_comprehensive': 'NAT规则综合测试',
+    'test_port_map_comprehensive': '端口映射综合测试',
 }
 
 
@@ -592,6 +594,22 @@ def nat_rule_page_logged_in(logged_in_page: Page, config: Config) -> 'NatRulePag
     return nat_page
 
 
+# ==================== 端口映射 fixtures ====================
+
+@pytest.fixture(scope="function")
+def port_map_page(page: Page, config: Config) -> 'PortMapPage':
+    """创建端口映射页面实例"""
+    return PortMapPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def port_map_page_logged_in(logged_in_page: Page, config: Config) -> 'PortMapPage':
+    """已登录并导航到端口映射页面的实例"""
+    pm_page = PortMapPage(logged_in_page, config.get_base_url())
+    pm_page.navigate_to_port_map()
+    return pm_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -801,6 +819,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "nat_rule: NAT规则模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "port_map: 端口映射模块测试"
     )
 
     # 记录开始时间

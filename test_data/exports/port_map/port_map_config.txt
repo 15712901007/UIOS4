@@ -1,0 +1,8 @@
+id=1 enabled=yes tagname=pm已编辑 comment=编辑后备注 interface=all src_addr={"custom":{},"object":{}} lan_addr=192.168.1.10 protocol=tcp wan_port=8080 lan_port=80 
+id=2 enabled=yes tagname=pm_udp单端口 comment= interface=all src_addr={"custom":{},"object":{}} lan_addr=192.168.1.11 protocol=udp wan_port=5353 lan_port=53 
+id=3 enabled=yes tagname=pm_tcpudp comment= interface=all src_addr={"custom":{},"object":{}} lan_addr=192.168.1.12 protocol=tcp+udp wan_port=9443 lan_port=443 
+id=4 enabled=yes tagname=pm端口范围 comment= interface=all src_addr={"custom":{},"object":{}} lan_addr=192.168.1.13 protocol=tcp wan_port=3000-4000 lan_port=1000-2000 
+id=5 enabled=yes tagname=pm多端口 comment= interface=all src_addr={"custom":{},"object":{}} lan_addr=192.168.1.14 protocol=tcp wan_port=8080,8443 lan_port=80,443 
+id=6 enabled=yes tagname=pm指定wan1 comment= interface=wan1 src_addr={"custom":{},"object":{}} lan_addr=192.168.1.15 protocol=tcp wan_port=2222 lan_port=22 
+id=8 enabled=yes tagname=pm源地址 comment= interface=all src_addr={"custom":["192.168.100.50"],"object":{}} lan_addr=192.168.1.17 protocol=tcp wan_port=18080 lan_port=8080 
+id=9 enabled=yes tagname=pm带备注 comment=MySQL端口映射 interface=all src_addr={"custom":{},"object":{}} lan_addr=192.168.1.18 protocol=tcp wan_port=13306 lan_port=3306 

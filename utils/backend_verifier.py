@@ -4202,3 +4202,328 @@ class BackendVerifier:
         results.append(self.verify_nat_rule_kernel())
 
         return FullChainResult(results=results)
+
+    # ==================== 端口映射(dst_nat)验证 ====================
+    # 后端脚本: /usr/ikuai/script/dnat.sh + /usr/ikuai/function/dnat
+    # 数据库: dst_nat表(id,enabled,tagname,comment,interface,src_addr,lan_addr,protocol,wan_port,lan_port)
+    # iptables: nat表DSTNAT链(switch_nat=1时) / filter表NONAT链(switch_nat=0时)
+    # 规则格式(switch_nat=1, interface=all):
+    #   -A DSTNAT -p <protocol> -m multiport --dports <wan_port> -m set --match-set Linux_wan_default dst -m addrtype --dst-type LOCAL -j DNAT --to-destination <lan_addr>:<lan_port>
+    # 规则格式(switch_nat=1, interface=具体网卡):
+    #   -A DSTNAT -p <protocol> -m multiport --dports <wan_port> -m ifname --ifname <iface> -j DNAT --to-destination <lan_addr>:<lan_port>
+    # ipset: dst_nat_<id> (源地址集合, src_addr非空时创建)
+
+    def query_port_maps(self) -> List[Dict]:
+        """查询所有端口映射规则(dst_nat表)"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "/usr/ikuai/function/dnat show limit=0,500 TYPE=total,data"
+            )
+            logger.info(f"dst_nat raw: {output[:200] if output else 'None'}")
+
+            if not output or "Error" in output:
+                return []
+
+            data = json.loads(output.strip())
+            if isinstance(data, dict):
+                return data.get("data", [])
+            return []
+        except Exception as e:
+            logger.error(f"query_port_maps error: {e}")
+            return []
+
+    def find_port_map(self, tagname: str) -> Optional[Dict]:
+        """按名称查找端口映射规则"""
+        rules = self.query_port_maps()
+        for rule in rules:
+            if rule.get("tagname") == tagname:
+                return rule
+        return None
+
+    def verify_port_map_database(self, tagname: str,
+                                  expected_fields: Dict = None,
+                                  expect_absent: bool = False) -> VerifyResult:
+        """L1: 验证端口映射在数据库中存在且字段正确
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望的字段值, 如 {"protocol": "tcp", "enabled": "yes",
+                             "lan_addr": "192.168.1.100", "wan_port": "8080", "lan_port": "80"}
+            expect_absent: True表示期望规则不存在(用于删除验证)
+        """
+        rule = self.find_port_map(tagname)
+        if rule is None:
+            if expect_absent:
+                return VerifyResult(
+                    level="L1-数据库",
+                    passed=True,
+                    message=f"端口映射 '{tagname}' 已不存在(符合预期)",
+                    details={"tagname": tagname, "absent": True},
+                    raw_output="",
+                )
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"端口映射 '{tagname}' 不存在",
+                details={"tagname": tagname},
+                raw_output="",
+            )
+
+        details = {"rule": {k: v for k, v in rule.items() if k in (
+            'id', 'enabled', 'tagname', 'interface', 'lan_addr',
+            'protocol', 'wan_port', 'lan_port', 'comment'
+        )}}
+
+        mismatches = []
+        if expected_fields:
+            # 字段映射: UI/测试名 -> DB名
+            field_map = {
+                "enabled": "enabled",
+                "protocol": "protocol",
+                "lan_addr": "lan_addr",
+                "wan_port": "wan_port",
+                "lan_port": "lan_port",
+                "interface": "interface",
+                "comment": "comment",
+                "remark": "comment",
+            }
+            for ui_key, db_key in field_map.items():
+                if ui_key in expected_fields:
+                    expected_val = str(expected_fields[ui_key])
+                    actual_val = str(rule.get(db_key, ""))
+                    if expected_val != actual_val:
+                        mismatches.append(f"{db_key}: 期望={expected_val}, 实际={actual_val}")
+
+        raw = json.dumps(details, ensure_ascii=False)[:300]
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"端口映射 '{tagname}' 字段不匹配: {'; '.join(mismatches)}",
+                details=details,
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"端口映射 '{tagname}' 数据库验证通过(proto={rule.get('protocol')}, wan={rule.get('wan_port')}, lan={rule.get('lan_addr')}:{rule.get('lan_port')})",
+            details=details,
+            raw_output=raw,
+        )
+
+    def verify_port_map_iptables(self, tagname: str = None,
+                                  lan_addr: str = None,
+                                  wan_port: str = None,
+                                  protocol: str = None,
+                                  expect_rules: bool = True) -> VerifyResult:
+        """L2: 验证端口映射iptables规则(DSTNAT链)
+
+        检查DSTNAT链中是否有匹配的DNAT规则(根据lan_addr/wan_port/protocol匹配)。
+
+        Args:
+            tagname: 规则名称(用于日志)
+            lan_addr: 内网地址(用于精确匹配--to-destination)
+            wan_port: 外网端口(用于匹配--dports)
+            protocol: 协议(用于匹配-p tcp/udp)
+            expect_rules: 期望是否有规则
+        """
+        self.connect_router()
+        try:
+            # 先判断switch_nat模式决定查哪个链
+            switch_nat = self._router.exec(
+                "sqlite3 /etc/mnt/ikuai/config.db \"select switch_nat from basic\""
+            ).strip()
+
+            if switch_nat == "0":
+                # 非NAT模式: 查filter表NONAT链
+                chain = "NONAT"
+                output = self._router.exec("iptables -S NONAT 2>/dev/null")
+            else:
+                # NAT模式: 查nat表DSTNAT链
+                chain = "DSTNAT"
+                output = self._router.exec("iptables -t nat -S DSTNAT 2>/dev/null")
+
+            if not output:
+                if expect_rules:
+                    return VerifyResult(
+                        level="L2-iptables",
+                        passed=False,
+                        message=f"端口映射 '{tagname}' iptables {chain}链为空(期望有规则)",
+                        raw_output="",
+                    )
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=True,
+                    message=f"端口映射 '{tagname}' {chain}链无规则(符合预期)",
+                    raw_output=output[:500],
+                )
+
+            # 解析规则, 检查是否有匹配的
+            lines = [l.strip() for l in output.strip().split('\n')
+                     if l.strip() and not l.strip().startswith("-N")]
+            matched_lines = []
+            for line in lines:
+                matched = True
+                if protocol and f"-p {protocol}" not in line:
+                    # tcp+udp在iptables里会生成两条规则, 分别-p tcp和-p udp
+                    if protocol == "tcp+udp":
+                        if "-p tcp" not in line and "-p udp" not in line:
+                            matched = False
+                    else:
+                        matched = False
+                if lan_addr and lan_addr not in line:
+                    matched = False
+                if wan_port:
+                    # wan_port可能是范围(1000-2000)或多端口(80,443)
+                    # iptables里范围用:连接, 多端口用,连接
+                    wp_normalized = wan_port.replace("-", ":")
+                    if f"--dports {wp_normalized}" not in line and wan_port not in line:
+                        matched = False
+                if matched:
+                    matched_lines.append(line)
+
+            label = tagname or "端口映射"
+            if expect_rules and not matched_lines:
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=False,
+                    message=f"端口映射 '{label}' iptables {chain}链未找到匹配规则",
+                    raw_output=output[:500],
+                )
+
+            if not expect_rules and matched_lines:
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=False,
+                    message=f"端口映射 '{label}' iptables {chain}链仍有残留规则",
+                    raw_output="\n".join(matched_lines)[:500],
+                )
+
+            return VerifyResult(
+                level="L2-iptables",
+                passed=True,
+                message=f"端口映射 '{label}' iptables {chain}链验证通过(匹配{len(matched_lines)}条规则)",
+                raw_output=("\n".join(matched_lines) if matched_lines else output)[:500],
+            )
+        except Exception as e:
+            logger.error(f"verify_port_map_iptables error: {e}")
+            return VerifyResult(
+                level="L2-iptables",
+                passed=False,
+                message=f"iptables验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_port_map_runtime(self, expect_active: bool = True) -> VerifyResult:
+        """L3: 验证端口映射运行时状态(iptables-save检查DSTNAT链注册)"""
+        self.connect_router()
+        try:
+            output = self._router.exec("iptables-save -t nat 2>/dev/null | grep -E 'DSTNAT|NONAT'")
+            has_dnat = ":DSTNAT" in output or "-A DSTNAT" in output or "-A PREROUTING.*DSTNAT" in output
+
+            if expect_active and not has_dnat:
+                return VerifyResult(
+                    level="L3-运行时",
+                    passed=False,
+                    message="端口映射运行时未注册DSTNAT链",
+                    raw_output=output[:300],
+                )
+
+            return VerifyResult(
+                level="L3-运行时",
+                passed=True,
+                message=f"端口映射运行时状态正常(DSTNAT链{'已注册' if has_dnat else '无规则'})",
+                raw_output=output[:300],
+            )
+        except Exception as e:
+            logger.error(f"verify_port_map_runtime error: {e}")
+            return VerifyResult(
+                level="L3-运行时",
+                passed=False,
+                message=f"运行时验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_port_map_kernel(self) -> VerifyResult:
+        """L4: 验证端口映射内核模块(nf_nat/iptable_nat)"""
+        self.connect_router()
+        try:
+            output = self._router.exec("lsmod 2>/dev/null | grep -E 'nf_nat|iptable_nat'")
+            if output and ("nf_nat" in output or "iptable_nat" in output):
+                return VerifyResult(
+                    level="L4-内核",
+                    passed=True,
+                    message="NAT内核模块已加载(nf_nat/iptable_nat)",
+                    raw_output=output[:200],
+                )
+            # 某些平台NAT编译进内核, 检查/proc
+            proc = self._router.exec("cat /proc/net/nf_conntrack 2>/dev/null | head -1")
+            if proc:
+                return VerifyResult(
+                    level="L4-内核",
+                    passed=True,
+                    message="NAT内核功能正常(conntrack可用)",
+                    raw_output="conntrack active",
+                )
+            return VerifyResult(
+                level="L4-内核",
+                passed=False,
+                message="NAT内核模块未找到",
+                raw_output=output[:200],
+            )
+        except Exception as e:
+            logger.error(f"verify_port_map_kernel error: {e}")
+            return VerifyResult(
+                level="L4-内核",
+                passed=False,
+                message=f"内核验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_port_map_full_chain(self, tagname: str,
+                                    expected_fields: Dict = None,
+                                    lan_addr: str = None,
+                                    wan_port: str = None,
+                                    protocol: str = None) -> FullChainResult:
+        """端口映射全链路验证: L1数据库 -> L2iptables -> L3运行时 -> L4内核
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望的数据库字段值
+            lan_addr: 内网地址(用于L2精确匹配)
+            wan_port: 外网端口(用于L2精确匹配)
+            protocol: 协议(用于L2精确匹配)
+        """
+        results = []
+
+        # L1: 数据库
+        results.append(self.verify_port_map_database(tagname, expected_fields))
+
+        # 根据L1结果决定后续验证
+        rule = self.find_port_map(tagname)
+        if rule:
+            enabled = rule.get("enabled", "yes") == "yes"
+            r_lan_addr = lan_addr or rule.get("lan_addr")
+            r_wan_port = wan_port or rule.get("wan_port")
+            r_protocol = protocol or rule.get("protocol")
+
+            # L2: iptables(仅启用时期望有规则)
+            if enabled:
+                results.append(self.verify_port_map_iptables(
+                    tagname, r_lan_addr, r_wan_port, r_protocol, expect_rules=True))
+            else:
+                results.append(self.verify_port_map_iptables(
+                    tagname, r_lan_addr, r_wan_port, r_protocol, expect_rules=False))
+
+            # L3: 运行时
+            results.append(self.verify_port_map_runtime(expect_active=enabled))
+        else:
+            results.append(self.verify_port_map_iptables(tagname, expect_rules=False))
+            results.append(self.verify_port_map_runtime(expect_active=False))
+
+        # L4: 内核
+        results.append(self.verify_port_map_kernel())
+
+        return FullChainResult(results=results)

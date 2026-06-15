@@ -798,6 +798,16 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "端口映射": {
+                                "testcases": [
+                                    "test_port_map_comprehensive.py::TestPortMapComprehensive::test_port_map_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_port_map_comprehensive.py::TestPortMapComprehensive::test_port_map_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "组播管理": {

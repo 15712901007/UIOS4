@@ -88,6 +88,12 @@ test_data:
     udp_proxy:
       export_filename: "udp_proxy_config.csv"
       import_filename: "udp_proxy_import.csv"
+    nat_rule:
+      export_filename: "nat_rule_config.csv"
+      import_filename: "nat_rule_import.csv"
+    port_map:
+      export_filename: "port_map_config.csv"
+      import_filename: "port_map_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"
