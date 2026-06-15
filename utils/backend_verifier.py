@@ -40,6 +40,11 @@ class FullChainResult:
     results: List[VerifyResult] = field(default_factory=list)
 
     @property
+    def passed(self) -> bool:
+        """兼容VerifyResult接口"""
+        return self.all_passed
+
+    @property
     def all_passed(self) -> bool:
         return all(r.passed for r in self.results)
 
@@ -49,6 +54,15 @@ class FullChainResult:
             status = "PASS" if r.passed else "FAIL"
             lines.append(f"  [{status}] {r.level}: {r.message}")
         return "\n".join(lines)
+
+    @property
+    def message(self) -> str:
+        passed_count = sum(1 for r in self.results if r.passed)
+        return f"{passed_count}/{len(self.results)} 项通过"
+
+    @property
+    def raw_output(self) -> str:
+        return self.summary()
 
 
 class SSHClient:
@@ -3848,5 +3862,343 @@ class BackendVerifier:
             results.append(self.verify_udp_proxy_ipset(
                 expect_present=(access == 0),
                 listen_port=listen_port))
+
+        return FullChainResult(results=results)
+
+    # ==================== NAT规则(nat_rule)验证 ====================
+    # 数据库表: nat_rule (多行)
+    # 字段: id, enabled(yes/no), tagname(名称), comment(备注),
+    #        ointerface(出接口), iinterface(进接口),
+    #        src_addr(base64 JSON), src_addr_inv(0/1),
+    #        dst_addr(base64 JSON), dst_addr_inv(0/1),
+    #        nat_addr(plain IP), nat_port(plain port),
+    #        protocol(any/tcp/udp/tcp+udp),
+    #        src_port(base64 JSON), dst_port(base64 JSON),
+    #        action(filter/snat/dnat)
+    # 后端脚本: /usr/ikuai/script/nat_rule.sh
+    # iptables链: NATRULE_SNAT(POSTROUTING), NATRULE_DNAT(PREROUTING)
+    # 全局设置: global_config.local_forward_nat (齿轮设置)
+
+    def _decode_b64_json(self, b64_str: str) -> Any:
+        """解码base64编码的JSON字段(NAT规则的地址/端口字段)
+
+        Args:
+            b64_str: base64编码的JSON字符串
+
+        Returns:
+            解码后的Python对象, 失败返回None
+        """
+        if not b64_str:
+            return None
+        try:
+            import base64
+            json_str = base64.b64decode(b64_str).decode('utf-8')
+            return json.loads(json_str)
+        except Exception as e:
+            logger.error(f"base64解码失败: {e}")
+            return None
+
+    def query_nat_rules(self) -> List[Dict]:
+        """查询所有NAT规则(nat_rule表)"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "/usr/ikuai/function/nat_rule show limit=0,500 TYPE=total,data"
+            )
+            logger.info(f"nat_rule raw: {output[:200] if output else 'None'}")
+
+            if not output or "Error" in output:
+                return []
+
+            data = json.loads(output.strip())
+            if isinstance(data, dict):
+                return data.get("data", [])
+            return []
+        except Exception as e:
+            logger.error(f"query_nat_rules error: {e}")
+            return []
+
+    def find_nat_rule(self, tagname: str) -> Optional[Dict]:
+        """按名称查找NAT规则"""
+        rules = self.query_nat_rules()
+        for rule in rules:
+            if rule.get("tagname") == tagname:
+                return rule
+        return None
+
+    def verify_nat_rule_database(self, tagname: str,
+                                  expected_fields: Dict = None,
+                                  expect_absent: bool = False) -> VerifyResult:
+        """L1: 验证NAT规则在数据库中存在且字段正确
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望的字段值, 如 {"action": "snat", "enabled": "yes",
+                             "protocol": "tcp", "nat_addr": "10.66.0.200"}
+            expect_absent: True表示期望规则不存在(用于删除验证)
+        """
+        rule = self.find_nat_rule(tagname)
+        if rule is None:
+            if expect_absent:
+                return VerifyResult(
+                    level="L1-数据库",
+                    passed=True,
+                    message=f"NAT规则 '{tagname}' 已不存在(符合预期)",
+                    details={"tagname": tagname, "absent": True},
+                    raw_output="",
+                )
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"NAT规则 '{tagname}' 不存在",
+                details={"tagname": tagname},
+                raw_output="",
+            )
+
+        details = {"rule": {k: v for k, v in rule.items() if k in (
+            'id', 'enabled', 'tagname', 'action', 'protocol',
+            'ointerface', 'iinterface', 'nat_addr', 'nat_port', 'comment'
+        )}}
+
+        mismatches = []
+        if expected_fields:
+            # 字段映射: UI/测试名 -> DB名
+            field_map = {
+                "enabled": "enabled",
+                "action": "action",
+                "protocol": "protocol",
+                "oinface": "ointerface",
+                "out_interface": "ointerface",
+                "iinface": "iinterface",
+                "in_interface": "iinterface",
+                "nat_addr": "nat_addr",
+                "nat_port": "nat_port",
+                "comment": "comment",
+                "remark": "comment",
+                "src_addr_inv": "src_addr_inv",
+                "dst_addr_inv": "dst_addr_inv",
+            }
+            for ui_key, db_key in field_map.items():
+                if ui_key in expected_fields:
+                    expected_val = str(expected_fields[ui_key])
+                    actual_val = str(rule.get(db_key, ""))
+                    if expected_val.isdigit() and actual_val.isdigit():
+                        if int(expected_val) != int(actual_val):
+                            mismatches.append(f"{db_key}: 期望={expected_val}, 实际={actual_val}")
+                    elif expected_val != actual_val:
+                        mismatches.append(f"{db_key}: 期望={expected_val}, 实际={actual_val}")
+
+        raw = json.dumps(details, ensure_ascii=False)[:300]
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"NAT规则 '{tagname}' 字段不匹配: {'; '.join(mismatches)}",
+                details=details,
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"NAT规则 '{tagname}' 数据库验证通过(action={rule.get('action')}, proto={rule.get('protocol')})",
+            details=details,
+            raw_output=raw,
+        )
+
+    def verify_local_forward_nat(self, expected_enabled: bool) -> VerifyResult:
+        """L1: 验证本地转发自动NAT设置(global_config.local_forward_nat)
+
+        数据库: global_config表中local_forward_nat字段(0=关闭, 1=开启)
+        """
+        self.connect_router()
+        try:
+            # 直接用sqlite3查询global_config表
+            output = self._router.exec(
+                "sqlite3 /etc/mnt/ikuai/config.db "
+                "\"SELECT local_forward_nat FROM global_config WHERE id=1\""
+            )
+            local_forward = output.strip() if output else None
+
+            expected_val = 1 if expected_enabled else 0
+            actual_val = int(local_forward) if local_forward is not None else -1
+
+            if actual_val == expected_val:
+                return VerifyResult(
+                    level="L1-设置",
+                    passed=True,
+                    message=f"本地转发自动NAT设置正确: {'开启' if expected_enabled else '关闭'}(值={actual_val})",
+                    details={"local_forward_nat": actual_val},
+                    raw_output=f"local_forward_nat={local_forward}",
+                )
+            else:
+                return VerifyResult(
+                    level="L1-设置",
+                    passed=False,
+                    message=f"本地转发自动NAT不匹配: 期望={'开启' if expected_enabled else '关闭'}({expected_val}), 实际={actual_val}",
+                    details={"local_forward_nat": actual_val},
+                    raw_output=f"local_forward_nat={local_forward}",
+                )
+        except Exception as e:
+            logger.error(f"verify_local_forward_nat error: {e}")
+            return VerifyResult(
+                level="L1-设置",
+                passed=False,
+                message=f"验证本地转发NAT异常: {e}",
+                raw_output="",
+            )
+
+    def verify_nat_rule_iptables(self, action: str = None,
+                                  expect_rules: bool = True) -> VerifyResult:
+        """L2: 验证NAT规则iptables链
+
+        Args:
+            action: 动作类型 filter/snat/dnat, None则检查所有
+            expect_rules: 期望是否有iptables规则
+        """
+        self.connect_router()
+        try:
+            chain_checks = []
+            if action == "filter":
+                chain_checks.append(("NATRULE_SNAT", f"iptables -t nat -L NATRULE_SNAT -n 2>/dev/null"))
+            elif action == "snat":
+                chain_checks.append(("NATRULE_SNAT", f"iptables -t nat -L NATRULE_SNAT -n 2>/dev/null"))
+            elif action == "dnat":
+                chain_checks.append(("NATRULE_DNAT", f"iptables -t nat -L NATRULE_DNAT -n 2>/dev/null"))
+            else:
+                # 检查所有NAT链
+                chain_checks.append(("NATRULE_SNAT", "iptables -t nat -L NATRULE_SNAT -n 2>/dev/null"))
+                chain_checks.append(("NATRULE_DNAT", "iptables -t nat -L NATRULE_DNAT -n 2>/dev/null"))
+
+            all_output = ""
+            has_rules = False
+            for chain_name, cmd in chain_checks:
+                output = self._router.exec(cmd)
+                all_output += f"\n--- {chain_name} ---\n{output}"
+                if output and "Chain" in output:
+                    # 检查链中是否有规则(非仅Chain头)
+                    lines = [l.strip() for l in output.strip().split('\n') if l.strip()]
+                    if len(lines) > 2:  # Chain头 + 字段头 = 2行, 更多行表示有规则
+                        has_rules = True
+
+            if expect_rules and not has_rules:
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=False,
+                    message="NAT规则iptables链中未发现规则",
+                    raw_output=all_output[:500],
+                )
+
+            if not expect_rules and has_rules:
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=False,
+                    message="NAT规则iptables链中仍有残留规则",
+                    raw_output=all_output[:500],
+                )
+
+            return VerifyResult(
+                level="L2-iptables",
+                passed=True,
+                message=f"NAT规则iptables验证通过(规则{'存在' if has_rules else '不存在'})",
+                raw_output=all_output[:500],
+            )
+        except Exception as e:
+            logger.error(f"verify_nat_rule_iptables error: {e}")
+            return VerifyResult(
+                level="L2-iptables",
+                passed=False,
+                message=f"iptables验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_nat_rule_runtime(self, expect_active: bool = True) -> VerifyResult:
+        """L3: 验证NAT规则运行时状态(iptables-save检查NAT链注册)"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "iptables-save -t nat 2>/dev/null | grep -E 'NATRULE_(SNAT|DNAT)'"
+            )
+
+            chains_registered = bool(output and output.strip())
+
+            if expect_active and not chains_registered:
+                return VerifyResult(
+                    level="L3-运行时",
+                    passed=False,
+                    message="NAT规则链未在iptables中注册",
+                    raw_output=output[:300] if output else "",
+                )
+
+            return VerifyResult(
+                level="L3-运行时",
+                passed=True,
+                message=f"NAT规则运行时验证通过(链{'已注册' if chains_registered else '未注册'})",
+                raw_output=output[:300] if output else "",
+            )
+        except Exception as e:
+            logger.error(f"verify_nat_rule_runtime error: {e}")
+            return VerifyResult(
+                level="L3-运行时",
+                passed=False,
+                message=f"运行时验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_nat_rule_kernel(self) -> VerifyResult:
+        """L4: 验证内核NAT模块"""
+        self.connect_router()
+        try:
+            output = self._router.exec("lsmod | grep nf_nat")
+            module_loaded = bool(output and output.strip())
+
+            return VerifyResult(
+                level="L4-内核",
+                passed=True,
+                message=f"NAT内核模块验证通过(nf_nat {'已加载' if module_loaded else '未加载(可能内置)'})",
+                raw_output=output[:200] if output else "",
+            )
+        except Exception as e:
+            logger.error(f"verify_nat_rule_kernel error: {e}")
+            return VerifyResult(
+                level="L4-内核",
+                passed=False,
+                message=f"内核验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_nat_rule_full_chain(self, tagname: str,
+                                    expected_fields: Dict = None) -> FullChainResult:
+        """NAT规则全链路验证: L1数据库 -> L2iptables -> L3运行时 -> L4内核
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望的字段值
+        """
+        results = []
+
+        # L1: 数据库
+        results.append(self.verify_nat_rule_database(tagname, expected_fields))
+
+        # 根据L1结果决定后续验证
+        rule = self.find_nat_rule(tagname)
+        if rule:
+            action = rule.get("action", "filter")
+            enabled = rule.get("enabled", "yes") == "yes"
+
+            # L2: iptables(仅启用时)
+            if enabled:
+                results.append(self.verify_nat_rule_iptables(action=action, expect_rules=True))
+            else:
+                results.append(self.verify_nat_rule_iptables(action=action, expect_rules=False))
+
+            # L3: 运行时
+            results.append(self.verify_nat_rule_runtime(expect_active=enabled))
+        else:
+            results.append(self.verify_nat_rule_iptables(expect_rules=False))
+            results.append(self.verify_nat_rule_runtime(expect_active=False))
+
+        # L4: 内核
+        results.append(self.verify_nat_rule_kernel())
 
         return FullChainResult(results=results)

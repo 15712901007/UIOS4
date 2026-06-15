@@ -788,6 +788,16 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "NAT规则": {
+                                "testcases": [
+                                    "test_nat_rule_comprehensive.py::TestNatRuleComprehensive::test_nat_rule_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_nat_rule_comprehensive.py::TestNatRuleComprehensive::test_nat_rule_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "组播管理": {

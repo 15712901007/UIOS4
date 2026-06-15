@@ -106,6 +106,7 @@ from pages.network.upnp_setting_page import UpnpSettingPage
 from pages.network.igmp_proxy_page import IgmpProxyPage
 from pages.network.iptv_page import IptvPage
 from pages.network.udp_proxy_page import UdpProxyPage
+from pages.network.nat_rule_page import NatRulePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -168,6 +169,7 @@ TEST_NAME_MAPPING = {
     'test_upnp_setting_comprehensive': 'UPnP/NAT设置综合测试',
     'test_igmp_proxy_comprehensive': 'IGMP代理综合测试',
     'test_iptv_comprehensive': 'IPTV透传综合测试',
+    'test_nat_rule_comprehensive': 'NAT规则综合测试',
 }
 
 
@@ -574,6 +576,22 @@ def udp_proxy_page_logged_in(logged_in_page: Page, config: Config) -> 'UdpProxyP
     return udp_page
 
 
+# ==================== NAT规则 fixtures ====================
+
+@pytest.fixture(scope="function")
+def nat_rule_page(page: Page, config: Config) -> 'NatRulePage':
+    """创建NAT规则页面实例"""
+    return NatRulePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def nat_rule_page_logged_in(logged_in_page: Page, config: Config) -> 'NatRulePage':
+    """已登录并导航到NAT规则页面的实例"""
+    nat_page = NatRulePage(logged_in_page, config.get_base_url())
+    nat_page.navigate_to_nat_rule()
+    return nat_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -780,6 +798,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "iptv: IPTV透传模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "nat_rule: NAT规则模块测试"
     )
 
     # 记录开始时间

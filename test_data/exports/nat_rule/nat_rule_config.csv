@@ -1,0 +1,9 @@
+id,enabled,tagname,comment,ointerface,iinterface,src_addr_inv,dst_addr_inv,nat_addr,nat_port,protocol,action,src_addr,dst_addr,src_port,dst_port
+1,"yes","nat过滤已编辑","编辑后备注","any","any",0,0,"","","any","filter","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}"
+2,"yes","nat过滤地址","","any","any",0,0,"","","any","filter","{""custom"":[""192.168.1.100""],""object"":{}}","{""custom"":[""10.0.0.1""],""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}"
+3,"yes","nat过滤TCP","","any","any",0,0,"","","tcp","filter","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":[""1000-2000""],""object"":{}}","{""custom"":[""80""],""object"":{}}"
+4,"yes","nat源地址基础","","wan1","any",0,0,"10.66.0.200","","any","snat","{""custom"":[""192.168.2.0\/24""],""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}"
+5,"yes","nat源地址TCP","","wan1","any",0,0,"10.66.0.201","","tcp","snat","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":[""3000-4000""],""object"":{}}","{""custom"":[""443""],""object"":{}}"
+6,"yes","nat目的地址基础","","any","lan1",0,0,"192.168.1.10","8080","any","dnat","{""custom"":{},""object"":{}}","{""custom"":[""10.66.0.150""],""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}"
+8,"yes","nat带备注","NAT规则测试备注","any","any",0,0,"","","any","filter","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}"
+9,"yes","nat反向匹配","","wan1","any",1,0,"10.66.0.202","","any","snat","{""custom"":[""192.168.3.0\/24""],""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}","{""custom"":{},""object"":{}}"
