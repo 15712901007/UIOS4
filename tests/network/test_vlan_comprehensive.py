@@ -1016,7 +1016,7 @@ class TestVlanComprehensive:
             for f in ssh_failures:
                 print(f"  - {f}")
             all_failures = ssh_failures + ui_failures
-        assert not all_failures, f"验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+        assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
 
 
 @pytest.mark.vlan
