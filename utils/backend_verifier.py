@@ -374,7 +374,12 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
         return self.exec(command, timeout)
 
     def exec(self, command: str, timeout: int = 30) -> str:
-        """执行命令并返回stdout，连接断开时自动重连一次"""
+        """执行命令并返回stdout，连接断开时自动重连一次
+
+        增加控制台模式检测: 如果shell被重置回/etc/setup/rc(测试过程中可能发生),
+        exec_command不会报错但返回的是控制台菜单内容而非命令结果。
+        检测到这种情况时自动重新走控制台登录修复shell。
+        """
         for attempt in range(2):
             try:
                 if self._client is None:
@@ -384,6 +389,20 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
                 err = stderr.read().decode("utf-8", errors="replace")
                 if err and "warning" not in err.lower():
                     logger.debug(f"SSH stderr: {err.strip()}")
+
+                # 控制台模式检测: shell被重置后exec返回的是菜单内容(含"请输入菜单编号")
+                # 而非命令结果, 这时需要重新走控制台登录
+                if self._is_console_output(output):
+                    logger.warning("检测到SSH shell被重置为控制台模式, 重新登录...")
+                    self._console_logged_in = False
+                    self._client.close()
+                    self._client = None
+                    self.connect()  # connect会重新走_check_and_login_console
+                    # 重连后重新执行命令
+                    if self._client is not None:
+                        _, stdout2, _ = self._client.exec_command(command, timeout=timeout)
+                        output = stdout2.read().decode("utf-8", errors="replace")
+
                 return output
             except (paramiko.SSHException, OSError, TimeoutError) as e:
                 if attempt == 0:
@@ -391,6 +410,17 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
                     self._client = None
                 else:
                     raise
+
+    def _is_console_output(self, output: str) -> bool:
+        """检测输出是否是控制台菜单内容(而非命令结果)
+
+        控制台菜单的特征文字:
+        - "爱快路由中文控制台" 或 "请输入菜单编号" 或 "IKKUAI"
+        """
+        if not output:
+            return False
+        console_markers = ["请输入菜单编号", "爱快路由中文控制台", "系统状态监视", "设置网卡绑定"]
+        return any(marker in output for marker in console_markers)
 
     def close(self):
         if self._client is not None:
