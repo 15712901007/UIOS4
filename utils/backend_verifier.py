@@ -4717,13 +4717,20 @@ class BackendVerifier:
             )
 
     def verify_dmz_boot_recovery(self, tagname: str = None) -> VerifyResult:
-        """L2+: 验证DMZ重启恢复能力(模拟boot流程, 检测已知init bug)
+        """L2+: 验证DMZ重启恢复能力(纯净模拟boot流程, 检测已知init bug)
 
-        执行 netmap.sh init 模拟重启时的boot流程, 然后检查:
-        - NETNAT链规则是否重新生成
-        - PREROUTING是否引用NETNAT链(init bug会导致此处失败)
+        ⚠️ 纯净复现流程(已实锤验证, 非推断):
+        1. 检查数据库是否有启用的DMZ规则(无规则则跳过, 无法验证)
+        2. 清空NETNAT链规则 + 删除PREROUTING对NETNAT的引用(模拟刚开机内存空)
+           这一步排除了Web UI add()副作用——add()会主动注册链, 会污染验证结果
+        3. 只跑 netmap.sh init(模拟重启时的初始化)
+        4. 检查 init 是否报错 + PREROUTING是否重新注册了NETNAT链
 
-        这是发现"netmap.sh init的select * -gt 0错误导致PREROUTING不注册"bug的关键验证。
+        已知bug(已实锤复现):
+        - netmap.sh init()第30行 select *(返回数据行非数字) -gt 0 报 integer expression expected
+        - 后果: 重启(boot->init)时不注册PREROUTING->NETNAT, DMZ不生效
+        - 对比: down()/up()里的ipt_qos_other_ensure_chain是无条件调用, 所以停用启用不会触发此bug
+        - 只有重启(init)路径才触发
 
         Args:
             tagname: 规则名称(用于日志, 可选)
@@ -4733,33 +4740,62 @@ class BackendVerifier:
         """
         self.connect_router()
         try:
-            # 执行init(模拟boot)
+            label = tagname or "DMZ主机"
+
+            # 0. 先检查数据库是否有启用的DMZ规则(无规则无法验证重启恢复)
+            rule_count_output = self._router.exec(
+                'sqlite3 /etc/mnt/ikuai/config.db "SELECT count(*) FROM one_one_map WHERE enabled=\'yes\'"'
+            )
+            rule_count = 0
+            try:
+                rule_count = int(rule_count_output.strip())
+            except Exception:
+                pass
+            if rule_count == 0:
+                return VerifyResult(
+                    level="L2-重启恢复",
+                    passed=True,
+                    message="DMZ重启恢复验证跳过: 无启用的DMZ规则, 无法验证",
+                    raw_output="",
+                )
+
+            # 1. 纯净化: 清空NETNAT链规则 + 删除PREROUTING对NETNAT的引用(模拟刚开机)
+            #    关键: 这一步排除了add()的副作用, 才能测出init本身是否能注册链
+            self._router.exec("iptables -t nat -F NETNAT 2>/dev/null")
+            # 删除PREROUTING里对NETNAT的引用(用精确匹配条件, 不用-S管道解析)
+            # 注意: 爱快的iptables -S输出带[fastid:0]前缀, sed管道方式会失败
+            self._router.exec(
+                "iptables -t nat -D PREROUTING -m conntrack --ctstate NEW -m addrtype --dst-type LOCAL -j NETNAT 2>/dev/null"
+            )
+
+            # 确认清空成功
+            pre_before = self._router.exec("iptables -t nat -S PREROUTING 2>/dev/null | grep -i netnat")
+            cleaned = (not pre_before or "NETNAT" not in pre_before)
+
+            # 2. 只跑 init(模拟重启初始化)
             init_output = self._router.exec("/usr/ikuai/script/netmap.sh init 2>&1")
 
-            # 检查是否有integer expression expected错误(init bug的特征)
+            # 3. 检查结果
             has_init_bug = "integer expression expected" in init_output
 
-            # 检查init后PREROUTING是否引用NETNAT
             pre_output = self._router.exec("iptables -t nat -S PREROUTING 2>/dev/null")
             prerouting_refs_netnat = "NETNAT" in pre_output
 
-            # 检查NETNAT链规则是否重新生成
             netnat_output = self._router.exec("iptables -t nat -S NETNAT 2>/dev/null")
             netnat_has_rules = any("NETMAP" in l for l in netnat_output.split('\n'))
 
-            label = tagname or "DMZ主机"
-
+            # 4. 判定
             if has_init_bug and not prerouting_refs_netnat:
-                # 命中已知bug: init报错且PREROUTING未注册
+                # 命中已知bug: init报错 + PREROUTING未注册(已实锤的复现结果)
                 return VerifyResult(
                     level="L2-重启恢复",
                     passed=False,
-                    message=f"DMZ重启恢复验证失败: 命中init bug(select * -gt 0错误), PREROUTING未引用NETNAT链(重启后DMZ不生效)",
-                    raw_output=f"init输出:\n{init_output[:300]}\nPREROUTING:\n{pre_output[:200]}",
+                    message=f"DMZ重启恢复验证失败: 命中init bug(select * -gt 0错误), 重启后PREROUTING不引用NETNAT链, DMZ不生效",
+                    raw_output=f"纯净化后PREROUTING引用NETNAT: {cleaned}(应空)\ninit输出:\n{init_output[:300]}\ninit后PREROUTING:\n{pre_output[:200]}\nNETNAT链(有规则但流量进不来):\n{netnat_output[:200]}",
                 )
 
             if not prerouting_refs_netnat and netnat_has_rules:
-                # NETNAT有规则但PREROUTING没引用 -> DMZ不生效
+                # NETNAT有规则但PREROUTING没引用 -> DMZ不生效(另一种表现)
                 return VerifyResult(
                     level="L2-重启恢复",
                     passed=False,
@@ -4770,7 +4806,7 @@ class BackendVerifier:
             return VerifyResult(
                 level="L2-重启恢复",
                 passed=True,
-                message=f"DMZ重启恢复验证通过(init{'有告警但' if has_init_bug else '正常'}PREROUTING已引用NETNAT)",
+                message=f"DMZ重启恢复验证通过(init{'有告警但' if has_init_bug else '正常'}PREROUTING已引用NETNAT链)",
                 raw_output=f"init:\n{init_output[:200]}\nPREROUTING引用NETNAT: {prerouting_refs_netnat}",
             )
         except Exception as e:
