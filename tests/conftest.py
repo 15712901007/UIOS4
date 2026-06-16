@@ -731,6 +731,80 @@ def screenshot_path(screenshot_dir: str, request) -> str:
     return os.path.join(screenshot_dir, f"{test_name}_{timestamp}.png")
 
 
+# ==================== 全局环境清理(session级) ====================
+
+@pytest.fixture(scope="session", autouse=True)
+def global_environment_cleanup(config: Config):
+    """全局环境清理: 全量测试开始前通过SSH清理所有模块的残留数据
+
+    解决全量跑时模块间环境污染问题:
+    - VLAN创建的虚拟接口影响IGMP/静态路由
+    - 残留规则影响IP限速批量删除
+    - 前序模块未清理的数据影响后序模块
+
+    清理范围: 各模块数据库表 + iptables链 + VLAN虚拟接口
+    仅当SSH配置有效时执行, 失败不阻断测试。
+    """
+    import traceback
+    try:
+        from utils.backend_verifier import BackendVerifier
+        verifier = BackendVerifier(config.ssh)
+        verifier.connect_router()
+        print("\n[全局清理] 开始清理设备环境...")
+
+        cleanup_sqls = [
+            # 各模块数据库表清理
+            ("VLAN虚拟接口", "DELETE FROM vlan_config;"),
+            ("IP限速", "DELETE FROM simple_qos;"),
+            ("MAC限速", "DELETE FROM mac_qos; DELETE FROM dt_mac_qos;"),
+            ("静态路由", "DELETE FROM static_route;"),
+            ("跨三层服务", "DELETE FROM snmp;"),
+            ("多线负载", "DELETE FROM lb_pcc;"),
+            ("协议分流", "DELETE FROM stream_proto;"),
+            ("端口分流", "DELETE FROM stream_port;"),
+            ("域名分流", "DELETE FROM stream_domain;"),
+            ("上下行分离", "DELETE FROM stream_updown;"),
+            ("UPnP设置", "DELETE FROM upnp;"),
+            ("NAT规则", "DELETE FROM nat_rule;"),
+            ("端口映射", "DELETE FROM dst_nat;"),
+            ("DMZ主机", "DELETE FROM one_one_map;"),
+            ("IGMP代理", "DELETE FROM igmp_proxy;"),
+            ("IPTV透传", "DELETE FROM iptv;"),
+            ("UDP代理", "DELETE FROM udpxy;"),
+        ]
+
+        cleaned = 0
+        for label, sql in cleanup_sqls:
+            try:
+                output = verifier._router.exec(
+                    f'sqlite3 /etc/mnt/ikuai/config.db "{sql}" 2>/dev/null; echo done'
+                )
+                if 'done' in (output or ''):
+                    cleaned += 1
+            except Exception:
+                pass
+
+        # 重新初始化各模块的iptables规则(清除残留)
+        init_scripts = [
+            "vlan.sh", "route.sh", "dnat.sh", "netmap.sh",
+            "stream_port.sh", "stream_proto.sh", "stream_domain.sh",
+            "stream_updown.sh", "igmp_proxy.sh", "iptv.sh", "udpxy.sh",
+        ]
+        for script in init_scripts:
+            try:
+                verifier._router.exec(f"/usr/ikuai/script/{script} init 2>/dev/null")
+            except Exception:
+                pass
+
+        print(f"[全局清理] 完成: 清理{cleaned}个模块数据库表 + {len(init_scripts)}个iptables初始化")
+        verifier.close()
+    except Exception as e:
+        print(f"[全局清理] 跳过(SSH不可用或异常): {e}")
+        traceback.print_exc()
+
+    yield  # 测试执行
+
+
 # ==================== Hook函数 ====================
 
 @pytest.hookimpl(hookwrapper=True)
