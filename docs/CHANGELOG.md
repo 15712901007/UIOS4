@@ -1,5 +1,100 @@
 # 开发日志
 
+## 2026-06-16 NAT规则+端口映射+DMZ主机三大模块 + 测试质量整改 + 报告优化
+
+### 新增模块（UPnP/NAT页面三个tab）
+
+#### NAT规则（28步综合测试）
+- **NatRulePage** (`pages/network/nat_rule_page.py`) — NAT规则页面操作类
+  - 3种动作: filter/snat/dnat + 地址取反 + 源/目的地址 + 源/目的端口
+  - 齿轮设置: 本地转发自动NAT开关(`#local_forward_nat` checkbox)
+  - **修复齿轮面板定位bug**: 原用`aside.ant-layout-sider`(左侧主菜单), 实为`div.ant-card`卡片
+- **test_nat_rule_comprehensive** — 28步: 9条规则+全CRUD+齿轮设置+SSH L1-L4
+- **BackendVerifier**: verify_nat_rule_database/iptables(NATRULE_SNAT/DNAT链)/full_chain
+- 数据库: `nat_rule`表, 开关: `global_config.local_forward_nat`
+
+#### 端口映射（27步综合测试）
+- **PortMapPage** (`pages/network/port_map_page.py`) — 端口映射页面操作类
+  - 映射类型radio: 外网接口(多选wan1/wan2/wan3) / 外网IP(必填IP)
+  - 3种协议: tcp/udp/tcp+udp（注意无"任意"）
+  - 端口格式: 单端口/范围(1000-2000)/多端口(80,443)
+  - **后端`__check_ports_equal`校验**: 内外网端口数量必须一致
+  - segmented筛选器: 全部/已停用/已启用
+  - **复制功能**: copy_rule方法(预填数据+新名称)
+- **test_port_map_comprehensive** — 27步: 9条规则+复制+segmented+SSH L1-L4
+- **BackendVerifier**: verify_port_map_database/iptables(DSTNAT链)/full_chain
+- 数据库: `dst_nat`表, 后端脚本: `dnat.sh`
+
+#### DMZ主机（24步综合测试 + 重启bug检测）
+- **DmzHostPage** (`pages/network/dmz_host_page.py`) — DMZ主机页面操作类
+  - 映射类型radio: 外网接口/外网IP
+  - 排除协议: 不限(any)/tcp/udp/tcp+udp — 排除端口动态显隐
+  - **⚠️安全设计**: DMZ的NETMAP是全流量劫持, interface=all或wan1会导致设备失联
+    - `add_rule`安全防护: 外网接口模式未指定时强制用wan2
+    - `try_add_rule_invalid`强制外网IP模式+安全IP
+    - `select_external_interfaces`修复多选下拉框不关闭
+- **test_dmz_host_comprehensive** — 24步: 5条规则(wan2/wan3/外网IP)+SSH L1-L4+重启恢复验证
+- **BackendVerifier**: verify_dmz_database/iptables(NETNAT链NETMAP+PREROUTING引用)/boot_recovery/full_chain
+- 数据库: `one_one_map`表, 后端脚本: `netmap.sh`
+
+### 🔴 产品Bug发现: DMZ重启后不生效（已实锤复现）
+- **根因**: `netmap.sh` init()第30行 `select * from one_one_map`(返回数据行非数字) 与0比大小
+  - 报`integer expression expected`, if块不执行, `ipt_qos_other_ensure_chain`未调用
+  - **后果**: 重启(boot→init)时PREROUTING不引用NETNAT链, DMZ不生效
+  - 对比: `dnat.sh`用`select count(*)`是正确的, netmap.sh是笔误
+  - **修复方案**: `select *` → `select count(*)` 即可
+- **纯净复现流程**(已验证): 清空iptables→跑init→PREROUTING未注册=bug命中
+- **测试检测**: `verify_dmz_boot_recovery`模拟init重启, 检测PREROUTING引用, must_pass=True判FAILED
+- **停用/启用不会触发**: down()/up()的链注册是无条件调用, 只有init(重启)路径才触发
+
+### 测试质量整改（全模块17文件）
+
+#### 问题: 测试失败被误判为通过
+- 之前前端UI操作(编辑/复制/导出/齿轮设置等)失败时只print [WARN]不assert
+- 功能坏了测试仍判通过, 掩盖真实问题
+
+#### 修复: ui_failures收集机制
+- 每个模块新增`ui_failures = []`列表
+- 所有`[WARN]`失败分支额外加`ui_failures.append(描述)`
+- 末尾断言改为`all_failures = ssh_failures + ui_failures`, 统一assert
+- **失败判FAILED但不中断后续步骤**(收集到列表末尾统一断言)
+- 覆盖: 编辑/复制/导出/齿轮设置/停用启用状态/搜索/排序/帮助 共60+处
+
+#### 修复: 批量脚本引入的all_failures未定义bug
+- 批量脚本把`all_failures = ssh_failures + ui_failures`放进了`if ssh_failures:`块内
+- 当ssh_failures为空时赋值不执行→UnboundLocalError→11个模块假失败
+- 修复: 把赋值移到if之前(11文件)
+
+#### 修复: 输入框定位歧义
+- VLAN: `fill_ip`改用`#ip_addr`(避免`get_by_role textbox IP`匹配到隐藏元素)
+- MAC限速: `fill_name`加`.first`(避免多个含"名称"的textbox歧义)
+
+### 报告优化（截图懒加载+筛选功能+性能提升）
+
+#### 三个问题修复
+1. **截图不准** → 截图懒加载: 点击按钮才加载base64, 收起时释放src
+2. **没法筛选** → 新增筛选按钮: 全部/通过/失败/跳过, 带计数, 点击即筛选
+3. **报告卡** → 截图不初始渲染(14张base64=4MB→0), 报告体积大幅缩小, 秒开
+
+### 测试验证结果
+- NAT规则: `1 passed` (347s, 28步全通过)
+- 端口映射: `1 passed` (321s, 27步全通过)
+- DMZ主机: `1 failed` (311s, 24步跑完, 步骤22重启恢复FAIL=产品bug)
+- 静态路由: `1 passed` (172s, all_failures修复后删除问题解决)
+- MAC限速: `1 passed` (297s, fill_name加.first后定位问题解决)
+- VLAN: 步骤1-8通过(IP定位修复生效), 异常测试有30s超时(不影响正确性)
+
+### 涉及文件清单
+- 新增: `pages/network/nat_rule_page.py`, `port_map_page.py`, `dmz_host_page.py`
+- 新增: `tests/network/test_nat_rule_comprehensive.py`, `test_port_map_comprehensive.py`, `test_dmz_host_comprehensive.py`
+- 修改: `utils/backend_verifier.py` (+NAT/端口映射/DMZ验证方法)
+- 修改: `tests/conftest.py` (fixtures+markers+名称映射)
+- 修改: `gui/main_window.py` (GUI模块树+3个新模块)
+- 修改: `config/settings.yaml`, `pytest.ini` (配置+markers)
+- 修改: 全部17个`test_*_comprehensive.py` (ui_failures+all_failures)
+- 修改: `pages/network/vlan_page.py`, `mac_rate_limit_page.py` (定位修复)
+- 修改: `reports/templates/report_template.html` (截图懒加载+筛选+性能)
+
 ## 2026-05-09 上下行分离综合测试（26步全量覆盖）+ 域名分流网卡修正
 
 ### 新增模块

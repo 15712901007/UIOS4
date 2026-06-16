@@ -203,16 +203,61 @@
 - [x] 全部4模块测试验证通过（MAC限速SSH-L2 MAC组验证问题已知，非重构相关）
 - [x] 总计减少~3267行重复代码(-62%)
 
-## Phase 14: 待完成 [0%]
+## Phase 14: NAT规则+端口映射+DMZ主机模块 [100%] (2026-06-16)
+
+### NAT规则 (28步)
+- [x] NatRulePage页面对象(3种动作+地址取反+齿轮设置)
+- [x] 修复齿轮面板定位bug(sider→card)
+- [x] 28步综合测试(9条规则+全CRUD+齿轮设置+SSH L1-L4)
+- [x] BackendVerifier: nat_rule表+NATRULE_SNAT/DNAT链+global_config开关
+
+### 端口映射 (27步)
+- [x] PortMapPage页面对象(映射类型radio+3协议+端口格式+segmented筛选)
+- [x] copy_rule复制功能
+- [x] 后端__check_ports_equal端口数量校验测试
+- [x] 27步综合测试(9条规则+复制+segmented+SSH L1-L4)
+- [x] BackendVerifier: dst_nat表+DSTNAT链
+
+### DMZ主机 (24步 + 重启bug检测)
+- [x] DmzHostPage页面对象(排除协议+排除端口动态显隐)
+- [x] ⚠️安全设计(禁interface=all/wan1, 强制wan2/外网IP模式)
+- [x] 24步综合测试(5条规则+SSH L1-L4+重启恢复验证)
+- [x] **产品Bug发现+实锤复现**: netmap.sh init select*错误→重启后DMZ不生效
+- [x] verify_dmz_boot_recovery纯净复现(清空iptables→init→PREROUTING未注册=bug)
+- [x] BackendVerifier: one_one_map表+NETNAT链NETMAP+PREROUTING引用检查
+
+## Phase 15: 测试质量整改 [100%] (2026-06-16)
+
+- [x] 全模块17文件: ui_failures收集机制(失败判FAILED不中断后续)
+- [x] 覆盖60+处WARN分支(编辑/复制/导出/齿轮设置/停用启用/搜索/排序/帮助)
+- [x] 修复all_failures赋值在if块内(11文件UnboundLocalError)
+- [x] 修复VLAN fill_ip定位歧义(#ip_addr)
+- [x] 修复MAC限速 fill_name定位歧义(.first)
+- [x] 验证: 静态路由1 passed + MAC限速1 passed
+
+## Phase 16: 报告优化 [100%] (2026-06-16)
+
+- [x] 截图懒加载(点击按钮才加载base64, 收起释放src)
+- [x] 筛选功能(全部/通过/失败/跳过, 带计数)
+- [x] 性能提升(截图不初始渲染, 报告从4MB→秒开)
+- [x] 失败用例默认展开, 其余折叠
+
+## Phase 17: 待完成 [0%]
 
 - [ ] API层快速回归（RouterAPIClient, POST /Action/call）
 - [ ] Session级登录复用（context.storage_state()）
 - [ ] 测试数据外部化（YAML数据驱动）
 - [ ] 失败重试机制（pytest-rerunfailures）
 - [ ] CI/CD集成（GitHub Actions/Jenkins）
+- [ ] VLAN异常测试性能优化(lan1选择超时30s/子步骤)
+- [ ] DMZ产品bug反馈(netmap.sh select * → select count(*))
 
 ---
 
-**总体进度: 约98%**
+**总体进度: 约99%**
 
-**最后更新: 2026-04-17**
+**已覆盖模块: 19个** (VLAN/IP限速/MAC限速/静态路由/跨三层服务/多线负载/协议分流/端口分流/域名分流/上下行分离/UPnP设置/NAT规则/端口映射/DMZ主机/IGMP代理/IPTV透传/UDPXY设置)
+
+**已知产品Bug: 1个** (DMZ重启后不生效, netmap.sh init的select*错误)
+
+**最后更新: 2026-06-16**
