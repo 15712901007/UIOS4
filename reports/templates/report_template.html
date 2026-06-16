@@ -707,9 +707,16 @@
             <div class="section-header">
                 📝 测试用例详情 (共 {{ test_cases|length }} 条)
             </div>
+            <!-- 筛选按钮 -->
+            <div class="filter-bar" style="display:flex; gap:8px; margin-bottom:15px; padding:10px; background:white; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,0.08);">
+                <button class="filter-btn active" onclick="filterCases('all', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:#1890ff; color:white; font-size:13px;">全部 ({{ test_cases|length }})</button>
+                <button class="filter-btn" onclick="filterCases('passed', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:white; color:#52c41a; font-size:13px;">✅ 通过 ({{ test_cases|selectattr('status','equalto','passed')|list|length }})</button>
+                <button class="filter-btn" onclick="filterCases('failed', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:white; color:#ff4d4f; font-size:13px;">❌ 失败 ({{ test_cases|selectattr('status','equalto','failed')|list|length }})</button>
+                <button class="filter-btn" onclick="filterCases('skipped', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:white; color:#faad14; font-size:13px;">⏭️ 跳过 ({{ test_cases|selectattr('status','equalto','skipped')|list|length }})</button>
+            </div>
             {% for case in test_cases %}
             {% set case_idx = loop.index %}
-            <div class="test-case">
+            <div class="test-case" data-status="{{ case.status }}">
                 <div class="test-case-header" onclick="toggleDetails({{ case_idx }})">
                     <div class="test-case-name">
                         <span>{% if case.status == 'passed' %}✅{% elif case.status == 'failed' %}❌{% else %}⏭️{% endif %}</span>
@@ -799,7 +806,8 @@
                     <div class="detail-item">
                         <div class="detail-label">📸 截图:</div>
                         <div style="padding: 10px; background: #f5f5f5; border-radius: 5px;">
-                            <img src="{{ case.screenshot }}" alt="测试截图" style="max-width: 100%; border-radius: 5px; border: 1px solid #e8e8e8;">
+                            <button class="screenshot-toggle-btn" onclick="toggleScreenshot(this)">📷 点击查看截图</button>
+                            <img data-src="{{ case.screenshot }}" alt="测试截图" style="display:none; max-width: 100%; border-radius: 5px; border: 1px solid #e8e8e8; margin-top:8px;">
                         </div>
                     </div>
                     {% endif %}
@@ -852,6 +860,44 @@
             {% endif %}
             {% endfor %}
         });
+
+        // 截图懒加载: 点击按钮才加载base64图片(避免报告打开时渲染所有大图导致卡顿)
+        function toggleScreenshot(btn) {
+            var img = btn.nextElementSibling;
+            if (img.style.display === 'none') {
+                if (!img.src) {
+                    img.src = img.getAttribute('data-src'); // 首次点击时从data-src加载
+                }
+                img.style.display = 'block';
+                btn.textContent = '📷 收起截图';
+            } else {
+                img.style.display = 'none';
+                img.src = ''; // 收起时释放内存
+                btn.textContent = '📷 点击查看截图';
+            }
+        }
+
+        // 筛选用例: 全部/通过/失败/跳过
+        function filterCases(status, btn) {
+            // 更新按钮样式
+            document.querySelectorAll('.filter-btn').forEach(function(b) {
+                b.classList.remove('active');
+                b.style.background = 'white';
+                b.style.color = b.textContent.includes('通过') ? '#52c41a' : (b.textContent.includes('失败') ? '#ff4d4f' : (b.textContent.includes('跳过') ? '#faad14' : '#333'));
+            });
+            btn.classList.add('active');
+            btn.style.background = '#1890ff';
+            btn.style.color = 'white';
+
+            // 筛选用例显示
+            document.querySelectorAll('.test-case[data-status]').forEach(function(tc) {
+                if (status === 'all' || tc.getAttribute('data-status') === status) {
+                    tc.style.display = '';
+                } else {
+                    tc.style.display = 'none';
+                }
+            });
+        }
     </script>
 </body>
 </html>
