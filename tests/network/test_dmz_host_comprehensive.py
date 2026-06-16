@@ -426,9 +426,9 @@ class TestDmzHostComprehensive:
                         print(f"  [OK] {fmt.upper()}导出成功: ({size} bytes)")
                         rec.add_detail(f"  [OK] {fmt.upper()}导出: ({size}B)")
                     else:
-                    print(f"  [WARN] {fmt.upper()}导出失败")
-                    rec.add_detail(f"  [WARN] {fmt.upper()}导出失败")
-                    ui_failures.append(f"{fmt.upper()}导出失败")
+                        print(f"  [WARN] {fmt.upper()}导出失败")
+                        rec.add_detail(f"  [WARN] {fmt.upper()}导出失败")
+                        ui_failures.append(f"{fmt.upper()}导出失败")
                 except Exception as e:
                     print(f"  [WARN] {fmt.upper()}导出异常: {e}")
                     rec.add_detail(f"  [WARN] {fmt.upper()}导出异常: {e}")
