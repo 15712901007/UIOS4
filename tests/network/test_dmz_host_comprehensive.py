@@ -717,12 +717,14 @@ class TestDmzHostComprehensive:
                     names = page.get_rule_list()
                     test_rule_name = names[0] if names else None
 
-                # 执行重启恢复验证(不must_pass, 因为这是bug检测, 失败也记录但不阻断测试)
+                # 执行重启恢复验证(must_pass=True: 确认的产品bug必须判测试失败)
+                # 这是已实锤的产品bug(netmap.sh init的select*错误导致重启后DMZ不生效),
+                # 测试的目的就是发现问题, 发现bug必须让测试失败, 不能掩盖
                 boot_result = ssh_verify(
                     "L2-重启恢复(init模拟)",
                     backend_verifier.verify_dmz_boot_recovery,
                     test_rule_name,
-                    must_pass=False,  # bug检测: 失败记录但不阻断测试流程
+                    must_pass=True,  # 产品bug: 发现即失败, 不掩盖
                 )
 
                 if boot_result:
@@ -730,10 +732,11 @@ class TestDmzHostComprehensive:
                         print(f"  [OK] 重启后DMZ正常生效(PREROUTING已引用NETNAT链)")
                         rec.add_detail(f"  [OK] 重启恢复正常: {boot_result.message}")
                     else:
-                        # 命中已知bug - 记录但不作为测试失败(产品bug非测试bug)
-                        print(f"  [发现已知bug] 重启后DMZ不生效: {boot_result.message}")
-                        rec.add_detail(f"  [BUG] 重启恢复失败: {boot_result.message}")
-                        rec.add_detail(f"  [说明] 这是netmap.sh init的select*bug, 非测试问题")
+                        # 命中产品bug: 记录详情 + 加入失败列表(最终判测试FAILED), 但不中断后续步骤
+                        # 测试目的是发现问题, 发现bug必须判失败, 同时继续跑完剩余步骤让报告完整
+                        print(f"  [FAIL] 重启后DMZ不生效: {boot_result.message}")
+                        rec.add_detail(f"  [FAIL] 重启恢复失败(产品bug): {boot_result.message}")
+                        rec.add_detail(f"  [根因] netmap.sh init用select*(非数字)-gt0, 导致PREROUTING不注册NETNAT链")
                         print(f"  [说明] netmap.sh init用select*(非数字)-gt0, 导致PREROUTING不注册NETNAT链")
 
                 # 清理临时规则
