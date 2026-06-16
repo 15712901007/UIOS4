@@ -1,5 +1,42 @@
 # 开发日志
 
+## 2026-06-16 全量测试整改 + 控制台shell检测 + 报告优化
+
+### 控制台shell被重置问题(重要修复)
+- **现象**: 全量测试过程中sshd的shell被重置回`/etc/setup/rc`(控制台模式),
+  后续模块SSH验证拿到的是控制台菜单内容而非命令结果
+- **根因**: backend_verifier是session级复用连接, `_console_logged_in`标记一旦为True就跳过检测,
+  即使shell被重置也不会重新走控制台登录
+- **修复**: exec方法增加`_is_console_output`检测, 发现控制台菜单特征文字时
+  自动重置标记+断开重连+重新执行命令
+- cron修复任务不持久(设备重启时固件覆盖crontab), 不能依赖cron
+
+### 全量测试14个失败的分析和修复
+- **all_failures未定义(11个假失败)**: 批量脚本把赋值放进if块内, 已移到外面
+- **all_failures错误信息(12文件)**: 错误信息里仍是ssh_failures, 已同步
+- **IGMP代理downstream匹配**: "全部"在数据库存为接口列表, 改用包含匹配
+- **跨三层频率保存**: set_frequency保存按钮选择器太窄, 已扩展+回退Enter
+- **VLAN/MAC限速定位歧义**: get_by_role匹配多个元素, 改用id/.first
+- **DMZ失败**: 产品bug(netmap.sh select*错误), 正确判FAILED
+
+### 环境污染教训(重要)
+- **绝不能用SSH直接DELETE数据库表清理环境**: 只删记录不清理内核状态(iptables/ipset/虚拟接口),
+  会破坏后端依赖(如`__show_interface`找不到), 导致页面下拉框一直Loading
+- VLAN的SSH清理删了数据库但内核虚拟接口残留, 污染了IGMP接口列表
+- igmp_proxy表被DELETE后默认配置行(id=1)丢失, 后端show返回空导致页面异常
+- **环境清理必须走Web页面批量删除**(走后端完整流程), 每个模块测试末尾本来就有清理步骤
+- 已删除全局环境清理fixture(session级), 恢复每模块自己清理的设计
+
+### 报告优化
+- 截图懒加载(点击按钮才加载base64, 解决报告卡顿)
+- 筛选功能(全部/通过/失败/跳过, 带计数)
+- 性能提升(截图不初始渲染, 报告从4MB→秒开)
+
+### 验证结果
+- 静态路由: 1 passed | MAC限速: 1 passed | IGMP代理: 1 passed(重启后恢复)
+- 控制台登录逻辑: 正常工作(whoami+密码+修复shell+重连)
+- DMZ: 1 failed(正确, 产品bug)
+
 ## 2026-06-16 NAT规则+端口映射+DMZ主机三大模块 + 测试质量整改 + 报告优化
 
 ### 新增模块（UPnP/NAT页面三个tab）
