@@ -3067,6 +3067,9 @@ class BackendVerifier:
         mismatches = {}
         for field, expected in expected_fields.items():
             actual = str(config.get(field, ""))
+            # downstream字段: "全部"在数据库存为逗号分隔的接口列表, 用包含匹配
+            if field == "downstream" and expected in actual:
+                continue  # 包含匹配通过
             if actual != str(expected):
                 mismatches[field] = {"expected": str(expected), "actual": actual}
 

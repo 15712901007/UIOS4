@@ -469,13 +469,25 @@ class CrossLayerServicePage(IkuaiTablePage):
                     freq_input.fill(str(seconds))
 
                 # 点击保存
-                save_btn = self.page.locator('.ant-drawer button:has-text("保存"), .ant-drawer button:has-text("确定")')
+                # 点击保存(多种选择器兼容)
+                save_btn = self.page.locator(
+                    '.ant-drawer button:has-text("保存"), '
+                    '.ant-drawer button:has-text("确定"), '
+                    'button:has-text("保存"), '
+                    'button:has-text("确定")'
+                )
                 if save_btn.count() > 0:
                     save_btn.first.click()
+                    self.page.wait_for_timeout(1500)  # 等保存生效
                 else:
-                    self.page.keyboard.press('Escape')
+                    # 回退: 直接Enter提交
+                    freq_input.press('Enter')
+                    self.page.wait_for_timeout(1000)
 
                 self.page.wait_for_timeout(500)
+                # 关闭可能残留的抽屉
+                self.page.keyboard.press('Escape')
+                self.page.wait_for_timeout(300)
         except Exception as e:
             print(f"[DEBUG] set_frequency error: {e}")
         return self
