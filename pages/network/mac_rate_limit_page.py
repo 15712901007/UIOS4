@@ -43,8 +43,8 @@ class MacRateLimitPage(IkuaiTablePage):
 
     # ==================== 表单字段填写 ====================
     def fill_name(self, name: str):
-        """填写规则名称"""
-        self.page.get_by_role("textbox", name="名称").fill(name)
+        """填写规则名称(用.first避免页面多个含名称的textbox导致歧义)"""
+        self.page.get_by_role("textbox", name="名称").first.fill(name)
         return self
 
     def select_protocol_stack(self, protocol_stack: str = "IPv4"):

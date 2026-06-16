@@ -59,8 +59,13 @@ class VlanPage(IkuaiTablePage):
         return self
 
     def fill_ip(self, ip: str):
-        """填写IP地址"""
-        self.page.get_by_role("textbox", name="IP").fill(ip)
+        """填写IP地址(用id定位, 避免get_by_role匹配到多个含IP的textbox)"""
+        ip_input = self.page.locator('#ip_addr')
+        if ip_input.count() > 0:
+            ip_input.first.fill(ip)
+        else:
+            # 回退: 用role但加.first避免歧义
+            self.page.get_by_role("textbox", name="IP").first.fill(ip)
         return self
 
     def select_subnet_mask(self, mask: str):
