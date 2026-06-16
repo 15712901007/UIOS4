@@ -4527,3 +4527,363 @@ class BackendVerifier:
         results.append(self.verify_port_map_kernel())
 
         return FullChainResult(results=results)
+
+    # ==================== DMZ主机(one_one_map)验证 ====================
+    # 后端脚本: /usr/ikuai/script/netmap.sh + /usr/ikuai/function/netmap
+    # 数据库: one_one_map表(id,enabled,tagname,comment,interface,lan_addr,protocol,excl_port)
+    # iptables: nat表NETNAT链, -j NETMAP --to <lan_addr>/32 (全端口映射)
+    # 链注册: PREROUTING需引用NETNAT链(ipt_qos_other_ensure_chain, 仅add/up/edit时调用)
+    #
+    # ⚠️ 已知产品BUG(netmap.sh init函数):
+    #   local qos_num=$(sqlite3 ... "select * from one_one_map")  # select *返回数据行非数字
+    #   if [ "$qos_num" -gt "0" ]; then ... fi  # 报"integer expression expected"
+    #   后果: init(boot重启时)不会调用ipt_qos_other_ensure_chain, PREROUTING不引用NETNAT链
+    #   表现: NETNAT链有规则但PREROUTING不引用 -> DMZ实际不生效(重启后尤其明显)
+    #   后台验证必须检查PREROUTING是否引用NETNAT链, 这是发现该bug的关键
+
+    def query_dmz_rules(self) -> List[Dict]:
+        """查询所有DMZ主机规则(one_one_map表)"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "/usr/ikuai/function/netmap show limit=0,500 TYPE=total,data"
+            )
+            logger.info(f"one_one_map raw: {output[:200] if output else 'None'}")
+
+            if not output or "Error" in output:
+                return []
+
+            data = json.loads(output.strip())
+            if isinstance(data, dict):
+                return data.get("data", [])
+            return []
+        except Exception as e:
+            logger.error(f"query_dmz_rules error: {e}")
+            return []
+
+    def find_dmz_rule(self, tagname: str) -> Optional[Dict]:
+        """按名称查找DMZ主机规则"""
+        rules = self.query_dmz_rules()
+        for rule in rules:
+            if rule.get("tagname") == tagname:
+                return rule
+        return None
+
+    def verify_dmz_database(self, tagname: str,
+                             expected_fields: Dict = None,
+                             expect_absent: bool = False) -> VerifyResult:
+        """L1: 验证DMZ主机在数据库中存在且字段正确"""
+        rule = self.find_dmz_rule(tagname)
+        if rule is None:
+            if expect_absent:
+                return VerifyResult(
+                    level="L1-数据库",
+                    passed=True,
+                    message=f"DMZ主机 '{tagname}' 已不存在(符合预期)",
+                    details={"tagname": tagname, "absent": True},
+                    raw_output="",
+                )
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"DMZ主机 '{tagname}' 不存在",
+                details={"tagname": tagname},
+                raw_output="",
+            )
+
+        details = {"rule": {k: v for k, v in rule.items() if k in (
+            'id', 'enabled', 'tagname', 'interface', 'lan_addr',
+            'protocol', 'excl_port', 'comment'
+        )}}
+
+        mismatches = []
+        if expected_fields:
+            field_map = {
+                "enabled": "enabled",
+                "protocol": "protocol",
+                "lan_addr": "lan_addr",
+                "interface": "interface",
+                "excl_port": "excl_port",
+                "comment": "comment",
+                "remark": "comment",
+            }
+            for ui_key, db_key in field_map.items():
+                if ui_key in expected_fields:
+                    expected_val = str(expected_fields[ui_key])
+                    actual_val = str(rule.get(db_key, ""))
+                    if expected_val != actual_val:
+                        mismatches.append(f"{db_key}: 期望={expected_val}, 实际={actual_val}")
+
+        raw = json.dumps(details, ensure_ascii=False)[:300]
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"DMZ主机 '{tagname}' 字段不匹配: {'; '.join(mismatches)}",
+                details=details,
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"DMZ主机 '{tagname}' 数据库验证通过(proto={rule.get('protocol')}, lan={rule.get('lan_addr')})",
+            details=details,
+            raw_output=raw,
+        )
+
+    def verify_dmz_iptables(self, tagname: str = None,
+                             lan_addr: str = None,
+                             protocol: str = None,
+                             expect_rules: bool = True) -> VerifyResult:
+        """L2: 验证DMZ主机iptables规则(NETNAT链 + PREROUTING链引用)
+
+        DMZ的iptables验证包含两部分:
+        1. NETNAT链中是否有NETMAP规则(匹配lan_addr)
+        2. PREROUTING是否引用了NETNAT链(这是发现重启bug的关键检查点)
+
+        Args:
+            tagname: 规则名称(用于日志)
+            lan_addr: 内网地址(用于匹配NETMAP --to)
+            protocol: 排除协议(用于匹配RETURN规则)
+            expect_rules: 期望是否有规则
+        """
+        self.connect_router()
+        try:
+            # 1. 检查NETNAT链规则
+            netnat_output = self._router.exec("iptables -t nat -S NETNAT 2>/dev/null")
+            netnat_lines = [l.strip() for l in netnat_output.strip().split('\n')
+                            if l.strip() and not l.strip().startswith("-N")]
+
+            # 匹配NETMAP规则(根据lan_addr)
+            matched_netmap = []
+            for line in netnat_lines:
+                if lan_addr and lan_addr in line and "NETMAP" in line:
+                    matched_netmap.append(line)
+                elif not lan_addr and "NETMAP" in line:
+                    matched_netmap.append(line)
+
+            # 2. 检查PREROUTING是否引用NETNAT链(关键! 重启bug的检测点)
+            pre_output = self._router.exec("iptables -t nat -S PREROUTING 2>/dev/null")
+            prerouting_refs_netnat = "NETNAT" in pre_output
+
+            label = tagname or "DMZ主机"
+
+            if expect_rules:
+                # 期望有规则: NETNAT链必须有NETMAP规则
+                if not matched_netmap:
+                    return VerifyResult(
+                        level="L2-iptables",
+                        passed=False,
+                        message=f"DMZ主机 '{label}' NETNAT链未找到NETMAP规则",
+                        raw_output=f"NETNAT链:\n{netnat_output[:400]}",
+                    )
+                # PREROUTING必须引用NETNAT(否则规则不生效)
+                if not prerouting_refs_netnat:
+                    return VerifyResult(
+                        level="L2-iptables",
+                        passed=False,
+                        message=f"DMZ主机 '{label}' NETNAT链有规则但PREROUTING未引用(规则不生效! 可能是重启bug)",
+                        raw_output=f"NETNAT链有{len(matched_netmap)}条规则, 但PREROUTING:\n{pre_output[:300]}",
+                    )
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=True,
+                    message=f"DMZ主机 '{label}' iptables验证通过(NETMAP规则{len(matched_netmap)}条, PREROUTING已引用)",
+                    raw_output="\n".join(matched_netmap)[:500],
+                )
+            else:
+                # 期望无规则
+                if matched_netmap:
+                    return VerifyResult(
+                        level="L2-iptables",
+                        passed=False,
+                        message=f"DMZ主机 '{label}' NETNAT链仍有残留NETMAP规则",
+                        raw_output="\n".join(matched_netmap)[:500],
+                    )
+                return VerifyResult(
+                    level="L2-iptables",
+                    passed=True,
+                    message=f"DMZ主机 '{label}' iptables验证通过(无规则, 符合预期)",
+                    raw_output=netnat_output[:300],
+                )
+        except Exception as e:
+            logger.error(f"verify_dmz_iptables error: {e}")
+            return VerifyResult(
+                level="L2-iptables",
+                passed=False,
+                message=f"iptables验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_dmz_boot_recovery(self, tagname: str = None) -> VerifyResult:
+        """L2+: 验证DMZ重启恢复能力(模拟boot流程, 检测已知init bug)
+
+        执行 netmap.sh init 模拟重启时的boot流程, 然后检查:
+        - NETNAT链规则是否重新生成
+        - PREROUTING是否引用NETNAT链(init bug会导致此处失败)
+
+        这是发现"netmap.sh init的select * -gt 0错误导致PREROUTING不注册"bug的关键验证。
+
+        Args:
+            tagname: 规则名称(用于日志, 可选)
+
+        Returns:
+            VerifyResult: 通过=重启后DMZ正常生效, 失败=重启后DMZ不生效(命中bug)
+        """
+        self.connect_router()
+        try:
+            # 执行init(模拟boot)
+            init_output = self._router.exec("/usr/ikuai/script/netmap.sh init 2>&1")
+
+            # 检查是否有integer expression expected错误(init bug的特征)
+            has_init_bug = "integer expression expected" in init_output
+
+            # 检查init后PREROUTING是否引用NETNAT
+            pre_output = self._router.exec("iptables -t nat -S PREROUTING 2>/dev/null")
+            prerouting_refs_netnat = "NETNAT" in pre_output
+
+            # 检查NETNAT链规则是否重新生成
+            netnat_output = self._router.exec("iptables -t nat -S NETNAT 2>/dev/null")
+            netnat_has_rules = any("NETMAP" in l for l in netnat_output.split('\n'))
+
+            label = tagname or "DMZ主机"
+
+            if has_init_bug and not prerouting_refs_netnat:
+                # 命中已知bug: init报错且PREROUTING未注册
+                return VerifyResult(
+                    level="L2-重启恢复",
+                    passed=False,
+                    message=f"DMZ重启恢复验证失败: 命中init bug(select * -gt 0错误), PREROUTING未引用NETNAT链(重启后DMZ不生效)",
+                    raw_output=f"init输出:\n{init_output[:300]}\nPREROUTING:\n{pre_output[:200]}",
+                )
+
+            if not prerouting_refs_netnat and netnat_has_rules:
+                # NETNAT有规则但PREROUTING没引用 -> DMZ不生效
+                return VerifyResult(
+                    level="L2-重启恢复",
+                    passed=False,
+                    message=f"DMZ重启恢复验证失败: NETNAT链有规则但PREROUTING未引用(DMZ不生效)",
+                    raw_output=f"NETNAT:\n{netnat_output[:300]}\nPREROUTING:\n{pre_output[:200]}",
+                )
+
+            return VerifyResult(
+                level="L2-重启恢复",
+                passed=True,
+                message=f"DMZ重启恢复验证通过(init{'有告警但' if has_init_bug else '正常'}PREROUTING已引用NETNAT)",
+                raw_output=f"init:\n{init_output[:200]}\nPREROUTING引用NETNAT: {prerouting_refs_netnat}",
+            )
+        except Exception as e:
+            logger.error(f"verify_dmz_boot_recovery error: {e}")
+            return VerifyResult(
+                level="L2-重启恢复",
+                passed=False,
+                message=f"重启恢复验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_dmz_runtime(self, expect_active: bool = True) -> VerifyResult:
+        """L3: 验证DMZ运行时状态(iptables-save检查NETNAT链)"""
+        self.connect_router()
+        try:
+            output = self._router.exec("iptables-save -t nat 2>/dev/null | grep -E 'NETNAT'")
+            has_netnat = ":NETNAT" in output or "-A NETNAT" in output
+
+            if expect_active and not has_netnat:
+                return VerifyResult(
+                    level="L3-运行时",
+                    passed=False,
+                    message="DMZ运行时未注册NETNAT链",
+                    raw_output=output[:300],
+                )
+
+            return VerifyResult(
+                level="L3-运行时",
+                passed=True,
+                message=f"DMZ运行时状态正常(NETNAT链{'已注册' if has_netnat else '无规则'})",
+                raw_output=output[:300],
+            )
+        except Exception as e:
+            logger.error(f"verify_dmz_runtime error: {e}")
+            return VerifyResult(
+                level="L3-运行时",
+                passed=False,
+                message=f"运行时验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_dmz_kernel(self) -> VerifyResult:
+        """L4: 验证DMZ内核模块(NETMAP需要nf_nat或编译进内核)"""
+        self.connect_router()
+        try:
+            output = self._router.exec("lsmod 2>/dev/null | grep -E 'nf_nat|iptable_nat|netmap'")
+            if output and ("nf_nat" in output or "iptable_nat" in output):
+                return VerifyResult(
+                    level="L4-内核",
+                    passed=True,
+                    message="NAT内核模块已加载(支持NETMAP)",
+                    raw_output=output[:200],
+                )
+            proc = self._router.exec("cat /proc/net/nf_conntrack 2>/dev/null | head -1")
+            if proc:
+                return VerifyResult(
+                    level="L4-内核",
+                    passed=True,
+                    message="NAT内核功能正常(conntrack可用)",
+                    raw_output="conntrack active",
+                )
+            return VerifyResult(
+                level="L4-内核",
+                passed=False,
+                message="NAT内核模块未找到",
+                raw_output=output[:200],
+            )
+        except Exception as e:
+            logger.error(f"verify_dmz_kernel error: {e}")
+            return VerifyResult(
+                level="L4-内核",
+                passed=False,
+                message=f"内核验证异常: {e}",
+                raw_output="",
+            )
+
+    def verify_dmz_full_chain(self, tagname: str,
+                               expected_fields: Dict = None,
+                               lan_addr: str = None) -> FullChainResult:
+        """DMZ全链路验证: L1数据库 -> L2iptables(NETMAP+PREROUTING引用) -> L3运行时 -> L4内核
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望的数据库字段值
+            lan_addr: 内网地址(用于L2精确匹配NETMAP目标)
+        """
+        results = []
+
+        # L1: 数据库
+        results.append(self.verify_dmz_database(tagname, expected_fields))
+
+        # 根据L1结果决定后续验证
+        rule = self.find_dmz_rule(tagname)
+        if rule:
+            enabled = rule.get("enabled", "yes") == "yes"
+            r_lan_addr = lan_addr or rule.get("lan_addr")
+            r_protocol = rule.get("protocol", "any")
+
+            # L2: iptables(NETNAT链规则 + PREROUTING引用)
+            if enabled:
+                results.append(self.verify_dmz_iptables(
+                    tagname, r_lan_addr, r_protocol, expect_rules=True))
+            else:
+                results.append(self.verify_dmz_iptables(
+                    tagname, r_lan_addr, r_protocol, expect_rules=False))
+
+            # L3: 运行时
+            results.append(self.verify_dmz_runtime(expect_active=enabled))
+        else:
+            results.append(self.verify_dmz_iptables(tagname, expect_rules=False))
+            results.append(self.verify_dmz_runtime(expect_active=False))
+
+        # L4: 内核
+        results.append(self.verify_dmz_kernel())
+
+        return FullChainResult(results=results)

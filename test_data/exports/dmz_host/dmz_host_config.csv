@@ -1,0 +1,5 @@
+id,enabled,tagname,comment,interface,lan_addr,protocol,excl_port
+1,"yes","dmz已编辑","编辑后备注","wan2","192.168.2.10","any",""
+2,"yes","dmz排除tcp","","wan2","192.168.2.11","tcp","80,443"
+3,"yes","dmz排除udp","","wan2","192.168.2.12","udp","53"
+5,"yes","dmz带备注","DMZ测试服务器","wan2","192.168.2.15","any",""

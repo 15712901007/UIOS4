@@ -1,0 +1,4 @@
+id=1 enabled=yes tagname=dmz已编辑 comment=编辑后备注 interface=wan2 lan_addr=192.168.2.10 protocol=any excl_port=
+id=2 enabled=yes tagname=dmz排除tcp comment= interface=wan2 lan_addr=192.168.2.11 protocol=tcp excl_port=80,443
+id=3 enabled=yes tagname=dmz排除udp comment= interface=wan2 lan_addr=192.168.2.12 protocol=udp excl_port=53
+id=5 enabled=yes tagname=dmz带备注 comment=DMZ测试服务器 interface=wan2 lan_addr=192.168.2.15 protocol=any excl_port=

@@ -808,6 +808,16 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "DMZ主机": {
+                                "testcases": [
+                                    "test_dmz_host_comprehensive.py::TestDmzHostComprehensive::test_dmz_host_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_dmz_host_comprehensive.py::TestDmzHostComprehensive::test_dmz_host_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "组播管理": {

@@ -108,6 +108,7 @@ from pages.network.iptv_page import IptvPage
 from pages.network.udp_proxy_page import UdpProxyPage
 from pages.network.nat_rule_page import NatRulePage
 from pages.network.port_map_page import PortMapPage
+from pages.network.dmz_host_page import DmzHostPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -172,6 +173,7 @@ TEST_NAME_MAPPING = {
     'test_iptv_comprehensive': 'IPTV透传综合测试',
     'test_nat_rule_comprehensive': 'NAT规则综合测试',
     'test_port_map_comprehensive': '端口映射综合测试',
+    'test_dmz_host_comprehensive': 'DMZ主机综合测试',
 }
 
 
@@ -610,6 +612,22 @@ def port_map_page_logged_in(logged_in_page: Page, config: Config) -> 'PortMapPag
     return pm_page
 
 
+# ==================== DMZ主机 fixtures ====================
+
+@pytest.fixture(scope="function")
+def dmz_host_page(page: Page, config: Config) -> 'DmzHostPage':
+    """创建DMZ主机页面实例"""
+    return DmzHostPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def dmz_host_page_logged_in(logged_in_page: Page, config: Config) -> 'DmzHostPage':
+    """已登录并导航到DMZ主机页面的实例"""
+    dz_page = DmzHostPage(logged_in_page, config.get_base_url())
+    dz_page.navigate_to_dmz()
+    return dz_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -822,6 +840,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "port_map: 端口映射模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "dmz_host: DMZ主机模块测试"
     )
 
     # 记录开始时间

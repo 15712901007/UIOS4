@@ -94,6 +94,9 @@ test_data:
     port_map:
       export_filename: "port_map_config.csv"
       import_filename: "port_map_import.csv"
+    dmz_host:
+      export_filename: "dmz_host_config.csv"
+      import_filename: "dmz_host_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"
