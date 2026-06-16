@@ -654,10 +654,10 @@ class TestStaticRouteComprehensive:
             rec.add_detail("  ✓ 帮助按钮存在")
 
         # ========== 最终: SSH验证汇总 ==========
+        all_failures = ssh_failures + ui_failures
         if ssh_failures:
             failure_summary = "\n".join(ssh_failures)
             print(f"\n[SSH验证失败汇总]\n{failure_summary}")
-            all_failures = ssh_failures + ui_failures
         assert not all_failures, f"验证失败 ({len(ssh_failures)} 项):\n{failure_summary}"
 
         print(f"\n{'='*60}")

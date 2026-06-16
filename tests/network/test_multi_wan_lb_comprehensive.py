@@ -788,9 +788,9 @@ class TestMultiWanLbComprehensive:
             )
 
         # SSH断言
+        all_failures = ssh_failures + ui_failures
         if ssh_failures:
             print(f"\n[断言] 共 {len(ssh_failures)} 项失败:")
             for f in ssh_failures:
                 print(f"  - {f}")
-            all_failures = ssh_failures + ui_failures
         assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"

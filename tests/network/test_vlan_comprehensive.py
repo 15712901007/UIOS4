@@ -1011,11 +1011,11 @@ class TestVlanComprehensive:
         print("  - 帮助功能: 右下角帮助图标/面板显示/链接跳转")
 
         # SSH后台验证最终断言
+        all_failures = ssh_failures + ui_failures
         if ssh_failures:
             print(f"\n[断言] 共 {len(ssh_failures)} 项后台验证失败:")
             for f in ssh_failures:
                 print(f"  - {f}")
-            all_failures = ssh_failures + ui_failures
         assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
 
 
