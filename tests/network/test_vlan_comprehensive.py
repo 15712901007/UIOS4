@@ -61,7 +61,8 @@ class TestVlanComprehensive:
         except Exception:
             backend_verifier = None
 
-        ssh_failures = []  # 收集must_pass=True但验证失败的项
+        ssh_failures = []
+        ui_failures = []  # 收集must_pass=True但验证失败的项
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             """执行SSH后台验证并记录结果"""
@@ -1011,10 +1012,11 @@ class TestVlanComprehensive:
 
         # SSH后台验证最终断言
         if ssh_failures:
-            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项后台验证失败:")
+            print(f"\n[断言] 共 {len(ssh_failures)} 项后台验证失败:")
             for f in ssh_failures:
                 print(f"  - {f}")
-            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+            all_failures = ssh_failures + ui_failures
+        assert not all_failures, f"验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
 
 
 @pytest.mark.vlan

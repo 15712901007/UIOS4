@@ -47,6 +47,7 @@ class TestUpnpSettingComprehensive:
             backend_verifier = None
 
         ssh_failures = []
+        ui_failures = []
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             if backend_verifier is None:
@@ -397,6 +398,7 @@ class TestUpnpSettingComprehensive:
             except Exception as e:
                 print(f"  [WARN] 导出异常: {e}")
                 rec.add_detail(f"  异常: {str(e)}")
+                ui_failures.append("导出失败")
 
             page.close_modal_if_exists()
             page.page.reload()
@@ -682,6 +684,7 @@ class TestUpnpSettingComprehensive:
                 else:
                     print(f"  [WARN] 设置保存失败")
                     rec.add_detail(f"  [WARN] 设置保存失败")
+                    ui_failures.append("齿轮设置保存失败")
             else:
                 print(f"  [WARN] 设置抽屉打开失败")
                 rec.add_detail(f"  [WARN] 设置抽屉打开失败")
@@ -723,6 +726,7 @@ class TestUpnpSettingComprehensive:
                 else:
                     print(f"  [WARN] 设置保存失败")
                     rec.add_detail(f"  [WARN] 设置保存失败")
+                    ui_failures.append("齿轮设置保存失败")
             else:
                 print(f"  [WARN] 设置抽屉打开失败")
 
@@ -805,6 +809,7 @@ class TestUpnpSettingComprehensive:
                 else:
                     print(f"  [WARN] 设置恢复失败")
                     rec.add_detail(f"  [WARN] 设置恢复失败")
+                    ui_failures.append("齿轮设置恢复失败")
             else:
                 print(f"  [WARN] 设置抽屉打开失败")
 
@@ -896,7 +901,8 @@ class TestUpnpSettingComprehensive:
 
         # SSH断言
         if ssh_failures:
-            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项失败:")
+            print(f"\n[断言] 共 {len(ssh_failures)} 项失败:")
             for f in ssh_failures:
                 print(f"  - {f}")
-            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+            all_failures = ssh_failures + ui_failures
+        assert not all_failures, f"验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"

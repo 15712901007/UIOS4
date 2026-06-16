@@ -48,6 +48,7 @@ class TestNatRuleComprehensive:
             backend_verifier = None
 
         ssh_failures = []
+        ui_failures = []
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             if backend_verifier is None:
@@ -285,6 +286,7 @@ class TestNatRuleComprehensive:
             else:
                 print(f"  [WARN] 编辑失败")
                 rec.add_detail(f"  [WARN] 编辑失败")
+                ui_failures.append("编辑规则失败")
 
         # ========== 步骤13: 停用规则 ==========
         with rec.step("步骤13: 停用规则", "停用nat过滤地址 + SSH验证"):
@@ -450,6 +452,7 @@ class TestNatRuleComprehensive:
                 else:
                     print(f"  [WARN] CSV导出失败")
                     rec.add_detail(f"  [WARN] CSV导出失败")
+                    ui_failures.append("CSV导出失败")
             except Exception as e:
                 print(f"  [WARN] CSV导出异常: {e}")
                 rec.add_detail(f"  [WARN] CSV导出异常: {e}")
@@ -465,6 +468,7 @@ class TestNatRuleComprehensive:
                 else:
                     print(f"  [WARN] TXT导出失败")
                     rec.add_detail(f"  [WARN] TXT导出失败")
+                    ui_failures.append("TXT导出失败")
             except Exception as e:
                 print(f"  [WARN] TXT导出异常: {e}")
                 rec.add_detail(f"  [WARN] TXT导出异常: {e}")
@@ -747,6 +751,7 @@ class TestNatRuleComprehensive:
                 else:
                     print(f"  [WARN] 设置保存失败")
                     rec.add_detail(f"  [WARN] 设置保存失败")
+                    ui_failures.append("齿轮设置保存失败(开启)")
             else:
                 print(f"  [WARN] 设置抽屉打开失败")
                 rec.add_detail(f"  [WARN] 设置抽屉打开失败")
@@ -777,6 +782,7 @@ class TestNatRuleComprehensive:
                 else:
                     print(f"  [WARN] 设置恢复失败")
                     rec.add_detail(f"  [WARN] 设置恢复失败")
+                    ui_failures.append("齿轮设置恢复失败(关闭)")
             else:
                 print(f"  [WARN] 设置抽屉打开失败")
 
@@ -895,9 +901,10 @@ class TestNatRuleComprehensive:
         print("  - 齿轮设置: 开启/关闭本地转发自动NAT(相同LAN)")
         print("  - SSH后台验证: L1数据库+L2 iptables+L3运行时+L4内核")
 
-        # SSH断言
-        if ssh_failures:
-            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项失败:")
-            for f in ssh_failures:
+        # 断言(SSH后台验证 + UI操作验证)
+        all_failures = ssh_failures + ui_failures
+        if all_failures:
+            print(f"\n[断言] 共 {len(all_failures)} 项失败:")
+            for f in all_failures:
                 print(f"  - {f}")
-            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+            assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"

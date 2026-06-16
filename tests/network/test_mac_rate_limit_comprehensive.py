@@ -51,7 +51,8 @@ class TestMacRateLimitComprehensive:
             backend_verifier = None
 
         # SSH后台验证辅助函数 + 软断言收集器
-        ssh_failures = []  # 收集must_pass=True但验证失败的项，测试末尾统一断言
+        ssh_failures = []
+        ui_failures = []  # 收集must_pass=True但验证失败的项，测试末尾统一断言
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             """执行SSH后台验证并记录结果。must_pass=True时失败会记录到ssh_failures"""
@@ -794,6 +795,7 @@ class TestMacRateLimitComprehensive:
             else:
                 print(f"  [WARN] 搜索未找到规则")
                 rec.add_detail(f"    - 搜索未找到")
+                ui_failures.append("搜索验证失败")
 
             # 搜索不存在的规则
             rec.add_detail(f"  测试2: 搜索不存在的规则")
@@ -1342,7 +1344,8 @@ class TestMacRateLimitComprehensive:
 
         # ========== SSH后台验证汇总断言 ==========
         if ssh_failures:
-            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项后台验证失败:")
+            print(f"\n[断言] 共 {len(ssh_failures)} 项后台验证失败:")
             for f in ssh_failures:
                 print(f"  - {f}")
-            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+            all_failures = ssh_failures + ui_failures
+        assert not all_failures, f"验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"

@@ -53,6 +53,7 @@ class TestStaticRouteComprehensive:
 
         # SSH后台验证辅助函数 + 软断言收集器
         ssh_failures = []
+        ui_failures = []
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             """执行SSH后台验证并记录结果"""
@@ -411,6 +412,7 @@ class TestStaticRouteComprehensive:
             else:
                 print(f"  [WARN] CSV导出失败")
                 rec.add_detail("  ✗ CSV导出失败")
+                ui_failures.append("CSV导出失败")
 
             page.page.wait_for_timeout(500)
 
@@ -422,6 +424,7 @@ class TestStaticRouteComprehensive:
             else:
                 print(f"  [WARN] TXT导出失败")
                 rec.add_detail("  ✗ TXT导出失败")
+                ui_failures.append("TXT导出失败")
 
             assert csv_success or txt_success, "CSV和TXT导出均失败"
 
@@ -654,7 +657,8 @@ class TestStaticRouteComprehensive:
         if ssh_failures:
             failure_summary = "\n".join(ssh_failures)
             print(f"\n[SSH验证失败汇总]\n{failure_summary}")
-            assert not ssh_failures, f"SSH后台验证失败 ({len(ssh_failures)} 项):\n{failure_summary}"
+            all_failures = ssh_failures + ui_failures
+        assert not all_failures, f"验证失败 ({len(ssh_failures)} 项):\n{failure_summary}"
 
         print(f"\n{'='*60}")
         print(f"静态路由综合测试全部完成！共 19 个步骤")

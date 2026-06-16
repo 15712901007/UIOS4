@@ -55,6 +55,7 @@ class TestCrossLayerServiceComprehensive:
 
         # SSH后台验证辅助函数 + 软断言收集器
         ssh_failures = []
+        ui_failures = []
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             if backend_verifier is None:
@@ -277,6 +278,7 @@ class TestCrossLayerServiceComprehensive:
             else:
                 print(f"  [WARN] 规则编辑失败")
                 rec.add_detail(f"  编辑失败")
+                ui_failures.append("编辑规则失败")
 
             page.page.reload()
             page.page.wait_for_timeout(500)
@@ -308,6 +310,7 @@ class TestCrossLayerServiceComprehensive:
             else:
                 print(f"  [WARN] 停用失败")
                 rec.add_detail(f"  停用失败")
+                ui_failures.append("停用失败")
 
             page.page.reload()
             page.page.wait_for_timeout(500)
@@ -338,6 +341,7 @@ class TestCrossLayerServiceComprehensive:
             else:
                 print(f"  [WARN] 启用失败")
                 rec.add_detail(f"  启用失败")
+                ui_failures.append("启用失败")
 
             page.page.reload()
             page.page.wait_for_timeout(500)
@@ -407,6 +411,7 @@ class TestCrossLayerServiceComprehensive:
             else:
                 print(f"  [WARN] 搜索未找到规则")
                 rec.add_detail(f"    搜索未找到")
+                ui_failures.append("搜索验证失败")
 
             # 搜索不存在的规则
             rec.add_detail(f"  测试2: 搜索不存在的规则")
@@ -910,11 +915,12 @@ class TestCrossLayerServiceComprehensive:
 
         # ========== SSH后台验证汇总断言 ==========
         if ssh_failures:
-            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项后台验证失败:")
+            print(f"\n[断言] 共 {len(ssh_failures)} 项后台验证失败:")
             for f in ssh_failures:
                 print(f"  - {f}")
                 rec.add_detail(f"  SSH失败: {f}")
-            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+            all_failures = ssh_failures + ui_failures
+        assert not all_failures, f"验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
 
         # ========== 测试总结 ==========
         print("\n" + "=" * 60)

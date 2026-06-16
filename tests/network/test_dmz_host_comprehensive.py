@@ -56,6 +56,7 @@ class TestDmzHostComprehensive:
             backend_verifier = None
 
         ssh_failures = []
+        ui_failures = []
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             if backend_verifier is None:
@@ -243,6 +244,7 @@ class TestDmzHostComprehensive:
             else:
                 print(f"  [WARN] 编辑失败")
                 rec.add_detail(f"  [WARN] 编辑失败")
+                ui_failures.append("编辑规则失败")
 
         # ========== 步骤10: 停用规则 ==========
         with rec.step("步骤10: 停用规则", "停用dmz排除tcp + SSH验证"):
@@ -424,8 +426,9 @@ class TestDmzHostComprehensive:
                         print(f"  [OK] {fmt.upper()}导出成功: ({size} bytes)")
                         rec.add_detail(f"  [OK] {fmt.upper()}导出: ({size}B)")
                     else:
-                        print(f"  [WARN] {fmt.upper()}导出失败")
-                        rec.add_detail(f"  [WARN] {fmt.upper()}导出失败")
+                    print(f"  [WARN] {fmt.upper()}导出失败")
+                    rec.add_detail(f"  [WARN] {fmt.upper()}导出失败")
+                    ui_failures.append(f"{fmt.upper()}导出失败")
                 except Exception as e:
                     print(f"  [WARN] {fmt.upper()}导出异常: {e}")
                     rec.add_detail(f"  [WARN] {fmt.upper()}导出异常: {e}")
@@ -854,9 +857,10 @@ class TestDmzHostComprehensive:
         print("  - 重启恢复验证: 检测netmap.sh init的select*bug")
         print("  - SSH后台验证: L1数据库+L2 iptables(NETMAP+PREROUTING引用)+L3+L4")
 
-        # SSH断言
-        if ssh_failures:
-            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项失败:")
-            for f in ssh_failures:
+        # 断言(SSH后台验证 + UI操作验证)
+        all_failures = ssh_failures + ui_failures
+        if all_failures:
+            print(f"\n[断言] 共 {len(all_failures)} 项失败:")
+            for f in all_failures:
                 print(f"  - {f}")
-            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+            assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"

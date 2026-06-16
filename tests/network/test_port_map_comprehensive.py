@@ -53,6 +53,7 @@ class TestPortMapComprehensive:
             backend_verifier = None
 
         ssh_failures = []
+        ui_failures = []
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             if backend_verifier is None:
@@ -264,6 +265,7 @@ class TestPortMapComprehensive:
             else:
                 print(f"  [WARN] 编辑失败")
                 rec.add_detail(f"  [WARN] 编辑失败")
+                ui_failures.append("编辑规则失败")
 
         # ========== 步骤13: 停用规则 ==========
         with rec.step("步骤13: 停用规则", "停用pm_udp单端口 + SSH验证"):
@@ -474,6 +476,7 @@ class TestPortMapComprehensive:
             else:
                 print(f"  [WARN] 复制失败")
                 rec.add_detail(f"  [WARN] 复制失败")
+                ui_failures.append("复制规则失败")
 
         # ========== 步骤19: 导出测试 ==========
         export_file_csv = os.path.join(
@@ -500,6 +503,7 @@ class TestPortMapComprehensive:
                 else:
                     print(f"  [WARN] CSV导出失败")
                     rec.add_detail(f"  [WARN] CSV导出失败")
+                    ui_failures.append("CSV导出失败")
             except Exception as e:
                 print(f"  [WARN] CSV导出异常: {e}")
                 rec.add_detail(f"  [WARN] CSV导出异常: {e}")
@@ -515,6 +519,7 @@ class TestPortMapComprehensive:
                 else:
                     print(f"  [WARN] TXT导出失败")
                     rec.add_detail(f"  [WARN] TXT导出失败")
+                    ui_failures.append("TXT导出失败")
             except Exception as e:
                 print(f"  [WARN] TXT导出异常: {e}")
                 rec.add_detail(f"  [WARN] TXT导出异常: {e}")
@@ -930,9 +935,10 @@ class TestPortMapComprehensive:
         print("  - 批量操作: 批量停用/启用/删除")
         print("  - SSH后台验证: L1数据库+L2 iptables(DSTNAT)+L3运行时+L4内核")
 
-        # SSH断言
-        if ssh_failures:
-            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项失败:")
-            for f in ssh_failures:
+        # 断言(SSH后台验证 + UI操作验证)
+        all_failures = ssh_failures + ui_failures
+        if all_failures:
+            print(f"\n[断言] 共 {len(all_failures)} 项失败:")
+            for f in all_failures:
                 print(f"  - {f}")
-            assert not ssh_failures, f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+            assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"

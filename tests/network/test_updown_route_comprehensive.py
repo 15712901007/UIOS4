@@ -92,6 +92,7 @@ class TestUpdownRouteComprehensive:
             backend_verifier = None
 
         ssh_failures = []
+        ui_failures = []
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             if backend_verifier is None:
@@ -351,6 +352,7 @@ class TestUpdownRouteComprehensive:
             except Exception as e:
                 print(f"  [WARN] 导出异常: {e}")
                 rec.add_detail(f"  异常: {str(e)}")
+                ui_failures.append("导出失败")
 
             page.close_modal_if_exists()
             page.page.reload()
@@ -635,7 +637,7 @@ class TestUpdownRouteComprehensive:
 
         # 断言所有SSH验证通过
         if ssh_failures:
-            pytest.fail(f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures[:5])}")
+            pytest.fail(f"验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures[:5])}")
 
         print("\n" + "=" * 60)
         print("上下行分离综合测试完成 - ALL PASSED")

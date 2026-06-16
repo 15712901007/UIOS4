@@ -45,6 +45,7 @@ class TestIgmpProxyComprehensive:
             backend_verifier = None
 
         ssh_failures = []
+        ui_failures = []
 
         def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
             if backend_verifier is None:
@@ -514,8 +515,9 @@ class TestIgmpProxyComprehensive:
         print("  - SSH后台验证: L1数据库+L2进程+L3配置文件+L4内核")
 
         if ssh_failures:
-            print(f"\n[SSH断言] 共 {len(ssh_failures)} 项失败:")
+            print(f"\n[断言] 共 {len(ssh_failures)} 项失败:")
             for f in ssh_failures:
                 print(f"  - {f}")
-            assert not ssh_failures, \
-                f"SSH后台验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+            all_failures = ssh_failures + ui_failures
+        assert not all_failures, \
+                f"验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
