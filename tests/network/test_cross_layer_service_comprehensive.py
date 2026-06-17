@@ -914,12 +914,12 @@ class TestCrossLayerServiceComprehensive:
                 rec.add_detail(f"  IP分组清理跳过: {str(e)[:60]}")
 
         # ========== SSH后台验证汇总断言 ==========
-        if ssh_failures:
-            print(f"\n[断言] 共 {len(ssh_failures)} 项后台验证失败:")
-            for f in ssh_failures:
+        all_failures = ssh_failures + ui_failures
+        if all_failures:
+            print(f"\n[断言] 共 {len(all_failures)} 项失败:")
+            for f in all_failures:
                 print(f"  - {f}")
-                rec.add_detail(f"  SSH失败: {f}")
-            all_failures = ssh_failures + ui_failures
+                rec.add_detail(f"  失败: {f}")
         assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
 
         # ========== 测试总结 ==========
