@@ -246,10 +246,18 @@ class IkuaiTablePage(BasePage):
     def select_all_rules(self):
         """全选规则"""
         try:
+            # 策略1: get_by_role Select all
             select_all = self.page.get_by_role("checkbox", name="Select all")
             if select_all.count() > 0:
                 if not select_all.is_checked():
                     select_all.click()
+                    self.page.wait_for_timeout(300)
+                return True
+            # 策略2: 表头checkbox(某些页面Select all不生效)
+            select_all2 = self.page.locator("thead input[type='checkbox']").first
+            if select_all2.count() > 0 and select_all2.is_enabled():
+                if not select_all2.is_checked():
+                    select_all2.click()
                     self.page.wait_for_timeout(300)
                 return True
         except Exception as e:
@@ -332,13 +340,23 @@ class IkuaiTablePage(BasePage):
         self.page.wait_for_timeout(500)
 
         try:
+            # 策略1: modal确认弹窗
             modal_confirm = self.page.locator(
                 ".ant-modal-confirm .ant-btn-primary, .ant-modal-wrap .ant-btn-primary"
             )
             if modal_confirm.count() > 0:
                 modal_confirm.first.click()
             else:
-                self.page.get_by_role("button", name="确定").click()
+                # 策略2: popover确认弹窗(爱快部分模块用popover)
+                popover_confirm = self.page.locator(
+                    ".ant-popover button:has-text('确定'), "
+                    ".ant-popover .ant-btn-primary"
+                )
+                if popover_confirm.count() > 0:
+                    popover_confirm.first.click()
+                else:
+                    # 策略3: 通用确定按钮
+                    self.page.get_by_role("button", name="确定").click()
         except Exception as e:
             print(f"[DEBUG] batch_delete 确认弹窗点击失败: {e}")
         return self
