@@ -120,15 +120,12 @@ class TestCrossLayerServiceComprehensive:
             current_count = page.get_rule_count()
             if current_count > 0:
                 print(f"  当前规则数量: {current_count}")
-                print(f"  检测到残留数据，执行清理(逐行删除)...")
+                print(f"  检测到残留数据，执行清理...")
                 rec.add_detail(f"  当前规则数量: {current_count}")
-                all_names = page.get_rule_list()
-                for name in all_names[:]:
-                    try:
-                        page.delete_rule(name)
-                        page.page.wait_for_timeout(800)
-                    except Exception:
-                        pass
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_delete()
+                page.page.wait_for_timeout(2000)
                 page.page.reload()
                 page.page.wait_for_timeout(500)
                 remaining = page.get_rule_count()
@@ -648,52 +645,44 @@ class TestCrossLayerServiceComprehensive:
             print(f"  [OK] 批量启用完成，当前共 {current_count} 条规则")
             rec.add_detail(f"  批量启用完成: {current_count} 条规则")
 
-        # ========== 步骤16: 批量删除(跨三层用虚拟滚动表格,get_rule_list可能返回空) ==========
-        with rec.step("步骤16: 批量删除所有规则", "测试删除功能(跨三层逐行删除)"):
-            print(f"\n[步骤16] 删除所有规则...")
-            rec.add_detail(f"【删除操作】")
-            rec.add_detail(f"  注: 跨三层服务页面无工具栏批量删除按钮+虚拟滚动表格,使用逐行删除")
+        # ========== 步骤16: 批量删除(用batch_delete, _click_batch_button已修复等待底部操作栏) ==========
+        with rec.step("步骤16: 批量删除所有规则", "测试批量删除功能"):
+            print(f"\n[步骤16] 批量删除所有规则...")
+            rec.add_detail(f"【批量删除操作】")
 
             page.page.reload()
             page.page.wait_for_timeout(500)
 
-            # 跨三层用虚拟滚动表格, get_rule_list可能只返回可见行
-            # 先尝试页面读取,如果为空则用SSH获取完整列表
-            all_rule_names = page.get_rule_list()
-            if len(all_rule_names) == 0 and backend_verifier is not None:
-                # 页面读不到(虚拟滚动), 用SSH获取规则名
-                ssh_rules = backend_verifier.query_netsnmpc_rules()
-                all_rule_names = [r.get("tagname", r.get("name", "")) for r in (ssh_rules or []) if r.get("tagname")]
-                rec.add_detail(f"  页面读取为空, SSH获取到{len(all_rule_names)}条规则")
+            delete_success = False
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)  # 等底部操作栏出现
+                page.batch_delete()
+                page.page.wait_for_timeout(2000)
 
-            rec.add_detail(f"  待删除规则: {all_rule_names}")
+                page.page.reload()
+                page.page.wait_for_timeout(500)
 
-            deleted_count = 0
-            for rule_name in all_rule_names[:]:
-                try:
-                    page.delete_rule(rule_name)
-                    page.page.wait_for_timeout(1000)
-                    deleted_count += 1
-                except Exception as e:
-                    print(f"  [WARN] 删除 {rule_name} 失败: {e}")
-                    rec.add_detail(f"  删除 {rule_name} 失败: {str(e)[:50]}")
+                # 用SSH验证(虚拟滚动表格页面get_rule_count可能不准)
+                if backend_verifier is not None:
+                    remaining_rules = backend_verifier.query_netsnmpc_rules()
+                    current_count = len(remaining_rules or [])
+                else:
+                    current_count = page.get_rule_count()
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
+                if current_count == 0:
+                    delete_success = True
+                    break
+                else:
+                    print(f"  第{attempt + 1}次批量删除后剩余 {current_count} 条，重试...")
+                    rec.add_detail(f"  第{attempt + 1}次删除后剩余{current_count}条，重试")
 
-            # 用SSH验证删除结果(页面get_rule_count在虚拟滚动下不可靠)
-            if backend_verifier is not None:
-                remaining_rules = backend_verifier.query_netsnmpc_rules()
-                current_count = len(remaining_rules or [])
+            if delete_success:
+                print(f"  [OK] 批量删除完成，所有规则已清除")
+                rec.add_detail(f"  批量删除成功: 所有规则已清除")
             else:
-                current_count = page.get_rule_count()
-
-            if current_count == 0:
-                print(f"  [OK] 删除完成, 已删除{deleted_count}条, 剩余0条")
-                rec.add_detail(f"  删除成功: 已删除{deleted_count}条")
-            else:
-                print(f"  [WARN] 删除后仍剩余 {current_count} 条规则")
-                rec.add_detail(f"  删除未完全清除: 剩余{current_count}条规则")
+                print(f"  [WARN] 批量删除后仍剩余 {current_count} 条规则")
+                rec.add_detail(f"  批量删除未完全清除: 剩余{current_count}条规则")
                 ui_failures.append(f"删除后仍剩余{current_count}条规则")
 
             # SSH验证删除结果
@@ -769,13 +758,10 @@ class TestCrossLayerServiceComprehensive:
 
             current_count = page.get_rule_count()
             if current_count > 0:
-                all_names = page.get_rule_list()
-                for name in all_names[:]:
-                    try:
-                        page.delete_rule(name)
-                        page.page.wait_for_timeout(800)
-                    except Exception:
-                        pass
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_delete()
+                page.page.wait_for_timeout(2000)
                 page.page.reload()
                 page.page.wait_for_timeout(500)
                 remaining = page.get_rule_count()
@@ -885,14 +871,10 @@ class TestCrossLayerServiceComprehensive:
 
             current_count = page.get_rule_count()
             if current_count > 0:
-                # 跨三层无批量删除按钮,用逐行删除
-                all_names = page.get_rule_list()
-                for name in all_names[:]:
-                    try:
-                        page.delete_rule(name)
-                        page.page.wait_for_timeout(800)
-                    except Exception:
-                        pass
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_delete()
+                page.page.wait_for_timeout(2000)
                 page.page.reload()
                 page.page.wait_for_timeout(500)
                 remaining = page.get_rule_count()

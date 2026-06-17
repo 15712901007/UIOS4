@@ -273,6 +273,12 @@ class IkuaiTablePage(BasePage):
         Args:
             button_name: 按钮名称（启用/停用/删除）
         """
+        # 等待选中行后底部批量操作栏出现(含"已选X条"文字)
+        self.page.wait_for_timeout(500)
+        try:
+            self.page.locator('text=/已选.*条/').wait_for(state='visible', timeout=3000)
+        except Exception:
+            pass  # 有些模块可能没有"已选"提示,继续尝试
         self.page.wait_for_timeout(300)
 
         icon_map = {
