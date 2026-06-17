@@ -289,21 +289,22 @@ class IkuaiTablePage(BasePage):
             for i in range(btn.count()):
                 b = btn.nth(i)
                 # 排除表格行内的按钮(行内也有同名按钮+图标)
-                parent_row = b.locator("xpath=ancestor::tr[1]")
-                if parent_row.count() == 0 and b.is_visible():
+                # 检查是否在tr或.ant-table-row内
+                in_row = b.evaluate("el => { let p = el; for(let i=0;i<6;i++){ p=p.parentElement; if(!p) break; if(p.tagName==='TR' || p.classList.contains('ant-table-row')) return true; } return false; }")
+                if not in_row and b.is_visible():
                     b.click()
                     self.page.wait_for_timeout(300)
                     return
         except Exception:
             pass
 
-        # 方法2: 找所有同名按钮，点击不在表格行中的那个
+        # 方法2: 找所有同名按钮，点击不在表格行中的那个(工具栏按钮)
         try:
             all_buttons = self.page.get_by_role("button", name=button_name)
             for i in range(all_buttons.count()):
                 btn = all_buttons.nth(i)
-                parent_row = btn.locator("xpath=ancestor::tr[1]")
-                if parent_row.count() == 0:
+                in_row = btn.evaluate("el => { let p = el; for(let i=0;i<6;i++){ p=p.parentElement; if(!p) break; if(p.tagName==='TR' || p.classList.contains('ant-table-row')) return true; } return false; }")
+                if not in_row and btn.is_visible():
                     btn.click()
                     self.page.wait_for_timeout(300)
                     return

@@ -469,17 +469,13 @@ class CrossLayerServicePage(IkuaiTablePage):
                     freq_input.fill(str(seconds))
 
                 # 点击保存
-                # 点击保存(多种选择器兼容)
-                save_btn = self.page.locator(
-                    '.ant-drawer button:has-text("保存"), '
-                    '.ant-drawer button:has-text("确定"), '
-                    'button:has-text("保存"), '
-                    'button:has-text("确定")'
-                )
+                # 点击保存(限定在抽屉内, 避免匹配到页面底部的其他保存按钮)
+                drawer = self.page.locator('.ant-drawer-content')
+                save_btn = drawer.locator('button:has-text("保存"), button:has-text("确定")')
                 if save_btn.count() > 0:
                     save_btn.first.click()
                     self.page.wait_for_timeout(1500)  # 等保存生效
-                else:
+                elif freq_input:
                     # 回退: 直接Enter提交
                     freq_input.press('Enter')
                     self.page.wait_for_timeout(1000)
