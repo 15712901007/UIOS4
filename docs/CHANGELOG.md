@@ -11,6 +11,12 @@
   自动重置标记+断开重连+重新执行命令
 - cron修复任务不持久(设备重启时固件覆盖crontab), 不能依赖cron
 
+### IP限速批量删除修复
+- **现象**: 步骤17批量删除后Web页面显示0条, 但SSH验证数据库仍有8条
+- **根因**: select_all_rules的`get_by_role("checkbox", name="Select all")`在某些页面不生效;
+  batch_delete的确认弹窗选择器只匹配`.ant-modal`, 漏了popover弹窗
+- **修复**: select_all_rules增加表头checkbox回退; batch_delete增加popover确认选择器
+
 ### 全量测试14个失败的分析和修复
 - **all_failures未定义(11个假失败)**: 批量脚本把赋值放进if块内, 已移到外面
 - **all_failures错误信息(12文件)**: 错误信息里仍是ssh_failures, 已同步
