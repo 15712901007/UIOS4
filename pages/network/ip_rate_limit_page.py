@@ -193,6 +193,15 @@ class IpRateLimitPage(IkuaiTablePage):
             if select_confirm_btn.count() > 0:
                 select_confirm_btn.click()
                 self.page.wait_for_timeout(300)
+
+            # 关闭可能残留的下拉框/textarea展开(避免遮挡保存按钮导致点击超时)
+            self.page.keyboard.press("Escape")
+            self.page.wait_for_timeout(300)
+            # 点击名称输入框让textarea失焦收起
+            name_input = self.page.locator('#tagname')
+            if name_input.count() > 0:
+                name_input.first.click()
+                self.page.wait_for_timeout(200)
         except Exception as e:
             print(f"[DEBUG] create_ip_group_in_dialog error: {e}")
         return self
