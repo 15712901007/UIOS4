@@ -648,19 +648,24 @@ class TestCrossLayerServiceComprehensive:
             print(f"  [OK] 批量启用完成，当前共 {current_count} 条规则")
             rec.add_detail(f"  批量启用完成: {current_count} 条规则")
 
-        # ========== 步骤16: 批量删除(跨三层无工具栏批量按钮,用逐行删除) ==========
-        with rec.step("步骤16: 批量删除所有规则", "测试删除功能(跨三层用逐行删除)"):
+        # ========== 步骤16: 批量删除(跨三层用虚拟滚动表格,get_rule_list可能返回空) ==========
+        with rec.step("步骤16: 批量删除所有规则", "测试删除功能(跨三层逐行删除)"):
             print(f"\n[步骤16] 删除所有规则...")
             rec.add_detail(f"【删除操作】")
-            rec.add_detail(f"  目标数量: {len(test_rules)} 条规则")
-            rec.add_detail(f"  注: 跨三层服务页面无工具栏批量删除按钮,使用逐行删除")
+            rec.add_detail(f"  注: 跨三层服务页面无工具栏批量删除按钮+虚拟滚动表格,使用逐行删除")
 
             page.page.reload()
             page.page.wait_for_timeout(500)
 
-            # 跨三层服务用虚拟滚动表格,没有工具栏批量删除按钮
-            # 逐行删除: 获取所有规则名,逐个用delete_rule(行内删除+确认)
+            # 跨三层用虚拟滚动表格, get_rule_list可能只返回可见行
+            # 先尝试页面读取,如果为空则用SSH获取完整列表
             all_rule_names = page.get_rule_list()
+            if len(all_rule_names) == 0 and backend_verifier is not None:
+                # 页面读不到(虚拟滚动), 用SSH获取规则名
+                ssh_rules = backend_verifier.query_netsnmpc_rules()
+                all_rule_names = [r.get("tagname", r.get("name", "")) for r in (ssh_rules or []) if r.get("tagname")]
+                rec.add_detail(f"  页面读取为空, SSH获取到{len(all_rule_names)}条规则")
+
             rec.add_detail(f"  待删除规则: {all_rule_names}")
 
             deleted_count = 0
@@ -675,7 +680,13 @@ class TestCrossLayerServiceComprehensive:
 
             page.page.reload()
             page.page.wait_for_timeout(500)
-            current_count = page.get_rule_count()
+
+            # 用SSH验证删除结果(页面get_rule_count在虚拟滚动下不可靠)
+            if backend_verifier is not None:
+                remaining_rules = backend_verifier.query_netsnmpc_rules()
+                current_count = len(remaining_rules or [])
+            else:
+                current_count = page.get_rule_count()
 
             if current_count == 0:
                 print(f"  [OK] 删除完成, 已删除{deleted_count}条, 剩余0条")
