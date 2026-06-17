@@ -685,6 +685,7 @@ class TestCrossLayerServiceComprehensive:
                 if test_rule_names:
                     rec.add_detail(f"    SSH: 测试规则未完全删除: {test_rule_names}")
                     print(f"    SSH WARNING: 测试规则未完全删除: {test_rule_names}")
+                    ui_failures.append(f"批量删除SSH验证失败: {len(test_rule_names)}条规则未删除")
                 else:
                     rec.add_detail(f"    SSH: 数据库中测试规则已全部删除（总规则数: {len(all_rules or [])}）")
                     print(f"    SSH: 数据库中测试规则已全部删除（总规则数: {len(all_rules or [])}）")
