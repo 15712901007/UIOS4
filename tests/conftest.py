@@ -745,9 +745,25 @@ def pytest_runtest_makereport(item, call):
 
     # 只在测试调用阶段（非setup/teardown）且失败时处理
     if call.when == "call" and report.failed:
-        # 获取page fixture
-        if "page" in item.funcargs:
-            page = item.funcargs["page"]
+        # 获取page fixture(优先用实际测试的page,而不是底层空白page)
+        # 测试用例通常用 xxx_page_logged_in fixture,它内部的page才是有内容的
+        screenshot_page = None
+        # 策略1: 找funcargs里所有含page属性的对象(各种Page对象)
+        for key, val in item.funcargs.items():
+            if hasattr(val, 'page') and val.page is not None:
+                try:
+                    # 确保page还没关闭
+                    if not val.page.is_closed():
+                        screenshot_page = val.page
+                        break
+                except Exception:
+                    pass
+        # 策略2: 回退到page fixture
+        if screenshot_page is None and "page" in item.funcargs:
+            screenshot_page = item.funcargs["page"]
+
+        if screenshot_page is not None:
+            page = screenshot_page
 
             # 创建截图目录
             config = get_config()
