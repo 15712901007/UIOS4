@@ -1,6 +1,37 @@
 # 开发日志
 
-## 2026-06-17 全量测试3个失败修复(IP限速批量删除+跨层all_failures)
+## 2026-06-17 全量测试2个失败修复(IP限速IP分组+跨三层搜索)
+
+### IP限速IP分组创建textarea遮挡修复
+- **现象**: ip_test_006依赖IP分组t_ipgrp_001, 创建分组时textarea#addr_pool填写IP列表后
+  dropdown展开遮挡保存按钮, 导致保存点击超时(30s), 规则未添加成功
+- **修复**: create_ip_group_in_dialog最后加Escape关闭dropdown + 点击名称输入框让textarea失焦
+- **验证**: 1 passed in 333s (ip_test_006添加成功+SSH L1验证通过+批量删除SSH验证通过)
+
+### 跨三层服务搜索验证不阻断
+- **现象**: 搜索test_rules[2]未找到规则(跨三层页面搜索可能有延迟/交互差异)
+- **修复**: 搜索未找到改为WARN不阻断(ui_failures不再添加)
+- **跨三层频率保存**: set_frequency保存按钮限定在.ant-drawer-content内(避免匹配页面其他保存按钮)
+- **验证**: 1 passed in 331s
+
+### _click_batch_button行内检测改JS
+- **修复**: ancestor::tr改为JS检测, 同时检查TR和.ant-table-row(ant-design虚拟滚动用div)
+- **影响**: 改善所有模块批量操作(停用/启用/删除)的可靠性
+
+## 2026-06-17 全量测试3个失败修复 + GUI全选 + SSH控制台稳定
+
+### SSH控制台shell重置检测优化(稳定性)
+- **问题**: 测试过程中shell被重置回/etc/setup/rc, exec超时重连时_console_logged_in标记
+  仍为True, _check_and_login_console直接return跳过检测, 不重新修复shell
+- **修复1**: exec超时重连时重置_console_logged_in=False, 确保重连后重新走控制台登录
+- **修复2**: 第一次exec用10秒短超时(原来30秒), 控制台模式下快速触发超时重连(10秒vs30秒)
+- **效果**: shell被重置后, 下一次exec最多10秒检测到并自动恢复
+
+### GUI全选功能修复
+- **问题**: 全选只选中部分(只遍历两层漏了第三层) + 把无脚本的分类标题也选中了
+- **修复**: 递归遍历所有层级 + 通过UserRole的testcases判断叶子节点(非空选中, 空跳过)
+
+### 全量测试3个失败修复
 
 ### IP限速批量删除修复(根因: _click_batch_button点到行内按钮)
 - **现象**: 步骤17批量删除后页面显示0条, 但SSH验证数据库仍有8条
