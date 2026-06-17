@@ -24,6 +24,21 @@
 - 步骤16删除结果用SSH验证(页面get_rule_count在虚拟滚动下不可靠)
 - 验证: 1 passed in 579s (步骤16已删除8条+剩余0条+SSH验证通过)
 
+## 2026-06-17 截图不匹配修复 + _click_batch_button底部操作栏
+
+### 截图不匹配修复(根因: 用了底层空白page)
+- **现象**: 失败截图拍到的是空白页而非错误现场
+- **根因**: 测试用xxx_page_logged_in fixture(内部.page有内容), 但conftest截图时用
+  item.funcargs['page'](pytest-playwright底层空白page)
+- **修复**: 截图时优先从funcargs找含.page属性的对象(各种Page对象), 用实际测试的page
+- **commit**: 3c1d50f
+
+### _click_batch_button等待底部操作栏(跨三层批量删除)
+- **根因**: 跨三层选中行后底部批量操作栏(div.footer含"已选X条")会出现,
+  但_click_batch_button没等待它出现就去查找,导致找不到
+- **修复**: 开头等待"已选X条"文字出现(最多3秒),确保底部操作栏已渲染
+- **验证**: 1 passed in 349s (批量删除成功+SSH验证通过)
+
 ## 2026-06-17 SSH验证失败被吞掉修复(跨三层批量删除)
 
 ### 问题: 测试失败被判通过(严重)
