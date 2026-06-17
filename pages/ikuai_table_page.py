@@ -282,14 +282,18 @@ class IkuaiTablePage(BasePage):
         }
         icon_name = icon_map.get(button_name, "")
 
-        # 方法1: 使用带图标的完整按钮名称定位
+        # 方法1: 使用带图标的完整按钮名称定位(排除表格行内的同名按钮)
         try:
             full_button_name = f"{icon_name} {button_name}" if icon_name else button_name
             btn = self.page.get_by_role("button", name=full_button_name)
-            if btn.count() > 0:
-                btn.first.click()
-                self.page.wait_for_timeout(300)
-                return
+            for i in range(btn.count()):
+                b = btn.nth(i)
+                # 排除表格行内的按钮(行内也有同名按钮+图标)
+                parent_row = b.locator("xpath=ancestor::tr[1]")
+                if parent_row.count() == 0 and b.is_visible():
+                    b.click()
+                    self.page.wait_for_timeout(300)
+                    return
         except Exception:
             pass
 
