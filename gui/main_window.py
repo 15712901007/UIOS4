@@ -930,14 +930,26 @@ class MainWindow(QMainWindow):
             self._on_auto_adapt_changed(Qt.Checked if auto_adapt else Qt.Unchecked)
 
     def _toggle_all_modules(self, state):
-        """全选/取消全选模块"""
+        """全选/取消全选模块(递归遍历所有层级, 只选中有testcases的叶子节点)"""
+        check_state = Qt.Checked if state else Qt.Unchecked
         self.module_tree.blockSignals(True)
-        for i in range(self.module_tree.topLevelItemCount()):
-            item = self.module_tree.topLevelItem(i)
-            item.setCheckState(0, Qt.Checked if state else Qt.Unchecked)
+
+        def set_check_recursive(item):
+            """递归设置checkState, 只对有testcases的叶子节点生效"""
+            # 检查这个节点是否有testcases(叶子节点)还是纯分类节点
+            has_testcases = item.data(0, Qt.UserRole)
+            if has_testcases:
+                item.setCheckState(0, check_state)
+            else:
+                # 分类节点不选中(不勾选checkbox)
+                item.setCheckState(0, Qt.Unchecked)
+            # 递归子节点
             for j in range(item.childCount()):
-                child = item.child(j)
-                child.setCheckState(0, Qt.Checked if state else Qt.Unchecked)
+                set_check_recursive(item.child(j))
+
+        for i in range(self.module_tree.topLevelItemCount()):
+            set_check_recursive(self.module_tree.topLevelItem(i))
+
         self.module_tree.blockSignals(False)
         self._update_testcase_list()
 
