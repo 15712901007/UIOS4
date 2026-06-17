@@ -384,7 +384,10 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
             try:
                 if self._client is None:
                     self.connect()
-                _, stdout, stderr = self._client.exec_command(command, timeout=timeout)
+                # 第一次尝试用短超时(10秒), 快速检测控制台模式; 第二次用正常超时
+                exec_timeout = 10 if attempt == 0 else timeout
+                _, stdout, stderr = self._client.exec_command(command, timeout=exec_timeout)
+                stdout.channel.settimeout(exec_timeout)  # 确保read也遵守超时
                 output = stdout.read().decode("utf-8", errors="replace")
                 err = stderr.read().decode("utf-8", errors="replace")
                 if err and "warning" not in err.lower():
@@ -407,6 +410,7 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
             except (paramiko.SSHException, OSError, TimeoutError) as e:
                 if attempt == 0:
                     logger.info(f"SSH exec failed ({e}), reconnecting...")
+                    self._console_logged_in = False  # 重置标记, 重连时重新检测控制台
                     self._client = None
                 else:
                     raise
