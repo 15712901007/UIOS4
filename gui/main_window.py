@@ -866,6 +866,16 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "多线路DNS服务": {
+                                "testcases": [
+                                    "test_dns_multi_line_comprehensive.py::TestDnsMultiLineComprehensive::test_dns_multi_line_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_dns_multi_line_comprehensive.py::TestDnsMultiLineComprehensive::test_dns_multi_line_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "智能流控": {

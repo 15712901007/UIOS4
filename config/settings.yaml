@@ -100,6 +100,9 @@ test_data:
     dns_accelerate:
       export_filename: "dns_accelerate_config.csv"
       import_filename: "dns_accelerate_import.csv"
+    dns_multi_line:
+      export_filename: "dns_multi_line_config.csv"
+      import_filename: "dns_multi_line_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"

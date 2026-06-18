@@ -576,12 +576,35 @@ class IkuaiTablePage(BasePage):
             self.page.wait_for_timeout(500)
 
             if clear_existing:
-                try:
-                    clear_checkbox = self.page.get_by_label("清空现有配置数据", exact=True)
-                    if clear_checkbox.count() > 0 and not clear_checkbox.is_checked():
-                        clear_checkbox.check()
-                except Exception as e:
-                    print(f"[WARN] Failed to check 'Clear existing config': {e}")
+                # 多文案匹配"清空"checkbox(各模块导入弹窗文案可能不同:
+                # "清空现有配置数据"/"清除全部数据"/"清除原有数据"等)
+                checked = False
+                for label in ["清空现有配置数据", "清除全部数据", "清除原有数据",
+                              "清空所有数据", "清空数据"]:
+                    try:
+                        clear_checkbox = self.page.get_by_label(label, exact=True)
+                        if clear_checkbox.count() > 0:
+                            if not clear_checkbox.is_checked():
+                                clear_checkbox.check()
+                            checked = True
+                            break
+                    except Exception:
+                        continue
+                if not checked:
+                    # 兜底: 弹窗内文字含"清空"/"清除"的checkbox
+                    try:
+                        wrappers = self.page.locator(
+                            "[role='dialog'] .ant-checkbox-wrapper, "
+                            "dialog .ant-checkbox-wrapper"
+                        )
+                        for i in range(min(wrappers.count(), 10)):
+                            txt = wrappers.nth(i).text_content() or ""
+                            if "清空" in txt or "清除" in txt:
+                                wrappers.nth(i).click()
+                                checked = True
+                                break
+                    except Exception as e:
+                        print(f"[WARN] Failed to check clear checkbox: {e}")
 
             with self.page.expect_file_chooser() as fc_info:
                 upload_btn = self.page.locator(

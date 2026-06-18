@@ -110,6 +110,7 @@ from pages.network.nat_rule_page import NatRulePage
 from pages.network.port_map_page import PortMapPage
 from pages.network.dmz_host_page import DmzHostPage
 from pages.network.dns_accelerate_page import DnsAcceleratePage
+from pages.network.dns_multi_line_page import DnsMultiLinePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -177,6 +178,7 @@ TEST_NAME_MAPPING = {
     'test_port_map_comprehensive': '端口映射综合测试',
     'test_dmz_host_comprehensive': 'DMZ主机综合测试',
     'test_dns_accelerate_comprehensive': 'DNS加速服务综合测试',
+    'test_dns_multi_line_comprehensive': '多线路DNS服务综合测试',
 }
 
 
@@ -613,6 +615,22 @@ def dns_accelerate_page_logged_in(logged_in_page: Page, config: Config) -> 'DnsA
     return dns_page
 
 
+# ==================== 多线路DNS服务 fixtures ====================
+
+@pytest.fixture(scope="function")
+def dns_multi_line_page(page: Page, config: Config) -> 'DnsMultiLinePage':
+    """创建多线路DNS服务页面实例"""
+    return DnsMultiLinePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def dns_multi_line_page_logged_in(logged_in_page: Page, config: Config) -> 'DnsMultiLinePage':
+    """已登录并导航到多线路DNS服务页面的实例"""
+    ml_page = DnsMultiLinePage(logged_in_page, config.get_base_url())
+    ml_page.navigate_to_dns_multi_line()
+    return ml_page
+
+
 # ==================== 端口映射 fixtures ====================
 
 @pytest.fixture(scope="function")
@@ -879,6 +897,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "dns_accelerate: DNS加速服务模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "dns_multi_line: 多线路DNS服务模块测试"
     )
 
     # 记录开始时间
