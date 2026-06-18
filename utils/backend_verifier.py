@@ -324,17 +324,19 @@ class SSHClient:
                     pass
 
     def _deploy_fix_script(self):
-        """部署SSH shell防重置脚本（持久分区，升级不丢失）"""
+        """部署SSH shell防重置脚本(持久分区) + 确保cron任务存在
+
+        !! 2026-06-18修复: 旧版"脚本存在就return"导致升级后cron任务丢失时不补——
+        实测固件升级后crontab里没有fix_sshd_shell任务(/tmp/sshd_fix.log不存在),
+        防重置形同虚设, sshd shell被固件默认/etc/setup/rc覆盖后无人修复,
+        表现为"控制台密码被自动开启". 改为: 脚本存在也每次检查cron, 缺则补上.
+        """
         try:
-            # 检查是否已部署
+            # 1. 确保脚本存在于持久分区(不存在才部署)
             check_cmd = "test -f /etc/mnt/ikuai/fix_sshd_shell.sh && echo EXISTS || echo NOT_EXISTS"
             _, stdout, _ = self._client.exec_command(check_cmd, timeout=5)
-            if "EXISTS" in stdout.read().decode():
-                logger.debug("防重置脚本已存在，跳过部署")
-                return
-
-            # 创建修复脚本
-            script_content = '''#!/bin/bash
+            if "EXISTS" not in stdout.read().decode():
+                script_content = '''#!/bin/bash
 # SSH Shell自动修复脚本
 # 解决固件升级或系统重置后sshd shell被改为/etc/setup/rc的问题
 
@@ -351,20 +353,22 @@ fi
 
 touch $MARKER_FILE
 '''
-            # 写入脚本
-            write_cmd = f'''cat > /etc/mnt/ikuai/fix_sshd_shell.sh << 'FIXSCRIPT'
+                write_cmd = f'''cat > /etc/mnt/ikuai/fix_sshd_shell.sh << 'FIXSCRIPT'
 {script_content}FIXSCRIPT
 chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
-            self._client.exec_command(write_cmd, timeout=10)
+                self._client.exec_command(write_cmd, timeout=10)
+                self._client.exec_command("/etc/mnt/ikuai/fix_sshd_shell.sh", timeout=5)
+                logger.info("SSH防重置脚本部署成功")
 
-            # 添加cron任务
-            cron_cmd = '''(crontab -l 2>/dev/null | grep -v fix_sshd_shell; echo "* * * * * /etc/mnt/ikuai/fix_sshd_shell.sh >> /tmp/sshd_fix.log 2>&1") | crontab -'''
-            self._client.exec_command(cron_cmd, timeout=5)
-
-            # 立即执行一次
-            self._client.exec_command("/etc/mnt/ikuai/fix_sshd_shell.sh", timeout=5)
-
-            logger.info("SSH防重置脚本部署成功")
+            # 2. !! 始终确保cron任务存在(升级/重启后cron可能丢, 必须每次连接都检查补上)
+            cron_check = 'crontab -l 2>/dev/null | grep -q fix_sshd_shell && echo CRON_OK || echo CRON_MISSING'
+            _, cout, _ = self._client.exec_command(cron_check, timeout=5)
+            if "CRON_OK" not in cout.read().decode():
+                cron_cmd = '(crontab -l 2>/dev/null | grep -v fix_sshd_shell; echo "* * * * * /etc/mnt/ikuai/fix_sshd_shell.sh >> /tmp/sshd_fix.log 2>&1") | crontab -'
+                self._client.exec_command(cron_cmd, timeout=5)
+                logger.info("SSH防重置cron任务(重新)部署成功")
+            else:
+                logger.debug("SSH防重置cron任务已存在")
 
         except Exception as e:
             logger.warning(f"部署防重置脚本失败: {e}")
@@ -4999,5 +5003,529 @@ class BackendVerifier:
 
         # L4: 内核
         results.append(self.verify_dmz_kernel())
+
+        return FullChainResult(results=results)
+
+    # ==================== DNS加速服务(dns)验证 ====================
+    # 后端脚本: /usr/ikuai/script/dns.sh
+    # CLI无独立show命令(dns show报错), 用sqlite3直查config.db
+    # 表: dns_config(基础配置,单记录id=1) + dns_reverse_proxy_new(反向代理)
+    # cachemode: 0=UDP, 1=多线分路, 2=第三方代理, 3=DoH
+    # 进程: ikdnsd(用户配置,UDP53) ≠ ikdnsx(系统,UDP54,始终运行)
+    # 运行时文件: /tmp/iktmp/ikdnsd.conf + ikdnsd.static.conf + ikdnsd.status
+
+    DNS_DB = "/etc/mnt/ikuai/config.db"
+
+    def _sqlite_query_line(self, sql: str) -> Optional[Dict]:
+        """
+        用sqlite3 -line模式查询, 解析'key = value'格式为dict
+        适用于单记录查询(如dns_config)或WHERE过滤后的单条记录
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                f'sqlite3 {self.DNS_DB} -line "{sql}" 2>/dev/null'
+            )
+            if not output or not output.strip():
+                return None
+            result = {}
+            for line in output.splitlines():
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    result[k.strip()] = v.strip()
+            return result if result else None
+        except Exception as e:
+            logger.error(f"[sqlite] 查询失败: {sql} -> {e}")
+            return None
+
+    def _sqlite_query_list(self, sql: str) -> List[Dict]:
+        """
+        用sqlite3 -line模式查询多条记录, 解析为dict列表
+        多条记录间用空行分隔
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                f'sqlite3 {self.DNS_DB} -line "{sql}" 2>/dev/null'
+            )
+            if not output or not output.strip():
+                return []
+            records = []
+            current = {}
+            for line in output.splitlines():
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    current[k.strip()] = v.strip()
+                elif not line and current:
+                    records.append(current)
+                    current = {}
+            if current:
+                records.append(current)
+            return records
+        except Exception as e:
+            logger.error(f"[sqlite] 列表查询失败: {sql} -> {e}")
+            return []
+
+    def query_dns_config(self) -> Optional[Dict]:
+        """L1: 查询dns_config基础配置(单记录id=1)"""
+        return self._sqlite_query_line(
+            "SELECT enabled,cachemode,forbid_dns_4a,proxy_force,dns1,dns2,"
+            "cache_ttl,query,proxy_force_dns FROM dns_config WHERE id=1"
+        )
+
+    def verify_dns_config_database(self, expected_fields: Dict = None,
+                                   must_pass: bool = False) -> VerifyResult:
+        """
+        L1: 验证DNS加速基础配置(dns_config表)
+
+        Args:
+            expected_fields: 期望字段值, 如 {"enabled": "yes", "cachemode": "0",
+                             "dns1": "114.114.114.114", "cache_ttl": "60"}
+            must_pass: 是否必须通过(失败时记录到断言)
+        """
+        config = self.query_dns_config()
+        if config is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message="dns_config配置不存在(数据库无记录)",
+                raw_output="",
+            )
+
+        details = {
+            "enabled": config.get("enabled"),
+            "cachemode": config.get("cachemode"),
+            "forbid_dns_4a": config.get("forbid_dns_4a"),
+            "proxy_force": config.get("proxy_force"),
+            "dns1": config.get("dns1"),
+            "dns2": config.get("dns2"),
+            "cache_ttl": config.get("cache_ttl"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+
+        cachemode_name = {"0": "UDP", "1": "多线分路", "2": "第三方代理", "3": "DoH"}.get(
+            str(config.get("cachemode", "")), str(config.get("cachemode")))
+
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=True,
+                message=f"DNS基础配置存在: enabled={config.get('enabled')}, "
+                        f"cachemode={cachemode_name}({config.get('cachemode')}), "
+                        f"dns1={config.get('dns1')}, dns2={config.get('dns2')}, "
+                        f"cache_ttl={config.get('cache_ttl')}, "
+                        f"proxy_force={config.get('proxy_force')}, "
+                        f"forbid_dns_4a={config.get('forbid_dns_4a')}",
+                details={"config": details},
+                raw_output=raw,
+            )
+
+        mismatches = {}
+        for field, expected in expected_fields.items():
+            actual = str(config.get(field, ""))
+            if actual != str(expected):
+                mismatches[field] = {"expected": str(expected), "actual": actual}
+
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"基础配置字段不匹配: {mismatches}",
+                details={"config": details, "mismatches": mismatches},
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"DNS基础配置数据库验证通过",
+            details={"config": details},
+            raw_output=raw,
+        )
+
+    def query_dns_reverse_proxy(self, domain: str) -> Optional[Dict]:
+        """L1: 查询指定域名的DNS反向代理规则(dns_reverse_proxy_new表)"""
+        records = self._sqlite_query_list(
+            f"SELECT id,domain,dns_addr,enabled,comment,src_addr,parse_type,is_ipv6 "
+            f"FROM dns_reverse_proxy_new WHERE domain='{domain}'"
+        )
+        return records[0] if records else None
+
+    def query_all_dns_reverse_proxy(self) -> List[Dict]:
+        """L1: 查询所有DNS反向代理规则"""
+        return self._sqlite_query_list(
+            "SELECT id,domain,dns_addr,enabled,comment,src_addr,parse_type,is_ipv6 "
+            "FROM dns_reverse_proxy_new"
+        )
+
+    def count_dns_reverse_proxy(self, enabled_only: bool = False) -> int:
+        """L1: 统计DNS反向代理规则数量"""
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM dns_reverse_proxy_new {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_dns_reverse_proxy_database(self, domain: str,
+                                          expected_fields: Dict = None,
+                                          must_exist: bool = True,
+                                          must_pass: bool = False) -> VerifyResult:
+        """
+        L1: 验证DNS反向代理规则(dns_reverse_proxy_new表)
+
+        Args:
+            domain: 域名(定位规则)
+            expected_fields: 期望字段值, 如 {"dns_addr": "192.168.200.1",
+                             "enabled": "yes", "parse_type": "ipv4"}
+            must_exist: True=规则必须存在, False=规则必须不存在
+            must_pass: 是否必须通过
+        """
+        rule = self.query_dns_reverse_proxy(domain)
+
+        if must_exist and rule is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"反向代理规则不存在(期望存在): {domain}",
+                raw_output="",
+            )
+        if not must_exist and rule is not None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"反向代理规则仍存在(期望已删除): {domain}",
+                details={"rule": rule},
+                raw_output=json.dumps(rule, ensure_ascii=False),
+            )
+        if not must_exist and rule is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=True,
+                message=f"反向代理规则已不存在: {domain}",
+                raw_output="",
+            )
+
+        details = {
+            "id": rule.get("id"),
+            "domain": rule.get("domain"),
+            "dns_addr": rule.get("dns_addr"),
+            "enabled": rule.get("enabled"),
+            "comment": rule.get("comment"),
+            "src_addr": rule.get("src_addr"),
+            "parse_type": rule.get("parse_type"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=True,
+                message=f"反向代理规则存在: {domain}, dns_addr={rule.get('dns_addr')}, "
+                        f"enabled={rule.get('enabled')}, parse_type={rule.get('parse_type')}",
+                details={"rule": details},
+                raw_output=raw,
+            )
+
+        mismatches = {}
+        for field, expected in expected_fields.items():
+            actual = str(rule.get(field, ""))
+            # dns_addr可能是多行, 数据库存为带换行的文本; 比较时去空白
+            if field == "dns_addr":
+                actual_norm = actual.replace("\n", ",").strip()
+                expected_norm = str(expected).replace("\n", ",").strip()
+                if actual_norm != expected_norm:
+                    mismatches[field] = {"expected": str(expected), "actual": actual}
+            elif field == "src_addr":
+                # src_addr比较宽松(顺序/换行可能不同), 检查expected的每段是否都存在
+                actual_norm = actual.replace("\n", ",").strip()
+                if str(expected).replace("\n", ",").strip() not in actual_norm and actual_norm != str(expected).replace("\n", ",").strip():
+                    mismatches[field] = {"expected": str(expected), "actual": actual}
+            else:
+                if actual != str(expected):
+                    mismatches[field] = {"expected": str(expected), "actual": actual}
+
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"反向代理字段不匹配({domain}): {mismatches}",
+                details={"rule": details, "mismatches": mismatches},
+                raw_output=raw,
+            )
+
+        return VerifyResult(
+            level="L1-数据库",
+            passed=True,
+            message=f"反向代理规则数据库验证通过: {domain}",
+            details={"rule": details},
+            raw_output=raw,
+        )
+
+    def verify_dns_runtime_config(self, expect_enabled: bool = True,
+                                  expected_static_domain: str = None,
+                                  expected_dns_addr: str = None) -> VerifyResult:
+        """
+        L2: 验证DNS加速运行时配置文件(/tmp/iktmp/)
+
+        enabled=yes时: ikdnsd.conf + ikdnsd.static.conf + ikdnsd.status 应存在
+        enabled=no时:  上述文件应被清理(rm -f)
+
+        Args:
+            expect_enabled: 期望DNS加速是否启用
+            expected_static_domain: 期望在ikdnsd.static.conf中出现的域名
+            expected_dns_addr: 期望在static.conf中出现的解析地址
+        """
+        self.connect_router()
+        checks = []
+
+        try:
+            # 检查ikdnsd.conf
+            conf_out = self._router.exec("cat /tmp/iktmp/ikdnsd.conf 2>/dev/null")
+            conf_exists = bool(conf_out and conf_out.strip())
+            if expect_enabled:
+                checks.append(("ikdnsd.conf存在", conf_exists,
+                               f"ikdnsd.conf{'存在' if conf_exists else '不存在(应存在)'}"))
+                if conf_exists:
+                    if "port" in conf_out:
+                        checks.append(("conf含port", True, "ikdnsd.conf含port配置"))
+                    if "cache_ttl" in conf_out:
+                        checks.append(("conf含cache_ttl", True, "ikdnsd.conf含cache_ttl"))
+            else:
+                checks.append(("ikdnsd.conf已清理", not conf_exists,
+                               f"ikdnsd.conf{'仍存在(应清理)' if conf_exists else '已清理(正确)'}"))
+
+            # 检查ikdnsd.static.conf(反向代理记录)
+            static_out = self._router.exec("cat /tmp/iktmp/ikdnsd.static.conf 2>/dev/null")
+            static_exists = bool(static_out and static_out.strip())
+            if expect_enabled:
+                if expected_static_domain:
+                    domain_found = expected_static_domain in (static_out or "")
+                    checks.append(("static.conf含域名", domain_found,
+                                   f"static.conf{'含' if domain_found else '不含'}{expected_static_domain}"))
+                if expected_dns_addr and domain_found if expected_static_domain else (expected_dns_addr and expected_dns_addr in (static_out or "")):
+                    addr_found = expected_dns_addr in (static_out or "")
+                    checks.append(("static.conf含解析地址", addr_found,
+                                   f"static.conf{'含' if addr_found else '不含'}{expected_dns_addr}"))
+            else:
+                # 关闭时static.conf也应清理
+                checks.append(("static.conf已清理", not static_exists,
+                               f"static.conf{'仍存在(应清理)' if static_exists else '已清理(正确)'}"))
+
+            # 检查ikdnsd.status
+            status_out = self._router.exec("cat /tmp/iktmp/ikdnsd.status 2>/dev/null")
+            status_exists = bool(status_out and status_out.strip())
+            if expect_enabled:
+                checks.append(("status存在", status_exists,
+                               f"ikdnsd.status{'存在' if status_exists else '不存在(应存在)'}"))
+            else:
+                checks.append(("status已清理", not status_exists,
+                               f"ikdnsd.status{'仍存在(应清理)' if status_exists else '已清理(正确)'}"))
+
+            passed = all(c[1] for c in checks if c[1] is not None)
+            messages = [c[2] for c in checks]
+            return VerifyResult(
+                level="L2-运行时文件",
+                passed=passed,
+                message="; ".join(messages),
+                details={"checks": [{"name": c[0], "ok": c[1], "msg": c[2]} for c in checks],
+                         "conf": (conf_out or "")[:300],
+                         "static": (static_out or "")[:300]},
+                raw_output=(static_out or "")[:300],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-运行时文件",
+                passed=False,
+                message=f"运行时文件检查失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_dns_iptables(self, expect_redirect: bool = None,
+                            proxy_force: bool = None) -> VerifyResult:
+        """
+        L3: 验证DNS加速iptables(nat表DNSPROXY链)
+
+        DNS加速启用时: PREROUTING引用DNSPROXY链, DNSPROXY含DNS重定向规则
+        proxy_force=1时: 有 REDIRECT udp dpt:53 -> port 53 规则
+        关闭时: DNSPROXY链清空(REDIRECT消失)
+
+        Args:
+            expect_redirect: 期望是否有REDIRECT规则(None=不检查, 按proxy_force推断)
+            proxy_force: 是否开启了强制客户端DNS代理(影响REDIRECT规则)
+        """
+        self.connect_router()
+        try:
+            # 查看DNSPROXY链
+            output = self._router.exec(
+                "iptables -t nat -L DNSPROXY -n 2>/dev/null"
+            )
+            # 查看PREROUTING是否引用DNSPROXY
+            pre_output = self._router.exec(
+                "iptables -t nat -L PREROUTING -n 2>/dev/null"
+            )
+            has_dnsproxy_ref = "DNSPROXY" in (pre_output or "")
+            has_redirect = "REDIRECT" in (output or "") and "dpt:53" in (output or "")
+
+            # 判断期望
+            if expect_redirect is None:
+                expect_redirect = bool(proxy_force)
+
+            checks = []
+            checks.append(("PREROUTING引用DNSPROXY", has_dnsproxy_ref,
+                           f"PREROUTING{'引用' if has_dnsproxy_ref else '未引用'}DNSPROXY链"))
+
+            if expect_redirect:
+                checks.append(("DNSPROXY含REDIRECT dpt:53", has_redirect,
+                               f"DNSPROXY{'含' if has_redirect else '不含'}REDIRECT udp dpt:53规则"))
+            else:
+                # proxy_force=0或关闭时不应有REDIRECT
+                checks.append(("DNSPROXY无REDIRECT(符合预期)", not has_redirect,
+                               f"DNSPROXY{'仍含REDIRECT(非预期)' if has_redirect else '无REDIRECT(正确)'}"))
+
+            passed = all(c[1] for c in checks if c[1] is not None)
+            messages = [c[2] for c in checks]
+            return VerifyResult(
+                level="L3-iptables",
+                passed=passed,
+                message="; ".join(messages),
+                details={"checks": [{"name": c[0], "ok": c[1], "msg": c[2]} for c in checks]},
+                raw_output=(output or "")[:500],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L3-iptables",
+                passed=False,
+                message=f"iptables检查失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_dns_process(self, expect_running: bool = True) -> VerifyResult:
+        """
+        L4: 验证ikdnsd进程状态 + UDP 53端口监听
+
+        注意区分:
+        - ikdnsd(用户配置DNS加速, enabled=yes时运行, 监听UDP 53)
+        - ikdnsx(系统基础DNS, 始终运行, 监听UDP 54) - 不应误判
+
+        Args:
+            expect_running: 期望ikdnsd进程是否运行
+        """
+        self.connect_router()
+        checks = []
+        try:
+            # 精确匹配ikdnsd(排除ikdnsx), 用ikdnsd.conf特征
+            ps_out = self._router.exec(
+                "ps | grep ikdnsd | grep ikdnsd.conf | grep -v grep"
+            )
+            running = bool(ps_out and ps_out.strip())
+            checks.append(("ikdnsd进程", running == expect_running,
+                           f"ikdnsd进程{'运行中' if running else '未运行'}"
+                           f"({'符合' if running == expect_running else '不符合'}期望"
+                           f"{'运行' if expect_running else '未运行'})"))
+
+            if expect_running and running:
+                # 检查UDP 53监听(ikdnsd监听53)
+                port_out = self._router.exec(
+                    "netstat -nlu 2>/dev/null | grep ':53 ' || ss -nlu 2>/dev/null | grep ':53 '"
+                )
+                has_53 = bool(port_out and port_out.strip())
+                checks.append(("UDP53监听", has_53,
+                               f"UDP 53{'有' if has_53 else '无'}监听(ikdnsd)"))
+
+            if not expect_running:
+                # 关闭时确认ikdnsd确实停止(ikdnsx仍运行监听54是正常的)
+                checks.append(("ikdnsd已停止", not running,
+                               f"ikdnsd{'仍运行(应停止)' if running else '已停止(正确)'}"))
+
+            passed = all(c[1] for c in checks if c[1] is not None)
+            messages = [c[2] for c in checks]
+            return VerifyResult(
+                level="L4-进程/端口",
+                passed=passed,
+                message="; ".join(messages),
+                details={"checks": [{"name": c[0], "ok": c[1], "msg": c[2]} for c in checks]},
+                raw_output=(ps_out or "").strip()[:300],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L4-进程/端口",
+                passed=False,
+                message=f"进程/端口检查失败: {e}",
+                raw_output=str(e),
+            )
+
+    def verify_dns_basic_full_chain(self, expect_enabled: bool = True,
+                                    expected_fields: Dict = None,
+                                    proxy_force: bool = None) -> FullChainResult:
+        """
+        DNS加速基础配置全链路验证: L1数据库 + L2运行时文件 + L3iptables + L4进程
+
+        Args:
+            expect_enabled: 期望DNS加速是否启用
+            expected_fields: 期望的dns_config字段值
+            proxy_force: 是否开启强制代理(影响L3 REDIRECT判断)
+        """
+        results = []
+
+        # L1: 数据库
+        ef = {"enabled": "yes" if expect_enabled else "no"}
+        if expected_fields:
+            ef.update(expected_fields)
+        results.append(self.verify_dns_config_database(expected_fields=ef))
+
+        # L2: 运行时文件
+        results.append(self.verify_dns_runtime_config(expect_enabled=expect_enabled))
+
+        # L3: iptables(开启时按proxy_force判断REDIRECT, 关闭时无REDIRECT)
+        if expect_enabled:
+            results.append(self.verify_dns_iptables(
+                expect_redirect=bool(proxy_force), proxy_force=proxy_force))
+        else:
+            results.append(self.verify_dns_iptables(expect_redirect=False))
+
+        # L4: 进程/端口
+        results.append(self.verify_dns_process(expect_running=expect_enabled))
+
+        return FullChainResult(results=results)
+
+    def verify_dns_reverse_proxy_full_chain(self, domain: str,
+                                             expect_exists: bool = True,
+                                             expected_fields: Dict = None,
+                                             dns_enabled: bool = True) -> FullChainResult:
+        """
+        DNS反向代理规则全链路验证: L1数据库 + L2运行时static.conf
+
+        Args:
+            domain: 域名
+            expect_exists: 期望规则是否存在
+            expected_fields: 期望字段值(dns_addr等)
+            dns_enabled: DNS加速是否启用(影响L2 static.conf是否生成)
+        """
+        results = []
+
+        # L1: 数据库
+        results.append(self.verify_dns_reverse_proxy_database(
+            domain, expected_fields=expected_fields, must_exist=expect_exists))
+
+        # L2: static.conf(仅DNS加速启用+规则存在时检查)
+        if expect_exists and dns_enabled:
+            dns_addr = None
+            if expected_fields and "dns_addr" in expected_fields:
+                dns_addr = expected_fields["dns_addr"]
+            elif not expected_fields:
+                rule = self.query_dns_reverse_proxy(domain)
+                if rule:
+                    dns_addr = rule.get("dns_addr")
+            results.append(self.verify_dns_runtime_config(
+                expect_enabled=True,
+                expected_static_domain=domain,
+                expected_dns_addr=dns_addr))
 
         return FullChainResult(results=results)

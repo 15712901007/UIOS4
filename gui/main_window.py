@@ -854,6 +854,20 @@ class MainWindow(QMainWindow):
                             },
                         }
                     },
+                    "DNS服务": {
+                        "children": {
+                            "DNS加速服务": {
+                                "testcases": [
+                                    "test_dns_accelerate_comprehensive.py::TestDnsAccelerateComprehensive::test_dns_accelerate_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_dns_accelerate_comprehensive.py::TestDnsAccelerateComprehensive::test_dns_accelerate_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
                     "智能流控": {
                         "testcases": []
                     },

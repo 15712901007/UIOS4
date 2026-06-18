@@ -109,6 +109,7 @@ from pages.network.udp_proxy_page import UdpProxyPage
 from pages.network.nat_rule_page import NatRulePage
 from pages.network.port_map_page import PortMapPage
 from pages.network.dmz_host_page import DmzHostPage
+from pages.network.dns_accelerate_page import DnsAcceleratePage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -175,6 +176,7 @@ TEST_NAME_MAPPING = {
     'test_nat_rule_comprehensive': 'NAT规则综合测试',
     'test_port_map_comprehensive': '端口映射综合测试',
     'test_dmz_host_comprehensive': 'DMZ主机综合测试',
+    'test_dns_accelerate_comprehensive': 'DNS加速服务综合测试',
 }
 
 
@@ -597,6 +599,20 @@ def nat_rule_page_logged_in(logged_in_page: Page, config: Config) -> 'NatRulePag
     return nat_page
 
 
+@pytest.fixture(scope="function")
+def dns_accelerate_page(page: Page, config: Config) -> 'DnsAcceleratePage':
+    """创建DNS加速服务页面实例"""
+    return DnsAcceleratePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def dns_accelerate_page_logged_in(logged_in_page: Page, config: Config) -> 'DnsAcceleratePage':
+    """已登录并导航到DNS加速服务页面的实例"""
+    dns_page = DnsAcceleratePage(logged_in_page, config.get_base_url())
+    dns_page.navigate_to_dns_accelerate()
+    return dns_page
+
+
 # ==================== 端口映射 fixtures ====================
 
 @pytest.fixture(scope="function")
@@ -860,6 +876,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "dmz_host: DMZ主机模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "dns_accelerate: DNS加速服务模块测试"
     )
 
     # 记录开始时间
