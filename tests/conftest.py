@@ -171,6 +171,7 @@ TEST_NAME_MAPPING = {
     'test_upnp_setting_comprehensive': 'UPnP/NAT设置综合测试',
     'test_igmp_proxy_comprehensive': 'IGMP代理综合测试',
     'test_iptv_comprehensive': 'IPTV透传综合测试',
+    'test_udp_proxy_comprehensive': 'UDPXY设置综合测试',
     'test_nat_rule_comprehensive': 'NAT规则综合测试',
     'test_port_map_comprehensive': '端口映射综合测试',
     'test_dmz_host_comprehensive': 'DMZ主机综合测试',
