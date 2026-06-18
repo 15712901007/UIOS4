@@ -281,6 +281,37 @@ class IkuaiTablePage(BasePage):
             pass  # 有些模块可能没有"已选"提示,继续尝试
         self.page.wait_for_timeout(300)
 
+        # 方法0(首选): 精确定位底部批量操作栏(div.footer)内的目标按钮
+        # 虚拟滚动表格页面(跨三层/多线负载/协议分流等)存在多个同名按钮:
+        #   - 表格行内固定操作列(停用/删除)
+        #   - 底部批量操作栏(启用/停用/删除)
+        # 原有"排除行内+取第一个非行内"策略(方法2)在多候选时不可靠, 且:
+        #   1. 按钮svg无aria-label → get_by_role按图标名(方法1)永远失效
+        #   2. "帮助"按钮aria-describedby描述含目标字样 → get_by_role按name误匹配帮助按钮
+        # 因此用JS: 在 div.footer(底部操作栏, classList token精确匹配, 区别于xpath子串误匹配的_footerContainer)
+        #         内按 textContent 精确匹配目标按钮(可见且非行内), JS click 触发React
+        #         (普通Ant Design Button的 element.click() 可靠, 同 edit_rule 行内按钮)
+        try:
+            clicked = self.page.evaluate("""(name) => {
+                const footer = Array.from(document.querySelectorAll('div')).find(d => d.classList.contains('footer'));
+                if (!footer) return false;
+                const btns = Array.from(footer.querySelectorAll('button'));
+                for (const b of btns) {
+                    const t = b.textContent.replace(/\\s+/g, '').trim();
+                    if (t !== name) continue;
+                    if (b.offsetParent === null) continue;
+                    let q = b, inRow = false;
+                    for (let j = 0; j < 6; j++) { q = q.parentElement; if (!q) break; if (q.tagName === 'TR' || (q.classList && q.classList.contains('ant-table-row'))) { inRow = true; break; } }
+                    if (!inRow) { b.click(); return true; }
+                }
+                return false;
+            }""", button_name)
+            if clicked:
+                self.page.wait_for_timeout(300)
+                return
+        except Exception as e:
+            print(f"[DEBUG] _click_batch_button 方法0(footer锚点)失败: {e}")
+
         icon_map = {
             "启用": "play-circle",
             "停用": "minus-circle",

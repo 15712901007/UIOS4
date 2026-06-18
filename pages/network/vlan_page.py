@@ -72,14 +72,33 @@ class VlanPage(IkuaiTablePage):
         """选择子网掩码"""
         self.page.get_by_role("combobox", name="子网掩码").click(force=True)
         self.page.wait_for_timeout(300)
-        self.page.get_by_title(mask, exact=True).nth(1).click()
+        # 同select_line: nth(1)在异常表单场景可能找不到, 默认30秒超时会累积卡死整个测试, 加短超时降级
+        title_items = self.page.get_by_title(mask, exact=True)
+        try:
+            title_items.nth(1).click(force=True, timeout=5000)
+        except Exception:
+            try:
+                title_items.first.click(force=True, timeout=5000)
+            except Exception:
+                print(f"[DEBUG] select_subnet_mask: 未能选中掩码'{mask}'(异常表单状态), 跳过")
         return self
 
     def select_line(self, line: str):
         """选择线路"""
         self.page.get_by_role("combobox", name="线路").click(force=True)
         self.page.wait_for_timeout(300)
-        self.page.get_by_title(line, exact=True).nth(1).click(force=True)
+        # nth(1)取dropdown里的选项项(第0个多为combobox内显示项)。异常输入场景下combobox/dropdown
+        # portal未正常渲染, 默认30秒超时×步骤10的13个子项会累积>9分钟卡死整个测试(被外层timeout杀)。
+        # 用短超时+降级: nth(1)失败→first→跳过。正常添加场景nth(1)即时成功不受影响;
+        # 异常测试不依赖line是否选中(字段校验独立判定), 跳过不影响测试有效性。
+        title_items = self.page.get_by_title(line, exact=True)
+        try:
+            title_items.nth(1).click(force=True, timeout=5000)
+        except Exception:
+            try:
+                title_items.first.click(force=True, timeout=5000)
+            except Exception:
+                print(f"[DEBUG] select_line: 未能选中线路'{line}'(异常表单状态), 跳过")
         return self
 
     # ==================== 添加VLAN ====================
@@ -194,7 +213,11 @@ class VlanPage(IkuaiTablePage):
             except:
                 pass
             self.page.reload()
-            self.page.wait_for_load_state("networkidle")
+            # networkidle在路由器页面(有状态轮询)常不达到, 默认30秒超时×步骤10的13项会累积卡死, 加短超时容忍
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
             self.page.wait_for_timeout(300)
 
         return result

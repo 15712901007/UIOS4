@@ -570,36 +570,94 @@ class TestUdpProxyComprehensive:
             print(f"\n[步骤14] 批量停用 {len(test_rules)} 条...")
             rec.add_detail(f"[批量停用] 目标: {len(test_rules)} 条")
 
-            select_all = page.page.locator("thead input[type='checkbox']").first
-            if select_all.count() > 0 and select_all.is_enabled():
-                select_all.click()
-                page.page.wait_for_timeout(500)
-            page.batch_disable()
-            page.page.wait_for_timeout(1500)
+            # 批量停用带重试 + SSH验证(参照跨三层, 原实现完全无SSH验证, 批量停用失败无法发现)
+            test_names = {r["name"] for r in test_rules}
+            total = len(test_rules)
+            disable_success = False
+            disabled_count = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_disable()
+                page.page.wait_for_timeout(1500)
+                page.navigate_to_udp_proxy()
+                page.page.wait_for_timeout(1000)
 
-            page.navigate_to_udp_proxy()
-            page.page.wait_for_timeout(1000)
-            disabled_count = sum(1 for r in test_rules if page.is_rule_disabled(r["name"]))
-            print(f"  [OK] 批量停用: {disabled_count}/{len(test_rules)} 条")
-            rec.add_detail(f"[结果] {disabled_count}/{len(test_rules)} 条已停用")
+                if backend_verifier is not None:
+                    db_rules = backend_verifier.query_udp_proxy_config() or []
+                    disabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                else:
+                    disabled_count = sum(1 for r in test_rules if page.is_rule_disabled(r["name"]))
+
+                if total == 0 or disabled_count >= total:
+                    disable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量停用后 {disabled_count}/{total} 条已停用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次停用: {disabled_count}/{total}条，重试")
+
+            if disable_success:
+                print(f"  [OK] 批量停用: {disabled_count}/{total} 条")
+                rec.add_detail(f"[结果] {disabled_count}/{total} 条已停用")
+            else:
+                print(f"  [WARN] 批量停用未完全生效: {disabled_count}/{total} 条")
+                rec.add_detail(f"[结果] 批量停用未完全生效: {disabled_count}/{total} 条")
+                ui_failures.append(f"批量停用仅{disabled_count}/{total}条规则停用")
+
+            # SSH验证(补断言: 防止批量停用失败却报告通过)
+            if backend_verifier is not None:
+                db_rules = backend_verifier.query_udp_proxy_config() or []
+                disabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                rec.add_detail(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                print(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                if total > 0 and disabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_count}/{total}条规则停用")
 
         # ========== 步骤15: 批量启用 ==========
         with rec.step("步骤15: 批量启用", f"批量启用剩余 {len(test_rules)} 条"):
             print(f"\n[步骤15] 批量启用 {len(test_rules)} 条...")
             rec.add_detail(f"[批量启用] 目标: {len(test_rules)} 条")
 
-            select_all = page.page.locator("thead input[type='checkbox']").first
-            if select_all.count() > 0 and select_all.is_enabled():
-                select_all.click()
-                page.page.wait_for_timeout(500)
-            page.batch_enable()
-            page.page.wait_for_timeout(1500)
+            # 批量启用带重试 + SSH验证(参照跨三层, 原实现完全无SSH验证, 批量启用失败无法发现)
+            test_names = {r["name"] for r in test_rules}
+            total = len(test_rules)
+            enable_success = False
+            enabled_count = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_enable()
+                page.page.wait_for_timeout(1500)
+                page.navigate_to_udp_proxy()
+                page.page.wait_for_timeout(1000)
 
-            page.navigate_to_udp_proxy()
-            page.page.wait_for_timeout(1000)
-            enabled_count = sum(1 for r in test_rules if page.is_rule_enabled(r["name"]))
-            print(f"  [OK] 批量启用: {enabled_count}/{len(test_rules)} 条")
-            rec.add_detail(f"[结果] {enabled_count}/{len(test_rules)} 条已启用")
+                if backend_verifier is not None:
+                    db_rules = backend_verifier.query_udp_proxy_config() or []
+                    enabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                else:
+                    enabled_count = sum(1 for r in test_rules if page.is_rule_enabled(r["name"]))
+
+                if total == 0 or enabled_count >= total:
+                    enable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量启用后 {enabled_count}/{total} 条已启用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次启用: {enabled_count}/{total}条，重试")
+
+            if enable_success:
+                print(f"  [OK] 批量启用: {enabled_count}/{total} 条")
+                rec.add_detail(f"[结果] {enabled_count}/{total} 条已启用")
+            else:
+                print(f"  [WARN] 批量启用未完全生效: {enabled_count}/{total} 条")
+                rec.add_detail(f"[结果] 批量启用未完全生效: {enabled_count}/{total} 条")
+                ui_failures.append(f"批量启用仅{enabled_count}/{total}条规则启用")
+
+            # SSH验证(补断言)
+            if backend_verifier is not None:
+                db_rules = backend_verifier.query_udp_proxy_config() or []
+                enabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                rec.add_detail(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                print(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                if total > 0 and enabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_count}/{total}条规则启用")
 
         # ========== 步骤16: 批量删除 ==========
         with rec.step("步骤16: 批量删除", f"批量删除剩余 {len(test_rules)} 条"):
@@ -630,8 +688,8 @@ class TestUdpProxyComprehensive:
                             ssh_failures.append(f"SSH-L1-批量删除: 数据库中仍有{len(remaining)}条")
                         else:
                             rec.add_detail(f"    SSH: 测试规则已全部删除")
-                except Exception:
-                    pass
+                except Exception as e:
+                    ssh_failures.append(f"SSH-L1-批量删除验证异常: {str(e)[:80]}")
 
         # ========== 步骤17: 导入追加(CSV) ==========
         with rec.step("步骤17: 导入配置(追加)", "使用导出的CSV追加导入"):

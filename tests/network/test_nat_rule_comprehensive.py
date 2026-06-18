@@ -586,50 +586,98 @@ class TestNatRuleComprehensive:
             print(f"\n[步骤20] 批量停用 {len(test_rules)} 条...")
             rec.add_detail(f"[批量停用] 目标: {len(test_rules)} 条")
 
-            select_all = page.page.locator("thead input[type='checkbox']").first
-            if select_all.count() > 0 and select_all.is_enabled():
-                select_all.click()
+            # 批量停用带重试 + SSH验证(参照跨三层, 原用ssh_verify must_pass=False软断言且只查第一条)
+            test_names = {r["name"] for r in test_rules}
+            total = len(test_rules)
+            disable_success = False
+            disabled_count = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_disable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
                 page.page.wait_for_timeout(500)
-            page.batch_disable()
-            page.page.wait_for_timeout(1500)
+                page.navigate_to_nat_rule()
+                page.page.wait_for_timeout(500)
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            page.navigate_to_nat_rule()
-            page.page.wait_for_timeout(500)
-            disabled_count = sum(1 for r in test_rules if page.is_rule_disabled(r["name"]))
-            print(f"  [OK] 批量停用: {disabled_count}/{len(test_rules)} 条")
-            rec.add_detail(f"[结果] {disabled_count}/{len(test_rules)} 条已停用")
+                if backend_verifier is not None:
+                    db_rules = backend_verifier.query_nat_rules() or []
+                    disabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                else:
+                    disabled_count = sum(1 for r in test_rules if page.is_rule_disabled(r["name"]))
 
+                if total == 0 or disabled_count >= total:
+                    disable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量停用后 {disabled_count}/{total} 条已停用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次停用: {disabled_count}/{total}条，重试")
+
+            if disable_success:
+                print(f"  [OK] 批量停用: {disabled_count}/{total} 条")
+                rec.add_detail(f"[结果] {disabled_count}/{total} 条已停用")
+            else:
+                print(f"  [WARN] 批量停用未完全生效: {disabled_count}/{total} 条")
+                rec.add_detail(f"[结果] 批量停用未完全生效: {disabled_count}/{total} 条")
+                ui_failures.append(f"批量停用仅{disabled_count}/{total}条规则停用")
+
+            # SSH验证(补断言: 防止批量停用失败却报告通过)
             if backend_verifier is not None:
-                ssh_verify("L1-批量停用", backend_verifier.verify_nat_rule_database,
-                           test_rules[0]["name"], must_pass=False,
-                           expected_fields={"enabled": "no"})
+                db_rules = backend_verifier.query_nat_rules() or []
+                disabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                rec.add_detail(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                print(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                if total > 0 and disabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_count}/{total}条规则停用")
 
         # ========== 步骤21: 批量启用 ==========
         with rec.step("步骤21: 批量启用", f"批量启用剩余 {len(test_rules)} 条"):
             print(f"\n[步骤21] 批量启用 {len(test_rules)} 条...")
             rec.add_detail(f"[批量启用] 目标: {len(test_rules)} 条")
 
-            select_all = page.page.locator("thead input[type='checkbox']").first
-            if select_all.count() > 0 and select_all.is_enabled():
-                select_all.click()
+            # 批量启用带重试 + SSH验证(参照跨三层, 原用ssh_verify must_pass=False软断言且只查第一条)
+            test_names = {r["name"] for r in test_rules}
+            total = len(test_rules)
+            enable_success = False
+            enabled_count = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_enable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
                 page.page.wait_for_timeout(500)
-            page.batch_enable()
-            page.page.wait_for_timeout(1500)
+                page.navigate_to_nat_rule()
+                page.page.wait_for_timeout(500)
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            page.navigate_to_nat_rule()
-            page.page.wait_for_timeout(500)
-            enabled_count = sum(1 for r in test_rules if page.is_rule_enabled(r["name"]))
-            print(f"  [OK] 批量启用: {enabled_count}/{len(test_rules)} 条")
-            rec.add_detail(f"[结果] {enabled_count}/{len(test_rules)} 条已启用")
+                if backend_verifier is not None:
+                    db_rules = backend_verifier.query_nat_rules() or []
+                    enabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                else:
+                    enabled_count = sum(1 for r in test_rules if page.is_rule_enabled(r["name"]))
 
+                if total == 0 or enabled_count >= total:
+                    enable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量启用后 {enabled_count}/{total} 条已启用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次启用: {enabled_count}/{total}条，重试")
+
+            if enable_success:
+                print(f"  [OK] 批量启用: {enabled_count}/{total} 条")
+                rec.add_detail(f"[结果] {enabled_count}/{total} 条已启用")
+            else:
+                print(f"  [WARN] 批量启用未完全生效: {enabled_count}/{total} 条")
+                rec.add_detail(f"[结果] 批量启用未完全生效: {enabled_count}/{total} 条")
+                ui_failures.append(f"批量启用仅{enabled_count}/{total}条规则启用")
+
+            # SSH验证(补断言)
             if backend_verifier is not None:
-                ssh_verify("L1-批量启用", backend_verifier.verify_nat_rule_database,
-                           test_rules[0]["name"], must_pass=False,
-                           expected_fields={"enabled": "yes"})
+                db_rules = backend_verifier.query_nat_rules() or []
+                enabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                rec.add_detail(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                print(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                if total > 0 and enabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_count}/{total}条规则启用")
 
         # ========== 步骤22: 批量删除 ==========
         with rec.step("步骤22: 批量删除", f"批量删除剩余 {len(test_rules)} 条"):

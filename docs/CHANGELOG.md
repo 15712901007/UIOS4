@@ -1,5 +1,128 @@
 # 开发日志
 
+## 2026-06-18 全模块测试验证通过(17模块) + 测出dmz重启失效产品bug + 修复4类测试代码缺陷
+
+### 背景
+断言漏洞修复(must_pass硬断言+3次重试+SSH计数)后, 全量回归全部17个表格模块, 用户实测验证通过。
+
+### 测试结果(2026-06-18 用户实测)
+17个模块: VLAN/IP限速/MAC限速/静态路由/跨三层/多线负载/协议分流/端口分流/域名分流/上下行分离/端口映射/DMZ/UDP代理/UPnP/NAT规则/IGMP代理/IPTV透传
+- **16个 PASS**
+- **dmz_host 符合预期失败**(真实产品bug, must_pass=True设计即捕获)
+
+### 测出真实产品bug(建议报禅道): DMZ主机重启后失效
+`/usr/ikuai/function/netmap` 的 init() 第40-43行:
+```bash
+local qos_num=$(sqlite3 $IK_DB_CONFIG "select * from one_one_map")  # 返回整行文本(非数字)
+if [ "$qos_num" -gt "0" ]; then    # ← 文本做-gt整数比较必报错失败
+    ipt_qos_other_ensure_chain     # ← 不执行 → PREROUTING不引用NETNAT链 → DMZ失效
+```
+SSH实测: `bash: [: 1 yes dmz 192.168.1.100 tcp: integer expression expected`
+- **因果**: 重启→init报错→不建链→NETNAT规则在但PREROUTING不跳转→DMZ对外不生效。用户必须在UI重新编辑/停用启用才恢复
+- **修复建议**: `select *` → `select count(*)`
+- **价值**: 此前must_pass=False软断言会吞掉报"通过", 改硬断言后才暴露——正是"测出真实问题"的核心成果
+
+### 修复的4类测试代码缺陷
+1. **vlan select超时卡死** [pages/network/vlan_page.py]: select_line/select_subnet_mask的nth(1)默认30秒超时, 异常输入表单态dropdown portal不渲染×步骤10的13项累积>9分钟被外层timeout杀。改5秒超时+降级(nth1→first→跳过); try_add_vlan_invalid finally加8秒networkidle
+2. **ip/mac批量删除单次无重试** [test_ip_rate_limit_comprehensive.py / test_mac_rate_limit_comprehensive.py]: 步骤17批量删除只执行1次, UI时序(弹窗/select_all)偶发删不干净即误报失败。改3次重试+SSH数据库计数(对齐步骤16批量启用)
+3. **updown编辑改名统计脱节** [test_updown_route_comprehensive.py]: 步骤13编辑ud10_remark→ud10_edit后, 步骤20/21统计集合TEST_RULES没同步→ud10_edit脱离统计→9/10。加edited_names映射+步骤19脏规则SSH清理(用_router.exec, 非backend_verifier.exec)
+4. **(上一阶段)全模块批量停用/启用断言对齐**: 13个测试文件统一must_pass硬断言重试, 详见下方2026-06-17条目
+
+### 自查误判修正(避免再犯)
+1. vlan卡死曾归"Playwright Windows IOCP环境问题"→实为nth(1) selector确定性超时。"正确拦截 - Timeout"这种成功+超时并存日志就是selector空等信号
+2. updown 9/10曾归"Ant Design分页漏选"→实为编辑改名后规则名集合脱节。批量操作9/10先排查name集合同步
+3. BackendVerifier类组合SSHClient(非继承), 自身无exec方法, 必须用`._router.exec()`
+
+### 经验(可复用)
+1. 测试卡死先看超时报错里的具体selector, 别归环境; "成功+超时"并存日志是selector空等信号
+2. 批量操作9/10先排查"编辑/复制改名后统计name集合是否同步", 不能只靠固定TEST_RULES类属性
+3. 任何批量操作的SSH验证都必须append到failures断言(must_pass=True), 否则失败被静默吞掉报"通过"
+4. SSH清理逻辑"删非test_names"要确保test_names含所有合法规则(含改名后的), 否则误删
+
+### 改动文件
+- pages/network/vlan_page.py (select超时降级3处)
+- tests/network/test_ip_rate_limit_comprehensive.py (步骤17批量删除3次重试+SSH计数)
+- tests/network/test_mac_rate_limit_comprehensive.py (步骤17批量删除3次重试+SSH计数)
+- tests/network/test_updown_route_comprehensive.py (edited_names映射+步骤19脏规则SSH清理)
+- docs/CHANGELOG.md
+- test_data/exports/* (各模块测试导出快照刷新)
+
+## 2026-06-17 全模块批量停用/启用"假成功"断言对齐(13个测试文件)
+
+### 背景
+跨三层批量停用"假成功"修复(方法0)后, 用户要求排查其他模块是否有相同问题。
+
+### 排查结论
+批量操作"假成功"由两层叠加导致, 定位层已全局修复, 断言层普遍缺失:
+1. **定位层** `_click_batch_button`方法0(footer锚点): 写在公共基类 `ikuai_table_page.py`,
+   11个表格模块共享, **已全局生效**——点击失败问题对所有模块自动修复
+2. **断言层**(本次修复): 批量停用/启用后的SSH验证只print/add_detail, 不ssh_failures.append,
+   失败被静默吞掉 → 即使批量操作失败测试也标记通过
+
+### 断言层缺口分布(修复前)
+批量操作验证存在3种风格, 后两种都会"假成功":
+- **风格A**(只add_detail不append): port_route/protocol_route/domain_route/updown_route/multi_wan_lb/udp_proxy/upnp_setting
+- **风格B**(ssh_verify must_pass=False软断言, 且只查test_rules[0]第一条): nat_rule/port_map/dmz_host
+- **风格C**(must_pass=True硬断言, 逐条): static_route ← **已正确, 排除不改**
+- 批量启用SSH断言: 原仅cross_layer有, **其余14个完全无验证**(含mac/ip/vlan)
+
+### 修复(13个测试文件 × 停用+启用 = 26处)
+统一改为跨三层模式(cross_layer 610-710):
+- 3次重试循环 + `page.select_all_rules()` + 等底部操作栏(800ms) + batch_disable/enable
+- SSH优先计数(tagname in test_names + enabled判定), 无backend_verifier时回退UI层is_rule_disabled/enabled
+- 成功判定(disabled_count>=total) + 失败时 `ui_failures.append`
+- 独立SSH计数验证 + `ssh_failures.append`
+- **static_route排除**(已有must_pass=True逐条硬断言)
+- **vlan保留原有UI硬断言**(assert is_vlan_enabled), 仅补SSH验证
+- **updown修掉** `disabled_count = current_count` 硬编码病灶(直接把剩余数当停用数)
+
+### 验证
+- py_compile 13个文件全部通过
+- 批量停用SSH断言: 14个表格模块全覆盖(cross+13)
+- 批量启用SSH断言: 14个表格模块全覆盖(原仅cross有)
+- `disabled_in_db`旧变量仅剩mac/ip/vlan(它们本就有断言, mac/ip改用统一变量名)
+
+### 经验(可复用)
+1. SSH验证只print/add_detail不append = mute(假成功); `must_pass=False`是软断言(失败不报错)
+2. 批量操作验证三件套: **重试**(虚拟滚动底部栏渲染延迟) + **SSH计数** + **append断言**
+3. query方法返回值务必 `or []` 防None(如query_udp_proxy_config注解Optional[Dict]但实际返回list)
+4. 全选用 `page.select_all_rules()`(有is_checked检查) 而非 inline `thead input`(重复click会取消选中)
+
+## 2026-06-17 跨三层批量停用"假成功"修复(方法0 footer锚点精确定位 + 断言补全)
+
+### 现象
+跨三层步骤14"批量停用"日志: `_click_batch_button: 未找到批量按钮 停用` +
+`batch_disable 确认弹窗点击失败: Timeout 30000ms`, SSH验证`数据库中0/8条规则已停用`,
+但测试报告却标记为**通过**(实际8条全部停用失败却没被发现)。
+
+### 根因(经Playwright实测DOM确认)
+1. **_click_batch_button方法1永远失效**: 所有模块底部按钮的svg无aria-label,
+   `get_by_role(name="minus-circle 停用")`永远匹配0个
+2. **方法2在虚拟滚动表格多候选时不可靠**: 跨三层有3处"停用"按钮
+   (行内固定操作列/operateSpace/底部footer), "取第一个非行内可见"会命中错的;
+   select_all后底部按钮渲染延迟时方法2也匹配不到 → "未找到"
+3. **get_by_role误匹配**: "帮助"按钮aria-describedby描述含"停用"字样,
+   导致get_by_role(name="停用")误匹配到帮助按钮(故必须用textContent精确匹配)
+4. **步骤14/15断言缺失(核心掩盖问题)**: SSH验证只print/add_detail不append到failures,
+   批量停用失败也不会让测试失败
+5. **步骤14无等待/无重试**: select_all后立即batch_disable(步骤16批量删除成功因有重试+wait)
+
+### 重要纠正
+此前记录"跨三层页面无工具栏批量删除/停用/启用按钮"是**错误**的——实测全选后
+底部 div.footer 含完整"启用/停用/删除"按钮, 只是定位方法(_click_batch_button)失效。
+
+### 修复
+- **_click_batch_button新增方法0(首选)**: JS在 div.footer(classList token精确匹配,
+  区别于xpath `contains(@class,'footer')`子串误匹配的_footerContainer)内按 textContent
+  精确匹配目标按钮(可见+非行内), JS click触发React(普通Button .click()可靠)。
+  保留方法1/2作回退(向后兼容其他模块)
+- **跨三层步骤14(批量停用)**: select_all后wait 800ms + 3次重试 + SSH验证补ssh_failures断言
+- **跨三层步骤15(批量启用)**: 原完全无验证 → 补SSH验证(enabled=yes)+断言+重试
+
+### 验证
+端到端脚本: 加2条规则→批量停用→2/2 enabled=no →批量启用→2/2 enabled=yes →清理。
+方法0在Python page.evaluate下中文传参正常(MCP工具层传中文参数会乱码,Python不会)。
+
 ## 2026-06-17 _click_batch_button等待底部操作栏修复(跨三层批量删除)
 
 ### 根因

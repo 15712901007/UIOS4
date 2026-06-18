@@ -190,6 +190,7 @@ class TestUpdownRouteComprehensive:
                     backend_verifier.verify_stream_updown_database,
                     rule_data["name"],
                     expected_fields=expected,
+                    must_pass=True,
                 )
 
                 # SSH L2 ipset验证
@@ -231,7 +232,12 @@ class TestUpdownRouteComprehensive:
                 backend_verifier.verify_stream_updown_database,
                 "ud10_edit",
                 expected_fields={"comment": "编辑后备注"},
+                must_pass=True,
             )
+
+            # 编辑把ud10_remark改名为ud10_edit, 后续步骤(清理脏规则/批量停用启用统计)的规则名集合需同步,
+            # 否则ud10_edit不被统计且会被"删除非TEST_RULES"清理逻辑误删→9/10误报(2026-06-17实测定位, 非分页问题)
+            edited_names = {"ud10_remark": "ud10_edit"}
 
         # ========== 步骤14: 停用规则 ==========
         with rec.step("步骤14: 停用规则", "停用ud01_basic"):
@@ -251,6 +257,7 @@ class TestUpdownRouteComprehensive:
                 backend_verifier.verify_stream_updown_database,
                 "ud01_basic",
                 expected_fields={"enabled": "no"},
+                must_pass=True,
             )
 
         # ========== 步骤15: 启用规则 ==========
@@ -271,6 +278,7 @@ class TestUpdownRouteComprehensive:
                 backend_verifier.verify_stream_updown_database,
                 "ud01_basic",
                 expected_fields={"enabled": "yes"},
+                must_pass=True,
             )
 
         # ========== 步骤16: 排序功能 ==========
@@ -381,6 +389,8 @@ class TestUpdownRouteComprehensive:
             dup_result = page.add_rule(name="ud_dup", upload_line="wan2", download_line="wan2")
             print(f"  19b 重复名称: {'被拒绝' if not dup_result else '允许'}")
             rec.add_detail(f"  19b-重复名称: {'被拒绝' if not dup_result else '允许'}")
+            if dup_result:
+                ui_failures.append("19b-重复名称未被拒绝(后端tagname应保证唯一)")
 
             # 19c: 超长名称
             page.navigate_back_to_list()
@@ -423,55 +433,135 @@ class TestUpdownRouteComprehensive:
             print(f"  19g 备注特殊字符: {'成功' if spcrmk_result else '被拒绝'}")
             rec.add_detail(f"  19g-备注特殊字符: {'成功' if spcrmk_result else '被拒绝'}")
 
+            # 步骤19产生的脏规则(ud_dup/超长名截断为15A/ud_longrmk/ud_spcrmk)会使总规则达14>10,
+            # 触发Ant Design分页, 步骤20/21 select_all只选当前页漏选第二页→批量操作不完整(2026-06-17实测9/10)。
+            # 测试设计缺陷: 异常测试不应污染批量操作数据集。清理脏规则使步骤20操作干净的10条TEST_RULES(恰好1页)。
+            # 注: SQL delete不触发iptables重载, 但步骤20/21的UI批量操作会触发重载重建iptables状态, 顺带清除残留。
+            if backend_verifier is not None:
+                # BackendVerifier组合SSHClient(self._router), 自身无exec方法(第一次修复误用backend_verifier.exec
+                # 抛AttributeError被except吞→cleaned=0→脏规则未删→分页漏选依旧)。改用_router.exec。
+                # 通用清理: 删除所有非TEST_RULES的updown规则(不依赖脏规则tagname猜测, 超长名截断长度未知)
+                test_names = {edited_names.get(r["name"], r["name"]) for r in self.TEST_RULES}
+                cleaned = 0
+                dirty_tags = []
+                try:
+                    all_rules = backend_verifier.query_stream_updown_rules() or []  # 内部connect_router
+                    dirty = [r for r in all_rules if (r.get("tagname") or "") not in test_names]
+                    dirty_tags = [r.get("tagname") for r in dirty]
+                    for r in dirty:
+                        tn = (r.get("tagname") or "").replace("'", "''")  # 转义SQL单引号
+                        try:
+                            backend_verifier._router.exec(
+                                f'sqlite3 /etc/mnt/ikuai/config.db '
+                                f'"delete from stream_updown where tagname=\'{tn}\'"'
+                            )
+                            cleaned += 1
+                        except Exception as e:
+                            print(f"  [清理] 删除'{r.get('tagname')}'失败: {str(e)[:60]}")
+                    print(f"  [清理] 步骤19脏规则: 删除{cleaned}/{len(dirty)}条 {dirty_tags}")
+                except Exception as e:
+                    print(f"  [清理] 查询/删除脏规则失败: {str(e)[:60]}")
+                page.navigate_back_to_list()
+                page.wait_for_timeout(800)
+                rec.add_detail(f"  [清理] 步骤19脏规则{dirty_tags}(避免污染步骤20/21批量操作数据集触发分页漏选)")
+
         # ========== 步骤20: 批量停用 ==========
         with rec.step("步骤20: 批量停用", f"批量停用所有规则"):
             print(f"\n[步骤20] 批量停用...")
             rec.add_detail(f"[批量停用]")
 
-            select_all = page.page.locator("thead input[type='checkbox']").first
-            if select_all.count() > 0 and select_all.is_enabled():
-                select_all.click()
+            # 批量停用带重试 + SSH验证(参照跨三层, 原实现 disabled_count=current_count 硬编码无真实验证)
+            test_names = {edited_names.get(r["name"], r["name"]) for r in self.TEST_RULES}
+            total = len(self.TEST_RULES)
+            disable_success = False
+            disabled_count = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_disable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
                 page.page.wait_for_timeout(500)
-            page.batch_disable()
-            page.page.wait_for_timeout(1500)
+                page.navigate_to_updown_route()
+                page.page.wait_for_timeout(500)
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            page.navigate_to_updown_route()
-            page.page.wait_for_timeout(500)
+                if backend_verifier is not None:
+                    db_rules = backend_verifier.query_stream_updown_rules() or []
+                    disabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                else:
+                    disabled_count = sum(1 for r in self.TEST_RULES if page.is_rule_disabled(edited_names.get(r["name"], r["name"])))
 
-            current_count = page.get_rule_count()
-            disabled_count = current_count  # after batch disable, all should be disabled
-            print(f"  [OK] 批量停用完成")
-            rec.add_detail(f"[结果] 批量停用完成")
+                if total == 0 or disabled_count >= total:
+                    disable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量停用后 {disabled_count}/{total} 条已停用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次停用: {disabled_count}/{total}条，重试")
 
+            if disable_success:
+                print(f"  [OK] 批量停用完成: {disabled_count}/{total} 条已停用")
+                rec.add_detail(f"[结果] 批量停用: {disabled_count}/{total} 条已停用")
+            else:
+                print(f"  [WARN] 批量停用未完全生效: {disabled_count}/{total} 条")
+                rec.add_detail(f"[结果] 批量停用未完全生效: {disabled_count}/{total} 条")
+                ui_failures.append(f"批量停用仅{disabled_count}/{total}条规则停用")
+
+            # SSH验证(补断言: 防止批量停用失败却报告通过)
             if backend_verifier is not None:
-                try:
-                    ud_rules = backend_verifier.query_stream_updown_rules()
-                    test_names = {r["name"] for r in self.TEST_RULES}
-                    disabled_in_db = sum(1 for r in ud_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
-                    rec.add_detail(f"    SSH: {disabled_in_db}/{len(self.TEST_RULES)}条停用")
-                except Exception:
-                    pass
+                db_rules = backend_verifier.query_stream_updown_rules() or []
+                disabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                rec.add_detail(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                print(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                if total > 0 and disabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_count}/{total}条规则停用")
 
         # ========== 步骤21: 批量启用 ==========
         with rec.step("步骤21: 批量启用", f"批量启用所有规则"):
             print(f"\n[步骤21] 批量启用...")
             rec.add_detail(f"[批量启用]")
 
-            select_all = page.page.locator("thead input[type='checkbox']").first
-            if select_all.count() > 0 and select_all.is_enabled():
-                select_all.click()
+            # 批量启用带重试 + SSH验证(参照跨三层, 原实现无验证, 批量启用失败无法发现)
+            test_names = {edited_names.get(r["name"], r["name"]) for r in self.TEST_RULES}
+            total = len(self.TEST_RULES)
+            enable_success = False
+            enabled_count = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_enable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
                 page.page.wait_for_timeout(500)
-            page.batch_enable()
-            page.page.wait_for_timeout(1500)
+                page.navigate_to_updown_route()
+                page.page.wait_for_timeout(500)
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            page.navigate_to_updown_route()
-            page.page.wait_for_timeout(500)
-            print(f"  [OK] 批量启用完成")
-            rec.add_detail(f"[结果] 批量启用完成")
+                if backend_verifier is not None:
+                    db_rules = backend_verifier.query_stream_updown_rules() or []
+                    enabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                else:
+                    enabled_count = sum(1 for r in self.TEST_RULES if page.is_rule_enabled(edited_names.get(r["name"], r["name"])))
+
+                if total == 0 or enabled_count >= total:
+                    enable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量启用后 {enabled_count}/{total} 条已启用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次启用: {enabled_count}/{total}条，重试")
+
+            if enable_success:
+                print(f"  [OK] 批量启用完成: {enabled_count}/{total} 条已启用")
+                rec.add_detail(f"[结果] 批量启用: {enabled_count}/{total} 条已启用")
+            else:
+                print(f"  [WARN] 批量启用未完全生效: {enabled_count}/{total} 条")
+                rec.add_detail(f"[结果] 批量启用未完全生效: {enabled_count}/{total} 条")
+                ui_failures.append(f"批量启用仅{enabled_count}/{total}条规则启用")
+
+            # SSH验证(补断言)
+            if backend_verifier is not None:
+                db_rules = backend_verifier.query_stream_updown_rules() or []
+                enabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                rec.add_detail(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                print(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                if total > 0 and enabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_count}/{total}条规则启用")
 
         # ========== 步骤22: 批量删除 ==========
         with rec.step("步骤22: 批量删除", "删除所有规则"):

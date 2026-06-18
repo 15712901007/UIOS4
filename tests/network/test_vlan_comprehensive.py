@@ -772,6 +772,20 @@ class TestVlanComprehensive:
             print(f"  [OK] 批量启用 {len(test_vlans)} 条VLAN成功")
             rec.add_detail(f"  ✓ 所有 {enabled_count} 条VLAN已启用")
 
+            # SSH验证批量启用后数据库中所有规则enabled=yes(参照跨三层, 补断言)
+            if backend_verifier is not None:
+                try:
+                    vlan_rules = backend_verifier.query_vlan_rules()
+                    test_names = {v["name"] for v in test_vlans}
+                    enabled_in_db = sum(1 for r in vlan_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                    print(f"    SSH: 数据库中{enabled_in_db}/{len(test_vlans)}条VLAN已启用")
+                    rec.add_detail(f"    SSH: {enabled_in_db}/{len(test_vlans)}条enabled=yes")
+                    if enabled_in_db < len(test_vlans):
+                        ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_in_db}/{len(test_vlans)}条VLAN启用")
+                except Exception as e:
+                    print(f"    SSH-L1-批量启用验证: 跳过 - {str(e)[:80]}")
+                    rec.add_detail(f"    SSH-L1-批量启用验证: 跳过 - {str(e)[:80]}")
+
         # ========== 步骤13: 批量删除所有VLAN ==========
         with rec.step("步骤13: 批量删除VLAN", f"批量删除剩余的 {len(test_vlans)} 条VLAN"):
             print("\n[步骤13] 批量删除所有VLAN...")

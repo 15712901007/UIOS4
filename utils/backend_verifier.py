@@ -374,6 +374,46 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
         return self.exec(command, timeout)
 
     def exec(self, command: str, timeout: int = 30) -> str:
+        """执行命令并返回stdout（exec方法的别名，保持兼容性）
+
+        外层线程硬超时防护: paramiko的channel.settimeout在Windows下偶发不生效,
+        会导致stdout.read()无限阻塞(实测测试过程中偶发卡死5分钟+)。
+        这里用看门狗线程, 超时后强制close client让阻塞的recv抛异常退出, 再重连重试一次。
+        """
+        import threading
+        hard_limit = timeout + 20  # settimeout应在timeout触发, 留20s余量后强制中断
+        holder = {}
+
+        def _worker():
+            try:
+                holder["result"] = self._exec_with_retry(command, timeout)
+            except BaseException as e:  # noqa: BLE001 看门狗需捕获所有异常
+                holder["error"] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(hard_limit)
+        if t.is_alive():
+            # worker仍阻塞 -> settimeout失效, 强制关闭连接让阻塞的recv抛异常
+            logger.warning(f"SSH exec 硬超时({hard_limit}s), 强制关闭连接重试: cmd={command[:80]}")
+            try:
+                if self._client is not None:
+                    self._client.close()
+            except Exception:
+                pass
+            self._client = None
+            self._console_logged_in = False
+            t.join(5)  # 等待阻塞的recv因连接关闭而退出
+            try:
+                self.connect()
+                return self._exec_with_retry(command, timeout)
+            except Exception as e:
+                raise RuntimeError(f"SSH exec 硬超时后重连重试仍失败: {e}") from e
+        if "error" in holder:
+            raise holder["error"]
+        return holder.get("result", "")
+
+    def _exec_with_retry(self, command: str, timeout: int = 30) -> str:
         """执行命令并返回stdout，连接断开时自动重连一次
 
         增加控制台模式检测: 如果shell被重置回/etc/setup/rc(测试过程中可能发生),
@@ -401,9 +441,10 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
                     self._client.close()
                     self._client = None
                     self.connect()  # connect会重新走_check_and_login_console
-                    # 重连后重新执行命令
+                    # 重连后重新执行命令(必须同样设置channel超时, 否则read可能无限阻塞)
                     if self._client is not None:
                         _, stdout2, _ = self._client.exec_command(command, timeout=timeout)
+                        stdout2.channel.settimeout(timeout)
                         output = stdout2.read().decode("utf-8", errors="replace")
 
                 return output

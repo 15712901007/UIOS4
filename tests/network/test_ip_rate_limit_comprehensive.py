@@ -1106,37 +1106,57 @@ class TestIpRateLimitComprehensive:
             print("\n[步骤16] 批量启用所有规则...")
             rec.add_detail(f"【批量启用操作】")
 
-            # 刷新页面清除选择状态
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-
-            # 获取当前实际规则数量
-            current_count = page.get_rule_count()
-            rec.add_detail(f"  当前规则数量: {current_count}")
-
-            # 使用全选功能
-            page.select_all_rules()
-            page.batch_enable()
-            page.page.wait_for_timeout(1500)
-
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-
-            # 验证启用结果 - 以实际页面数据为准
-            final_count = page.get_rule_count()
-
-            # 统计test_rules中启用的规则数（用于记录）
+            # 批量启用带重试 + SSH验证(参照跨三层, 原实现无验证且异常被吞, 批量启用失败无法发现)
+            enable_success = False
             enabled_count = 0
-            for rule in test_rules:
-                try:
-                    if page.is_rule_enabled(rule["name"]):
-                        enabled_count += 1
-                except Exception:
-                    pass
+            total = len(test_rules)
+            for attempt in range(3):
+                page.page.reload()
+                page.page.wait_for_timeout(500)
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_enable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
+                page.page.wait_for_timeout(500)
 
-            print(f"  [OK] 批量启用完成，当前共 {final_count} 条规则")
-            rec.add_detail(f"【验证结果】")
-            rec.add_detail(f"  ✓ 批量启用完成，当前共 {final_count} 条规则（test_rules中{enabled_count}条已启用）")
+                if backend_verifier is not None:
+                    rules_db = backend_verifier.query_qos_rules("simple_qos") or []
+                    enabled_count = sum(1 for r in rules_db if r.get("enabled") == "yes")
+                    total = len(rules_db) or total
+                else:
+                    enabled_count = 0
+                    for rule in test_rules:
+                        try:
+                            if page.is_rule_enabled(rule["name"]):
+                                enabled_count += 1
+                        except Exception:
+                            pass
+
+                if total == 0 or enabled_count >= total:
+                    enable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量启用后 {enabled_count}/{total} 条已启用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次启用: {enabled_count}/{total}条，重试")
+
+            if enable_success:
+                print(f"  [OK] 批量启用完成: {enabled_count}/{total} 条已启用")
+                rec.add_detail(f"【验证结果】")
+                rec.add_detail(f"  ✓ 批量启用完成，{enabled_count}/{total} 条规则已启用")
+            else:
+                print(f"  [WARN] 批量启用未完全生效: {enabled_count}/{total} 条")
+                rec.add_detail(f"【验证结果】 批量启用未完全生效: {enabled_count}/{total} 条")
+                ui_failures.append(f"批量启用仅{enabled_count}/{total}条规则启用")
+
+            # SSH验证(补断言: 防止批量启用失败却报告通过)
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-批量启用后】")
+                rules_db = backend_verifier.query_qos_rules("simple_qos") or []
+                enabled_in_db = sum(1 for r in rules_db if r.get("enabled") == "yes")
+                print(f"    SSH: 数据库中{enabled_in_db}/{len(rules_db)}条规则已启用")
+                rec.add_detail(f"    SSH: 数据库中{enabled_in_db}/{len(rules_db)}条规则enabled=yes")
+                if len(rules_db) > 0 and enabled_in_db < len(rules_db):
+                    ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_in_db}/{len(rules_db)}条规则启用")
 
         # ========== 步骤17: 批量删除IP限速规则 ==========
         with rec.step("步骤17: 批量删除IP限速规则", f"批量删除剩余的 {len(test_rules)} 条规则"):
@@ -1144,40 +1164,56 @@ class TestIpRateLimitComprehensive:
             rec.add_detail(f"【批量删除操作】")
             rec.add_detail(f"  目标数量: {len(test_rules)} 条规则")
 
-            # 刷新页面清除选择状态
-            page.page.reload()
-            page.page.wait_for_timeout(500)
+            # 批量删除带重试 + SSH计数验证(参照步骤16批量启用)
+            # 偶发删除时序失败(select_all/batch_delete/确认弹窗时序不稳)需重试自愈,
+            # 3次都删不干净才判真实失败(不掩盖产品bug)。原实现单次执行+事后SSH验证,
+            # 只验证不重试 → try1偶发删不干净即误报失败。
+            test_names = {r["name"] for r in test_rules}
+            delete_success = False
+            remaining_count = 0
+            for attempt in range(3):
+                page.page.reload()
+                page.page.wait_for_timeout(800)
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_delete()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
+                page.page.wait_for_timeout(800)
 
-            # 使用全选功能
-            page.select_all_rules()
-            page.batch_delete()
-            page.page.wait_for_timeout(1500)
+                # 以SSH数据库真实状态为准(get_rule_count读"共N条"文字, reload后过早会读0, 不可靠)
+                if backend_verifier is not None:
+                    rules_db = backend_verifier.query_qos_rules("simple_qos") or []
+                    remaining = [r for r in rules_db if r.get("tagname") in test_names]
+                    remaining_count = len(remaining)
+                else:
+                    remaining_count = 0
+                    for rule in test_rules:
+                        try:
+                            if page.rule_exists(rule["name"]):
+                                remaining_count += 1
+                        except Exception:
+                            pass
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
+                if remaining_count == 0:
+                    delete_success = True
+                    break
+                print(f"  第{attempt + 1}次批量删除后数据库仍剩 {remaining_count} 条测试规则，重试...")
+                rec.add_detail(f"  第{attempt + 1}次删除: 剩{remaining_count}条测试规则，重试")
 
-            # 以实际页面数据为准
-            final_count = page.get_rule_count()
+            if delete_success:
+                print(f"  [OK] 批量删除完成，测试规则已全部删除")
+                rec.add_detail(f"【验证结果】")
+                rec.add_detail(f"  ✓ 批量删除完成，测试规则已全部删除(重试{attempt + 1}次)")
+            else:
+                print(f"  [WARN] 批量删除未完全生效: 仍剩 {remaining_count} 条测试规则")
+                rec.add_detail(f"【验证结果】 批量删除未完全生效: 仍剩 {remaining_count} 条")
+                ui_failures.append(f"批量删除仍剩{remaining_count}条测试规则")
 
-            # 统计test_rules中删除的规则数（用于记录）
-            deleted_count = 0
-            for rule in test_rules:
-                try:
-                    if not page.rule_exists(rule["name"]):
-                        deleted_count += 1
-                except Exception:
-                    deleted_count += 1  # 如果检查失败，假设已删除
-
-            print(f"  [OK] 批量删除完成，剩余 {final_count} 条规则")
-            rec.add_detail(f"【验证结果】")
-            rec.add_detail(f"  ✓ 批量删除完成，剩余 {final_count} 条规则（test_rules中{deleted_count}条已删除）")
-
-            # SSH后台验证：批量删除后数据库应为空
+            # SSH最终验证：批量删除后数据库测试规则应为空(3次重试都删不干净→真实失败, 不掩盖)
             if backend_verifier is not None:
                 rec.add_detail(f"  【SSH验证-批量删除后】")
                 rules_db = backend_verifier.query_qos_rules("simple_qos")
-                # 过滤掉测试数据（可能有其他用户的规则）
-                test_names = {r["name"] for r in test_rules}
                 remaining_test_rules = [r for r in rules_db if r.get("tagname") in test_names]
                 if len(remaining_test_rules) == 0:
                     print(f"    SSH: 数据库中测试规则已全部删除（总规则数: {len(rules_db)}）")

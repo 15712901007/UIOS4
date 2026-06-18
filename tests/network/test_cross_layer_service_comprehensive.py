@@ -607,24 +607,53 @@ class TestCrossLayerServiceComprehensive:
             page.page.reload()
             page.page.wait_for_timeout(500)
 
-            page.select_all_rules()
-            page.batch_disable()
-            page.page.wait_for_timeout(1500)
+            # 批量停用带重试(参照批量删除步骤16), 确保所有规则停用
+            # 修复: 原实现select_all后立即batch_disable且无重试, 底部操作栏渲染延迟时点击失败;
+            #       且SSH验证只print不断言, 导致批量停用实际失败却报告通过
+            disable_success = False
+            disabled_count = 0
+            total = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)  # 等底部操作栏出现
+                page.batch_disable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
+                page.page.wait_for_timeout(500)
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
+                # 用SSH验证(虚拟滚动表格页面get_rule_count可能不准)
+                if backend_verifier is not None:
+                    all_rules = backend_verifier.query_netsnmpc_rules()
+                    total = len(all_rules or [])
+                    disabled_count = sum(1 for r in (all_rules or []) if r.get('enabled') == 'no')
+                else:
+                    total = page.get_rule_count()
+                    disabled_count = total
 
-            current_count = page.get_rule_count()
-            print(f"  [OK] 批量停用完成，当前共 {current_count} 条规则")
-            rec.add_detail(f"  批量停用完成: {current_count} 条规则")
+                if total == 0 or disabled_count >= total:
+                    disable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量停用后 {disabled_count}/{total} 条已停用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次停用: {disabled_count}/{total}条，重试")
 
-            # SSH验证
+            if disable_success:
+                print(f"  [OK] 批量停用完成: {disabled_count}/{total} 条规则已停用")
+                rec.add_detail(f"  批量停用成功: {disabled_count}/{total} 条已停用")
+            else:
+                print(f"  [WARN] 批量停用未完全生效: {disabled_count}/{total} 条已停用")
+                rec.add_detail(f"  批量停用未完全生效: {disabled_count}/{total} 条已停用")
+                ui_failures.append(f"批量停用仅{disabled_count}/{total}条规则停用")
+
+            # SSH验证(补断言: 防止批量停用失败却报告通过)
             if backend_verifier is not None:
                 rec.add_detail(f"  【SSH验证-批量停用后】")
                 all_rules = backend_verifier.query_netsnmpc_rules()
+                total = len(all_rules or [])
                 disabled_count = sum(1 for r in (all_rules or []) if r.get('enabled') == 'no')
-                rec.add_detail(f"    SSH: 数据库中{disabled_count}/{len(all_rules or [])}条规则已停用")
-                print(f"    SSH: 数据库中{disabled_count}/{len(all_rules or [])}条规则已停用")
+                rec.add_detail(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                print(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                if total > 0 and disabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_count}/{total}条规则停用")
 
         # ========== 步骤15: 批量启用 ==========
         with rec.step("步骤15: 批量启用所有规则", "测试批量启用功能"):
@@ -634,16 +663,51 @@ class TestCrossLayerServiceComprehensive:
             page.page.reload()
             page.page.wait_for_timeout(500)
 
-            page.select_all_rules()
-            page.batch_enable()
-            page.page.wait_for_timeout(1500)
+            # 批量启用带重试 + SSH验证(参照批量停用步骤14)
+            # 修复: 原实现无重试且完全无验证, 批量启用失败无法发现
+            enable_success = False
+            enabled_count = 0
+            total = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_enable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
+                page.page.wait_for_timeout(500)
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
+                if backend_verifier is not None:
+                    all_rules = backend_verifier.query_netsnmpc_rules()
+                    total = len(all_rules or [])
+                    enabled_count = sum(1 for r in (all_rules or []) if r.get('enabled') == 'yes')
+                else:
+                    total = page.get_rule_count()
+                    enabled_count = total
 
-            current_count = page.get_rule_count()
-            print(f"  [OK] 批量启用完成，当前共 {current_count} 条规则")
-            rec.add_detail(f"  批量启用完成: {current_count} 条规则")
+                if total == 0 or enabled_count >= total:
+                    enable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量启用后 {enabled_count}/{total} 条已启用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次启用: {enabled_count}/{total}条，重试")
+
+            if enable_success:
+                print(f"  [OK] 批量启用完成: {enabled_count}/{total} 条规则已启用")
+                rec.add_detail(f"  批量启用成功: {enabled_count}/{total} 条已启用")
+            else:
+                print(f"  [WARN] 批量启用未完全生效: {enabled_count}/{total} 条已启用")
+                rec.add_detail(f"  批量启用未完全生效: {enabled_count}/{total} 条已启用")
+                ui_failures.append(f"批量启用仅{enabled_count}/{total}条规则启用")
+
+            # SSH验证(补断言)
+            if backend_verifier is not None:
+                rec.add_detail(f"  【SSH验证-批量启用后】")
+                all_rules = backend_verifier.query_netsnmpc_rules()
+                total = len(all_rules or [])
+                enabled_count = sum(1 for r in (all_rules or []) if r.get('enabled') == 'yes')
+                rec.add_detail(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                print(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                if total > 0 and enabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_count}/{total}条规则启用")
 
         # ========== 步骤16: 批量删除(用batch_delete, _click_batch_button已修复等待底部操作栏) ==========
         with rec.step("步骤16: 批量删除所有规则", "测试批量删除功能"):

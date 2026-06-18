@@ -341,7 +341,7 @@ class TestDomainRouteComprehensive:
             rec.add_detail(f"[验证] [OK] 编辑成功，新名称已生效")
 
             if backend_verifier is not None:
-                ssh_verify("L1-编辑验证", backend_verifier.verify_stream_domain_database, new_name)
+                ssh_verify("L1-编辑验证", backend_verifier.verify_stream_domain_database, new_name, must_pass=True)
 
         # ========== 步骤5.5: 复制规则测试 ==========
         with rec.step("步骤5.5: 复制规则", "复制编辑后的规则，修改名称保存"):
@@ -391,7 +391,7 @@ class TestDomainRouteComprehensive:
                     rec.add_detail(f"  [OK] 复制成功")
 
                     if backend_verifier is not None:
-                        ssh_verify("L1-复制验证", backend_verifier.verify_stream_domain_database, copy_name)
+                        ssh_verify("L1-复制验证", backend_verifier.verify_stream_domain_database, copy_name, must_pass=True)
                 else:
                     rec.add_detail(f"  [WARN] 复制保存未返回成功")
                     print(f"  [WARN] 复制保存未返回成功")
@@ -877,49 +877,98 @@ class TestDomainRouteComprehensive:
             print(f"\n[步骤13] 批量停用 {len(test_rules)} 条...")
             rec.add_detail(f"[批量停用] 目标: {len(test_rules)} 条")
 
-            select_all = page.page.locator("thead input[type='checkbox']").first
-            if select_all.count() > 0 and select_all.is_enabled():
-                select_all.click()
+            # 批量停用带重试 + SSH验证(参照跨三层, 防止底部操作栏延迟导致点击失败却报告通过)
+            test_names = {r["name"] for r in test_rules}
+            total = len(test_rules)
+            disable_success = False
+            disabled_count = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_disable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
                 page.page.wait_for_timeout(500)
-            page.batch_disable()
-            page.page.wait_for_timeout(1500)
+                page.navigate_to_domain_route()
+                page.page.wait_for_timeout(500)
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            page.navigate_to_domain_route()
-            page.page.wait_for_timeout(500)
-            disabled_count = sum(1 for r in test_rules if page.is_rule_disabled(r["name"]))
-            print(f"  [OK] 批量停用: {disabled_count}/{len(test_rules)} 条")
-            rec.add_detail(f"[结果] {disabled_count}/{len(test_rules)} 条已停用")
+                if backend_verifier is not None:
+                    db_rules = backend_verifier.query_stream_domain_rules() or []
+                    disabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                else:
+                    disabled_count = sum(1 for r in test_rules if page.is_rule_disabled(r["name"]))
 
+                if total == 0 or disabled_count >= total:
+                    disable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量停用后 {disabled_count}/{total} 条已停用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次停用: {disabled_count}/{total}条，重试")
+
+            if disable_success:
+                print(f"  [OK] 批量停用: {disabled_count}/{total} 条")
+                rec.add_detail(f"[结果] {disabled_count}/{total} 条已停用")
+            else:
+                print(f"  [WARN] 批量停用未完全生效: {disabled_count}/{total} 条")
+                rec.add_detail(f"[结果] 批量停用未完全生效: {disabled_count}/{total} 条")
+                ui_failures.append(f"批量停用仅{disabled_count}/{total}条规则停用")
+
+            # SSH验证(补断言: 防止批量停用失败却报告通过)
             if backend_verifier is not None:
-                try:
-                    dm_rules = backend_verifier.query_stream_domain_rules()
-                    test_names = {r["name"] for r in test_rules}
-                    disabled_in_db = sum(1 for r in dm_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
-                    rec.add_detail(f"    SSH: {disabled_in_db}/{len(test_rules)}条停用")
-                except Exception:
-                    pass
+                db_rules = backend_verifier.query_stream_domain_rules() or []
+                disabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
+                rec.add_detail(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                print(f"    SSH: 数据库中{disabled_count}/{total}条规则已停用")
+                if total > 0 and disabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_count}/{total}条规则停用")
 
         # ========== 步骤14: 批量启用 ==========
         with rec.step("步骤14: 批量启用", f"批量启用剩余 {len(test_rules)} 条"):
             print(f"\n[步骤14] 批量启用 {len(test_rules)} 条...")
             rec.add_detail(f"[批量启用] 目标: {len(test_rules)} 条")
 
-            select_all = page.page.locator("thead input[type='checkbox']").first
-            if select_all.count() > 0 and select_all.is_enabled():
-                select_all.click()
+            # 批量启用带重试 + SSH验证(参照跨三层, 原实现无验证, 批量启用失败无法发现)
+            test_names = {r["name"] for r in test_rules}
+            total = len(test_rules)
+            enable_success = False
+            enabled_count = 0
+            for attempt in range(3):
+                page.select_all_rules()
+                page.page.wait_for_timeout(800)
+                page.batch_enable()
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
                 page.page.wait_for_timeout(500)
-            page.batch_enable()
-            page.page.wait_for_timeout(1500)
+                page.navigate_to_domain_route()
+                page.page.wait_for_timeout(500)
 
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            page.navigate_to_domain_route()
-            page.page.wait_for_timeout(500)
-            enabled_count = sum(1 for r in test_rules if page.is_rule_enabled(r["name"]))
-            print(f"  [OK] 批量启用: {enabled_count}/{len(test_rules)} 条")
-            rec.add_detail(f"[结果] {enabled_count}/{len(test_rules)} 条已启用")
+                if backend_verifier is not None:
+                    db_rules = backend_verifier.query_stream_domain_rules() or []
+                    enabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                else:
+                    enabled_count = sum(1 for r in test_rules if page.is_rule_enabled(r["name"]))
+
+                if total == 0 or enabled_count >= total:
+                    enable_success = True
+                    break
+                print(f"  第{attempt + 1}次批量启用后 {enabled_count}/{total} 条已启用，重试...")
+                rec.add_detail(f"  第{attempt + 1}次启用: {enabled_count}/{total}条，重试")
+
+            if enable_success:
+                print(f"  [OK] 批量启用: {enabled_count}/{total} 条")
+                rec.add_detail(f"[结果] {enabled_count}/{total} 条已启用")
+            else:
+                print(f"  [WARN] 批量启用未完全生效: {enabled_count}/{total} 条")
+                rec.add_detail(f"[结果] 批量启用未完全生效: {enabled_count}/{total} 条")
+                ui_failures.append(f"批量启用仅{enabled_count}/{total}条规则启用")
+
+            # SSH验证(补断言)
+            if backend_verifier is not None:
+                db_rules = backend_verifier.query_stream_domain_rules() or []
+                enabled_count = sum(1 for r in db_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
+                rec.add_detail(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                print(f"    SSH: 数据库中{enabled_count}/{total}条规则已启用")
+                if total > 0 and enabled_count < total:
+                    ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_count}/{total}条规则启用")
 
         # ========== 步骤15: 批量删除 ==========
         with rec.step("步骤15: 批量删除", f"批量删除剩余 {len(test_rules)} 条"):
