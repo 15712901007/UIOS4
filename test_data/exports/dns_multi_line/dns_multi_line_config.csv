@@ -1,0 +1,3 @@
+id,interface,tagname,dns1,dns2,enabled,comment
+1,"wan1","mldns1","223.5.5.5","223.6.6.6","yes","∞¢¿ÔDNS"
+2,"wan2","mldns2","114.114.114.114","114.114.115.115","yes","114DNS"

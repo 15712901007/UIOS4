@@ -111,6 +111,10 @@ from pages.network.port_map_page import PortMapPage
 from pages.network.dmz_host_page import DmzHostPage
 from pages.network.dns_accelerate_page import DnsAcceleratePage
 from pages.network.dns_multi_line_page import DnsMultiLinePage
+from pages.network.stream_control_page import StreamControlPage
+from pages.network.alone_limit_page import AloneLimitPage
+from pages.network.layer7_qos_page import Layer7QosPage
+from pages.network.high_prio_host_page import HighPrioHostPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -179,6 +183,7 @@ TEST_NAME_MAPPING = {
     'test_dmz_host_comprehensive': 'DMZ主机综合测试',
     'test_dns_accelerate_comprehensive': 'DNS加速服务综合测试',
     'test_dns_multi_line_comprehensive': '多线路DNS服务综合测试',
+    'test_stream_control_comprehensive': '智能流控综合测试',
 }
 
 
@@ -631,6 +636,25 @@ def dns_multi_line_page_logged_in(logged_in_page: Page, config: Config) -> 'DnsM
     return ml_page
 
 
+# ==================== 智能流控 fixtures ====================
+
+@pytest.fixture(scope="function")
+def stream_control_page(page: Page, config: Config) -> 'StreamControlPage':
+    """创建智能流控页面实例"""
+    return StreamControlPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def stream_control_page_logged_in(logged_in_page: Page, config: Config) -> 'StreamControlPage':
+    """已登录并导航到智能流控页面的实例
+
+    导航到智能流控主页面(不自动开启流控, 由测试内控制开关/模式切换)
+    """
+    sc_page = StreamControlPage(logged_in_page, config.get_base_url())
+    sc_page.navigate_to_stream_control()
+    return sc_page
+
+
 # ==================== 端口映射 fixtures ====================
 
 @pytest.fixture(scope="function")
@@ -900,6 +924,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "dns_multi_line: 多线路DNS服务模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "stream_control: 智能流控模块测试"
     )
 
     # 记录开始时间

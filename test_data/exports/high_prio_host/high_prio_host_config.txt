@@ -1,0 +1,2 @@
+id=1 enabled=yes tagname=hp1 comment=已编辑A host=a-edit.example.com
+id=2 enabled=yes tagname=hp2 comment=测试域名B host=b.example.com

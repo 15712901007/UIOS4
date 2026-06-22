@@ -5842,3 +5842,520 @@ class BackendVerifier:
         results.append(self.verify_dns_multi_line_kernel(expect_enabled=expect_enabled))
 
         return FullChainResult(results=results)
+
+    # ==================== 智能流控(Stream Control)验证 ====================
+    # 涉及表: global_config(stream_ctl_mode), layer7_intell(智能配置),
+    #         wan_config(线路带宽), alone_limit(终端独立限速),
+    #         layer7_qos(手动流控策略), high_prio_host(优先域名)
+    # 后端脚本: stream_control.sh / layer7_intell.sh / alone_limit.sh /
+    #          layer7_qos.sh / high_prio_host.sh
+
+    # ---------- alone_limit(终端独立限速) ----------
+    def query_alone_limit_rule(self, name: str) -> Optional[Dict]:
+        """L1: 查询终端独立限速规则(alone_limit表, 按tagname)"""
+        return self._sqlite_query_line(
+            f"SELECT id,tagname,enabled,ip_addr,upload,download,prio,comment "
+            f"FROM alone_limit WHERE tagname='{name}'"
+        )
+
+    def query_all_alone_limit(self) -> List[Dict]:
+        """L1: 查询所有终端独立限速规则"""
+        return self._sqlite_query_list(
+            "SELECT id,tagname,enabled,upload,download,prio FROM alone_limit"
+        )
+
+    def count_alone_limit(self, enabled_only: bool = False) -> int:
+        """L1: 统计终端独立限速规则数"""
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM alone_limit {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_alone_limit_database(self, name: str,
+                                    expected_fields: Dict = None,
+                                    must_exist: bool = True) -> VerifyResult:
+        """L1: 验证终端独立限速规则(alone_limit表)
+
+        expected_fields可含: tagname/ip_addr(检查IP子串)/upload/download/prio/enabled
+        """
+        rule = self.query_alone_limit_rule(name)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=not must_exist,
+                message=f"规则'{name}'不存在"
+                        f"({'符合预期' if not must_exist else '应为存在'})",
+                raw_output="",
+            )
+        details = {
+            "tagname": rule.get("tagname"), "enabled": rule.get("enabled"),
+            "ip_addr": rule.get("ip_addr"), "upload": rule.get("upload"),
+            "download": rule.get("download"), "prio": rule.get("prio"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"规则'{name}'存在: up={details['upload']}, "
+                        f"down={details['download']}, prio={details['prio']}, "
+                        f"enabled={details['enabled']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if fld == "ip_addr":
+                # ip_addr是json, 检查IP是否在custom列表里(子串匹配)
+                if str(expected) not in actual:
+                    mismatches[fld] = {"expected": str(expected), "actual": actual}
+            elif actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"规则'{name}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"终端独立限速规则'{name}'数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_alone_limit_ipset(self, rule_id: int, ip: str = None,
+                                 should_exist: bool = True) -> VerifyResult:
+        """L2: 验证终端独立限速规则的ipset
+
+        alone_limit启用后创建: alone_limit_$id(list:set) + _alone_limit_$id(IP) + _alone_limit_$id_mac
+        停用/删除后清理。
+        """
+        self.connect_router()
+        try:
+            all_ipset = self._router.exec("ipset list -n 2>/dev/null") or ""
+            main_set = f"alone_limit_{rule_id}"
+            ip_set = f"_alone_limit_{rule_id}"
+            main_exists = main_set in all_ipset
+            ip_exists = ip_set in all_ipset
+
+            if should_exist:
+                ok = main_exists or ip_exists
+                msg = f"ipset {main_set}={'存在' if main_exists else '缺失'}, "
+                msg += f"{ip_set}={'存在' if ip_exists else '缺失'}"
+                # 进一步检查IP是否在ipset里
+                if ok and ip:
+                    content = self._router.exec(
+                        f"ipset list {ip_set} 2>/dev/null") or ""
+                    ip_in = ip in content
+                    msg += f", IP({ip})={'在集合中' if ip_in else '不在集合中'}"
+                    ok = ok and ip_in
+                return VerifyResult(
+                    level="L2-ipset", passed=ok, message=msg,
+                    details={"main_set": main_exists, "ip_set": ip_exists},
+                    raw_output=all_ipset[-300:],
+                )
+            else:
+                ok = not main_exists and not ip_exists
+                return VerifyResult(
+                    level="L2-ipset", passed=ok,
+                    message=f"停用/删除后ipset应清理({main_set}/{ip_set})"
+                            f"{'已清理' if ok else '仍存在'}",
+                    raw_output=all_ipset[-200:],
+                )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-ipset", passed=False,
+                message=f"ipset检查失败: {e}", raw_output=str(e),
+            )
+
+    # ---------- layer7_qos(手动流控策略) ----------
+    def query_layer7_qos_rule(self, name: str) -> Optional[Dict]:
+        """L1: 查询手动流控策略规则(layer7_qos表, 按name/tagname)"""
+        return self._sqlite_query_line(
+            f"SELECT id,name,tagname,enabled,interface,prio,min_up,min_down,"
+            f"max_up,max_down,app_proto FROM layer7_qos WHERE name='{name}' "
+            f"OR tagname='{name}'"
+        )
+
+    def query_all_layer7_qos(self) -> List[Dict]:
+        """L1: 查询所有手动流控策略规则"""
+        return self._sqlite_query_list(
+            "SELECT id,name,tagname,enabled,interface,prio FROM layer7_qos"
+        )
+
+    def count_layer7_qos(self, enabled_only: bool = False) -> int:
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM layer7_qos {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_layer7_qos_database(self, name: str,
+                                   expected_fields: Dict = None,
+                                   must_exist: bool = True) -> VerifyResult:
+        """L1: 验证手动流控策略规则(layer7_qos表)"""
+        rule = self.query_layer7_qos_rule(name)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=not must_exist,
+                message=f"规则'{name}'不存在"
+                        f"({'符合预期' if not must_exist else '应为存在'})",
+                raw_output="",
+            )
+        details = {k: rule.get(k) for k in
+                   ["name", "tagname", "enabled", "interface", "prio",
+                    "min_up", "min_down", "max_up", "max_down"]}
+        raw = json.dumps(details, ensure_ascii=False)
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"规则'{name}'存在: interface={details['interface']}, "
+                        f"prio={details['prio']}, enabled={details['enabled']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"规则'{name}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"手动流控策略规则'{name}'数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_layer7_qos_ipset(self, rule_id: int,
+                                should_exist: bool = True) -> VerifyResult:
+        """L2: 验证手动流控策略规则的ipset
+
+        ipset命名可能是 layer7qos_src_$id / _layer7qos_$id / layer7qos_$id, 用模糊匹配。
+        """
+        self.connect_router()
+        try:
+            all_ipset = self._router.exec("ipset list -n 2>/dev/null") or ""
+            sets = [s.strip() for s in all_ipset.split("\n") if s.strip()]
+            matched = [s for s in sets if "layer7qos" in s and str(rule_id) in s]
+            exists = len(matched) > 0
+            if should_exist:
+                return VerifyResult(
+                    level="L2-ipset", passed=exists,
+                    message=f"layer7qos规则{rule_id} ipset={matched}",
+                    raw_output=all_ipset[-300:],
+                )
+            else:
+                ok = not exists
+                return VerifyResult(
+                    level="L2-ipset", passed=ok,
+                    message=f"停用/删除后layer7qos ipset应清理, matched={matched}",
+                    raw_output=all_ipset[-200:],
+                )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-ipset", passed=False,
+                message=f"ipset检查失败: {e}", raw_output=str(e),
+            )
+
+    # ---------- high_prio_host(优先域名) ----------
+    def query_high_prio_host_rule(self, name: str) -> Optional[Dict]:
+        """L1: 查询优先域名规则(high_prio_host表, 按tagname)"""
+        return self._sqlite_query_line(
+            f"SELECT id,tagname,host,enabled,comment FROM high_prio_host "
+            f"WHERE tagname='{name}'"
+        )
+
+    def count_high_prio_host(self, enabled_only: bool = False) -> int:
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM high_prio_host {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_high_prio_host_database(self, name: str,
+                                       expected_fields: Dict = None,
+                                       must_exist: bool = True) -> VerifyResult:
+        """L1: 验证优先域名规则(high_prio_host表)"""
+        rule = self.query_high_prio_host_rule(name)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=not must_exist,
+                message=f"规则'{name}'不存在"
+                        f"({'符合预期' if not must_exist else '应为存在'})",
+                raw_output="",
+            )
+        details = {k: rule.get(k) for k in
+                   ["tagname", "host", "enabled", "comment"]}
+        raw = json.dumps(details, ensure_ascii=False)
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"规则'{name}'存在: host={details['host']}, "
+                        f"enabled={details['enabled']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"规则'{name}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"优先域名规则'{name}'数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_high_prio_host_effect(self, expect_enabled: bool = True) -> VerifyResult:
+        """L3/L4: 验证优先域名生效条件
+
+        优先域名仅在 layer7_intell.auto=2(网页优先) 且 domain_prio_switch=1
+        且 domain_prio_ports非空 时生效(ik_cntl http_app high_prio_host on)。
+        ik_cntl http_app无show命令, 通过数据库条件判断生效状态。
+        """
+        self.connect_router()
+        try:
+            cfg = self._sqlite_query_line(
+                "SELECT auto,domain_prio_switch,domain_prio_ports "
+                "FROM layer7_intell WHERE id=1"
+            ) or {}
+            cnt = self.count_high_prio_host(enabled_only=True)
+            auto = cfg.get("auto", "")
+            switch = cfg.get("domain_prio_switch", "")
+            ports = cfg.get("domain_prio_ports", "")
+            # 生效条件: auto=2 && switch=1 && ports非空 && 有enabled记录
+            cond_ok = (auto == "2" and switch == "1" and ports != "" and cnt > 0)
+            if expect_enabled:
+                ok = cond_ok
+                msg = (f"生效条件 auto={auto}(需2)/switch={switch}(需1)/"
+                       f"ports='{ports}'(需非空)/enabled记录={cnt}(需>0) "
+                       f"=>{'满足' if ok else '不满足'}")
+            else:
+                # 期望不生效: 至少一个条件不满足
+                ok = not cond_ok
+                msg = (f"期望不生效, 当前条件 auto={auto}/switch={switch}/"
+                       f"ports='{ports}'/记录={cnt} =>{'未生效' if ok else '仍在生效'}")
+            return VerifyResult(
+                level="L3/L4-生效条件", passed=ok, message=msg,
+                details={"auto": auto, "domain_prio_switch": switch,
+                         "domain_prio_ports": ports, "enabled_count": cnt},
+                raw_output=json.dumps(cfg, ensure_ascii=False),
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L3/L4-生效条件", passed=False,
+                message=f"优先域名生效条件检查失败: {e}", raw_output=str(e),
+            )
+
+    # ---------- layer7_intell(智能流控配置) ----------
+    def query_layer7_intell(self) -> Optional[Dict]:
+        """L1: 查询智能流控配置(layer7_intell表, 单记录id=1)"""
+        return self._sqlite_query_line(
+            "SELECT auto,Http,Game,Im,Transport,Relax,Utils,Office,Education,"
+            "Life,Financial,Unknown,domain_prio_switch,domain_prio_ports "
+            "FROM layer7_intell WHERE id=1"
+        )
+
+    def verify_layer7_intell_config(self, expected_fields: Dict = None) -> VerifyResult:
+        """L1: 验证智能流控配置(auto场景/应用优先级/domain_prio)
+
+        expected_fields可含: auto/Http/Game/.../domain_prio_switch/domain_prio_ports
+        """
+        cfg = self.query_layer7_intell()
+        if cfg is None:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message="layer7_intell配置不存在", raw_output="",
+            )
+        raw = json.dumps(cfg, ensure_ascii=False)
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"智能流控配置: auto={cfg.get('auto')}, "
+                        f"domain_prio_switch={cfg.get('domain_prio_switch')}, "
+                        f"ports={cfg.get('domain_prio_ports')}",
+                details={"config": cfg}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(cfg.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"智能流控配置不匹配: {mismatches}",
+                details={"config": cfg, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"智能流控配置验证通过",
+            details={"config": cfg}, raw_output=raw,
+        )
+
+    # ---------- wan_config(线路带宽) ----------
+    def query_wan_config_bandwidth(self, line: str) -> Optional[Dict]:
+        """L1: 查询指定线路的带宽配置(wan_config表)"""
+        return self._sqlite_query_line(
+            f"SELECT name,qos_upload,qos_download,qos_switch "
+            f"FROM wan_config WHERE name='{line}'"
+        )
+
+    def verify_wan_config_bandwidth(self, line: str, upload: int = None,
+                                    download: int = None,
+                                    qos_switch: int = None) -> VerifyResult:
+        """L1: 验证线路带宽配置(wan_config.qos_upload/qos_download/qos_switch)"""
+        cfg = self.query_wan_config_bandwidth(line)
+        if cfg is None:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"线路'{line}'不存在", raw_output="",
+            )
+        raw = json.dumps(cfg, ensure_ascii=False)
+        checks = []
+        if upload is not None:
+            ok = str(cfg.get("qos_upload", "")) == str(upload)
+            checks.append(("上行带宽", ok,
+                           f"qos_upload={cfg.get('qos_upload')}(期望{upload})"))
+        if download is not None:
+            ok = str(cfg.get("qos_download", "")) == str(download)
+            checks.append(("下行带宽", ok,
+                           f"qos_download={cfg.get('qos_download')}(期望{download})"))
+        if qos_switch is not None:
+            ok = str(cfg.get("qos_switch", "")) == str(qos_switch)
+            checks.append(("流控开关", ok,
+                           f"qos_switch={cfg.get('qos_switch')}(期望{qos_switch})"))
+        if not checks:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"线路'{line}': up={cfg.get('qos_upload')}, "
+                        f"down={cfg.get('qos_download')}, "
+                        f"switch={cfg.get('qos_switch')}",
+                details={"config": cfg}, raw_output=raw,
+            )
+        passed = all(c[1] for c in checks)
+        return VerifyResult(
+            level="L1-数据库", passed=passed,
+            message="; ".join(c[2] for c in checks),
+            details={"config": cfg}, raw_output=raw,
+        )
+
+    # ---------- global_config(流控模式) ----------
+    def query_stream_ctl_mode(self) -> str:
+        """L1: 查询流控模式(global_config.stream_ctl_mode: 0关/1智能/2手动)"""
+        result = self._sqlite_query_line(
+            "SELECT stream_ctl_mode FROM global_config WHERE id=1"
+        )
+        return result.get("stream_ctl_mode", "") if result else ""
+
+    def verify_stream_ctl_mode(self, expected_mode: int) -> VerifyResult:
+        """L1: 验证流控模式(0关闭/1智能/2手动)"""
+        mode = self.query_stream_ctl_mode()
+        mode_name = {"0": "关闭", "1": "智能模式", "2": "手动模式"}.get(mode, mode)
+        exp_name = {"0": "关闭", "1": "智能模式", "2": "手动模式"}.get(str(expected_mode), str(expected_mode))
+        ok = mode == str(expected_mode)
+        return VerifyResult(
+            level="L1-数据库", passed=ok,
+            message=f"stream_ctl_mode={mode}({mode_name})"
+                    f"({'符合' if ok else '不符合'}期望{exp_name})",
+            details={"stream_ctl_mode": mode, "expected": str(expected_mode)},
+            raw_output=f"stream_ctl_mode={mode}",
+        )
+
+    # ---------- 运行时(qos进程/htb) ----------
+    def verify_qos_runtime(self, expect_enabled: bool = True) -> VerifyResult:
+        """L4: 验证流控运行时状态(htb_rate_est + LAYER7 iptables链)
+
+        流控开启后: htb_rate_est=1, iptables mangle有LAYER7_IN/OUT/STREAM_LAYER7_NEW链
+        """
+        self.connect_router()
+        try:
+            htb = self._router.exec(
+                "cat /sys/module/sch_htb/parameters/htb_rate_est 2>/dev/null"
+            ).strip()
+            ipt = self._router.exec(
+                "iptables -t mangle -S 2>/dev/null | grep -cE 'LAYER7|STREAM_LAYER7'"
+            ).strip()
+            htb_on = (htb == "1")
+            has_layer7 = False
+            try:
+                has_layer7 = int(ipt) > 0
+            except ValueError:
+                has_layer7 = False
+
+            if expect_enabled:
+                ok = htb_on  # htb_rate_est=1是核心标志
+                msg = (f"htb_rate_est={htb}({'开启' if htb_on else '关闭'}), "
+                       f"LAYER7规则数={ipt}")
+            else:
+                ok = not htb_on
+                msg = (f"期望流控关闭, htb_rate_est={htb}"
+                       f"({'已关闭' if not htb_on else '仍开启'})")
+            return VerifyResult(
+                level="L4-运行时", passed=ok, message=msg,
+                details={"htb_rate_est": htb, "layer7_rule_count": ipt,
+                         "has_layer7_chain": has_layer7},
+                raw_output=f"htb={htb}, layer7_rules={ipt}",
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L4-运行时", passed=False,
+                message=f"流控运行时检查失败: {e}", raw_output=str(e),
+            )
+
+    # ---------- 清理 ----------
+    def cleanup_stream_control(self, disable: bool = True) -> str:
+        """清理智能流控环境(关闭流控 + 清空规则表 + 清理ipset)
+
+        测试异常退出后的兜底清理。正常流程通过UI操作。
+        """
+        self.connect_router()
+        out_parts = []
+        try:
+            # 清空规则表
+            for tbl in ["alone_limit", "layer7_qos", "high_prio_host"]:
+                o = self._router.exec(
+                    f"sqlite3 {self.DNS_DB} 'DELETE FROM {tbl};' 2>&1"
+                )
+                out_parts.append(f"{tbl}: {o.strip()[:40]}")
+            # 关闭流控
+            if disable:
+                o = self._router.exec(
+                    f"sqlite3 {self.DNS_DB} "
+                    f"'UPDATE global_config SET stream_ctl_mode=0 WHERE id=1;' 2>&1"
+                )
+                out_parts.append(f"stream_ctl_mode=0: {o.strip()[:40]}")
+            # 重启qos使配置生效 + 清理残留ipset
+            self._router.exec("killall -q qos.sh 2>/dev/null; killall -q qos 2>/dev/null")
+            self._router.exec(
+                "for s in $(ipset list -n 2>/dev/null | grep -E 'alone_limit|layer7qos'); "
+                "do ipset destroy $s 2>/dev/null; done"
+            )
+            self._router.exec("ik_cntl http_app high_prio_host off 2>/dev/null")
+            logger.info(f"[清理] 智能流控环境: {'; '.join(out_parts)}")
+        except Exception as e:
+            logger.warning(f"[清理] 智能流控清理失败: {e}")
+        return "; ".join(out_parts)

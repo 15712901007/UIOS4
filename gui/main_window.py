@@ -879,7 +879,14 @@ class MainWindow(QMainWindow):
                         }
                     },
                     "智能流控": {
-                        "testcases": []
+                        "testcases": [
+                            "test_stream_control_comprehensive.py::TestStreamControlComprehensive::test_stream_control_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "test_stream_control_comprehensive.py::TestStreamControlComprehensive::test_stream_control_comprehensive",
+                            ],
+                        }
                     },
                 }
             },

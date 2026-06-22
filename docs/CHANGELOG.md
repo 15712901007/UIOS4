@@ -1,5 +1,59 @@
 # 开发日志
 
+## 2026-06-22 智能流控模块自动化(26步全链路通过) + 攻克Ant Form modal破坏Form绑定难题
+
+### 背景
+用户要求开发网络配置>智能流控的全部自动化测试。涉及三个页面(随stream_ctl_mode切换):
+- 智能模式(3 tab): 流控线路 / 优先域名设置 / 终端独立限速
+- 手动模式(2 tab): 流控线路 / 流控策略设置
+切换模式页控制: 流控场景(auto 0自定义/1游戏/2网页/3休闲/4下载) + 11类应用优先级 + domain_prio
+
+### 后端机制(5脚本6表)
+- stream_control.sh → global_config.stream_ctl_mode(0关/1智能/2手动)
+- layer7_intell.sh → layer7_intell表(智能配置) + wan_config(线路带宽set_iface)
+- alone_limit.sh → alone_limit表(终端独立限速)
+- layer7_qos.sh → layer7_qos表(手动流控策略)
+- high_prio_host.sh → high_prio_host表(优先域名, 用户给的4脚本没含, 自行探索发现)
+- 运行时: alone_limit→ipset alone_limit_$id+_alone_limit_$id+Linux_alone_intell; layer7_qos→_layer7qos_$id; iptables LAYER7_IN/OUT/STREAM_LAYER7_NEW链; htb_rate_est=1表示流控开启
+
+### 攻克的关键技术难点(调试核心)
+1. **!!select_app_proto modal破坏min_up/min_down的Form绑定**(耗时最长): layer7_qos应用协议是modal树选择, 关闭modal后min_up/min_down的DOM input.value还在(fill能写入), 但Ant Form内部state丢失, 保存校验报"请输入单线上行". fill/type/evaluate-setter/调用input.onChange/Tab+blur**都无法恢复Form state**. **最终方案**: 通过React fiber找Form实例(document.querySelector('form').__reactFiber$向上遍历fiber.return找memoizedProps.form), 调用form.setFieldsValue({min_up,max_up,min_down,max_down,avg_up,avg_down})直达Form state绕过input. 校验规则: 单机上行avg_up ≤ 单线最高max_up, 故设max_up=avg_up*2. 实现见 Layer7QosPage._set_numeric_fields
+2. **应用协议是modal树**(非dropdown): JS click .ant-tree-checkbox勾选 + 点modal内"确定"关闭. 按普通dropdown处理会残留modal拦截保存按钮
+3. **Ant Select虚拟滚动选项不可见**(优先级"7 (最低)"等is_visible=False): 必须 JS scrollIntoView+click, Playwright .click()的可见性检查会30s超时
+4. **应用优先级combobox用setFieldsValue**(切换模式页自定义场景): 11类优先级是Ant Form字段, 字段名=数据库字段(getFieldsValue确认Http/Game/Im/Transport/Relax/Utils/Office/Education/Life/Financial/Unknown), _select_ant_option逐个选不稳
+5. **智能流控所有tab无搜索框**(与DNS/分流模块不同): 基类search_rule超时, 改用列排序(6个sortIcon)
+6. **流控线路"全部启用/停用"按钮无效**(表格无checkbox列, 点击qos_switch不变): 改单条enable_line/disable_line(qos_switch 0↔1)
+7. **high_prio_host停用不弹确认框**(alone_limit/layer7_qos弹): 基类disable_rule误等"确定"超时, 重写为结果导向
+8. **domain_prio_switch无UI开关**(添加域名/保存模式都不触发=1): 测试时用SQL设1验证high_prio_host生效条件(auto=2&&switch=1&&ports非空→ik_cntl http_app on)
+9. **UI"单机上行"=数据库avg_up非max_up**, max_up/max_down是Form隐藏校验字段
+
+### 测试结果
+26步综合测试全绿通过(548s), SSH四级验证(DB/ipset/iptables/htb)全过:
+- 流控线路: 带宽编辑/启停 + SSH(wan_config.qos_upload/download/switch)
+- 切换模式: 网页优先/自定义+11类应用优先级 + SSH(layer7_intell.auto/Http/Game等)
+- 优先域名(high_prio_host): 增删改/停启用/排序/导出导入/异常/批量 + SSH
+- 终端独立限速(alone_limit): 增删改/停启用/异常/批量 + SSH L1数据库+L2 ipset
+- 手动流控策略(layer7_qos): 增改/停启用/导出 + SSH L1数据库+L2 ipset
+- 模式切换: 智能(1)/手动(2)/关闭(0) + SSH运行时(htb_rate_est)
+
+### 改动文件
+- pages/network/stream_control_page.py (新增, 主控+模式切换+流控线路带宽, 继承BasePage)
+- pages/network/alone_limit_page.py (新增, 终端独立限速, 继承IkuaiTablePage)
+- pages/network/layer7_qos_page.py (新增, 手动流控策略, 含select_app_proto modal树+_set_numeric_fields setFieldsValue)
+- pages/network/high_prio_host_page.py (新增, 优先域名, 重写disable/enable结果导向)
+- tests/network/test_stream_control_comprehensive.py (新增, 26步综合测试)
+- utils/backend_verifier.py (新增: query/count/verify_alone_limit/layer7_qos/high_prio_host/layer7_intell/wan_config/stream_ctl_mode + ipset验证 + qos_runtime + cleanup_stream_control)
+- tests/conftest.py (stream_control_page_logged_in fixture + stream_control marker + TEST_NAME_MAPPING['智能流控综合测试'])
+- gui/main_window.py (网络配置>智能流控节点注册test_stream_control_comprehensive + 综合测试分组)
+- docs/CHANGELOG.md
+
+### 经验(可复用)
+1. **Ant Form受控组件被modal破坏字段绑定时**, fill/type/调用onChange都无效(DOM值在但Form state丢, 保存校验报必填空). 用React fiber找Form实例调setFieldsValue直达Form state: `document.querySelector('form')`取`__reactFiber$`键→`fiber.return`向上遍历找`memoizedProps.form`(有setFieldsValue/getFieldsValue)→直接设字段值
+2. 探索新模块先SSH cat后端脚本+sqlite3 .schema看表结构, 再mcp-playwright点遍UI, 两边对照字段映射(本次发现UI"单机上行"=DB avg_up非max_up)
+3. UI输入框有id时(min_up/min_down/avg_up/avg_down/tagname/host)优先用id定位, 比label/placeholder可靠
+4. 表格tab是否有搜索框/排序需实测, 不能假设(智能流控所有tab无搜索框但有6列排序, DNS/分流有搜索框)
+5. Ant Select虚拟滚动选项不可见时用JS scrollIntoView+click; Ant Form字段值收集绕过用fiber+setFieldsValue
+
 ## 2026-06-18 全模块测试验证通过(17模块) + 测出dmz重启失效产品bug + 修复4类测试代码缺陷
 
 ### 背景
