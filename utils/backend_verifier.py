@@ -7730,3 +7730,244 @@ class BackendVerifier:
         except Exception as e:
             logger.warning(f"[清理] 自定义协议清理失败: {e}")
         return "; ".join(out_parts)
+
+    # ==================== 路由对象 (object_group) ====================
+    # 后端脚本: /usr/ikuai/script/route_object.sh
+    # 数据库表: object_group (统一表, type字段区分类型, 无enabled字段)
+    #   type: 0=IPv4 1=IPv6 2=MAC 3=端口 4=时间 5=协议 6=域名
+    #   字段: id, type, group_name(对象名), tagname, group_id(触发器生成), group_value(JSON明文文本)
+    #   group_id前缀: IPGP/IPV6GP/MACGP/PORTGP/TIMEGP/PROTOGP/DOMAINGP + id
+    #   约束: UNIQUE(group_name, type)
+    # group_value JSON格式(明文, 非base64; 前端传base64, 后端解码入库):
+    #   IPv4=[{"ip":"x","comment":""}]  IPv6=[{"ipv6":"x","comment":""}]
+    #   MAC=[{"mac":"x","comment":""}]  端口=[{"port":"80","comment":""}]
+    #   域名=[{"domain":"x","comment":""}]  时间/协议格式较复杂
+    # 引用: object_ref(group_id,type,func_name,rule_id) → ref_count>0 被引用无法删除
+    # 后端生效(内核级, 关键验证点):
+    #   - 所有type都建立内核 ipset: group_{group_id} (IPv4/IPv6=hash:ip, MAC=hash:mac, 端口=hash:port)
+    #   - cache: /tmp/iktmp/cache/{ip,ipv6,mac,port,time,proto,domain}group
+    # 校验: group_name 仅中文/英文/数字 1-15字符
+    # CLI无统一show, 用sqlite3直查 object_group
+
+    # type名称 → 数字
+    OBJECT_GROUP_TYPES = {
+        'ip': 0, 'ipv4': 0,
+        'ipv6': 1,
+        'mac': 2,
+        'port': 3,
+        'time': 4,
+        'proto': 5, 'protocol': 5,
+        'domain': 6,
+    }
+    _OG_PREFIX = {0: 'IPGP', 1: 'IPV6GP', 2: 'MACGP', 3: 'PORTGP',
+                  4: 'TIMEGP', 5: 'PROTOGP', 6: 'DOMAINGP'}
+    _OG_CACHE = {0: 'ipgroup', 1: 'ipv6group', 2: 'macgroup', 3: 'portgroup',
+                 4: 'timegroup', 5: 'protogroup', 6: 'domaingroup'}
+
+    def _og_type(self, type_key) -> int:
+        """type_key支持int或str名称(ip/ipv6/mac/port/time/proto/domain)"""
+        if isinstance(type_key, int):
+            return type_key
+        return self.OBJECT_GROUP_TYPES.get(str(type_key).lower(), 0)
+
+    def find_object_group(self, name: str, type_key) -> Optional[Dict]:
+        """按group_name+type查询单条分组"""
+        t = self._og_type(type_key)
+        return self._sqlite_query_line(
+            f"SELECT id,type,group_name,tagname,group_id,group_value "
+            f"FROM object_group WHERE group_name='{name}' AND type={t}"
+        )
+
+    def count_object_group(self, type_key) -> int:
+        """统计某type的分组总数"""
+        t = self._og_type(type_key)
+        r = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM object_group WHERE type={t}"
+        )
+        try:
+            return int(r.get("cnt", 0)) if r else 0
+        except (ValueError, TypeError):
+            return 0
+
+    def get_object_ref_count(self, group_id: str) -> int:
+        """查询分组被引用次数(object_ref表)"""
+        if not group_id:
+            return 0
+        r = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM object_ref WHERE group_id='{group_id}'"
+        )
+        try:
+            return int(r.get("cnt", 0)) if r else 0
+        except (ValueError, TypeError):
+            return 0
+
+    def query_object_refs(self, group_id: str) -> List[Dict]:
+        """查询分组的所有引用记录(func_name+rule_id)"""
+        if not group_id:
+            return []
+        return self._sqlite_query_list(
+            f"SELECT group_id,type,func_name,rule_id,tagname "
+            f"FROM object_ref WHERE group_id='{group_id}'"
+        )
+
+    def verify_object_group_database(self, name: str, type_key,
+                                     expected_value=None,
+                                     expect_absent: bool = False) -> VerifyResult:
+        """L1: 验证object_group数据库存在且字段正确
+
+        Args:
+            name: 分组名称
+            type_key: type(int或名称)
+            expected_value: group_value包含匹配(字符串或列表, 每个都要在JSON中出现)
+            expect_absent: True表示期望不存在(删除验证)
+        """
+        t = self._og_type(type_key)
+        lvl = f"L1-对象分组(type{t})"
+        rule = self.find_object_group(name, type_key)
+        if rule is None:
+            return VerifyResult(
+                level=lvl, passed=expect_absent,
+                message=f"分组'{name}'(type{t})不存在"
+                        f"({'符合预期' if expect_absent else '应为存在'})",
+                raw_output="",
+            )
+        details = {"id": rule.get("id"), "type": rule.get("type"),
+                   "group_name": rule.get("group_name"),
+                   "group_id": rule.get("group_id"), "tagname": rule.get("tagname")}
+        raw = json.dumps(details, ensure_ascii=False)
+        if expect_absent:
+            return VerifyResult(level=lvl, passed=False,
+                                message=f"分组'{name}'存在但期望不存在",
+                                details={"rule": details}, raw_output=raw)
+        gv = (rule.get("group_value") or "")
+        details["group_value"] = gv[:120]
+        if expected_value is not None:
+            ok = True
+            vals = expected_value if isinstance(expected_value, (list, tuple)) else [expected_value]
+            for v in vals:
+                if str(v) not in gv:
+                    ok = False
+            if not ok:
+                return VerifyResult(
+                    level=lvl, passed=False,
+                    message=f"分组'{name}'group_value不含期望值'{expected_value}': {gv[:80]}",
+                    details={"rule": details}, raw_output=gv[:200],
+                )
+        return VerifyResult(
+            level=lvl, passed=True,
+            message=f"分组'{name}'数据库验证通过(group_id={details['group_id']})",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_object_group_ipset(self, name: str, type_key,
+                                  expect_exists: bool = True) -> VerifyResult:
+        """L2: 验证内核ipset group_{group_id}存在(所有type都建立, 关键内核验证点)"""
+        t = self._og_type(type_key)
+        lvl = f"L2-ipset(type{t})"
+        rule = self.find_object_group(name, type_key)
+        if rule is None:
+            return VerifyResult(
+                level=lvl, passed=not expect_exists,
+                message=f"分组'{name}'不存在, ipset无法验证", raw_output="",
+            )
+        gid = rule.get("group_id", "")
+        ipset_name = f"group_{gid}"
+        self.connect_router()
+        out = self._router.exec(f"ipset list {ipset_name} 2>/dev/null")
+        exists = "Name:" in (out or "")
+        members = ""
+        if exists:
+            for line in (out or "").splitlines():
+                if "Number of entries" in line:
+                    members = line.strip()
+                    break
+        if expect_exists:
+            ok = exists
+            msg = f"ipset {ipset_name}{'存在' if exists else '不存在'}" + (f"({members})" if members else "")
+        else:
+            ok = not exists
+            msg = f"ipset {ipset_name}{'已删除' if not exists else '仍存在(应已删)'}"
+        return VerifyResult(
+            level=lvl, passed=ok, message=msg,
+            details={"ipset": ipset_name, "exists": exists},
+            raw_output=(out or "")[:200],
+        )
+
+    def verify_object_group_cache(self, name: str, type_key) -> VerifyResult:
+        """L3: 验证cache文件含该分组(分组名出现在cache JSON中)"""
+        t = self._og_type(type_key)
+        cache_file = f"/tmp/iktmp/cache/{self._OG_CACHE[t]}"
+        self.connect_router()
+        out = self._router.exec(f"cat {cache_file} 2>/dev/null")
+        ok = name in (out or "")
+        return VerifyResult(
+            level=f"L3-cache(type{t})", passed=ok,
+            message=f"cache {self._OG_CACHE[t]} {'含' if ok else '不含'}'{name}'",
+            details={"cache_file": cache_file},
+            raw_output=(out or "")[:150],
+        )
+
+    def verify_object_group_ref(self, name: str, type_key,
+                                expect_referenced: bool = False) -> VerifyResult:
+        """L4: 验证分组引用状态(ref_count>0=被引用, 删除会被拦截)"""
+        t = self._og_type(type_key)
+        rule = self.find_object_group(name, type_key)
+        if rule is None:
+            return VerifyResult(level=f"L4-引用(type{t})", passed=False,
+                                message=f"分组'{name}'不存在", raw_output="")
+        gid = rule.get("group_id", "")
+        cnt = self.get_object_ref_count(gid)
+        referenced = cnt > 0
+        ok = (referenced == expect_referenced)
+        msg = (f"分组'{name}'被引用{cnt}次(期望{'被引用' if expect_referenced else '未被引用'})")
+        return VerifyResult(
+            level=f"L4-引用(type{t})", passed=ok, message=msg,
+            details={"group_id": gid, "ref_count": cnt},
+            raw_output=str(cnt),
+        )
+
+    def verify_object_group_full_chain(self, name: str, type_key,
+                                       expected_value=None,
+                                       expect_absent: bool = False) -> FullChainResult:
+        """全链路验证: L1数据库 + L2 ipset + L3 cache"""
+        r = FullChainResult()
+        r.results.append(self.verify_object_group_database(
+            name, type_key, expected_value, expect_absent))
+        if not expect_absent:
+            r.results.append(self.verify_object_group_ipset(name, type_key))
+            r.results.append(self.verify_object_group_cache(name, type_key))
+        return r
+
+    def cleanup_object_group_test(self, type_key, prefix: str = "AUTO") -> str:
+        """清理测试分组: SQL直删 + destroy残留ipset + 重建cache
+
+        按type+prefix精确删除, 避免误删系统分组(如snmp_ipgroup_te)。
+        """
+        t = self._og_type(type_key)
+        self.connect_router()
+        parts = []
+        try:
+            rows = self._sqlite_query_list(
+                f"SELECT group_name,group_id FROM object_group "
+                f"WHERE type={t} AND group_name LIKE '{prefix}%'"
+            )
+            for row in rows:
+                gid = row.get("group_id", "")
+                gn = row.get("group_name", "")
+                self._router.exec(
+                    f"sqlite3 {self.DNS_DB} "
+                    f"\"DELETE FROM object_group WHERE group_id='{gid}';\" 2>&1"
+                )
+                if gid:
+                    self._router.exec(f"ipset destroy group_{gid} 2>/dev/null")
+                parts.append(f"{gn}({gid})")
+            # 重建cache
+            self._router.exec(
+                "/usr/ikuai/script/route_object.sh init >/dev/null 2>&1 &"
+            )
+            logger.info(f"[清理] object_group(type{t}): 删除{len(parts)}条 "
+                        f"{'; '.join(parts)}")
+            return f"type{t}: del {len(parts)}"
+        except Exception as e:
+            logger.warning(f"[清理] object_group清理失败: {e}")
+            return f"type{t}: error"

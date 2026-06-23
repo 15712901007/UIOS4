@@ -121,6 +121,10 @@ from pages.network.dhcp_lease_page import DhcpLeasePage
 from pages.network.dhcp_acl_mac_page import DhcpAclMacPage
 from pages.network.ipv6_static_page import Ipv6StaticPage
 from pages.network.custom_protocol_page import CustomProtocolPage, AdvancedCustomProtocolPage
+from pages.network.route_object_page import (
+    IpGroupPage, MacGroupPage, PortGroupPage, DomainGroupPage,
+    TimePlanPage, ProtocolGroupPage,
+)
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -197,6 +201,12 @@ TEST_NAME_MAPPING = {
     'test_ipv6_static_comprehensive': 'IPv6前缀静态分配综合测试',
     'test_custom_protocol_comprehensive': '自定义协议综合测试',
     'test_advanced_custom_protocol_comprehensive': '高级自定义协议综合测试',
+    'test_ip_group_comprehensive': 'IP分组综合测试',
+    'test_mac_group_comprehensive': 'MAC分组综合测试',
+    'test_port_group_comprehensive': '端口分组综合测试',
+    'test_domain_group_comprehensive': '域名分组综合测试',
+    'test_time_plan_comprehensive': '时间计划综合测试',
+    'test_protocol_group_comprehensive': '协议分组综合测试',
 }
 
 
@@ -800,6 +810,56 @@ def advanced_custom_protocol_page_logged_in(logged_in_page: Page, config: Config
     return adv_page
 
 
+# ==================== 路由对象(IP/MAC/端口/域名/时间/协议分组) fixtures ====================
+
+@pytest.fixture(scope="function")
+def ip_group_page_logged_in(logged_in_page: Page, config: Config) -> 'IpGroupPage':
+    """已登录并导航到IP分组页面的实例"""
+    pg = IpGroupPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_route_object()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def mac_group_page_logged_in(logged_in_page: Page, config: Config) -> 'MacGroupPage':
+    """已登录并导航到MAC分组页面的实例"""
+    pg = MacGroupPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_route_object()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def port_group_page_logged_in(logged_in_page: Page, config: Config) -> 'PortGroupPage':
+    """已登录并导航到端口分组页面的实例"""
+    pg = PortGroupPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_route_object()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def domain_group_page_logged_in(logged_in_page: Page, config: Config) -> 'DomainGroupPage':
+    """已登录并导航到域名分组页面的实例"""
+    pg = DomainGroupPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_route_object()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def time_plan_page_logged_in(logged_in_page: Page, config: Config) -> 'TimePlanPage':
+    """已登录并导航到时间计划页面的实例"""
+    pg = TimePlanPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_route_object()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def protocol_group_page_logged_in(logged_in_page: Page, config: Config) -> 'ProtocolGroupPage':
+    """已登录并导航到协议分组页面的实例"""
+    pg = ProtocolGroupPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_route_object()
+    return pg
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -1061,6 +1121,24 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "advanced_custom_protocol: 高级自定义协议(L7)模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "ip_group: IP分组模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "mac_group: MAC分组模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "port_group: 端口分组模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "domain_group: 域名分组模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "time_plan: 时间计划模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "protocol_group: 协议分组模块测试"
     )
 
     # 记录开始时间

@@ -115,6 +115,25 @@ test_data:
     ipv6_static:
       export_filename: "ipv6_static_config.csv"
       import_filename: "ipv6_static_import.csv"
+    # 路由对象(6个分组, 导出格式txt)
+    route_object_ip:
+      export_filename: "route_object_ip_config.txt"
+      import_filename: "route_object_ip_import.txt"
+    route_object_mac:
+      export_filename: "route_object_mac_config.txt"
+      import_filename: "route_object_mac_import.txt"
+    route_object_port:
+      export_filename: "route_object_port_config.txt"
+      import_filename: "route_object_port_import.txt"
+    route_object_time:
+      export_filename: "route_object_time_config.txt"
+      import_filename: "route_object_time_import.txt"
+    route_object_proto:
+      export_filename: "route_object_proto_config.txt"
+      import_filename: "route_object_proto_import.txt"
+    route_object_domain:
+      export_filename: "route_object_domain_config.txt"
+      import_filename: "route_object_domain_import.txt"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"
