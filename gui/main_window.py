@@ -722,6 +722,30 @@ class MainWindow(QMainWindow):
                             ],
                         }
                     },
+                    "自定义协议": {
+                        "children": {
+                            "自定义协议": {
+                                "testcases": [
+                                    "test_custom_protocol_comprehensive.py::TestCustomProtocolComprehensive::test_custom_protocol_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_custom_protocol_comprehensive.py::TestCustomProtocolComprehensive::test_custom_protocol_comprehensive",
+                                    ],
+                                }
+                            },
+                            "高级自定义协议": {
+                                "testcases": [
+                                    "test_advanced_custom_protocol_comprehensive.py::TestAdvancedCustomProtocolComprehensive::test_advanced_custom_protocol_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_advanced_custom_protocol_comprehensive.py::TestAdvancedCustomProtocolComprehensive::test_advanced_custom_protocol_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
                     "分流策略": {
                         "children": {
                             "多线负载": {

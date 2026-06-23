@@ -1,0 +1,2 @@
+id=1 enabled=yes comment=编辑后 name=DPROTO_L7_1 class=0 appid=1450002 rule=UHJvdG9jb2w9VENQIERpcmVjdGlvbj1DTElFTlQgRGF0YT1lZGl0ZWRfYXBw
+id=2 enabled=yes comment=L7-UDP name=DPROTO_L7_2 class=0 appid=1450003 rule=UHJvdG9jb2w9VURQIERpcmVjdGlvbj1TRVJWRVIgRGF0YT10ZXN0YXBwMg==

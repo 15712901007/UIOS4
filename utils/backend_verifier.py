@@ -7549,3 +7549,184 @@ class BackendVerifier:
         except Exception as e:
             logger.warning(f"[清理] IPv6清理失败: {e}")
             return ""
+
+    # ==================== 自定义协议(dprotos / dprotos_l7)验证 ====================
+    # 两个独立平行子模块(SSH探查确认 2026-06-23):
+    #   L4 dprotos: 表dprotos, iptables mangle DPROTO链 + ipset dproto_src/dst/sport/dport_$id
+    #               (-A DPROTO -p tcp -m set --match-set dproto_*_$id ... -j APPMARK--set-appid <appid>)
+    #   L7 dprotos_l7: 表dprotos_l7, rule字段base64(空格分隔 Protocol=TCP Direction=CLIENT Data=xxx),
+    #                  loadapp加载进DPI(异步, 验证以DB+rule解码为准)
+    # class 10类(0=网络协议自定义…9=金融理财自定义), appid由custom_app_get_appid派生
+
+    def _dproto_params(self, proto_type: str = 'l4') -> dict:
+        if proto_type == 'l7':
+            return {'table': 'dprotos_l7', 'cli': 'dprotos_l7', 'init': '/usr/ikuai/script/dprotos_l7.sh init'}
+        return {'table': 'dprotos', 'cli': 'dprotos', 'init': '/usr/ikuai/script/dprotos.sh init'}
+
+    def find_dproto(self, name: str, proto_type: str = 'l4') -> Optional[Dict]:
+        """查询自定义协议规则(按name)。L4/L7表列不同, 按类型选列。"""
+        p = self._dproto_params(proto_type)
+        if proto_type == 'l7':
+            cols = "id,enabled,comment,name,class,appid,rule"
+        else:
+            cols = "id,enabled,comment,name,class,appid,protocol,src_addr,dst_addr,src_port,dst_port"
+        return self._sqlite_query_line(
+            f"SELECT {cols} FROM {p['table']} WHERE name='{name}'"
+        )
+
+    def count_dprotos(self, proto_type: str = 'l4', enabled_only: bool = False) -> int:
+        p = self._dproto_params(proto_type)
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM {p['table']} {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_dproto_database(self, name: str, proto_type: str = 'l4',
+                               expected_fields: Dict = None,
+                               expect_absent: bool = False) -> VerifyResult:
+        """L1: 验证自定义协议数据库(dprotos/dprotos_l7表)
+
+        expected_fields: name/class/protocol(精确比), src_addr/dst_addr/src_port/dst_port/rule
+                         (JSON/base64字段用包含匹配)。
+        """
+        p = self._dproto_params(proto_type)
+        lvl = f"L1-{proto_type}表"
+        rule = self.find_dproto(name, proto_type)
+        if rule is None:
+            return VerifyResult(
+                level=lvl, passed=expect_absent,
+                message=f"自定义协议'{name}'({p['table']})不存在"
+                        f"({'符合预期' if expect_absent else '应为存在'})",
+                raw_output="",
+            )
+        details = {"id": rule.get("id"), "enabled": rule.get("enabled"),
+                   "name": rule.get("name"), "class": rule.get("class"),
+                   "appid": rule.get("appid")}
+        raw = json.dumps(details, ensure_ascii=False)
+        if expect_absent:
+            return VerifyResult(level=lvl, passed=False,
+                                message=f"规则'{name}'存在但期望不存在",
+                                details={"rule": details}, raw_output=raw)
+        if expected_fields is None:
+            return VerifyResult(level=lvl, passed=True,
+                                message=f"规则'{name}'存在: enabled={details['enabled']}, class={details['class']}",
+                                details={"rule": details}, raw_output=raw)
+        # JSON/base64字段: 包含匹配; 其余: 精确
+        json_fields = {"src_addr", "dst_addr", "src_port", "dst_port", "rule"}
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if fld in json_fields:
+                if str(expected) not in actual:
+                    mismatches[fld] = {"expected_contains": str(expected), "actual": actual[:60]}
+            else:
+                if actual != str(expected):
+                    mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(level=lvl, passed=False,
+                                message=f"规则'{name}'字段不匹配: {mismatches}",
+                                details={"rule": details, "mismatches": mismatches}, raw_output=raw)
+        return VerifyResult(level=lvl, passed=True,
+                            message=f"规则'{name}'数据库验证通过",
+                            details={"rule": details}, raw_output=raw)
+
+    def verify_dproto_backend(self, name: str, proto_type: str = 'l4') -> VerifyResult:
+        """L2/L3: 验证自定义协议后端生效
+
+        L4: ipset dproto_src/dst/sport/dport_$id(按填的字段) + iptables mangle DPROTO链含该id/apid
+        L7: rule字段base64解码含预期特征(loadapp加载异步不可靠, 仅验证rule可解码)
+        """
+        rule = self.find_dproto(name, proto_type)
+        if rule is None:
+            return VerifyResult(level=f"L2-{proto_type}", passed=False,
+                                message=f"规则'{name}'不存在, 无法验证后端", raw_output="")
+        self.connect_router()
+        rid = rule.get("id")
+        if proto_type == 'l7':
+            # L7: base64解码rule
+            import base64 as _b64
+            raw_rule = rule.get("rule", "") or ""
+            try:
+                decoded = _b64.b64decode(raw_rule).decode("utf-8", errors="replace")
+                ok = "Protocol=" in decoded and "Direction=" in decoded
+                return VerifyResult(
+                    level="L2-l7", passed=ok,
+                    message=f"L7 rule解码{'成功' if ok else '异常'}: {decoded[:80]}",
+                    details={"rule_decoded": decoded[:200]}, raw_output=decoded[:200],
+                )
+            except Exception as e:
+                return VerifyResult(level="L2-l7", passed=False,
+                                    message=f"L7 rule base64解码失败: {e}", raw_output=raw_rule[:100])
+        # L4: ipset + iptables DPROTO
+        import re as _re
+        def _filled(val):
+            """JSON字段是否真正填了内容(空{"custom":[]}算未填)"""
+            v = (val or "").strip()
+            if not v or v == '{}':
+                return False
+            m = _re.search(r'"custom"\s*:\s*\[([^\]]*)\]', v)
+            if m and m.group(1).strip():
+                return True
+            m2 = _re.search(r'"object"\s*:\s*\{([^}]*)\}', v)
+            if m2 and m2.group(1).strip():
+                return True
+            return False
+        try:
+            checks = []
+            filled_any = False
+            # ipset: 仅对"真正填了"的字段查
+            for fld, suffix in [("src_addr", "src"), ("dst_addr", "dst"),
+                                ("src_port", "sport"), ("dst_port", "dport")]:
+                if _filled(rule.get(fld, "")):
+                    filled_any = True
+                    ipset_name = f"dproto_{suffix}_{rid}"
+                    out = self._router.exec(f"ipset list {ipset_name} 2>/dev/null")
+                    exists = "Name:" in (out or "")
+                    checks.append((f"ipset {ipset_name}", exists,
+                                   f"{ipset_name}{'存在' if exists else '不存在'}"))
+            ipt = self._router.exec("iptables -t mangle -S DPROTO 2>/dev/null")
+            appid = rule.get("appid")
+            has_appid = f"set-appid {appid}" in (ipt or "") if appid else False
+            # 仅当有地址/端口时才要求DPROTO链含该规则(任意+无地址的规则本就无DPROTO规则)
+            if filled_any:
+                has_rule = any(f"dproto_{s}_{rid}" in (ipt or "")
+                               for s in ("src", "dst", "sport", "dport"))
+                checks.append(("iptables DPROTO链含规则", has_rule,
+                               f"DPROTO链{'含' if has_rule else '不含'}id={rid}"))
+            checks.append((f"APPMARK appid={appid}", has_appid,
+                           f"appid标记{'存在' if has_appid else '缺失'}"))
+            passed = all(c[1] for c in checks) if checks else True
+            return VerifyResult(
+                level="L2-L4", passed=passed,
+                message="; ".join(c[2] for c in checks) or "无ipset字段(规则无地址/端口)",
+                details={"id": rid, "appid": appid, "checks": checks},
+                raw_output=(ipt or "")[:300],
+            )
+        except Exception as e:
+            return VerifyResult(level="L2-L4", passed=False,
+                                message=f"L4后端检查失败: {e}", raw_output=str(e))
+
+    def cleanup_dproto_test(self, prefix: str = "DPROTO") -> str:
+        """清理自定义协议测试规则(dprotos+dprotos_l7两表) + 重建"""
+        self.connect_router()
+        out_parts = []
+        try:
+            for pt in ['l4', 'l7']:
+                p = self._dproto_params(pt)
+                o = self._router.exec(
+                    f"sqlite3 {self.DNS_DB} \"DELETE FROM {p['table']} WHERE name LIKE '{prefix}%';\" 2>&1"
+                )
+                out_parts.append(f"{pt}: {o.strip()[:40]}")
+            # L4重建iptables/ipset; L7重建(loadapp异步)
+            self._router.exec("/usr/ikuai/script/dprotos.sh init 2>&1")
+            self._router.exec("/usr/ikuai/script/dprotos_l7.sh init 2>&1")
+            logger.info(f"[清理] 自定义协议({prefix}*): {'; '.join(out_parts)}")
+        except Exception as e:
+            logger.warning(f"[清理] 自定义协议清理失败: {e}")
+        return "; ".join(out_parts)

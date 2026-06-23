@@ -120,6 +120,7 @@ from pages.network.dhcp_static_page import DhcpStaticPage
 from pages.network.dhcp_lease_page import DhcpLeasePage
 from pages.network.dhcp_acl_mac_page import DhcpAclMacPage
 from pages.network.ipv6_static_page import Ipv6StaticPage
+from pages.network.custom_protocol_page import CustomProtocolPage, AdvancedCustomProtocolPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -194,6 +195,8 @@ TEST_NAME_MAPPING = {
     'test_dhcp_lease_comprehensive': 'DHCP客户端综合测试',
     'test_dhcp_acl_mac_comprehensive': 'DHCP黑白名单综合测试',
     'test_ipv6_static_comprehensive': 'IPv6前缀静态分配综合测试',
+    'test_custom_protocol_comprehensive': '自定义协议综合测试',
+    'test_advanced_custom_protocol_comprehensive': '高级自定义协议综合测试',
 }
 
 
@@ -769,6 +772,34 @@ def ipv6_static_page_logged_in(logged_in_page: Page, config: Config) -> 'Ipv6Sta
     return ipv6_page
 
 
+@pytest.fixture(scope="function")
+def custom_protocol_page(page: Page, config: Config) -> 'CustomProtocolPage':
+    """创建自定义协议(L4)页面实例"""
+    return CustomProtocolPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def custom_protocol_page_logged_in(logged_in_page: Page, config: Config) -> 'CustomProtocolPage':
+    """已登录并导航到自定义协议(L4)页面的实例"""
+    cp_page = CustomProtocolPage(logged_in_page, config.get_base_url())
+    cp_page.navigate_to_custom_protocol()
+    return cp_page
+
+
+@pytest.fixture(scope="function")
+def advanced_custom_protocol_page(page: Page, config: Config) -> 'AdvancedCustomProtocolPage':
+    """创建高级自定义协议(L7)页面实例"""
+    return AdvancedCustomProtocolPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def advanced_custom_protocol_page_logged_in(logged_in_page: Page, config: Config) -> 'AdvancedCustomProtocolPage':
+    """已登录并导航到高级自定义协议(L7)页面的实例"""
+    adv_page = AdvancedCustomProtocolPage(logged_in_page, config.get_base_url())
+    adv_page.navigate_to_advanced_custom_protocol()
+    return adv_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -1024,6 +1055,12 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "ipv6_static: IPv6前缀静态分配模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "custom_protocol: 自定义协议(L4)模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "advanced_custom_protocol: 高级自定义协议(L7)模块测试"
     )
 
     # 记录开始时间

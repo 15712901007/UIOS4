@@ -1,0 +1,2 @@
+enabled=yes comment=导入追加1 name=DPROTO_IMP_1 src_addr={"object":{},"custom":{}} dst_addr={"object":{},"custom":{}} protocol=tcp src_port={"object":{},"custom":{}} dst_port={"object":{},"custom":["8080"]} class=0 
+enabled=yes comment=导入追加2 name=DPROTO_IMP_2 src_addr={"object":{},"custom":{}} dst_addr={"object":{},"custom":{}} protocol=tcp src_port={"object":{},"custom":{}} dst_port={"object":{},"custom":["8080"]} class=0 
