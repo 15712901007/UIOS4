@@ -1,0 +1,6 @@
+id=1 enabled=yes mac=02:11:22:33:44:51 termname= tagname=DHACL_1 comment=黑名单测试1
+id=2 enabled=yes mac=02:11:22:33:44:52 termname= tagname=DHACL_2 comment=黑名单测试2
+id=3 enabled=yes mac=02:11:22:33:44:99 termname= tagname=DHACL_3 comment=编辑后
+id=4 enabled=yes mac=02:11:22:33:44:54 termname= tagname=DHACL_4 comment=黑名单测试4
+id=5 enabled=yes mac=02:11:22:33:44:55 termname= tagname=DHACL_5 comment=黑名单测试5
+id=6 enabled=yes mac=02:11:22:33:44:56 termname= tagname=DHACL_6 comment=黑名单测试6

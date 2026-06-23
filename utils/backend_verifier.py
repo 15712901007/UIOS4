@@ -6359,3 +6359,1137 @@ class BackendVerifier:
         except Exception as e:
             logger.warning(f"[清理] 智能流控清理失败: {e}")
         return "; ".join(out_parts)
+
+    # ==================== DHCP服务端(DHCP Server)验证 ====================
+    # 涉及表: dhcp_server(DHCP地址池配置, 多记录每行一个LAN/VLAN接口的池)
+    # 后端脚本: /usr/ikuai/script/dhcp_server.sh
+    # 进程: ik_dhcpd -c /tmp/iktmp/ik_dhcpd.conf -s ik_dhcpd_static.conf -l /var/db/leases.db
+    # 配置: /tmp/iktmp/ik_dhcpd.conf(主, 仅enabled=yes规则) + /tmp/iktmp/dhcp-server.status(running标志)
+    #       /tmp/iktmp/ik_dhcpd.status(地址池可用数)
+    # 网络: UDP67(DHCP服务端监听)/68(客户端中继)
+    # iptables: DHCP_ACL链(黑白名单模块创建, UDP67流量经此链; DHCP服务端本身不创建iptables规则)
+    # 重启: __delayed_restart延迟2秒重启ik_dhcpd; boot()模拟开机初始化(从db重建conf+重启进程)
+    # 字段映射: tagname=名称 interface=服务接口 addr_pool=客户端地址(start-end) netmask=子网掩码
+    #          gateway=网关 dns1/dns2=首选/备选DNS lease=租期(分钟) delay=过期保留(小时)
+    #          check_addr_valid/check_relay_only phy_ifnames=关联接口(默认all) status=运行状态
+
+    DHCP_CONFILE = "/tmp/iktmp/ik_dhcpd.conf"
+    DHCP_STATUS_FILE = "/tmp/iktmp/dhcp-server.status"
+    DHCP_POOL_STATUS = "/tmp/iktmp/ik_dhcpd.status"
+
+    def query_dhcp_server_rule(self, name: str) -> Optional[Dict]:
+        """L1: 查询单条DHCP服务端配置(按tagname)"""
+        return self._sqlite_query_line(
+            f"SELECT id,enabled,tagname,interface,addr_pool,exclude_pool,netmask,"
+            f"gateway,dns1,dns2,domain,wins1,wins2,next_server,lease,delay,"
+            f"phy_ifnames,check_addr_valid,check_relay_only,status "
+            f"FROM dhcp_server WHERE tagname='{name}'"
+        )
+
+    def query_all_dhcp_server(self) -> List[Dict]:
+        """L1: 查询所有DHCP服务端配置"""
+        return self._sqlite_query_list(
+            "SELECT id,enabled,tagname,interface,addr_pool,gateway,netmask,"
+            "dns1,dns2,lease,phy_ifnames FROM dhcp_server"
+        )
+
+    def count_dhcp_server(self, enabled_only: bool = False) -> int:
+        """L1: 统计DHCP服务端规则数"""
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM dhcp_server {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_dhcp_server_database(self, name: str,
+                                    expected_fields: Dict = None,
+                                    must_exist: bool = True) -> VerifyResult:
+        """L1: 验证DHCP服务端数据库配置(dhcp_server表, 按tagname)
+
+        expected_fields可含: enabled/interface/addr_pool/netmask/gateway/dns1/dns2/lease/delay/
+                            check_addr_valid/check_relay_only 等(均精确匹配, 转字符串比较)
+        """
+        rule = self.query_dhcp_server_rule(name)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=not must_exist,
+                message=f"DHCP服务端'{name}'不存在"
+                        f"({'符合预期' if not must_exist else '应为存在'})",
+                raw_output="",
+            )
+        details = {
+            "id": rule.get("id"), "enabled": rule.get("enabled"),
+            "tagname": rule.get("tagname"), "interface": rule.get("interface"),
+            "addr_pool": rule.get("addr_pool"), "netmask": rule.get("netmask"),
+            "gateway": rule.get("gateway"), "dns1": rule.get("dns1"),
+            "dns2": rule.get("dns2"), "lease": rule.get("lease"),
+            "delay": rule.get("delay"), "check_addr_valid": rule.get("check_addr_valid"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"DHCP服务端'{name}'存在: interface={details['interface']}, "
+                        f"pool={details['addr_pool']}, enabled={details['enabled']}, "
+                        f"lease={details['lease']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"DHCP服务端'{name}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"DHCP服务端'{name}'数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_dhcp_server_process(self, expect_running: bool = True) -> VerifyResult:
+        """L2: 验证ik_dhcpd进程状态(DHCP服务端核心进程, 监听UDP67)"""
+        self.connect_router()
+        try:
+            output = self._router.exec("pidof ik_dhcpd 2>/dev/null; ps | grep ik_dhcpd | grep -v grep")
+            running = "ik_dhcpd" in output
+            if running == expect_running:
+                return VerifyResult(
+                    level="L2-进程", passed=True,
+                    message=f"ik_dhcpd进程状态正确: {'运行中' if running else '未运行'}",
+                    details={"running": running},
+                    raw_output=output.strip()[:200],
+                )
+            else:
+                return VerifyResult(
+                    level="L2-进程", passed=False,
+                    message=f"ik_dhcpd进程状态不匹配: 期望{'运行' if expect_running else '未运行'}, "
+                            f"实际{'运行中' if running else '未运行'}",
+                    details={"running": running, "expected": expect_running},
+                    raw_output=output.strip()[:200],
+                )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-进程", passed=False,
+                message=f"进程检查失败: {e}", raw_output=str(e),
+            )
+
+    def verify_dhcp_server_config_file(self, tagname: str = None,
+                                       expect_in_conf: bool = True,
+                                       expect_any_enabled: bool = None) -> VerifyResult:
+        """L3: 验证ik_dhcpd.conf配置文件
+
+        - expect_any_enabled=True: 期望conf存在(有enabled=yes规则时ik_dhcpd启动生成)
+        - expect_any_enabled=False: 期望conf为空(无enabled规则)
+        - tagname非None: 检查该规则是否出现在conf(仅enabled=yes规则写入conf, 停用的不入conf)
+        - expect_in_conf: True=应在conf(启用), False=不应在conf(停用)
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec(f"cat {self.DHCP_CONFILE} 2>/dev/null")
+            exists = bool(output and output.strip())
+            checks = []
+            if expect_any_enabled is True:
+                checks.append(("配置文件存在", exists,
+                               f"ik_dhcpd.conf{'存在' if exists else '不存在(异常,应有enabled规则)'}"))
+            elif expect_any_enabled is False:
+                checks.append(("配置文件为空", not exists,
+                               f"ik_dhcpd.conf{'为空(正确)' if not exists else '非空(异常)'}"))
+            if tagname:
+                in_conf = f"tagname={tagname}" in (output or "")
+                if expect_in_conf:
+                    checks.append((f"规则{tagname}在conf中", in_conf,
+                                   f"规则{tagname}{'已下发到ik_dhcpd' if in_conf else '未在conf中(异常,应启用)'}"))
+                else:
+                    checks.append((f"规则{tagname}不在conf中", not in_conf,
+                                   f"规则{tagname}{'已从conf移除(正确停用)' if not in_conf else '仍在conf中(异常,应停用)'}"))
+            passed = all(c[1] for c in checks) if checks else exists
+            return VerifyResult(
+                level="L3-配置文件", passed=passed,
+                message="; ".join(c[2] for c in checks) if checks else
+                f"ik_dhcpd.conf{'存在' if exists else '不存在'}",
+                details={"exists": exists, "checks": checks},
+                raw_output=(output or "")[:300],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L3-配置文件", passed=False,
+                message=f"配置文件检查失败: {e}", raw_output=str(e),
+            )
+
+    def verify_dhcp_server_runtime(self, expect_running: bool = True) -> VerifyResult:
+        """L4: 验证DHCP服务端运行时(UDP67监听 + status文件 + 地址池可用数)
+
+        ik_dhcpd监听UDP67(服务端), 68为客户端中继。dhcp-server.status是running标志
+        (start写入启动命令, stop删除)。ik_dhcpd.status记录地址池可用数。
+        """
+        self.connect_router()
+        checks = []
+        try:
+            net_out = self._router.exec("netstat -uln 2>/dev/null | grep -E ':67|:68'")
+            has_67 = ":67" in net_out
+            if expect_running:
+                checks.append(("UDP67监听", has_67,
+                               f"UDP67{'监听中' if has_67 else '未监听(异常)'}"))
+            else:
+                checks.append(("UDP67未监听", not has_67,
+                               f"UDP67{'未监听(正确)' if not has_67 else '仍监听(异常)'}"))
+        except Exception as e:
+            checks.append(("UDP67监听", None, f"检查失败: {e}"))
+
+        try:
+            st = self._router.exec(f"cat {self.DHCP_STATUS_FILE} 2>/dev/null")
+            has_status = bool(st and st.strip() and "No such" not in st)
+            if expect_running:
+                checks.append(("status文件存在", has_status,
+                               f"dhcp-server.status{'存在(运行中)' if has_status else '不存在(异常)'}"))
+            else:
+                checks.append(("status文件不存在", not has_status,
+                               f"dhcp-server.status{'不存在(正确)' if not has_status else '仍存在(异常)'}"))
+        except Exception as e:
+            checks.append(("status文件", None, f"检查失败: {e}"))
+
+        passed = all(c[1] for c in checks if c[1] is not None)
+        return VerifyResult(
+            level="L4-运行时", passed=passed,
+            message="; ".join(c[2] for c in checks),
+            details={"checks": checks},
+            raw_output=str(checks)[:300],
+        )
+
+    def verify_dhcp_server_iptables(self, expect_dhcp_acl: bool = True) -> VerifyResult:
+        """L4: 验证iptables DHCP_ACL链(INPUT对UDP67引用, 由黑白名单模块创建)
+
+        DHCP服务端本身不创建iptables规则, 但所有UDP67(DHCP请求)流量经INPUT→DHCP_ACL链。
+        此验证确认DHCP流量路径完整(链存在=流量能到达ik_dhcpd)。
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                "iptables -t filter -S 2>/dev/null | grep -iE 'DHCP_ACL|dport 67'"
+            )
+            has_acl = "DHCP_ACL" in output or "--dport 67" in output
+            if has_acl == expect_dhcp_acl:
+                return VerifyResult(
+                    level="L4-iptables", passed=True,
+                    message=f"DHCP_ACL链{'存在(DHCP流量路径完整)' if has_acl else '不存在(符合预期)'}",
+                    details={"has_dhcp_acl": has_acl},
+                    raw_output=output.strip()[:200],
+                )
+            else:
+                return VerifyResult(
+                    level="L4-iptables", passed=False,
+                    message=f"DHCP_ACL链状态不匹配: 期望{'存在' if expect_dhcp_acl else '不存在'}, "
+                            f"实际{'存在' if has_acl else '不存在'}",
+                    details={"has_dhcp_acl": has_acl},
+                    raw_output=output.strip()[:200],
+                )
+        except Exception as e:
+            return VerifyResult(
+                level="L4-iptables", passed=False,
+                message=f"iptables检查失败: {e}", raw_output=str(e),
+            )
+
+    def verify_dhcp_server_reboot(self, tagname: str = None,
+                                  expect_any_enabled: bool = True) -> VerifyResult:
+        """L4 模拟重启验证: 执行dhcp_server.sh boot模拟开机初始化, 验证配置从数据库完整重建
+
+        流程:
+        1. 记录boot前数据库规则数 + ik_dhcpd.conf是否含tagname + 进程pid
+        2. /usr/ikuai/script/dhcp_server.sh boot (模拟重启: init重建conf + 重启ik_dhcpd)
+        3. 验证: 数据库规则数不变 + conf重新生成 + ik_dhcpd运行 + (tagname仍在conf)
+        对照DMZ bug(netmap init用文本做整数比较导致重启失效): dhcp_server boot从db重建conf+重启,
+        若init有缺陷则重启后配置不生效。本验证捕获此类bug。
+        """
+        self.connect_router()
+        import time as _t
+        try:
+            total_before = self.count_dhcp_server(enabled_only=False)
+            enabled_before = self.count_dhcp_server(enabled_only=True)
+            pid_before = self._router.exec("pidof ik_dhcpd 2>/dev/null").strip()
+
+            boot_out = self._router.exec(
+                "/usr/ikuai/script/dhcp_server.sh boot 2>&1; echo BOOT_EXIT=$?"
+            )
+            _t.sleep(4)  # boot含start + delayed_restart, 等待ik_dhcpd重启完成
+
+            total_after = self.count_dhcp_server(enabled_only=False)
+            enabled_after = self.count_dhcp_server(enabled_only=True)
+            pid_after = self._router.exec("pidof ik_dhcpd 2>/dev/null").strip()
+            conf_out = self._router.exec(f"cat {self.DHCP_CONFILE} 2>/dev/null")
+            conf_exists = bool(conf_out and conf_out.strip())
+
+            checks = []
+            db_intact = (total_after == total_before)
+            checks.append(("数据库规则完整", db_intact,
+                           f"规则数 boot前={total_before} boot后={total_after}"
+                           f"({'完整' if db_intact else '变化(异常)'})"))
+            boot_executed = "BOOT_EXIT=" in (boot_out or "")
+            checks.append(("boot脚本已执行", boot_executed,
+                           f"dhcp_server.sh boot{'已执行' if boot_executed else '未执行(异常)'}"))
+            process_running = bool(pid_after)
+            checks.append(("ik_dhcpd重启运行", process_running,
+                           f"ik_dhcpd pid={pid_after or '无'}({'运行' if process_running else '未运行(异常)'})"))
+            if expect_any_enabled:
+                checks.append(("配置文件已重建", conf_exists,
+                               f"ik_dhcpd.conf{'已生成' if conf_exists else '未生成(异常)'}"))
+            if tagname:
+                in_conf = f"tagname={tagname}" in (conf_out or "")
+                checks.append((f"规则{tagname}重建后在conf", in_conf,
+                               f"规则{tagname}{'仍在conf(重启生效)' if in_conf else '丢失(重启失效bug!)'}"))
+
+            passed = all(c[1] for c in checks)
+            return VerifyResult(
+                level="L4-模拟重启", passed=passed,
+                message="; ".join(c[2] for c in checks),
+                details={"checks": [{"name": c[0], "ok": c[1], "msg": c[2]} for c in checks],
+                         "total_before": total_before, "total_after": total_after,
+                         "enabled_before": enabled_before, "enabled_after": enabled_after,
+                         "pid_before": pid_before, "pid_after": pid_after,
+                         "boot_output": (boot_out or "")[-200:]},
+                raw_output=(boot_out or "")[-300:],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L4-模拟重启", passed=False,
+                message=f"模拟重启验证失败: {e}", raw_output=str(e),
+            )
+
+    def verify_dhcp_server_full_chain(self, name: str = None,
+                                      expected_fields: Dict = None,
+                                      expect_in_conf: bool = True,
+                                      expect_process_running: bool = True) -> FullChainResult:
+        """DHCP服务端全链路验证: L1数据库 + L2进程 + L3配置文件 + L4运行时"""
+        results = []
+        if name:
+            results.append(self.verify_dhcp_server_database(
+                name, expected_fields=expected_fields, must_exist=expect_in_conf))
+        results.append(self.verify_dhcp_server_process(expect_running=expect_process_running))
+        results.append(self.verify_dhcp_server_config_file(
+            tagname=name, expect_in_conf=expect_in_conf,
+            expect_any_enabled=expect_process_running))
+        results.append(self.verify_dhcp_server_runtime(expect_running=expect_process_running))
+        return FullChainResult(results=results)
+
+    def cleanup_dhcp_server_test_rules(self, prefix: str = "DHTEST") -> str:
+        """清理DHCP服务端测试规则(按tagname前缀), 测试异常退出兜底用
+
+        正常流程通过UI删除规则(数据库+ik_dhcpd同步)。本方法直接SQL清理 + restart生效。
+        """
+        self.connect_router()
+        try:
+            out = self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"DELETE FROM dhcp_server WHERE tagname LIKE '{prefix}%';\" 2>&1"
+            )
+            self._router.exec("/usr/ikuai/script/dhcp_server.sh restart 2>&1")
+            logger.info(f"[清理] DHCP测试规则({prefix}*): {out}")
+            return out or ""
+        except Exception as e:
+            logger.warning(f"[清理] DHCP清理失败: {e}")
+            return ""
+
+    def snapshot_dhcp_server(self) -> str:
+        """备份dhcp_server表完整数据(.dump导出INSERT语句)
+
+        导入清空测试前调用, 万一清空导入异常导致DHS_1丢失可恢复。
+        """
+        self.connect_router()
+        try:
+            out = self._router.exec(
+                f"sqlite3 {self.DNS_DB} '.dump dhcp_server' 2>/dev/null"
+            )
+            return out or ""
+        except Exception as e:
+            logger.warning(f"[备份] dhcp_server dump失败: {e}")
+            return ""
+
+    def restore_dhcp_server(self, dump: str) -> bool:
+        """从.dump备份恢复dhcp_server表(清空现有+重新导入+restart), 兜底用
+
+        用base64传输避免SQL引号转义问题。
+        """
+        if not dump or not dump.strip():
+            return False
+        self.connect_router()
+        try:
+            import base64 as _b64
+            b64 = _b64.b64encode(dump.encode('utf-8')).decode('ascii')
+            tmp = "/tmp/iktmp/_dhcp_restore.sql"
+            self._router.exec(f"echo '{b64}' | base64 -d > {tmp} 2>/dev/null")
+            self._router.exec(
+                f"sqlite3 {self.DNS_DB} 'DELETE FROM dhcp_server;' 2>/dev/null; "
+                f"sqlite3 {self.DNS_DB} < {tmp} 2>/dev/null; rm -f {tmp}"
+            )
+            self._router.exec("/usr/ikuai/script/dhcp_server.sh restart 2>&1")
+            logger.info("[恢复] dhcp_server表已从备份恢复")
+            return True
+        except Exception as e:
+            logger.warning(f"[恢复] dhcp_server恢复失败: {e}")
+            return False
+
+    # ==================== DHCP静态分配(DHCP Static)验证 ====================
+    # 涉及表: dhcp_static(MAC-IP绑定, DHCP服务端子功能)
+    # 后端脚本: /usr/ikuai/function/dhcp_static
+    # 共用ik_dhcpd进程(无独立进程/iptables/内核), 绑定下发到:
+    #   /tmp/iktmp/ik_dhcp_static_cache.conf (cache, 仅enabled=yes, 格式: <interface> <ip> <mac> [<gw> <dns1> <dns2>])
+    #   /tmp/iktmp/ik_dhcpd_static.conf (最终给ik_dhcpd, = cache + arp[dhcpd_arp时] + ike_dhcp)
+    # add/edit/del/up/down后 __dhcp_static_update(重建cache+static.conf) + dhcp_server.sh delayed_restart
+    # 约束: tagname唯一, ip_addr唯一, (interface,mac)组合唯一
+    # 字段: id/enabled/tagname/comment/cl_name/interface(默认auto)/ip_addr/mac/gateway/dns1/dns2
+
+    DHCP_STATIC_CACHE = "/tmp/iktmp/ik_dhcp_static_cache.conf"
+    DHCP_STATIC_CONF = "/tmp/iktmp/ik_dhcpd_static.conf"
+
+    def query_dhcp_static_rule(self, name: str) -> Optional[Dict]:
+        """L1: 查询单条DHCP静态分配(按tagname)"""
+        return self._sqlite_query_line(
+            f"SELECT id,enabled,tagname,comment,cl_name,interface,ip_addr,mac,"
+            f"gateway,dns1,dns2 FROM dhcp_static WHERE tagname='{name}'"
+        )
+
+    def query_dhcp_static_by_mac(self, mac: str) -> Optional[Dict]:
+        """L1: 按MAC查询DHCP静态分配"""
+        return self._sqlite_query_line(
+            f"SELECT id,enabled,tagname,interface,ip_addr,mac FROM dhcp_static WHERE mac='{mac}'"
+        )
+
+    def query_all_dhcp_static(self) -> List[Dict]:
+        """L1: 查询所有DHCP静态分配"""
+        return self._sqlite_query_list(
+            "SELECT id,enabled,tagname,interface,ip_addr,mac,gateway,dns1,dns2 "
+            "FROM dhcp_static"
+        )
+
+    def count_dhcp_static(self, enabled_only: bool = False) -> int:
+        """L1: 统计DHCP静态分配规则数"""
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM dhcp_static {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_dhcp_static_database(self, name: str,
+                                    expected_fields: Dict = None,
+                                    must_exist: bool = True) -> VerifyResult:
+        """L1: 验证DHCP静态分配数据库配置(dhcp_static表, 按tagname)
+
+        expected_fields可含: enabled/interface/ip_addr/mac/gateway/dns1/dns2/comment
+        """
+        rule = self.query_dhcp_static_rule(name)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=not must_exist,
+                message=f"DHCP静态分配'{name}'不存在"
+                        f"({'符合预期' if not must_exist else '应为存在'})",
+                raw_output="",
+            )
+        details = {
+            "id": rule.get("id"), "enabled": rule.get("enabled"),
+            "tagname": rule.get("tagname"), "interface": rule.get("interface"),
+            "ip_addr": rule.get("ip_addr"), "mac": rule.get("mac"),
+            "gateway": rule.get("gateway"), "dns1": rule.get("dns1"),
+            "dns2": rule.get("dns2"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"DHCP静态分配'{name}'存在: interface={details['interface']}, "
+                        f"ip={details['ip_addr']}, mac={details['mac']}, "
+                        f"enabled={details['enabled']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"DHCP静态分配'{name}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"DHCP静态分配'{name}'数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_dhcp_static_config_file(self, tagname: str = None,
+                                       ip: str = None, mac: str = None,
+                                       expect_in_conf: bool = True) -> VerifyResult:
+        """L3: 验证DHCP静态绑定是否下发到ik_dhcpd_static.conf(给ik_dhcpd的最终配置)
+
+        cache(ik_dhcp_static_cache.conf)仅含enabled=yes规则; static.conf = cache+arp+ike。
+        检查 static.conf 是否包含指定绑定(用mac最独特, 辅以ip)。
+        - expect_in_conf=True: 应在conf(规则启用, 绑定已下发)
+        - expect_in_conf=False: 不应在conf(规则停用, 绑定已移除)
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec(f"cat {self.DHCP_STATIC_CONF} 2>/dev/null")
+            cache_out = self._router.exec(f"cat {self.DHCP_STATIC_CACHE} 2>/dev/null")
+            checks = []
+            # mac最独特, 优先检查mac
+            key = mac or ip
+            if key:
+                in_conf = key in (output or "")
+                in_cache = key in (cache_out or "")
+                if expect_in_conf:
+                    checks.append((f"绑定({key})在static.conf", in_conf,
+                                   f"static.conf{'含' if in_conf else '不含'}{key}"
+                                   f"({'已下发' if in_conf else '未下发(异常)'})"))
+                    # cache反映enabled=yes(停用的不在cache但可能在static.conf的arp段)
+                    checks.append((f"绑定({key})在cache", in_cache,
+                                   f"cache{'含' if in_cache else '不含'}{key}"
+                                   f"(enabled={'yes' if in_cache else 'no/arp来源'})"))
+                else:
+                    # 停用的不应在cache(cache仅enabled=yes)
+                    checks.append((f"绑定({key})不在cache", not in_cache,
+                                   f"cache{'不含' if not in_cache else '仍含'}{key}"
+                                   f"({'停用正确' if not in_cache else '异常(应停用)'})"))
+            elif tagname:
+                # 无mac/ip时, 查数据库拿mac
+                rule = self.query_dhcp_static_rule(tagname)
+                if rule:
+                    m = rule.get("mac", "")
+                    if m:
+                        in_conf = m in (output or "")
+                        checks.append((f"绑定(mac={m})在static.conf", in_conf if expect_in_conf else not in_conf,
+                                       f"static.conf{'含' if in_conf else '不含'}{m}"))
+                    else:
+                        checks.append(("mac为空", True, "规则mac字段为空"))
+                else:
+                    checks.append(("规则不存在", not expect_in_conf, f"规则{tagname}不存在"))
+
+            passed = all(c[1] for c in checks) if checks else False
+            return VerifyResult(
+                level="L3-配置文件", passed=passed,
+                message="; ".join(c[2] for c in checks) if checks else "无检查项",
+                details={"static_conf_exists": bool(output and output.strip()),
+                         "cache_exists": bool(cache_out and cache_out.strip()),
+                         "checks": checks},
+                raw_output=(output or "")[:300],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L3-配置文件", passed=False,
+                message=f"配置文件检查失败: {e}", raw_output=str(e),
+            )
+
+    def verify_dhcp_static_process(self, expect_running: bool = True) -> VerifyResult:
+        """L2: 验证ik_dhcpd进程状态(静态绑定共用DHCP服务端ik_dhcpd进程)"""
+        # 复用DHCP服务端的进程验证逻辑
+        return self.verify_dhcp_server_process(expect_running=expect_running)
+
+    def verify_dhcp_static_reboot(self, tagname: str = None, mac: str = None) -> VerifyResult:
+        """L4 模拟重启验证: dhcp_server.sh boot后, 静态绑定仍从数据库重建到static.conf
+
+        对照DMZ bug: 验证重启后绑定配置不丢失。
+        """
+        self.connect_router()
+        import time as _t
+        try:
+            total_before = self.count_dhcp_static(enabled_only=False)
+            enabled_before = self.count_dhcp_static(enabled_only=True)
+            # 取mac(优先传入, 否则从数据库)
+            check_mac = mac
+            if not check_mac and tagname:
+                rule = self.query_dhcp_static_rule(tagname)
+                check_mac = rule.get("mac") if rule else None
+
+            boot_out = self._router.exec(
+                "/usr/ikuai/script/dhcp_server.sh boot 2>&1; echo BOOT_EXIT=$?"
+            )
+            _t.sleep(4)
+
+            total_after = self.count_dhcp_static(enabled_only=False)
+            enabled_after = self.count_dhcp_static(enabled_only=True)
+            static_conf = self._router.exec(f"cat {self.DHCP_STATIC_CONF} 2>/dev/null")
+
+            checks = []
+            db_intact = (total_after == total_before)
+            checks.append(("数据库绑定完整", db_intact,
+                           f"绑定数 boot前={total_before} boot后={total_after}"
+                           f"({'完整' if db_intact else '变化(异常)'})"))
+            boot_executed = "BOOT_EXIT=" in (boot_out or "")
+            checks.append(("boot脚本已执行", boot_executed,
+                           f"dhcp_server.sh boot{'已执行' if boot_executed else '未执行(异常)'}"))
+            if check_mac:
+                in_conf = check_mac in (static_conf or "")
+                checks.append((f"绑定({check_mac})重启后在static.conf", in_conf,
+                               f"static.conf{'仍含' if in_conf else '丢失'}{check_mac}"
+                               f"({'重启生效' if in_conf else '重启失效bug!'})"))
+
+            passed = all(c[1] for c in checks)
+            return VerifyResult(
+                level="L4-模拟重启", passed=passed,
+                message="; ".join(c[2] for c in checks),
+                details={"checks": [{"name": c[0], "ok": c[1], "msg": c[2]} for c in checks],
+                         "total_before": total_before, "total_after": total_after,
+                         "enabled_before": enabled_before, "enabled_after": enabled_after,
+                         "boot_output": (boot_out or "")[-200:]},
+                raw_output=(boot_out or "")[-300:],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L4-模拟重启", passed=False,
+                message=f"模拟重启验证失败: {e}", raw_output=str(e),
+            )
+
+    def verify_dhcp_static_full_chain(self, name: str = None,
+                                      expected_fields: Dict = None,
+                                      mac: str = None,
+                                      expect_in_conf: bool = True,
+                                      expect_process_running: bool = True) -> FullChainResult:
+        """DHCP静态分配全链路验证: L1数据库 + L2进程 + L3静态配置文件"""
+        results = []
+        if name:
+            results.append(self.verify_dhcp_static_database(
+                name, expected_fields=expected_fields, must_exist=expect_in_conf))
+        results.append(self.verify_dhcp_static_process(expect_running=expect_process_running))
+        results.append(self.verify_dhcp_static_config_file(
+            tagname=name, mac=mac, expect_in_conf=expect_in_conf))
+        return FullChainResult(results=results)
+
+    def verify_dhcpd_arp(self, expect_enabled: bool) -> VerifyResult:
+        """验证"兼容ARP绑定列表为静态分配"开关(global_config.dhcpd_arp)
+
+        DHCP静态分配设置面板(右上角齿轮)的"兼容ARP绑定列表为静态分配"复选框。
+        开启后dhcp_server.sh的__dhcpd_static_dump会把arp表lan/vlan条目加入ik_dhcpd_static.conf。
+        - expect_enabled=True: dhcpd_arp=1
+        - expect_enabled=False: dhcpd_arp=0
+        """
+        self.connect_router()
+        try:
+            result = self._sqlite_query_line(
+                "SELECT dhcpd_arp FROM global_config WHERE id=1"
+            )
+            arp_val = result.get("dhcpd_arp") if result else None
+            arp_enabled = (arp_val == "1")
+            checks = []
+            checks.append(("dhcpd_arp字段值",
+                           arp_enabled == expect_enabled,
+                           f"dhcpd_arp={arp_val}({'开启' if arp_enabled else '关闭'}, "
+                           f"期望{'开启' if expect_enabled else '关闭'})"))
+            if expect_enabled:
+                static_conf = self._router.exec(f"cat {self.DHCP_STATIC_CONF} 2>/dev/null")
+                has_mac = bool(re.search(r'[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}',
+                                          static_conf or ''))
+                checks.append(("static.conf含ARP条目", has_mac,
+                               f"ik_dhcpd_static.conf{'含MAC行(ARP已注入)' if has_mac else '无MAC行(arp表可能空)'}"))
+            passed = all(c[1] for c in checks)
+            return VerifyResult(
+                level="L1-设置(dhcpd_arp)", passed=passed,
+                message="; ".join(c[2] for c in checks),
+                details={"dhcpd_arp": arp_val, "expect_enabled": expect_enabled,
+                         "checks": checks},
+                raw_output=f"dhcpd_arp={arp_val}",
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L1-设置(dhcpd_arp)", passed=False,
+                message=f"dhcpd_arp验证失败: {e}", raw_output=str(e),
+            )
+
+    def cleanup_dhcp_static_test_rules(self, prefix: str = "DHSTEST") -> str:
+        """清理DHCP静态分配测试规则(按tagname前缀), 测试异常退出兜底用"""
+        self.connect_router()
+        try:
+            out = self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"DELETE FROM dhcp_static WHERE tagname LIKE '{prefix}%';\" 2>&1"
+            )
+            self._router.exec("/usr/ikuai/script/dhcp_server.sh restart 2>&1")
+            logger.info(f"[清理] DHCP静态分配测试规则({prefix}*): {out}")
+            return out or ""
+        except Exception as e:
+            logger.warning(f"[清理] DHCP静态分配清理失败: {e}")
+            return ""
+
+    # ==================== DHCP客户端(DHCP Lease)验证 ====================
+    # DHCP客户端是只读+操作型页面, 显示/var/db/leases.db的动态租约
+    # 操作: 一键回收IP地址(recycle清leases) / 加入静态分配(→dhcp_static) / 加入黑名单(→dhcp_acl_mac_black)
+    # 共用ik_dhcpd进程(DHCP服务端子功能, 无独立iptables/内核)
+
+    LEASES_DB = "/var/db/leases.db"
+
+    def query_lease(self, ip: str = None, mac: str = None) -> Optional[Dict]:
+        """查询leases.db租约(按IP或MAC)"""
+        self.connect_router()
+        try:
+            where_parts = []
+            if ip:
+                where_parts.append(f"ip_addr='{ip}'")
+            if mac:
+                where_parts.append(f"mac='{mac}'")
+            where = " or ".join(where_parts) if where_parts else "1=1"
+            output = self._router.exec(
+                f"sqlite3 {self.LEASES_DB} -line \"select id,interface,ip_addr,mac,"
+                f"hostname,start_time,end_time,status from leases where {where}\" 2>/dev/null"
+            )
+            if not output or not output.strip():
+                return None
+            result = {}
+            for line in output.splitlines():
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    result[k.strip()] = v.strip()
+            return result if result else None
+        except Exception as e:
+            logger.error(f"[L1] 查询lease失败: {e}")
+            return None
+
+    def count_leases(self) -> int:
+        """统计leases.db租约总数"""
+        self.connect_router()
+        try:
+            output = self._router.exec(
+                f"sqlite3 {self.LEASES_DB} \"select count(*) from leases\" 2>/dev/null"
+            ).strip()
+            return int(output) if output.isdigit() else 0
+        except Exception:
+            return 0
+
+    def verify_lease_in_db(self, ip: str = None, mac: str = None,
+                           must_exist: bool = True) -> VerifyResult:
+        """L1: 验证leases.db有/无指定租约(按IP或MAC)"""
+        lease = self.query_lease(ip=ip, mac=mac)
+        exists = lease is not None
+        if exists == must_exist:
+            return VerifyResult(
+                level="L1-租约", passed=True,
+                message=f"租约(ip={ip},mac={mac}){'存在' if exists else '不存在'}(符合预期)"
+                        + (f": {lease.get('hostname')}" if lease else ""),
+                details={"lease": lease}, raw_output=str(lease),
+            )
+        else:
+            return VerifyResult(
+                level="L1-租约", passed=False,
+                message=f"租约状态不匹配: 期望{'存在' if must_exist else '不存在'}, "
+                        f"实际{'存在' if exists else '不存在'}",
+                details={"lease": lease}, raw_output=str(lease),
+            )
+
+    def verify_leases_recycled(self, expect_count: int = 0) -> VerifyResult:
+        """L1: 验证一键回收后leases.db租约数(回收清空→expect_count=0或减少)"""
+        count = self.count_leases()
+        # recycle可能清空(force)或只清过期, 用<=expect_count或显著减少判断
+        passed = (count <= expect_count) if expect_count > 0 else (count == 0)
+        return VerifyResult(
+            level="L1-回收", passed=passed,
+            message=f"leases.db租约数={count}(期望{'<= Expect_count='+str(expect_count) if expect_count>0 else '=0'})",
+            details={"count": count, "expect_count": expect_count},
+            raw_output=f"leases_count={count}",
+        )
+
+    def query_acl_mac_black(self, mac: str) -> Optional[Dict]:
+        """查询acl_mac_black(通用MAC黑名单, DHCP客户端'加入黑名单'写入此表)
+
+        !!注意: DHCP客户端行内'加入黑名单'调用func_name=acl_mac(不是dhcp_acl_mac),
+        把MAC加入acl_mac_black表(ACL_MAC iptables链), **不是**dhcp_acl_mac_black(DHCP专用黑白名单)。
+        两者是不同的表/功能。
+        """
+        return self._sqlite_query_line(
+            f"SELECT id,enabled,tagname,mac,comment FROM acl_mac_black WHERE mac='{mac}'"
+        )
+
+    def verify_lease_to_blacklist(self, mac: str, must_exist: bool = True) -> VerifyResult:
+        """L1: 验证MAC是否在acl_mac_black(DHCP客户端'加入黑名单'的结果)"""
+        rule = self.query_acl_mac_black(mac)
+        exists = rule is not None
+        if exists == must_exist:
+            return VerifyResult(
+                level="L1-黑名单", passed=True,
+                message=f"MAC {mac}{'在' if exists else '不在'}acl_mac_black黑名单(符合预期)",
+                details={"rule": rule}, raw_output=str(rule),
+            )
+        else:
+            return VerifyResult(
+                level="L1-黑名单", passed=False,
+                message=f"黑名单状态不匹配: 期望{'在' if must_exist else '不在'}, "
+                        f"实际{'在' if exists else '不在'}",
+                details={"rule": rule}, raw_output=str(rule),
+            )
+
+    def verify_lease_to_static(self, name: str, must_exist: bool = True) -> VerifyResult:
+        """L1: 验证加入静态分配后dhcp_static有该绑定(复用dhcp_static验证)"""
+        return self.verify_dhcp_static_database(name, must_exist=must_exist)
+
+    def cleanup_dhcp_lease_test(self, static_prefix: str = "DHLEASE",
+                                blacklist_macs: list = None) -> str:
+        """清理DHCP客户端测试残留(加入静态分配的规则 + 加入黑名单的MAC)"""
+        self.connect_router()
+        out_parts = []
+        try:
+            o = self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"DELETE FROM dhcp_static WHERE tagname LIKE '{static_prefix}%';\" 2>&1"
+            )
+            out_parts.append(f"static({static_prefix}): {o.strip()[:40]}")
+            if blacklist_macs:
+                for mac in blacklist_macs:
+                    o = self._router.exec(
+                        f"sqlite3 {self.DNS_DB} \"DELETE FROM acl_mac_black WHERE mac='{mac}';\" 2>&1"
+                    )
+                    out_parts.append(f"blacklist({mac}): {o.strip()[:40]}")
+            self._router.exec("/usr/ikuai/script/dhcp_server.sh restart 2>&1")
+            logger.info(f"[清理] DHCP客户端残留: {'; '.join(out_parts)}")
+        except Exception as e:
+            logger.warning(f"[清理] DHCP客户端清理失败: {e}")
+        return "; ".join(out_parts)
+
+    # ==================== DHCP黑白名单(DHCP Acl Mac)验证 ====================
+    # 涉及表: dhcp_acl_mac_black(模式0)/dhcp_acl_mac_white(模式1)
+    # 后端脚本: /usr/ikuai/script/dhcp_acl_mac.sh
+    # ipset: Linux_dhcp_aclmac_default(hash:mac, enabled=yes的MAC)
+    # iptables: DHCP_ACL链(INPUT→UDP67→DHCP_ACL), 模式决定规则:
+    #   0黑名单: -m set --match-set Linux_dhcp_aclmac_default src -j DROP (黑名单内禁止)
+    #   1白名单: -m set ! --match-set Linux_dhcp_aclmac_default src -j DROP (白名单外禁止,空ipset阻止所有!)
+    #   2同步: 使用Linux_aclmac_default(通用MAC访问控制)
+    # 模式: global_config.dhcp_acl_mac(0/1/2), __get_acl_action: 0→black表, 非0→white表
+    # 字段: id/enabled(默认'no'!)/tagname(unique)/ip_type(默认'4')/comment/mac(unique)
+    # 关键: enabled默认'no', 添加的规则默认不入ipset, up()启用才加入ipset
+
+    DHCP_ACL_IPSET = "Linux_dhcp_aclmac_default"
+
+    def query_dhcp_acl_rule(self, mac: str = None, name: str = None,
+                            table: str = 'black') -> Optional[Dict]:
+        """查询dhcp_acl_mac_black/white表(按mac或tagname)"""
+        where = []
+        if mac:
+            where.append(f"mac='{mac}'")
+        if name:
+            where.append(f"tagname='{name}'")
+        w = " and ".join(where) if where else "1=1"
+        return self._sqlite_query_line(
+            f"SELECT id,enabled,tagname,ip_type,mac,comment FROM dhcp_acl_mac_{table} WHERE {w}"
+        )
+
+    def count_dhcp_acl_rules(self, table: str = 'black', enabled_only: bool = False) -> int:
+        """统计dhcp_acl_mac表规则数"""
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM dhcp_acl_mac_{table} {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_dhcp_acl_database(self, name: str = None, mac: str = None,
+                                 table: str = 'black',
+                                 expected_fields: Dict = None,
+                                 must_exist: bool = True) -> VerifyResult:
+        """L1: 验证dhcp_acl_mac表规则(按name或mac)
+
+        expected_fields可含: enabled/tagname/mac/comment/ip_type
+        """
+        rule = self.query_dhcp_acl_rule(mac=mac, name=name, table=table)
+        if rule is None:
+            return VerifyResult(
+                level=f"L1-{table}表", passed=not must_exist,
+                message=f"DHCP黑白名单'{name or mac}'({table}表)不存在"
+                        f"({'符合预期' if not must_exist else '应为存在'})",
+                raw_output="",
+            )
+        details = {
+            "id": rule.get("id"), "enabled": rule.get("enabled"),
+            "tagname": rule.get("tagname"), "mac": rule.get("mac"),
+            "table": table,
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+        if not must_exist:
+            # 规则存在但期望不存在 → 失败
+            return VerifyResult(
+                level=f"L1-{table}表", passed=False,
+                message=f"规则'{name or mac}'({table}表)存在但期望不存在(删除/清理未生效)",
+                details={"rule": details}, raw_output=raw,
+            )
+        if expected_fields is None:
+            return VerifyResult(
+                level=f"L1-{table}表", passed=True,
+                message=f"规则'{name or mac}'({table}表)存在: enabled={details['enabled']}, mac={details['mac']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level=f"L1-{table}表", passed=False,
+                message=f"规则'{name or mac}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level=f"L1-{table}表", passed=True,
+            message=f"规则'{name or mac}'({table}表)数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_dhcp_acl_ipset(self, mac: str, should_in_ipset: bool = True) -> VerifyResult:
+        """L2: 验证ipset Linux_dhcp_aclmac_default含/不含该MAC
+
+        enabled=yes的MAC在ipset(add/up时ipset_add, del/down时ipset_del)。
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec(f"ipset list {self.DHCP_ACL_IPSET} 2>/dev/null")
+            in_ipset = mac in (output or "")
+            if in_ipset == should_in_ipset:
+                return VerifyResult(
+                    level="L2-ipset", passed=True,
+                    message=f"MAC {mac}{('在' if in_ipset else '不在')}ipset(符合预期)",
+                    details={"in_ipset": in_ipset}, raw_output=output[:200],
+                )
+            else:
+                return VerifyResult(
+                    level="L2-ipset", passed=False,
+                    message=f"ipset状态不匹配: 期望{'在' if should_in_ipset else '不在'}, "
+                            f"实际{'在' if in_ipset else '不在'}",
+                    details={"in_ipset": in_ipset}, raw_output=output[:200],
+                )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-ipset", passed=False,
+                message=f"ipset检查失败: {e}", raw_output=str(e),
+            )
+
+    def verify_dhcp_acl_mode(self, expected_mode: int) -> VerifyResult:
+        """L1: 验证global_config.dhcp_acl_mac模式(0黑名单/1白名单/2同步)"""
+        result = self._sqlite_query_line(
+            "SELECT dhcp_acl_mac FROM global_config WHERE id=1"
+        )
+        mode_val = result.get("dhcp_acl_mac") if result else None
+        try:
+            mode_int = int(mode_val) if mode_val is not None else -1
+        except (ValueError, TypeError):
+            mode_int = -1
+        mode_desc = {0: "黑名单", 1: "白名单", 2: "同步MAC访问控制"}.get(mode_int, f"未知({mode_val})")
+        passed = (mode_int == expected_mode)
+        return VerifyResult(
+            level="L1-模式", passed=passed,
+            message=f"dhcp_acl_mac={mode_val}({mode_desc}), 期望{expected_mode}({mode_desc if passed else ''})",
+            details={"mode": mode_val, "expected": expected_mode},
+            raw_output=f"dhcp_acl_mac={mode_val}",
+        )
+
+    def verify_dhcp_acl_iptables(self, mode: int) -> VerifyResult:
+        """L4: 验证iptables DHCP_ACL链规则符合模式
+
+        mode0黑名单: --match-set Linux_dhcp_aclmac_default src -j DROP (无!)
+        mode1白名单: ! --match-set Linux_dhcp_aclmac_default src -j DROP (有!)
+        mode2同步: --match-set Linux_aclmac_default src -j DROP
+        """
+        self.connect_router()
+        try:
+            output = self._router.exec("iptables -t filter -S DHCP_ACL 2>/dev/null")
+            has_dhcp_aclmac = "Linux_dhcp_aclmac_default" in output
+            has_aclmac = "Linux_aclmac_default" in output
+            has_not = "! --match-set" in output or "!  --match-set" in output
+            mode_desc = {0: "黑名单", 1: "白名单", 2: "同步"}.get(mode, "?")
+            checks = []
+            if mode == 0:
+                # 黑名单: 用dhcp_aclmac + 无!
+                checks.append(("黑名单规则(dhcp_aclmac)", has_dhcp_aclmac and not has_not,
+                               f"DHCP_ACL{'含dhcp_aclmac无!' if (has_dhcp_aclmac and not has_not) else '规则不符'}"))
+            elif mode == 1:
+                # 白名单: 用dhcp_aclmac + 有!
+                checks.append(("白名单规则(! dhcp_aclmac)", has_dhcp_aclmac and has_not,
+                               f"DHCP_ACL{'含! dhcp_aclmac' if (has_dhcp_aclmac and has_not) else '规则不符'}"))
+            elif mode == 2:
+                # 同步: 用aclmac
+                checks.append(("同步规则(acl_mac)", has_aclmac,
+                               f"DHCP_ACL{'含acl_mac' if has_aclmac else '规则不符'}"))
+            passed = all(c[1] for c in checks) if checks else False
+            return VerifyResult(
+                level="L4-iptables", passed=passed,
+                message=f"模式{mode}({mode_desc}): " + "; ".join(c[2] for c in checks),
+                details={"mode": mode, "has_dhcp_aclmac": has_dhcp_aclmac,
+                         "has_aclmac": has_aclmac, "has_not": has_not},
+                raw_output=output[:300],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L4-iptables", passed=False,
+                message=f"iptables检查失败: {e}", raw_output=str(e),
+            )
+
+    def verify_dhcp_acl_reboot(self) -> VerifyResult:
+        """L4 模拟重启: dhcp_acl_mac.sh init重建ipset+iptables"""
+        self.connect_router()
+        import time as _t
+        try:
+            out = self._router.exec(
+                "/usr/ikuai/script/dhcp_acl_mac.sh init 2>&1; echo INIT_EXIT=$?"
+            )
+            _t.sleep(2)
+            # 验证ipset存在 + iptables DHCP_ACL链存在
+            ipset_out = self._router.exec(f"ipset list {self.DHCP_ACL_IPSET} 2>/dev/null | head -2")
+            ipt_out = self._router.exec("iptables -t filter -S DHCP_ACL 2>/dev/null")
+            checks = []
+            checks.append(("init已执行", "INIT_EXIT=" in (out or ""),
+                           f"init{'已执行' if 'INIT_EXIT=' in (out or '') else '未执行'}"))
+            checks.append(("ipset存在", "Name:" in ipset_out,
+                           f"ipset{'存在' if 'Name:' in ipset_out else '不存在'}"))
+            checks.append(("DHCP_ACL链存在", "DHCP_ACL" in ipt_out,
+                           f"DHCP_ACL链{'存在' if 'DHCP_ACL' in ipt_out else '不存在'}"))
+            passed = all(c[1] for c in checks)
+            return VerifyResult(
+                level="L4-模拟重启", passed=passed,
+                message="; ".join(c[2] for c in checks),
+                details={"checks": checks, "init_output": (out or "")[-200:]},
+                raw_output=(out or "")[-300:],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L4-模拟重启", passed=False,
+                message=f"模拟重启失败: {e}", raw_output=str(e),
+            )
+
+    def cleanup_dhcp_acl_test(self, prefix: str = "DHACL") -> str:
+        """清理DHCP黑白名单测试规则(black+white两表) + 恢复模式0 + 重建ipset
+
+        测试异常退出兜底用。模式1(白名单)空ipset会阻止所有DHCP, 必须恢复模式0。
+        """
+        self.connect_router()
+        out_parts = []
+        try:
+            for table in ['black', 'white']:
+                o = self._router.exec(
+                    f"sqlite3 {self.DNS_DB} \"DELETE FROM dhcp_acl_mac_{table} WHERE tagname LIKE '{prefix}%';\" 2>&1"
+                )
+                out_parts.append(f"{table}: {o.strip()[:40]}")
+            # 恢复模式0(黑名单, 安全)
+            self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"UPDATE global_config SET dhcp_acl_mac=0 WHERE id=1;\" 2>&1"
+            )
+            # 重建ipset+iptables
+            self._router.exec("/usr/ikuai/script/dhcp_acl_mac.sh init 2>&1")
+            logger.info(f"[清理] DHCP黑白名单({prefix}*): {'; '.join(out_parts)} + 模式恢复0")
+        except Exception as e:
+            logger.warning(f"[清理] DHCP黑白名单清理失败: {e}")
+        return "; ".join(out_parts)
+
+    # ==================== IPv6前缀静态分配(IPv6 Static)验证 ====================
+    # 涉及表: ipv6_dhcp_static_config(DHCPv6-PD前缀静态分配)
+    # 后端脚本: /usr/ikuai/script/ipv6_static.sh (add/edit/del + ipv6.sh add_static/del_static生效)
+    # 字段: id/enabled(默认yes)/tagname(unique)/link_addr(终端本地链接IPv6)/src_iface(内网接口lan1)/
+    #       dst_iface(外网线路)/ipv6_addr/ipv6_addr_len/comment
+    # 约束: tagname唯一, (src_iface,link_addr)唯一; __check_dst_iface: dst_iface须在src_iface的parent(IPv6 LAN配置)
+    # !!环境限制: 需WAN IPv6前缀+LAN IPv6配置(ipv6_lan_config), IPv6关闭时添加被lan_prefix_error拦
+
+    def query_ipv6_static_rule(self, name: str) -> Optional[Dict]:
+        """查询IPv6前缀静态分配规则(按tagname)"""
+        return self._sqlite_query_line(
+            f"SELECT id,enabled,tagname,link_addr,src_iface,dst_iface,ipv6_addr,comment "
+            f"FROM ipv6_dhcp_static_config WHERE tagname='{name}'"
+        )
+
+    def count_ipv6_static(self, enabled_only: bool = False) -> int:
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM ipv6_dhcp_static_config {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_ipv6_static_database(self, name: str,
+                                    expected_fields: Dict = None,
+                                    must_exist: bool = True) -> VerifyResult:
+        """L1: 验证IPv6前缀静态分配数据库(ipv6_dhcp_static_config表)"""
+        rule = self.query_ipv6_static_rule(name)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=not must_exist,
+                message=f"IPv6前缀静态分配'{name}'不存在"
+                        f"({'符合预期' if not must_exist else '应为存在'})",
+                raw_output="",
+            )
+        details = {
+            "id": rule.get("id"), "enabled": rule.get("enabled"),
+            "tagname": rule.get("tagname"), "link_addr": rule.get("link_addr"),
+            "src_iface": rule.get("src_iface"), "dst_iface": rule.get("dst_iface"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+        if not must_exist:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"规则'{name}'存在但期望不存在",
+                details={"rule": details}, raw_output=raw,
+            )
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"规则'{name}'存在: link_addr={details['link_addr']}, "
+                        f"src={details['src_iface']}, dst={details['dst_iface']}, enabled={details['enabled']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"规则'{name}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"规则'{name}'数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_ipv6_static_init(self) -> VerifyResult:
+        """L4 模拟重启: ipv6_static.sh init(init_static重建IPv6前缀)"""
+        self.connect_router()
+        try:
+            out = self._router.exec("/usr/ikuai/script/ipv6_static.sh init 2>&1; echo INIT_EXIT=$?")
+            executed = "INIT_EXIT=" in out
+            return VerifyResult(
+                level="L4-模拟重启", passed=executed,
+                message=f"ipv6_static.sh init{'已执行' if executed else '未执行'}",
+                details={"output": out[-200:]}, raw_output=out[-300:],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L4-模拟重启", passed=False,
+                message=f"init失败: {e}", raw_output=str(e),
+            )
+
+    def cleanup_ipv6_static_test(self, prefix: str = "IPV6TEST") -> str:
+        """清理IPv6前缀静态分配测试规则(按tagname前缀)"""
+        self.connect_router()
+        try:
+            out = self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"DELETE FROM ipv6_dhcp_static_config WHERE tagname LIKE '{prefix}%';\" 2>&1"
+            )
+            logger.info(f"[清理] IPv6前缀静态分配({prefix}*): {out}")
+            return out or ""
+        except Exception as e:
+            logger.warning(f"[清理] IPv6清理失败: {e}")
+            return ""

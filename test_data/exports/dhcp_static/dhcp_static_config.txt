@@ -1,0 +1,6 @@
+id=1 enabled=yes interface=lan1 ip_addr=192.168.148.51 mac=02:11:22:33:44:56 cl_name= comment=编辑后的绑定 termname= gateway=192.168.148.1 dns1=114.114.114.114 dns2=223.5.5.5 tagname=DHSTEST_1
+id=2 enabled=yes interface=auto ip_addr=192.168.148.60 mac=02:11:22:33:44:62 cl_name= comment=静态绑定2 termname= gateway= dns1= dns2= tagname=DHSTEST_2
+id=3 enabled=yes interface=auto ip_addr=192.168.148.61 mac=02:11:22:33:44:63 cl_name= comment=静态绑定3 termname= gateway= dns1= dns2= tagname=DHSTEST_3
+id=4 enabled=yes interface=auto ip_addr=192.168.148.62 mac=02:11:22:33:44:64 cl_name= comment=静态绑定4 termname= gateway= dns1= dns2= tagname=DHSTEST_4
+id=5 enabled=yes interface=auto ip_addr=192.168.148.63 mac=02:11:22:33:44:65 cl_name= comment=静态绑定5 termname= gateway= dns1= dns2= tagname=DHSTEST_5
+id=6 enabled=yes interface=auto ip_addr=192.168.148.64 mac=02:11:22:33:44:66 cl_name= comment=静态绑定6 termname= gateway= dns1= dns2= tagname=DHSTEST_6

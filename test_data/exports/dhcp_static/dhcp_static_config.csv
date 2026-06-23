@@ -1,0 +1,2 @@
+id,enabled,interface,ip_addr,mac,cl_name,comment,termname,gateway,dns1,dns2,tagname
+1,"yes","lan1","192.168.148.51","02:11:22:33:44:56","","±à¼­ºóµÄ°ó¶¨","","192.168.148.1","114.114.114.114","223.5.5.5","DHSTEST_1"

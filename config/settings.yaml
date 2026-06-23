@@ -103,6 +103,18 @@ test_data:
     dns_multi_line:
       export_filename: "dns_multi_line_config.csv"
       import_filename: "dns_multi_line_import.csv"
+    dhcp_server:
+      export_filename: "dhcp_server_config.csv"
+      import_filename: "dhcp_server_import.csv"
+    dhcp_static:
+      export_filename: "dhcp_static_config.csv"
+      import_filename: "dhcp_static_import.csv"
+    dhcp_acl_mac:
+      export_filename: "dhcp_acl_mac_config.csv"
+      import_filename: "dhcp_acl_mac_import.csv"
+    ipv6_static:
+      export_filename: "ipv6_static_config.csv"
+      import_filename: "ipv6_static_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"

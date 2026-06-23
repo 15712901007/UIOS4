@@ -115,6 +115,11 @@ from pages.network.stream_control_page import StreamControlPage
 from pages.network.alone_limit_page import AloneLimitPage
 from pages.network.layer7_qos_page import Layer7QosPage
 from pages.network.high_prio_host_page import HighPrioHostPage
+from pages.network.dhcp_server_page import DhcpServerPage
+from pages.network.dhcp_static_page import DhcpStaticPage
+from pages.network.dhcp_lease_page import DhcpLeasePage
+from pages.network.dhcp_acl_mac_page import DhcpAclMacPage
+from pages.network.ipv6_static_page import Ipv6StaticPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -184,6 +189,11 @@ TEST_NAME_MAPPING = {
     'test_dns_accelerate_comprehensive': 'DNS加速服务综合测试',
     'test_dns_multi_line_comprehensive': '多线路DNS服务综合测试',
     'test_stream_control_comprehensive': '智能流控综合测试',
+    'test_dhcp_server_comprehensive': 'DHCP服务端综合测试',
+    'test_dhcp_static_comprehensive': 'DHCP静态分配综合测试',
+    'test_dhcp_lease_comprehensive': 'DHCP客户端综合测试',
+    'test_dhcp_acl_mac_comprehensive': 'DHCP黑白名单综合测试',
+    'test_ipv6_static_comprehensive': 'IPv6前缀静态分配综合测试',
 }
 
 
@@ -687,6 +697,78 @@ def dmz_host_page_logged_in(logged_in_page: Page, config: Config) -> 'DmzHostPag
     return dz_page
 
 
+# ==================== DHCP服务端 fixtures ====================
+
+@pytest.fixture(scope="function")
+def dhcp_server_page(page: Page, config: Config) -> 'DhcpServerPage':
+    """创建DHCP服务端页面实例"""
+    return DhcpServerPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def dhcp_server_page_logged_in(logged_in_page: Page, config: Config) -> 'DhcpServerPage':
+    """已登录并导航到DHCP服务端页面的实例"""
+    dhcp_page = DhcpServerPage(logged_in_page, config.get_base_url())
+    dhcp_page.navigate_to_dhcp_server()
+    return dhcp_page
+
+
+@pytest.fixture(scope="function")
+def dhcp_static_page(page: Page, config: Config) -> 'DhcpStaticPage':
+    """创建DHCP静态分配页面实例"""
+    return DhcpStaticPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def dhcp_static_page_logged_in(logged_in_page: Page, config: Config) -> 'DhcpStaticPage':
+    """已登录并导航到DHCP静态分配页面的实例"""
+    static_page = DhcpStaticPage(logged_in_page, config.get_base_url())
+    static_page.navigate_to_dhcp_static()
+    return static_page
+
+
+@pytest.fixture(scope="function")
+def dhcp_lease_page(page: Page, config: Config) -> 'DhcpLeasePage':
+    """创建DHCP客户端页面实例"""
+    return DhcpLeasePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def dhcp_lease_page_logged_in(logged_in_page: Page, config: Config) -> 'DhcpLeasePage':
+    """已登录并导航到DHCP客户端页面的实例"""
+    lease_page = DhcpLeasePage(logged_in_page, config.get_base_url())
+    lease_page.navigate_to_dhcp_lease()
+    return lease_page
+
+
+@pytest.fixture(scope="function")
+def dhcp_acl_mac_page(page: Page, config: Config) -> 'DhcpAclMacPage':
+    """创建DHCP黑白名单页面实例"""
+    return DhcpAclMacPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def dhcp_acl_mac_page_logged_in(logged_in_page: Page, config: Config) -> 'DhcpAclMacPage':
+    """已登录并导航到DHCP黑白名单页面的实例"""
+    acl_page = DhcpAclMacPage(logged_in_page, config.get_base_url())
+    acl_page.navigate_to_dhcp_acl_mac()
+    return acl_page
+
+
+@pytest.fixture(scope="function")
+def ipv6_static_page(page: Page, config: Config) -> 'Ipv6StaticPage':
+    """创建IPv6前缀静态分配页面实例"""
+    return Ipv6StaticPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def ipv6_static_page_logged_in(logged_in_page: Page, config: Config) -> 'Ipv6StaticPage':
+    """已登录并导航到IPv6前缀静态分配页面的实例"""
+    ipv6_page = Ipv6StaticPage(logged_in_page, config.get_base_url())
+    ipv6_page.navigate_to_ipv6_static()
+    return ipv6_page
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -927,6 +1009,21 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "stream_control: 智能流控模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "dhcp_server: DHCP服务端模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "dhcp_static: DHCP静态分配模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "dhcp_lease: DHCP客户端模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "dhcp_acl_mac: DHCP黑白名单模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "ipv6_static: IPv6前缀静态分配模块测试"
     )
 
     # 记录开始时间

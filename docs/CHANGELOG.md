@@ -1,5 +1,56 @@
 # 开发日志
 
+## 2026-06-23 DHCP服务模块全量自动化(5子模块/6条数据/全链路通过)
+
+### 背景
+用户要求开发网络配置>DHCP服务的全部自动化测试。DHCP服务含5个tab子模块:
+- DHCP服务端(表格型,DHCP地址池) / DHCP静态分配(表格型,MAC-IP绑定)
+- DHCP客户端(只读+操作型,动态租约) / DHCP黑白名单(表格型+模式切换,DHCP访问控制)
+- IPv6前缀静态分配(表格型,DHCPv6-PD)
+
+### 后端机制(5脚本7表)
+- dhcp_server.sh → dhcp_server表 + ik_dhcpd进程 + ik_dhcpd.conf(仅enabled=yes)
+- dhcp_static/dhcp_lease.sh(共用脚本) → dhcp_static表 + ik_dhcp_static_cache.conf + ik_dhcpd_static.conf
+- dhcp_lease → /var/db/leases.db(动态租约) + recycle(一键回收)
+- dhcp_acl_mac.sh → dhcp_acl_mac_black/white表 + ipset Linux_dhcp_aclmac_default + iptables DHCP_ACL链(UDP67)
+- ipv6_static.sh → ipv6_dhcp_static_config表(DHCPv6-PD,需WAN IPv6前缀+LAN配置)
+
+### 攻克的关键技术难点(调试核心)
+1. **!!DHCP客户端"加入黑名单"入acl_mac_black非dhcp_acl_mac_black**(耗时最长定位): 行内"加入黑名单"调用func_name=acl_mac(通用MAC访问控制,ACL_MAC链),MAC加入**acl_mac_black**表,**不是**dhcp_acl_mac(DHCP专用,DHCP_ACL链)!两者不同表/功能.之前查错表误判,dump整个config.db定位INSERT INTO acl_mac_black.区分:DHCP黑白名单(dhcp_acl_mac,控制DHCP的UDP67) ≠ 通用MAC访问控制(acl_mac,控制MAC层访问)
+2. **verify_dhcp_acl_database must_exist bug(假通过)**: 规则存在+expected_fields=None+must_exist=False原返回passed=True,修复为规则存在+must_exist=False→passed=False(诚实防假通过)
+3. **batch_delete确认弹窗not visible**: .ant-modal-confirm .ant-btn-primary找到但not visible(30s超时),批量删除用batch_delete尝试+循环delete_rule兜底
+4. **DHCP黑白名单模式切换radio渲染不稳定+value是property**: 右侧设置面板异步加载慢/依赖状态,radio的value是DOM property非attribute(querySelector([value=])找不到).模式切换用前端API(/Action/call set_access_mode,即radio onChange接口)比UI click可靠
+5. **DHS_1保护限制批量**: DHCP服务端select_all会选系统默认DHS_1,批量停用→停用DHS_1→iktest断网.故服务端不能批量停用/启用(步骤数受限于IP限速21步)
+6. **IPv6环境不具备**: ipv6_config.enabled=no,WAN无IPv6前缀,添加被__check_dst_iface拦(lan_prefix_error"内网接口没绑定外网线路").无法真实CRUD,测试聚焦UI+校验+后端拦截验证
+7. **DHCP服务端列不可排序**(与静态分配/VLAN可排序不同): sort_by_column返回0次(列头无sortIcon)
+8. **6条数据让排序/批量有意义**: 服务端6条不重叠地址池(151.210-250)/静态分配6条MAC/IP/黑白名单6条MAC,之前1条排序无意义
+9. **DHCP客户端行内按钮是兄弟列**: 操作按钮(加入静态分配/加入黑名单)与IP/MAC在不同cell(兄弟非祖先),不能用_click_rule_button(上溯找按钮),用_click_row_action(filter has_text定位行+行内button)
+
+### 测试结果(5模块全绿通过)
+- **DHCP服务端**(18步):6条不重叠地址池+编辑+停启用+模拟重启(dhcp_server.sh boot)+前端校验(空必填/非法地址/租期越界)+重启服务+搜索(存在/不存在)+排序(0次,不可排序)+导出+两种导入(追加过滤DHS_1+清空DHTEST_EXTRA标志+DHS_1备份恢复兜底)+帮助+批量删除. SSH: L1 dhcp_server+L2 ik_dhcpd+L3 ik_dhcpd.conf+L4 UDP67/iptables+L4模拟重启
+- **DHCP静态分配**(18步):6条MAC/IP+编辑+停用(cache移除)/启用(conf恢复)+模拟重启+前端校验+搜索(存在/不存在)+排序(6条有效)+设置面板(dhcpd_arp兼容ARP绑定开关)+导出+两种导入(txt)+帮助+批量删除. SSH: L1 dhcp_static+L2 ik_dhcpd+L3 cache+static.conf+L4模拟重启+dhcpd_arp
+- **DHCP客户端**(10步):只读+操作型.租约读取(动态定iktest)+搜索+排序+加入静态分配(或查看,iktest在arp表)+加入黑名单(acl_mac_black入库)+一键回收IP地址+帮助+状态恢复. SSH: L1 leases.db+L1 dhcp_static+L1 acl_mac_black
+- **DHCP黑白名单**(15步):6条MAC+批量停用启用(ipset移出/入)+编辑+搜索(存在/不存在)+排序(MAC列)+前端校验+模式切换(0黑→1白→2同步→0,API)+模拟重启(init)+导出+帮助+批量删除(batch_delete+循环兜底). SSH: L1 dhcp_acl_mac_black+L2 ipset+L4 iptables+L1模式+L4模拟重启
+- **IPv6前缀静态分配**(9步):环境不具备版.表单字段(全#id)+前端校验(空必填/非法IPv6)+**后端lan_prefix_error拦截**(验证错误+不入库)+帮助+模拟重启(init)+导出. SSH: L1 ipv6_dhcp_static_config+L4模拟重启
+
+### 改动文件
+- pages/network/dhcp_{server,static,lease,acl_mac}_page.py + ipv6_static_page.py (新增5个Page)
+- tests/network/test_dhcp_{server,static,lease,acl_mac}_comprehensive.py + test_ipv6_static_comprehensive.py (新增5综合测试)
+- utils/backend_verifier.py (新增: verify_dhcp_server/static/lease/acl_mac/ipv6_static + ipset/iptables/mode/reboot + snapshot/restore + cleanup)
+- tests/conftest.py (5 fixture+marker+TEST_NAME_MAPPING)
+- config/settings.yaml (5模块导出导入路径)
+- gui/main_window.py (网络配置>DHCP服务节点注册5子模块+综合测试分组)
+- docs/CHANGELOG.md
+
+### 经验(可复用)
+1. **!!区分同名功能不同表**: "DHCP黑白名单"(dhcp_acl_mac,DHCP_ACL链,控制DHCP) vs "通用MAC访问控制"(acl_mac,ACL_MAC链,DHCP客户端"加入黑名单"调这个).同一页面"加入黑名单"可能入不同表,dump整个config.db定位INSERT语句最可靠
+2. **verify must_exist防假通过**: 规则存在+must_exist=False必须返回FAIL(否则删除失败也报通过),所有verify_*_database的must_exist逻辑要正确
+3. **React radio value是property非attribute**: querySelector('input[value="1"]')找不到,用遍历inp.value===mode.radio渲染不稳定时用前端API(/Action/call)替代UI click
+4. **系统默认规则保护策略**: 测试表格CRUD前确认有无系统默认关键规则(如DHS_1),有的话不能批量停用(select_all会选中),测试规则用不冲突配置(不重叠地址池/虚拟MAC)
+5. **环境不具备模块的处理**: 需特定环境(IPv6前缀需WAN IPv6)的模块,添加被后端校验拦,测试聚焦UI+前端校验+后端拦截验证(防无效配置),不假装能测
+6. **多条数据让排序/批量有意义**: 1条数据排序无意义,补6条(不重叠地址池/不同MAC)让批量+排序有实际验证价值
+7. **batch_delete确认弹窗兼容性**: 部分模块.ant-modal-confirm .ant-btn-primary not visible,用batch_delete尝试+循环delete_rule兜底
+
 ## 2026-06-22 智能流控模块自动化(26步全链路通过) + 攻克Ant Form modal破坏Form绑定难题
 
 ### 背景

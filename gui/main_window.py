@@ -878,6 +878,60 @@ class MainWindow(QMainWindow):
                             },
                         }
                     },
+                    "DHCP服务": {
+                        "children": {
+                            "DHCP服务端": {
+                                "testcases": [
+                                    "test_dhcp_server_comprehensive.py::TestDhcpServerComprehensive::test_dhcp_server_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_dhcp_server_comprehensive.py::TestDhcpServerComprehensive::test_dhcp_server_comprehensive",
+                                    ],
+                                }
+                            },
+                            "DHCP静态分配": {
+                                "testcases": [
+                                    "test_dhcp_static_comprehensive.py::TestDhcpStaticComprehensive::test_dhcp_static_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_dhcp_static_comprehensive.py::TestDhcpStaticComprehensive::test_dhcp_static_comprehensive",
+                                    ],
+                                }
+                            },
+                            "DHCP客户端": {
+                                "testcases": [
+                                    "test_dhcp_lease_comprehensive.py::TestDhcpLeaseComprehensive::test_dhcp_lease_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_dhcp_lease_comprehensive.py::TestDhcpLeaseComprehensive::test_dhcp_lease_comprehensive",
+                                    ],
+                                }
+                            },
+                            "DHCP黑白名单": {
+                                "testcases": [
+                                    "test_dhcp_acl_mac_comprehensive.py::TestDhcpAclMacComprehensive::test_dhcp_acl_mac_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_dhcp_acl_mac_comprehensive.py::TestDhcpAclMacComprehensive::test_dhcp_acl_mac_comprehensive",
+                                    ],
+                                }
+                            },
+                            "IPv6前缀静态分配": {
+                                "testcases": [
+                                    "test_ipv6_static_comprehensive.py::TestIpv6StaticComprehensive::test_ipv6_static_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_ipv6_static_comprehensive.py::TestIpv6StaticComprehensive::test_ipv6_static_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
                     "智能流控": {
                         "testcases": [
                             "test_stream_control_comprehensive.py::TestStreamControlComprehensive::test_stream_control_comprehensive",
