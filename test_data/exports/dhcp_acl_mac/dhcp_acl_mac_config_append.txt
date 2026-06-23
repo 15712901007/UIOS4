@@ -1,0 +1,2 @@
+enabled=yes mac=02:11:22:33:44:71 termname= tagname=DHCL_IMP_1 comment=导入追加1
+enabled=yes mac=02:11:22:33:44:72 termname= tagname=DHCL_IMP_2 comment=导入追加2

@@ -68,40 +68,97 @@ class DhcpAclMacPage(IkuaiTablePage):
         except Exception:
             pass
 
-    def navigate_to_dhcp_acl_mac(self):
-        """导航到DHCP服务 > DHCP黑白名单tab > IPv4子tab"""
+    def navigate_to_dhcp_acl_mac(self, ip_version: str = 'v4'):
+        """导航到DHCP服务 > DHCP黑白名单tab > 指定IPv4/IPv6子tab
+
+        ip_version='v4'/'v6'。默认v4(不破坏现有调用)。
+        注: 模式radio现移入齿轮设置抽屉, 主页面无radio, 故等待降到2s
+        (原10s等待每次必超时, 多次navigate累积大量浪费)。
+        """
         self._dismiss_residual_modal()
         url = f"{self.base_url}{self.PAGE_URL}"
         self.page.goto(url)
         self.page.wait_for_load_state("networkidle")
         self.page.wait_for_timeout(1000)
         self._dismiss_residual_modal()
-        # 点DHCP黑白名单tab
+        # 点DHCP黑白名单tab(用 active class 判断激活, aria-selected在内层btn不可靠)
         try:
-            tab = self.page.get_by_role("tab", name="DHCP黑白名单")
-            if tab.count() > 0:
-                selected = tab.get_attribute("aria-selected")
-                if selected != "true":
+            if not self._is_tab_active_by_text("DHCP黑白名单"):
+                tab = self.page.get_by_role("tab", name="DHCP黑白名单")
+                if tab.count() > 0:
                     tab.click()
                     self.page.wait_for_timeout(1000)
         except Exception as e:
             logger.warning(f"[导航] 切换DHCP黑白名单tab异常: {e}")
-        # 确保IPv4子tab选中(默认)
+        target = "IPv6" if ip_version == 'v6' else "IPv4"
+        # 等待IPv4/IPv6子tab渲染(主tab点击后子tab异步渲染, 未渲染就点会停在IPv4→找不到v6规则)
         try:
-            ipv4 = self.page.get_by_role("tab", name="IPv4")
-            if ipv4.count() > 0 and ipv4.first.get_attribute("aria-selected") != "true":
-                ipv4.first.click()
-                self.page.wait_for_timeout(800)
+            self.page.get_by_role("tab", name="IPv4", exact=True).first.wait_for(
+                state="visible", timeout=5000)
         except Exception:
             pass
-        # 等待模式radio渲染(右侧设置面板异步加载,较慢; radio的value是property非attribute)
+        self._switch_ipv_subtab(target)
+        # 等待模式radio渲染(齿轮设置抽屉内, 默认不展开→主页面无radio, 短超时避免浪费)
         try:
-            self.page.wait_for_selector('input[type="radio"]', timeout=10000)
-            self.page.wait_for_timeout(800)
+            self.page.wait_for_selector('input[type="radio"]', timeout=2000)
+            self.page.wait_for_timeout(500)
         except Exception:
             pass
-        logger.info("[导航] 已到达DHCP黑白名单页面(IPv4)")
+        logger.info(f"[导航] 已到达DHCP黑白名单页面({target})")
         return self
+
+    def _is_tab_active_by_text(self, text: str) -> bool:
+        """通过 ant-tabs-tab-active class 判断指定文本(精确)的tab是否激活"""
+        try:
+            return self.page.evaluate("""(txt) => {
+                const tab = Array.from(document.querySelectorAll('.ant-tabs-tab'))
+                    .find(t => (t.textContent || '').trim() === txt);
+                return tab ? tab.classList.contains('ant-tabs-tab-active') : false;
+            }""", text)
+        except Exception:
+            return False
+
+    def _switch_ipv_subtab(self, target: str) -> bool:
+        """切换到IPv4/IPv6子tab(JS精确点击 + active class验证 + 重试)
+
+        关键(2026-06-23实测根因):
+        - get_by_role默认子串匹配, "IPv6"会同时命中子tab和主tab"IPv6前缀静态分配"
+          → 用JS textContent==='IPv6'精确匹配规避;
+        - aria-selected在内层.ant-tabs-tab-btn上, 外层.ant-tabs-tab(role=tab)上为null
+          → 用 ant-tabs-tab-active class 判断激活态;
+        - 主tab点击后子tab需时间渲染 → 调用方应先wait_for子tab可见。
+        """
+        for attempt in range(3):
+            try:
+                res = self.page.evaluate("""(tgt) => {
+                    const tab = Array.from(document.querySelectorAll('.ant-tabs-tab'))
+                        .find(t => (t.textContent || '').trim() === tgt);
+                    if (!tab) return 'notfound';
+                    if (tab.classList.contains('ant-tabs-tab-active')) return 'already';
+                    tab.click();
+                    return 'clicked';
+                }""", target)
+                if res == 'already':
+                    return True
+                self.page.wait_for_timeout(800)
+                if self._is_tab_active_by_text(target):
+                    return True
+            except Exception as e:
+                logger.warning(f"[切换] 切到{target}异常(尝试{attempt+1}): {e}")
+        logger.warning(f"[切换] 切到{target}失败(3次重试均未激活)")
+        return False
+
+    def switch_ip_version(self, ip_version: str) -> bool:
+        """切换IPv4/IPv6子tab(已选中则跳过), 用 active class 验证"""
+        target = "IPv6" if ip_version == 'v6' else "IPv4"
+        return self._switch_ipv_subtab(target)
+
+    def get_current_ip_version(self) -> str:
+        """返回当前激活子tab名('IPv4'/'IPv6'), 空串=未知(active class判断)"""
+        for v in ["IPv6", "IPv4"]:
+            if self._is_tab_active_by_text(v):
+                return v
+        return ""
 
     def navigate_back_to_list(self):
         return self.navigate_to_dhcp_acl_mac()
@@ -135,69 +192,73 @@ class DhcpAclMacPage(IkuaiTablePage):
             logger.warning(f"[读取] 获取模式失败: {e}")
         return ""
 
-    def select_mode(self, mode: str) -> bool:
+    def select_mode(self, mode: str, ip_version: str = 'v4') -> bool:
         """选择模式(0黑名单/1白名单/2同步MAC访问控制)
 
-        切换后后端set_access_mode → __seting_dhcp_acl_mac重建iptables规则。
-        !!UI radio(右侧设置面板)异步渲染不稳定(依赖状态/慢), 用前端相同API
+        切换后后端set_access_mode → __seting_dhcp_acl[_6]_mac重建iptables规则。
+        v4 用 func_name=dhcp_acl_mac; v6 用 func_name=dhcp6_acl_mac(独立模式字段)。
+        !!UI radio(齿轮设置抽屉)异步渲染不稳定, 用前端相同API
         (/Action/call set_access_mode, 即radio onChange调用的接口)切换更可靠。
         SSH验证后端global_config+iptables确认生效。
         """
+        func_name = 'dhcp6_acl_mac' if ip_version == 'v6' else 'dhcp_acl_mac'
         try:
-            result = self.page.evaluate('''async (mode) => {
+            result = self.page.evaluate('''async (args) => {
                 const resp = await fetch('/Action/call', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({func_name: 'dhcp_acl_mac', action: 'set_access_mode', param: {mode: parseInt(mode)}})
+                    body: JSON.stringify({func_name: args.func, action: 'set_access_mode', param: {mode: parseInt(args.mode)}})
                 });
                 const txt = await resp.text();
                 return {status: resp.status, body: txt.slice(0,200)};
-            }''', mode)
+            }''', {"func": func_name, "mode": mode})
             body = result.get('body', '')
-            logger.info(f"[操作] set_access_mode({mode}): {body[:80]}")
+            logger.info(f"[操作] {func_name} set_access_mode({mode}): {body[:80]}")
             self.page.wait_for_timeout(2500)  # 等iptables重建
             return result.get('status') == 200 and ('Success' in body or '"code":0' in body)
         except Exception as e:
-            logger.warning(f"[操作] set_access_mode({mode})失败: {e}")
+            logger.warning(f"[操作] {func_name} set_access_mode({mode})失败: {e}")
             return False
 
     # ==================== 表单字段(全#id, 独立页面) ====================
 
-    def fill_name(self, name: str):
-        inp = self.page.locator('#tagname')
-        if inp.count() > 0:
-            inp.first.click()
-            inp.first.fill("")
-            inp.first.fill(name)
+    def _set_field_by_id(self, field_id: str, value: str):
+        """用JS原生value setter + dispatchEvent填值, 确保触发React onChange
+
+        根因: Playwright .fill() 在IPv6 #mac等输入框上不触发React onChange(值未注册),
+        保存时#mac为空报"请输入终端本地链接IPv6地址"空值校验(2026-06-23实测)。
+        JS原生 value setter + input/change/blur 事件是React兼容标准写法,
+        对IPv4/IPv6表单的 #tagname/#mac/#termname/#comment 均可靠。
+        """
+        try:
+            self.page.evaluate("""({id, val}) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                const proto = (el.tagName === 'TEXTAREA')
+                    ? window.HTMLTextAreaElement.prototype
+                    : window.HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+            }""", {"id": field_id, "val": value})
             self.page.wait_for_timeout(150)
+        except Exception as e:
+            logger.warning(f"[填值] #{field_id}填充异常: {e}")
         return self
+
+    def fill_name(self, name: str):
+        return self._set_field_by_id('tagname', name)
 
     def fill_mac(self, mac: str):
-        inp = self.page.locator('#mac')
-        if inp.count() > 0:
-            inp.first.click()
-            inp.first.fill("")
-            inp.first.fill(mac)
-            self.page.wait_for_timeout(150)
-        return self
+        return self._set_field_by_id('mac', mac)
 
     def fill_termname(self, termname: str):
-        inp = self.page.locator('#termname')
-        if inp.count() > 0:
-            inp.first.click()
-            inp.first.fill("")
-            inp.first.fill(termname)
-            self.page.wait_for_timeout(150)
-        return self
+        return self._set_field_by_id('termname', termname)
 
     def fill_comment(self, comment: str):
-        inp = self.page.locator('#comment')
-        if inp.count() > 0:
-            inp.first.click()
-            inp.first.fill("")
-            inp.first.fill(comment)
-            self.page.wait_for_timeout(150)
-        return self
+        return self._set_field_by_id('comment', comment)
 
     # ==================== 保存与高层操作 ====================
 
@@ -234,14 +295,16 @@ class DhcpAclMacPage(IkuaiTablePage):
             return False
 
     def add_rule(self, name: str, mac: str, comment: str = "",
-                 termname: str = "", enable: bool = False) -> bool:
+                 termname: str = "", enable: bool = False,
+                 ip_version: str = 'v4') -> bool:
         """添加一条DHCP黑白名单规则(独立页面)
 
+        ip_version='v4'→dhcp_acl_mac表; 'v6'→dhcp6_acl_mac表(v6无termname列, fill_termname自动跳过)。
         注意: enabled默认'no', 添加后规则不入ipset, 需启用(enable=True或后续up)。
         实际enabled状态由后端add决定(UI无enabled开关, 默认no)。
         """
         try:
-            self.navigate_to_dhcp_acl_mac()
+            self.navigate_to_dhcp_acl_mac(ip_version=ip_version)
             self.page.wait_for_timeout(500)
             self.click_add_button()
             self.page.wait_for_load_state("networkidle")
@@ -260,10 +323,10 @@ class DhcpAclMacPage(IkuaiTablePage):
             logger.error(f"[添加] 添加DHCP黑白名单异常: {e}")
             return False
 
-    def edit_rule(self, current_name: str, **kwargs) -> bool:
+    def edit_rule(self, current_name: str, ip_version: str = 'v4', **kwargs) -> bool:
         """编辑指定名称的规则(kwargs: name/mac/termname/comment)"""
         try:
-            self.navigate_to_dhcp_acl_mac()
+            self.navigate_to_dhcp_acl_mac(ip_version=ip_version)
             self.page.wait_for_timeout(500)
             self.edit_rule_base(current_name)
             self.page.wait_for_load_state("networkidle")
@@ -293,15 +356,29 @@ class DhcpAclMacPage(IkuaiTablePage):
     # ==================== 帮助 ====================
 
     def click_help(self) -> bool:
+        """点击帮助按钮。若帮助用window.open新开tab(帮助文档常如此), 捕获并关闭避免孤儿tab。"""
         try:
             help_btn = self.page.locator('button').filter(has_text="帮助")
-            if help_btn.count() > 0:
-                help_btn.last.click()
+            if help_btn.count() == 0:
+                return False
+            # 用expect_page同步捕获新开tab(若帮助开tab则关闭, 若不开tab则2.5s超时走面板检查)
+            try:
+                with self.page.context.expect_page(timeout=2500) as new_page_info:
+                    help_btn.last.click()
+                new_p = new_page_info.value
+                try:
+                    new_p.close()
+                    logger.info("[帮助] 检测到新开tab, 已关闭")
+                except Exception:
+                    pass
+                self.page.wait_for_timeout(300)
+                return True
+            except Exception:
+                # 未新开tab → 可能是drawer/popover, 留给调用方检查面板
                 self.page.wait_for_timeout(500)
                 return True
         except Exception:
-            pass
-        return False
+            return False
 
     def is_help_panel_visible(self) -> bool:
         try:

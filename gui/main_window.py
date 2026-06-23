@@ -1015,20 +1015,17 @@ class MainWindow(QMainWindow):
             self._on_auto_adapt_changed(Qt.Checked if auto_adapt else Qt.Unchecked)
 
     def _toggle_all_modules(self, state):
-        """全选/取消全选模块(递归遍历所有层级, 只选中有testcases的叶子节点)"""
+        """全选/取消全选模块(递归设置所有节点, 含分类节点, 与三态联动一致)
+
+        注: 分类节点无testcases, _update_testcase_list只从有testcases的叶子收集,
+        故分类节点置Checked不会重复计数。统一设置避免"全选后分类显示未选,
+        再点分类反向取消子节点"的交互问题。
+        """
         check_state = Qt.Checked if state else Qt.Unchecked
         self.module_tree.blockSignals(True)
 
         def set_check_recursive(item):
-            """递归设置checkState, 只对有testcases的叶子节点生效"""
-            # 检查这个节点是否有testcases(叶子节点)还是纯分类节点
-            has_testcases = item.data(0, Qt.UserRole)
-            if has_testcases:
-                item.setCheckState(0, check_state)
-            else:
-                # 分类节点不选中(不勾选checkbox)
-                item.setCheckState(0, Qt.Unchecked)
-            # 递归子节点
+            item.setCheckState(0, check_state)
             for j in range(item.childCount()):
                 set_check_recursive(item.child(j))
 
@@ -1060,29 +1057,59 @@ class MainWindow(QMainWindow):
         self._update_testcase_count()
 
     def _on_module_changed(self, item, column):
-        """模块选择变化"""
+        """模块勾选变化: 父→子全选传播 + 子→父三态联动
+
+        修复(2026-06-23): 原实现只读取状态不传播, 勾选"DHC服务"等分类节点
+        无法联动选中其下的子模块(如DHCP服务端/静态分配/客户端/黑白名单/IPv6前缀)。
+        """
+        self.module_tree.blockSignals(True)
+        try:
+            state = item.checkState(0)
+            # 父→子: 把当前节点的勾选状态传播给所有后代节点
+            self._propagate_check_to_children(item, state)
+            # 子→父: 按兄弟节点勾选情况, 更新所有祖先为 全选/部分选/未选
+            self._update_ancestor_check_state(item)
+        finally:
+            self.module_tree.blockSignals(False)
         self._update_testcase_list()
 
+    def _propagate_check_to_children(self, item, state):
+        """把 state 传播给 item 的所有后代节点(父→子全选)"""
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(0, state)
+            self._propagate_check_to_children(child, state)
+
+    def _update_ancestor_check_state(self, item):
+        """按兄弟节点勾选情况, 把每个祖先更新为 Checked/PartiallyChecked/Unchecked"""
+        parent = item.parent()
+        while parent is not None:
+            total = parent.childCount()
+            checked = sum(1 for i in range(total)
+                          if parent.child(i).checkState(0) == Qt.Checked)
+            if checked == 0:
+                new_state = Qt.Unchecked
+            elif checked == total:
+                new_state = Qt.Checked
+            else:
+                new_state = Qt.PartiallyChecked
+            parent.setCheckState(0, new_state)
+            parent = parent.parent()
+
     def _update_testcase_list(self):
-        """更新测试用例列表"""
+        """更新测试用例列表(递归收集所有已勾选节点的testcases, 支持任意层级)"""
         self.testcase_list.clear()
         selected_testcases = []
 
+        def collect(item):
+            testcases = item.data(0, Qt.UserRole)
+            if testcases and item.checkState(0) == Qt.Checked:
+                selected_testcases.extend(testcases)
+            for i in range(item.childCount()):
+                collect(item.child(i))
+
         for i in range(self.module_tree.topLevelItemCount()):
-            parent = self.module_tree.topLevelItem(i)
-            for j in range(parent.childCount()):
-                child = parent.child(j)
-                if child.checkState(0) == Qt.Checked:
-                    testcases = child.data(0, Qt.UserRole)
-                    if testcases:
-                        selected_testcases.extend(testcases)
-                # 检查第三层嵌套
-                for k in range(child.childCount()):
-                    sub_child = child.child(k)
-                    if sub_child.checkState(0) == Qt.Checked:
-                        testcases = sub_child.data(0, Qt.UserRole)
-                        if testcases:
-                            selected_testcases.extend(testcases)
+            collect(self.module_tree.topLevelItem(i))
 
         for testcase in selected_testcases:
             item = QListWidgetItem(testcase)

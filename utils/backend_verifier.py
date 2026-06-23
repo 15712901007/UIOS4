@@ -7166,25 +7166,65 @@ class BackendVerifier:
     # 关键: enabled默认'no', 添加的规则默认不入ipset, up()启用才加入ipset
 
     DHCP_ACL_IPSET = "Linux_dhcp_aclmac_default"
+    DHCP6_ACL_IPSET = "Linux_dhcp6_aclmac_default"
+
+    def _dhcp_acl_params(self, ip_version: str = 'v4') -> dict:
+        """按 ip_version 返回 DHCP 黑白名单各层资源名映射。
+
+        IPv4 与 IPv6 是两个完全独立的平行模块(SSH探查确认 2026-06-23):
+          - v4: dhcp_acl_mac_{black,white}表 / Linux_dhcp_aclmac_default ipset /
+                global_config.dhcp_acl_mac / iptables DHCP_ACL链(UDP67) / dhcp_acl_mac.sh
+          - v6: dhcp6_acl_mac_{black,white}表 / Linux_dhcp6_aclmac_default ipset /
+                global_config.dhcp6_acl_mac / ip6tables DHCP6_ACL链(UDP547) / dhcp6_acl_mac.sh
+        v6 表无 ip_type / termname 列(隐式 IPv6)。
+        """
+        if ip_version == 'v6':
+            return {
+                'tbl': 'dhcp6_acl_mac',
+                'ipset': self.DHCP6_ACL_IPSET,
+                'mode_col': 'dhcp6_acl_mac',
+                'ipt_cmd': 'ip6tables -t filter -S DHCP6_ACL 2>/dev/null',
+                'chain': 'DHCP6_ACL',
+                'init': '/usr/ikuai/script/dhcp6_acl_mac.sh init',
+                'has_ip_type': False,
+            }
+        return {
+            'tbl': 'dhcp_acl_mac',
+            'ipset': self.DHCP_ACL_IPSET,
+            'mode_col': 'dhcp_acl_mac',
+            'ipt_cmd': 'iptables -t filter -S DHCP_ACL 2>/dev/null',
+            'chain': 'DHCP_ACL',
+            'init': '/usr/ikuai/script/dhcp_acl_mac.sh init',
+            'has_ip_type': True,
+        }
 
     def query_dhcp_acl_rule(self, mac: str = None, name: str = None,
-                            table: str = 'black') -> Optional[Dict]:
-        """查询dhcp_acl_mac_black/white表(按mac或tagname)"""
+                            table: str = 'black', ip_version: str = 'v4') -> Optional[Dict]:
+        """查询dhcp黑白名单表(按mac或tagname)
+
+        ip_version='v4' → dhcp_acl_mac_{table}(含ip_type列);
+        ip_version='v6' → dhcp6_acl_mac_{table}(无ip_type列)。
+        """
+        p = self._dhcp_acl_params(ip_version)
         where = []
         if mac:
             where.append(f"mac='{mac}'")
         if name:
             where.append(f"tagname='{name}'")
         w = " and ".join(where) if where else "1=1"
+        cols = ("id,enabled,tagname,ip_type,mac,comment"
+                if p['has_ip_type'] else "id,enabled,tagname,mac,comment")
         return self._sqlite_query_line(
-            f"SELECT id,enabled,tagname,ip_type,mac,comment FROM dhcp_acl_mac_{table} WHERE {w}"
+            f"SELECT {cols} FROM {p['tbl']}_{table} WHERE {w}"
         )
 
-    def count_dhcp_acl_rules(self, table: str = 'black', enabled_only: bool = False) -> int:
-        """统计dhcp_acl_mac表规则数"""
+    def count_dhcp_acl_rules(self, table: str = 'black', enabled_only: bool = False,
+                             ip_version: str = 'v4') -> int:
+        """统计dhcp黑白名单表规则数"""
+        p = self._dhcp_acl_params(ip_version)
         where = "WHERE enabled='yes'" if enabled_only else ""
         result = self._sqlite_query_line(
-            f"SELECT count(*) as cnt FROM dhcp_acl_mac_{table} {where}"
+            f"SELECT count(*) as cnt FROM {p['tbl']}_{table} {where}"
         )
         if result and "cnt" in result:
             try:
@@ -7196,15 +7236,19 @@ class BackendVerifier:
     def verify_dhcp_acl_database(self, name: str = None, mac: str = None,
                                  table: str = 'black',
                                  expected_fields: Dict = None,
-                                 must_exist: bool = True) -> VerifyResult:
-        """L1: 验证dhcp_acl_mac表规则(按name或mac)
+                                 must_exist: bool = True,
+                                 ip_version: str = 'v4') -> VerifyResult:
+        """L1: 验证dhcp黑白名单表规则(按name或mac)
 
-        expected_fields可含: enabled/tagname/mac/comment/ip_type
+        expected_fields可含: enabled/tagname/mac/comment (v4 另含 ip_type)。
+        ip_version='v4'/'v6' 决定查询 dhcp_acl_mac_/dhcp6_acl_mac_ 表。
         """
-        rule = self.query_dhcp_acl_rule(mac=mac, name=name, table=table)
+        p = self._dhcp_acl_params(ip_version)
+        lvl = f"L1-{table}{ip_version}表"
+        rule = self.query_dhcp_acl_rule(mac=mac, name=name, table=table, ip_version=ip_version)
         if rule is None:
             return VerifyResult(
-                level=f"L1-{table}表", passed=not must_exist,
+                level=lvl, passed=not must_exist,
                 message=f"DHCP黑白名单'{name or mac}'({table}表)不存在"
                         f"({'符合预期' if not must_exist else '应为存在'})",
                 raw_output="",
@@ -7218,13 +7262,13 @@ class BackendVerifier:
         if not must_exist:
             # 规则存在但期望不存在 → 失败
             return VerifyResult(
-                level=f"L1-{table}表", passed=False,
+                level=lvl, passed=False,
                 message=f"规则'{name or mac}'({table}表)存在但期望不存在(删除/清理未生效)",
                 details={"rule": details}, raw_output=raw,
             )
         if expected_fields is None:
             return VerifyResult(
-                level=f"L1-{table}表", passed=True,
+                level=lvl, passed=True,
                 message=f"规则'{name or mac}'({table}表)存在: enabled={details['enabled']}, mac={details['mac']}",
                 details={"rule": details}, raw_output=raw,
             )
@@ -7235,50 +7279,59 @@ class BackendVerifier:
                 mismatches[fld] = {"expected": str(expected), "actual": actual}
         if mismatches:
             return VerifyResult(
-                level=f"L1-{table}表", passed=False,
+                level=lvl, passed=False,
                 message=f"规则'{name or mac}'字段不匹配: {mismatches}",
                 details={"rule": details, "mismatches": mismatches}, raw_output=raw,
             )
         return VerifyResult(
-            level=f"L1-{table}表", passed=True,
+            level=lvl, passed=True,
             message=f"规则'{name or mac}'({table}表)数据库验证通过",
             details={"rule": details}, raw_output=raw,
         )
 
-    def verify_dhcp_acl_ipset(self, mac: str, should_in_ipset: bool = True) -> VerifyResult:
-        """L2: 验证ipset Linux_dhcp_aclmac_default含/不含该MAC
+    def verify_dhcp_acl_ipset(self, mac: str, should_in_ipset: bool = True,
+                              ip_version: str = 'v4') -> VerifyResult:
+        """L2: 验证ipset含/不含该MAC
 
+        v4 → Linux_dhcp_aclmac_default; v6 → Linux_dhcp6_aclmac_default。
         enabled=yes的MAC在ipset(add/up时ipset_add, del/down时ipset_del)。
         """
+        p = self._dhcp_acl_params(ip_version)
         self.connect_router()
+        lvl = f"L2-ipset{ip_version}"
         try:
-            output = self._router.exec(f"ipset list {self.DHCP_ACL_IPSET} 2>/dev/null")
+            output = self._router.exec(f"ipset list {p['ipset']} 2>/dev/null")
             in_ipset = mac in (output or "")
             if in_ipset == should_in_ipset:
                 return VerifyResult(
-                    level="L2-ipset", passed=True,
-                    message=f"MAC {mac}{('在' if in_ipset else '不在')}ipset(符合预期)",
+                    level=lvl, passed=True,
+                    message=f"MAC {mac}{('在' if in_ipset else '不在')}{p['ipset']}(符合预期)",
                     details={"in_ipset": in_ipset}, raw_output=output[:200],
                 )
             else:
                 return VerifyResult(
-                    level="L2-ipset", passed=False,
-                    message=f"ipset状态不匹配: 期望{'在' if should_in_ipset else '不在'}, "
+                    level=lvl, passed=False,
+                    message=f"{p['ipset']}状态不匹配: 期望{'在' if should_in_ipset else '不在'}, "
                             f"实际{'在' if in_ipset else '不在'}",
                     details={"in_ipset": in_ipset}, raw_output=output[:200],
                 )
         except Exception as e:
             return VerifyResult(
-                level="L2-ipset", passed=False,
+                level=lvl, passed=False,
                 message=f"ipset检查失败: {e}", raw_output=str(e),
             )
 
-    def verify_dhcp_acl_mode(self, expected_mode: int) -> VerifyResult:
-        """L1: 验证global_config.dhcp_acl_mac模式(0黑名单/1白名单/2同步)"""
+    def verify_dhcp_acl_mode(self, expected_mode: int, ip_version: str = 'v4') -> VerifyResult:
+        """L1: 验证模式(0黑名单/1白名单/2同步)
+
+        v4 → global_config.dhcp_acl_mac; v6 → global_config.dhcp6_acl_mac。
+        """
+        p = self._dhcp_acl_params(ip_version)
+        col = p['mode_col']
         result = self._sqlite_query_line(
-            "SELECT dhcp_acl_mac FROM global_config WHERE id=1"
+            f"SELECT {col} FROM global_config WHERE id=1"
         )
-        mode_val = result.get("dhcp_acl_mac") if result else None
+        mode_val = result.get(col) if result else None
         try:
             mode_int = int(mode_val) if mode_val is not None else -1
         except (ValueError, TypeError):
@@ -7286,42 +7339,42 @@ class BackendVerifier:
         mode_desc = {0: "黑名单", 1: "白名单", 2: "同步MAC访问控制"}.get(mode_int, f"未知({mode_val})")
         passed = (mode_int == expected_mode)
         return VerifyResult(
-            level="L1-模式", passed=passed,
-            message=f"dhcp_acl_mac={mode_val}({mode_desc}), 期望{expected_mode}({mode_desc if passed else ''})",
+            level=f"L1-模式{ip_version}", passed=passed,
+            message=f"{col}={mode_val}({mode_desc}), 期望{expected_mode}({mode_desc if passed else ''})",
             details={"mode": mode_val, "expected": expected_mode},
-            raw_output=f"dhcp_acl_mac={mode_val}",
+            raw_output=f"{col}={mode_val}",
         )
 
-    def verify_dhcp_acl_iptables(self, mode: int) -> VerifyResult:
-        """L4: 验证iptables DHCP_ACL链规则符合模式
+    def verify_dhcp_acl_iptables(self, mode: int, ip_version: str = 'v4') -> VerifyResult:
+        """L4: 验证iptables/ip6tables链规则符合模式
 
-        mode0黑名单: --match-set Linux_dhcp_aclmac_default src -j DROP (无!)
-        mode1白名单: ! --match-set Linux_dhcp_aclmac_default src -j DROP (有!)
+        v4 → iptables DHCP_ACL链(UDP67); v6 → ip6tables DHCP6_ACL链(UDP547)。
+        mode0黑名单: --match-set <ipset> src -j DROP (无!)
+        mode1白名单: ! --match-set <ipset> src -j DROP (有!)
         mode2同步: --match-set Linux_aclmac_default src -j DROP
         """
+        p = self._dhcp_acl_params(ip_version)
         self.connect_router()
+        lvl = f"L4-iptables{ip_version}"
         try:
-            output = self._router.exec("iptables -t filter -S DHCP_ACL 2>/dev/null")
-            has_dhcp_aclmac = "Linux_dhcp_aclmac_default" in output
+            output = self._router.exec(p['ipt_cmd'])
+            has_dhcp_aclmac = p['ipset'] in output
             has_aclmac = "Linux_aclmac_default" in output
             has_not = "! --match-set" in output or "!  --match-set" in output
             mode_desc = {0: "黑名单", 1: "白名单", 2: "同步"}.get(mode, "?")
             checks = []
             if mode == 0:
-                # 黑名单: 用dhcp_aclmac + 无!
-                checks.append(("黑名单规则(dhcp_aclmac)", has_dhcp_aclmac and not has_not,
-                               f"DHCP_ACL{'含dhcp_aclmac无!' if (has_dhcp_aclmac and not has_not) else '规则不符'}"))
+                checks.append((f"黑名单规则({p['ipset']})", has_dhcp_aclmac and not has_not,
+                               f"{p['chain']}{'含'+p['ipset']+'无!' if (has_dhcp_aclmac and not has_not) else '规则不符'}"))
             elif mode == 1:
-                # 白名单: 用dhcp_aclmac + 有!
-                checks.append(("白名单规则(! dhcp_aclmac)", has_dhcp_aclmac and has_not,
-                               f"DHCP_ACL{'含! dhcp_aclmac' if (has_dhcp_aclmac and has_not) else '规则不符'}"))
+                checks.append((f"白名单规则(! {p['ipset']})", has_dhcp_aclmac and has_not,
+                               f"{p['chain']}{'含! '+p['ipset'] if (has_dhcp_aclmac and has_not) else '规则不符'}"))
             elif mode == 2:
-                # 同步: 用aclmac
                 checks.append(("同步规则(acl_mac)", has_aclmac,
-                               f"DHCP_ACL{'含acl_mac' if has_aclmac else '规则不符'}"))
+                               f"{p['chain']}{'含acl_mac' if has_aclmac else '规则不符'}"))
             passed = all(c[1] for c in checks) if checks else False
             return VerifyResult(
-                level="L4-iptables", passed=passed,
+                level=lvl, passed=passed,
                 message=f"模式{mode}({mode_desc}): " + "; ".join(c[2] for c in checks),
                 details={"mode": mode, "has_dhcp_aclmac": has_dhcp_aclmac,
                          "has_aclmac": has_aclmac, "has_not": has_not},
@@ -7329,64 +7382,67 @@ class BackendVerifier:
             )
         except Exception as e:
             return VerifyResult(
-                level="L4-iptables", passed=False,
+                level=lvl, passed=False,
                 message=f"iptables检查失败: {e}", raw_output=str(e),
             )
 
-    def verify_dhcp_acl_reboot(self) -> VerifyResult:
-        """L4 模拟重启: dhcp_acl_mac.sh init重建ipset+iptables"""
+    def verify_dhcp_acl_reboot(self, ip_version: str = 'v4') -> VerifyResult:
+        """L4 模拟重启: dhcp_acl_mac.sh / dhcp6_acl_mac.sh init重建ipset+iptables"""
+        p = self._dhcp_acl_params(ip_version)
         self.connect_router()
         import time as _t
+        lvl = f"L4-模拟重启{ip_version}"
         try:
             out = self._router.exec(
-                "/usr/ikuai/script/dhcp_acl_mac.sh init 2>&1; echo INIT_EXIT=$?"
+                f"{p['init']} 2>&1; echo INIT_EXIT=$?"
             )
             _t.sleep(2)
-            # 验证ipset存在 + iptables DHCP_ACL链存在
-            ipset_out = self._router.exec(f"ipset list {self.DHCP_ACL_IPSET} 2>/dev/null | head -2")
-            ipt_out = self._router.exec("iptables -t filter -S DHCP_ACL 2>/dev/null")
+            ipset_out = self._router.exec(f"ipset list {p['ipset']} 2>/dev/null | head -2")
+            ipt_out = self._router.exec(p['ipt_cmd'])
             checks = []
             checks.append(("init已执行", "INIT_EXIT=" in (out or ""),
                            f"init{'已执行' if 'INIT_EXIT=' in (out or '') else '未执行'}"))
             checks.append(("ipset存在", "Name:" in ipset_out,
                            f"ipset{'存在' if 'Name:' in ipset_out else '不存在'}"))
-            checks.append(("DHCP_ACL链存在", "DHCP_ACL" in ipt_out,
-                           f"DHCP_ACL链{'存在' if 'DHCP_ACL' in ipt_out else '不存在'}"))
+            checks.append((f"{p['chain']}链存在", p['chain'] in ipt_out,
+                           f"{p['chain']}链{'存在' if p['chain'] in ipt_out else '不存在'}"))
             passed = all(c[1] for c in checks)
             return VerifyResult(
-                level="L4-模拟重启", passed=passed,
+                level=lvl, passed=passed,
                 message="; ".join(c[2] for c in checks),
                 details={"checks": checks, "init_output": (out or "")[-200:]},
                 raw_output=(out or "")[-300:],
             )
         except Exception as e:
             return VerifyResult(
-                level="L4-模拟重启", passed=False,
+                level=lvl, passed=False,
                 message=f"模拟重启失败: {e}", raw_output=str(e),
             )
 
-    def cleanup_dhcp_acl_test(self, prefix: str = "DHACL") -> str:
-        """清理DHCP黑白名单测试规则(black+white两表) + 恢复模式0 + 重建ipset
+    def cleanup_dhcp_acl_test(self, prefix: str = "DHACL", ip_version: str = 'v4') -> str:
+        """清理DHCP黑白名单测试规则 + 恢复模式0 + 重建ipset
 
-        测试异常退出兜底用。模式1(白名单)空ipset会阻止所有DHCP, 必须恢复模式0。
+        ip_version='v4'清dhcp_acl_mac_{black,white}+恢复dhcp_acl_mac=0+dhcp_acl_mac.sh init;
+        ip_version='v6'清dhcp6_acl_mac_{black,white}+恢复dhcp6_acl_mac=0+dhcp6_acl_mac.sh init。
+        测试异常退出兜底用(白名单空ipset会阻止所有DHCP, 必须恢复模式0)。
         """
+        p = self._dhcp_acl_params(ip_version)
+        col = p['mode_col']
         self.connect_router()
         out_parts = []
         try:
             for table in ['black', 'white']:
                 o = self._router.exec(
-                    f"sqlite3 {self.DNS_DB} \"DELETE FROM dhcp_acl_mac_{table} WHERE tagname LIKE '{prefix}%';\" 2>&1"
+                    f"sqlite3 {self.DNS_DB} \"DELETE FROM {p['tbl']}_{table} WHERE tagname LIKE '{prefix}%';\" 2>&1"
                 )
                 out_parts.append(f"{table}: {o.strip()[:40]}")
-            # 恢复模式0(黑名单, 安全)
             self._router.exec(
-                f"sqlite3 {self.DNS_DB} \"UPDATE global_config SET dhcp_acl_mac=0 WHERE id=1;\" 2>&1"
+                f"sqlite3 {self.DNS_DB} \"UPDATE global_config SET {col}=0 WHERE id=1;\" 2>&1"
             )
-            # 重建ipset+iptables
-            self._router.exec("/usr/ikuai/script/dhcp_acl_mac.sh init 2>&1")
-            logger.info(f"[清理] DHCP黑白名单({prefix}*): {'; '.join(out_parts)} + 模式恢复0")
+            self._router.exec(f"{p['init']} 2>&1")
+            logger.info(f"[清理] DHCP黑白名单{ip_version}({prefix}*): {'; '.join(out_parts)} + 模式恢复0")
         except Exception as e:
-            logger.warning(f"[清理] DHCP黑白名单清理失败: {e}")
+            logger.warning(f"[清理] DHCP黑白名单{ip_version}清理失败: {e}")
         return "; ".join(out_parts)
 
     # ==================== IPv6前缀静态分配(IPv6 Static)验证 ====================

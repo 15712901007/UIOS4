@@ -126,21 +126,10 @@ class IkuaiTablePage(BasePage):
             return False
 
     def disable_rule(self, rule_name: str) -> bool:
-        """停用指定规则（有确认弹窗）"""
+        """停用指定规则（有确认弹窗, 确认点击短超时快速失败）"""
         self._click_rule_button(rule_name, "停用")
         self.page.wait_for_timeout(500)
-
-        try:
-            confirm_btn = self.page.locator(
-                "dialog button:has-text('确定'), [role='dialog'] button:has-text('确定')"
-            )
-            if confirm_btn.count() > 0:
-                confirm_btn.first.click()
-            else:
-                self.page.get_by_role("button", name="确定").click()
-        except Exception as e:
-            print(f"[DEBUG] disable_rule 点击确定失败: {e}")
-            return False
+        self._click_visible_confirm(timeout=4000)
 
         try:
             self.page.wait_for_selector("text=停用成功", timeout=5000)
@@ -178,9 +167,11 @@ class IkuaiTablePage(BasePage):
 
             self.page.wait_for_timeout(500)
 
-            confirm_btn = self.page.get_by_role("button", name="确定")
-            if confirm_btn.count() > 0:
-                confirm_btn.click()
+            # 用可见确认弹窗处理(非 get_by_role("确定").click()):
+            # .ant-modal-confirm 常驻一个隐藏根节点(含残留"确定"按钮), 点击删除后可见弹窗的"确定"
+            # 会让 get_by_role("确定") 命中2个 → Playwright strict mode violation → 异常吞掉 → 删除未确认
+            # (2026-06-23 IPv6黑白名单删除实测根因)。_click_visible_confirm 用 :visible+.first 规避。
+            self._click_visible_confirm(timeout=4000)
 
             self.page.wait_for_timeout(1000)
             self.page.reload()
@@ -357,50 +348,62 @@ class IkuaiTablePage(BasePage):
         self._click_batch_button("启用")
         return self
 
+    def _click_visible_confirm(self, timeout: int = 4000) -> bool:
+        """点击可见的批量操作确认弹窗"确定"按钮(短超时快速失败, 不死等)
+
+        根因修复: Ant Design 的 ``.ant-modal-confirm`` 即使无弹窗也会常驻一个
+        隐藏根节点(内含上一次确认按钮), 直接 ``.first.click()`` 会因元素 not visible
+        而触发 Playwright 默认 30s 超时(实测 DHCP黑白名单批量删除因此每次卡 30s)。
+        本方法用 ``:visible`` 过滤 + ``wait_for(state="visible", timeout)`` 短超时:
+        - 有真实可见弹窗 → 在 timeout 内点中(成功路径行为不变);
+        - 仅隐藏残留容器 → timeout 内快速失败返回 False, 调用方(测试层)自行用
+          SSH 计数 / 行内 delete_rule 兜底, 不再卡死。
+
+        多策略: modal-confirm / popover / 通用 role 确定, 全部限定 :visible。
+        """
+        candidates = [
+            ".ant-modal-confirm .ant-btn-primary:visible",
+            ".ant-modal-wrap .ant-btn-primary:visible",
+            ".ant-popover button:has-text('确定'):visible",
+            ".ant-popover .ant-btn-primary:visible",
+        ]
+        for sel in candidates:
+            try:
+                loc = self.page.locator(sel).first
+                loc.wait_for(state="visible", timeout=timeout)
+                loc.click()
+                return True
+            except Exception:
+                continue
+        # 最后兜底: 通用 role 确定(短超时), 无弹窗时也快速失败
+        try:
+            self.page.get_by_role("button", name="确定").first.click(timeout=timeout)
+            return True
+        except Exception as e:
+            print(f"[DEBUG] 确认弹窗无可见'确定'按钮({str(e)[:50]}), 调用方自行兜底")
+            return False
+
     def batch_disable(self):
-        """批量停用选中的规则（有确认弹窗）"""
+        """批量停用选中的规则（有确认弹窗, 确认点击短超时快速失败）"""
         self.close_modal_if_exists()
         self.page.wait_for_timeout(500)
         self._click_batch_button("停用")
         self.page.wait_for_timeout(800)
-
-        try:
-            confirm_btn = self.page.locator("button:has-text('确定'):visible")
-            if confirm_btn.count() > 0:
-                confirm_btn.first.click()
-            else:
-                self.page.get_by_role("button", name="确定").click()
-        except Exception as e:
-            print(f"[DEBUG] batch_disable 确认弹窗点击失败: {e}")
+        self._click_visible_confirm(timeout=4000)
         return self
 
     def batch_delete(self):
-        """批量删除选中的规则（有确认弹窗）"""
+        """批量删除选中的规则（有确认弹窗, 确认点击短超时快速失败）
+
+        注意: 部分模块(如 DHCP黑白名单)选中后无底部批量操作栏, batch 删除按钮
+        不会被点中 → 无确认弹窗。本方法此时 4s 内快速失败返回, 测试层用行内
+        delete_rule 循环兜底(参考 MEMORY 批量操作教训)。
+        """
         self.close_modal_if_exists()
         self.page.wait_for_timeout(500)
         self._click_batch_button("删除")
         self.page.wait_for_timeout(500)
-
-        try:
-            # 策略1: modal确认弹窗
-            modal_confirm = self.page.locator(
-                ".ant-modal-confirm .ant-btn-primary, .ant-modal-wrap .ant-btn-primary"
-            )
-            if modal_confirm.count() > 0:
-                modal_confirm.first.click()
-            else:
-                # 策略2: popover确认弹窗(爱快部分模块用popover)
-                popover_confirm = self.page.locator(
-                    ".ant-popover button:has-text('确定'), "
-                    ".ant-popover .ant-btn-primary"
-                )
-                if popover_confirm.count() > 0:
-                    popover_confirm.first.click()
-                else:
-                    # 策略3: 通用确定按钮
-                    self.page.get_by_role("button", name="确定").click()
-        except Exception as e:
-            print(f"[DEBUG] batch_delete 确认弹窗点击失败: {e}")
+        self._click_visible_confirm(timeout=4000)
         return self
 
     # ==================== 搜索 ====================
