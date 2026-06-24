@@ -428,8 +428,12 @@ class TestDhcpAclMacComprehensive:
             exported = False
             try:
                 exported = page.export_rules(use_config_path=True, export_format="txt")
-                print(f"  导出: {exported}, 文件: {_os.path.basename(export_file)}")
-                rec.add_detail(f"导出: {exported}, 文件: {_os.path.basename(export_file)}")
+                print(f"  导出txt: {exported}, 文件: {_os.path.basename(export_file)}")
+                rec.add_detail(f"导出txt: {exported}, 文件: {_os.path.basename(export_file)}")
+                # csv导出(导出弹窗支持CSV+TXT两种格式, 验证csv导出)
+                csv_ok = page.export_rules(use_config_path=True, export_format="csv")
+                print(f"  导出csv: {csv_ok}")
+                rec.add_detail(f"导出csv: {csv_ok}")
             except Exception as e:
                 print(f"  [WARN] 导出异常: {e}")
                 rec.add_detail(f"[WARN] 导出异常: {e}")

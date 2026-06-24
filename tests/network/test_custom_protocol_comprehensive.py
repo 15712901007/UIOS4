@@ -213,8 +213,11 @@ class TestCustomProtocolComprehensive:
                 page.navigate_to_custom_protocol()
                 page.page.wait_for_timeout(800)
                 exported = page.export_rules(use_config_path=True, export_format="txt")
-                print(f"  导出: {exported}")
-                rec.add_detail(f"导出: {exported}")
+                print(f"  导出txt: {exported}")
+                rec.add_detail(f"导出txt: {exported}")
+                csv_ok = page.export_rules(use_config_path=True, export_format="csv")
+                print(f"  导出csv: {csv_ok}")
+                rec.add_detail(f"导出csv: {csv_ok}")
             except Exception as e:
                 print(f"  [WARN] 导出异常: {e}")
 
@@ -475,8 +478,11 @@ class TestAdvancedCustomProtocolComprehensive:
                 page.navigate_to_advanced_custom_protocol()
                 page.page.wait_for_timeout(800)
                 exported = page.export_rules(use_config_path=True, export_format="txt")
-                print(f"  导出: {exported}")
-                rec.add_detail(f"导出: {exported}")
+                print(f"  导出txt: {exported}")
+                rec.add_detail(f"导出txt: {exported}")
+                csv_ok = page.export_rules(use_config_path=True, export_format="csv")
+                print(f"  导出csv: {csv_ok}")
+                rec.add_detail(f"导出csv: {csv_ok}")
             except Exception as e:
                 print(f"  [WARN] 导出异常: {e}")
 

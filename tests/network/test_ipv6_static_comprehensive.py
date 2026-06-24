@@ -236,8 +236,12 @@ class TestIpv6StaticComprehensive:
             page.page.wait_for_timeout(800)
             try:
                 exported = page.export_rules(use_config_path=True, export_format="txt")
-                print(f"  导出: {exported}")
-                rec.add_detail(f"导出: {exported}")
+                print(f"  导出txt: {exported}")
+                rec.add_detail(f"导出txt: {exported}")
+                # csv导出(导出弹窗支持CSV+TXT两种格式, 验证csv导出)
+                csv_ok = page.export_rules(use_config_path=True, export_format="csv")
+                print(f"  导出csv: {csv_ok}")
+                rec.add_detail(f"导出csv: {csv_ok}")
             except Exception as e:
                 print(f"  [WARN] 导出异常: {e}")
                 rec.add_detail(f"[WARN] 导出异常: {e}")
