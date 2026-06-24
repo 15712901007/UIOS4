@@ -727,9 +727,10 @@ class TestUpdownRouteComprehensive:
                 print(f"  [WARN] 帮助功能测试异常: {e}")
                 rec.add_detail(f"  帮助功能异常: {e}")
 
-        # 断言所有SSH验证通过
-        if ssh_failures:
-            pytest.fail(f"验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures[:5])}")
+        # 断言所有验证通过(SSH + UI; 修复ui_failures死代码: 原只查ssh_failures, ui_failures写了从未assert)
+        all_failures = ssh_failures + ui_failures
+        if all_failures:
+            pytest.fail(f"验证失败({len(all_failures)}项): {'; '.join(all_failures[:5])}")
 
         print("\n" + "=" * 60)
         print("上下行分离综合测试完成 - ALL PASSED")
