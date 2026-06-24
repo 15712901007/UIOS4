@@ -736,11 +736,11 @@ class MainWindow(QMainWindow):
                             },
                             "高级自定义协议": {
                                 "testcases": [
-                                    "test_advanced_custom_protocol_comprehensive.py::TestAdvancedCustomProtocolComprehensive::test_advanced_custom_protocol_comprehensive",
+                                    "test_custom_protocol_comprehensive.py::TestAdvancedCustomProtocolComprehensive::test_advanced_custom_protocol_comprehensive",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
-                                        "test_advanced_custom_protocol_comprehensive.py::TestAdvancedCustomProtocolComprehensive::test_advanced_custom_protocol_comprehensive",
+                                        "test_custom_protocol_comprehensive.py::TestAdvancedCustomProtocolComprehensive::test_advanced_custom_protocol_comprehensive",
                                     ],
                                 }
                             },
