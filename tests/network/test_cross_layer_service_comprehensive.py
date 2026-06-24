@@ -390,8 +390,9 @@ class TestCrossLayerServiceComprehensive:
                     backend_verifier.verify_netsnmpc_database,
                     tagname=delete_rule["name"],
                     must_pass=False,
+                    expect_absent=True,
                 )
-                if l1 and not l1.passed:
+                if l1 and l1.passed:
                     rec.add_detail(f"    SSH-L1-删除验证: 通过 - 规则已从数据库删除")
                 else:
                     rec.add_detail(f"    SSH-L1-删除验证: 规则可能仍存在")

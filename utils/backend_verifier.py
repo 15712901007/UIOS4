@@ -1423,7 +1423,8 @@ class BackendVerifier:
         return None
 
     def verify_netsnmpc_database(self, tagname: str,
-                                  expected_fields: Dict = None) -> VerifyResult:
+                                  expected_fields: Dict = None,
+                                  expect_absent: bool = False) -> VerifyResult:
         """
         L1: 验证跨三层服务规则在数据库中存在且字段正确
 
@@ -1438,9 +1439,17 @@ class BackendVerifier:
             logger.debug(f"netsnmpc rule not found: {tagname}, existing: {existing_names}")
             return VerifyResult(
                 level="L1-数据库",
-                passed=False,
-                message=f"跨三层服务规则未找到: tagname={tagname}",
+                passed=expect_absent,
+                message=f"跨三层服务规则未找到: tagname={tagname}" + ("(应不存在-删除生效)" if expect_absent else ""),
                 raw_output=f"数据库中现有规则: {existing_names}",
+            )
+
+        if expect_absent:
+            return VerifyResult(
+                level="L1-数据库",
+                passed=False,
+                message=f"跨三层服务规则仍存在(应已删除): tagname={tagname}",
+                raw_output=json.dumps(rule, ensure_ascii=False),
             )
 
         mismatches = {}
