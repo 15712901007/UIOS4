@@ -66,6 +66,8 @@ class TestNatRuleComprehensive:
             except Exception as e:
                 print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
                 rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                if must_pass:
+                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
                 return None
 
         # 测试数据 - 9条规则, 覆盖3种动作类型

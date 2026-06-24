@@ -66,6 +66,8 @@ class TestUpnpSettingComprehensive:
             except Exception as e:
                 print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
                 rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                if must_pass:
+                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
                 return None
 
         # 测试数据 - 7条规则，覆盖单IP/多IP/IP段/多线路/所有线路/备注

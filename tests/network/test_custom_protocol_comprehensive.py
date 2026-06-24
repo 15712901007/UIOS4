@@ -55,6 +55,8 @@ def _make_ssh_verify(rec, backend_verifier, failures):
         except Exception as e:
             print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
             rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+            if must_pass:
+                failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
             return None
     return ssh_verify
 

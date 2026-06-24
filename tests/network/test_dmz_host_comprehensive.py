@@ -74,6 +74,8 @@ class TestDmzHostComprehensive:
             except Exception as e:
                 print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
                 rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                if must_pass:
+                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
                 return None
 
         # 测试数据 - 覆盖映射类型(外网接口选wan2/wan3 + 外网IP)和排除协议的组合

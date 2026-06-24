@@ -75,6 +75,8 @@ class TestStreamControlComprehensive:
             except Exception as e:
                 print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
                 rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
+                if must_pass:
+                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
                 return None
 
         # 导出文件路径(提前定义)
