@@ -1,0 +1,3 @@
+id,enabled,name,tagname,comment,server,server_port,username,passwd,ipsec_secret,interface,leftid,rightid,upload,download,mtu,mru,check_link_mode,check_link_host,timing_rst_switch,timing_rst_week,timing_rst_time,cycle_rst_time,qos_switch
+1,"yes","l2tpedit1","","±à¼­ºó±¸×¢","10.66.0.40",1701,"test","test","","auto","","","","",1400,1400,1,"www.baidu.com",0,"","",0,0
+2,"yes","l2tppsk1","","","10.66.0.40",1701,"test","test","ikuai8test","auto","l2tpcli","l2tpsrv","","",1400,1400,1,"www.baidu.com",0,"","",0,0

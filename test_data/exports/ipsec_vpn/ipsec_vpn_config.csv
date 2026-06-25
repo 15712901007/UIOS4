@@ -1,0 +1,3 @@
+id,name,tagname,comment,remote_addr,authby,leftsubnet,rightsubnet,interface,enabled,keyexchange,aggressive,keyingtries,ikelifetime,ike_enc,ike_auth,ike_dh,secret,leftid,rightid,privatekey,leftcert,rightcert,lifetime,esp_enc,esp_auth,dpdaction,dpddelay,dpdtimeout,compress
+1,"ipsecauto1","","±à¼­ºó±¸×¢","10.66.0.40","secret","192.168.1.0/24","10.0.0.0/24","auto","yes","ikev2","","","3","","","","ikuaipsk01","","","","","","1","","","none",0,0,"0"
+2,"ipsecnoip1","","","","secret","192.168.2.0/24","10.0.1.0/24","auto","yes","ikev2","","","3","","","","ikuaipsk02","localid2","remoteid2","","","","1","","","none",0,0,"0"

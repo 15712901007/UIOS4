@@ -134,6 +134,25 @@ test_data:
     route_object_domain:
       export_filename: "route_object_domain_config.txt"
       import_filename: "route_object_domain_import.txt"
+    # VPN客户端(6子模块, 网络配置→内外网设置→VPN客户端)
+    pptp_client:
+      export_filename: "pptp_client_config.csv"
+      import_filename: "pptp_client_import.csv"
+    l2tp_client:
+      export_filename: "l2tp_client_config.csv"
+      import_filename: "l2tp_client_import.csv"
+    openvpn_client:
+      export_filename: "openvpn_client_config.csv"
+      import_filename: "openvpn_client_import.csv"
+    ipsec_vpn:
+      export_filename: "ipsec_vpn_config.csv"
+      import_filename: "ipsec_vpn_import.csv"
+    ike_client:
+      export_filename: "ike_client_config.csv"
+      import_filename: "ike_client_import.csv"
+    wireguard:
+      export_filename: "wireguard_config.csv"
+      import_filename: "wireguard_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"

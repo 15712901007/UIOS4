@@ -125,6 +125,12 @@ from pages.network.route_object_page import (
     IpGroupPage, MacGroupPage, PortGroupPage, DomainGroupPage,
     TimePlanPage, ProtocolGroupPage,
 )
+from pages.network.pptp_client_page import PptpClientPage
+from pages.network.l2tp_client_page import L2tpClientPage
+from pages.network.openvpn_client_page import OpenvpnClientPage
+from pages.network.ipsec_vpn_page import IpsecVpnPage
+from pages.network.ike_client_page import IkeClientPage
+from pages.network.wireguard_page import WireguardPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -207,6 +213,12 @@ TEST_NAME_MAPPING = {
     'test_domain_group_comprehensive': '域名分组综合测试',
     'test_time_plan_comprehensive': '时间计划综合测试',
     'test_protocol_group_comprehensive': '协议分组综合测试',
+    'test_pptp_client_comprehensive': 'PPTP客户端综合测试',
+    'test_l2tp_client_comprehensive': 'L2TP客户端综合测试',
+    'test_openvpn_client_comprehensive': 'OpenVPN客户端综合测试',
+    'test_ipsec_vpn_comprehensive': 'IPSec VPN综合测试',
+    'test_ike_client_comprehensive': 'IKEv2/IPSec客户端综合测试',
+    'test_wireguard_comprehensive': 'WireGuard客户端综合测试',
 }
 
 
@@ -860,6 +872,56 @@ def protocol_group_page_logged_in(logged_in_page: Page, config: Config) -> 'Prot
     return pg
 
 
+# ==================== VPN客户端(PPTP/L2TP/OpenVPN/IPSec/IKEv2/WireGuard) fixtures ====================
+
+@pytest.fixture(scope="function")
+def pptp_client_page_logged_in(logged_in_page: Page, config: Config) -> 'PptpClientPage':
+    """已登录并导航到PPTP客户端页面的实例"""
+    pg = PptpClientPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_pptp()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def l2tp_client_page_logged_in(logged_in_page: Page, config: Config) -> 'L2tpClientPage':
+    """已登录并导航到L2TP客户端页面的实例"""
+    pg = L2tpClientPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_l2tp()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def openvpn_client_page_logged_in(logged_in_page: Page, config: Config) -> 'OpenvpnClientPage':
+    """已登录并导航到OpenVPN客户端页面的实例"""
+    pg = OpenvpnClientPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_openvpn()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def ipsec_vpn_page_logged_in(logged_in_page: Page, config: Config) -> 'IpsecVpnPage':
+    """已登录并导航到IPSec VPN页面的实例"""
+    pg = IpsecVpnPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_ipsec()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def ike_client_page_logged_in(logged_in_page: Page, config: Config) -> 'IkeClientPage':
+    """已登录并导航到IKEv2/IPSec客户端页面的实例"""
+    pg = IkeClientPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_ike()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def wireguard_page_logged_in(logged_in_page: Page, config: Config) -> 'WireguardPage':
+    """已登录并导航到WireGuard客户端页面的实例"""
+    pg = WireguardPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_wireguard()
+    return pg
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -1140,9 +1202,91 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "protocol_group: 协议分组模块测试"
     )
+    config.addinivalue_line(
+        "markers", "pptp_client: PPTP客户端模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "l2tp_client: L2TP客户端模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "openvpn_client: OpenVPN客户端模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "ipsec_vpn: IPSec VPN模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "ike_client: IKEv2/IPSec客户端模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "wireguard: WireGuard客户端模块测试"
+    )
 
     # 记录开始时间
     _test_results['start_time'] = datetime.now()
+
+
+def _dt_to_str(v):
+    """datetime/字符串 -> 字符串(JSON 安全)"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    try:
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(v)
+
+
+def _find_screenshot_path(screenshot_dir, original_name):
+    """按用例名在截图目录找最新的失败截图文件路径(文件名含时间戳)"""
+    if not screenshot_dir or not os.path.isdir(screenshot_dir) or not original_name:
+        return ""
+    try:
+        prefix = original_name + "_"
+        matches = [f for f in os.listdir(screenshot_dir)
+                   if f.startswith(prefix) and f.endswith("_failure.png")]
+        if not matches:
+            return ""
+        matches.sort(reverse=True)  # 文件名含时间戳, 倒序取最新
+        return os.path.join(screenshot_dir, matches[0])
+    except Exception:
+        return ""
+
+
+def _dump_test_results_json(results, output_dir, screenshot_dir):
+    """把 _test_results dump 成 JSON(供 GUI 导出真实测试结果 Excel)。
+    截图只存文件路径不存 base64, 避免文件过大。"""
+    import json
+    data = {
+        "total": results.get("total", 0),
+        "passed": results.get("passed", 0),
+        "failed": results.get("failed", 0),
+        "skipped": results.get("skipped", 0),
+        "total_steps": results.get("total_steps", 0),
+        "duration": results.get("duration", ""),
+        "start_time": _dt_to_str(results.get("start_time")),
+        "end_time": _dt_to_str(results.get("end_time")),
+        "test_cases": [],
+    }
+    for tc in results.get("test_cases", []):
+        orig = tc.get("original_name", "")
+        # 有 base64 截图才去找文件路径
+        shot_path = _find_screenshot_path(screenshot_dir, orig) if tc.get("screenshot") else ""
+        data["test_cases"].append({
+            "name": tc.get("name", ""),
+            "original_name": orig,
+            "status": tc.get("status", ""),
+            "duration": tc.get("duration", ""),
+            "error_message": tc.get("error_message"),
+            "error_traceback": tc.get("error_traceback"),
+            "steps": tc.get("steps", []),
+            "step_count": tc.get("step_count", 0),
+            "screenshot_path": shot_path,
+        })
+    json_path = os.path.join(output_dir, "test_results.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return json_path
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -1194,6 +1338,16 @@ def pytest_sessionfinish(session, exitstatus):
             )
 
             print(f"\n[报告] 自定义HTML报告已生成: {output_path}")
+
+            # 保存测试结果 JSON(供 GUI "导出测试结果" 使用)
+            try:
+                screenshot_dir = config.report.screenshot_dir
+                if not os.path.isabs(screenshot_dir):
+                    screenshot_dir = os.path.join(project_root, screenshot_dir)
+                json_path = _dump_test_results_json(_test_results, output_dir, screenshot_dir)
+                print(f"[报告] 测试结果JSON已保存: {json_path}")
+            except Exception as je:
+                print(f"[警告] 保存测试结果JSON失败: {je}")
 
         except Exception as e:
             print(f"\n[警告] 生成自定义报告失败: {e}")

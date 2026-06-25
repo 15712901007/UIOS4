@@ -7980,3 +7980,226 @@ class BackendVerifier:
         except Exception as e:
             logger.warning(f"[清理] object_group清理失败: {e}")
             return f"type{t}: error"
+
+    # ==================== VPN客户端(PPTP/L2TP/OpenVPN/IPSec VPN/IKEv2/WireGuard)验证 ====================
+    # 网络配置→内外网设置→VPN客户端 tab 下6子模块
+    # 通用特征: name(拨号名称/接口名, unique) + enabled(yes/no) + comment(备注)
+    # L1数据库(sqlite直查表, must_pass=True) + L2进程/接口连接(软断言, 拨号依赖远端VPN服务端)
+    # 拨号不一定成功(依赖服务端配置/凭据), 连接验证must_pass=False只记录状态不阻断
+    # 模块映射: key -> (数据库表, 标签, 连接类型)
+    VPN_CLIENT_MODULES = {
+        'pptp':      ('pptp_client',    'PPTP',       'ppp'),    # 接口名=name, pppd进程
+        'l2tp':      ('l2tp_client',    'L2TP',       'ppp'),    # 接口名=name, xl2tpd进程
+        'openvpn':   ('openvpn_client', 'OpenVPN',    'tun'),    # 接口名=name, openvpn进程
+        'ipsec':     ('ipsec_vpn',      'IPSec VPN',  'ipsec'),  # site-to-site, ipsec sa
+        'ike':       ('ike_client',     'IKEv2',      'ipsec'),  # ipsec sa (charon)
+        'wireguard': ('wireguard',      'WireGuard',  'wg'),     # 接口名=name, wg接口
+    }
+
+    def _vpn_query_rules(self, module_key: str) -> List[Dict]:
+        """L1: 查询指定VPN客户端模块全部规则(sqlite直查表)"""
+        table = self.VPN_CLIENT_MODULES[module_key][0]
+        return self._sqlite_query_list(f"SELECT * FROM {table}")
+
+    def _vpn_find_rule(self, module_key: str, name: str) -> Optional[Dict]:
+        """L1: 按拨号名称(name)查找单条VPN客户端规则"""
+        table = self.VPN_CLIENT_MODULES[module_key][0]
+        return self._sqlite_query_line(f"SELECT * FROM {table} WHERE name='{name}'")
+
+    def _vpn_verify_database_core(self, module_key: str, name: str,
+                                   expected_fields: Dict = None,
+                                   expect_absent: bool = False) -> VerifyResult:
+        """L1: VPN客户端数据库验证核心(6模块共用)
+
+        Args:
+            module_key: pptp/l2tp/openvpn/ipsec/ike/wireguard
+            name: 拨号名称(规则标识)
+            expected_fields: 期望字段值, 如 {"enabled":"yes","server":"10.66.0.40"}
+            expect_absent: True=期望规则不存在(删除验证)
+        """
+        label = self.VPN_CLIENT_MODULES[module_key][1]
+        rule = self._vpn_find_rule(module_key, name)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=expect_absent,
+                message=f"{label} '{name}' 不存在({'符合预期' if expect_absent else '应为存在'})",
+                raw_output="")
+        if expect_absent:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"{label} '{name}' 仍存在(期望已删除)",
+                details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+
+        details = {k: rule.get(k) for k in ('id', 'enabled', 'name', 'comment') if k in rule}
+        for k, v in rule.items():
+            if k not in details and v not in (None, '', '0'):
+                details[k] = v
+        raw = json.dumps(details, ensure_ascii=False)[:400]
+
+        if not expected_fields:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"{label} '{name}' 存在(enabled={details.get('enabled')})",
+                details={"rule": details}, raw_output=raw)
+
+        mismatches = {}
+        for f, exp in expected_fields.items():
+            act = str(rule.get(f, ""))
+            if str(exp) != act:
+                mismatches[f] = {"expected": str(exp), "actual": act}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"{label} '{name}' 字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw)
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"{label} '{name}' 数据库验证通过",
+            details={"rule": details}, raw_output=raw)
+
+    def _vpn_verify_connection_core(self, module_key: str, name: str,
+                                     expect_enabled: bool = True) -> VerifyResult:
+        """L2: VPN客户端连接状态验证(软断言, 拨号依赖服务端)
+
+        通过接口存在性/IP/SA判断拨号或隧道是否建立。
+        拨号不一定成功(服务端未配/凭据错), 测试中must_pass=False只记录状态。
+        停用态(expect_enabled=False)宽松放行: 接口/SA可能因惯性还在, 不做硬性要求。
+
+        Args:
+            module_key: 模块key
+            name: 拨号名称/接口名
+            expect_enabled: 期望是否启用(启用=应有连接)
+        """
+        entry = self.VPN_CLIENT_MODULES[module_key]
+        label, conn_type = entry[1], entry[2]
+        self.connect_router()
+        try:
+            if conn_type in ('ppp', 'tun', 'wg'):
+                link_out = self._router.exec(
+                    f"ip -o link show 2>/dev/null | grep -w '{name}'") or ""
+                iface_exists = name in link_out
+                iface_up = iface_exists and ('UP' in link_out or 'LOWER_UP' in link_out)
+                ip_out = self._router.exec(
+                    f"ip -o -4 addr show dev {name} 2>/dev/null") or ""
+                has_ip = bool(ip_out.strip()) and 'inet' in ip_out
+                connected = iface_up and has_ip
+                msg = (f"{label} '{name}' 接口{'存在' if iface_exists else '不存在'}"
+                       f"{'+UP' if iface_up else ''}, "
+                       f"{'已获IP(已连接)' if has_ip else '无IP(未连接/拨号中)'}")
+                # 停用态宽松: 接口可能惯性仍在, 仅记录不阻断
+                passed = connected if expect_enabled else True
+                return VerifyResult(
+                    level="L2-连接", passed=passed,
+                    message=msg,
+                    details={"iface_exists": iface_exists, "iface_up": iface_up, "has_ip": has_ip},
+                    raw_output=(link_out + ip_out)[:300])
+            else:  # ipsec (IPSec VPN site-to-site / IKEv2)
+                sa_out = self._router.exec(
+                    f"ipsec statusall 2>/dev/null | grep -iE '{name}'") or ""
+                xfrm_cnt = self._router.exec(
+                    "ip xfrm state 2>/dev/null | grep -c ' src '") or "0"
+                try:
+                    xfrm_n = int(str(xfrm_cnt).strip() or "0")
+                except ValueError:
+                    xfrm_n = 0
+                has_sa = bool(sa_out.strip()) or xfrm_n > 0
+                msg = (f"{label} '{name}' {'有SA(隧道建立)' if has_sa else '无SA(隧道未建立)'}, "
+                       f"xfrm_state={xfrm_n}")
+                passed = has_sa if expect_enabled else True
+                return VerifyResult(
+                    level="L2-连接", passed=passed,
+                    message=msg, details={"has_sa": has_sa, "xfrm_state_count": xfrm_n},
+                    raw_output=sa_out[:300])
+        except Exception as e:
+            return VerifyResult(
+                level="L2-连接", passed=False,
+                message=f"{label} '{name}' 连接检查异常: {e}", raw_output=str(e)[:200])
+
+    def _vpn_verify_full_chain_core(self, module_key: str, name: str,
+                                     expect_enabled: bool = True,
+                                     expected_fields: Dict = None) -> FullChainResult:
+        """VPN客户端全链路验证: L1数据库 + L2连接"""
+        results = []
+        db_expected = dict(expected_fields or {})
+        db_expected["enabled"] = "yes" if expect_enabled else "no"
+        results.append(self._vpn_verify_database_core(module_key, name, db_expected))
+        results.append(self._vpn_verify_connection_core(module_key, name, expect_enabled))
+        return FullChainResult(results=results)
+
+    # ----- PPTP客户端 -----
+    def query_pptp_rules(self) -> List[Dict]:
+        return self._vpn_query_rules('pptp')
+
+    def verify_pptp_database(self, name, expected_fields=None, expect_absent=False):
+        return self._vpn_verify_database_core('pptp', name, expected_fields, expect_absent)
+
+    def verify_pptp_connection(self, name, expect_enabled=True):
+        return self._vpn_verify_connection_core('pptp', name, expect_enabled)
+
+    def verify_pptp_full_chain(self, name, expect_enabled=True, expected_fields=None):
+        return self._vpn_verify_full_chain_core('pptp', name, expect_enabled, expected_fields)
+
+    # ----- L2TP客户端 -----
+    def query_l2tp_rules(self) -> List[Dict]:
+        return self._vpn_query_rules('l2tp')
+
+    def verify_l2tp_database(self, name, expected_fields=None, expect_absent=False):
+        return self._vpn_verify_database_core('l2tp', name, expected_fields, expect_absent)
+
+    def verify_l2tp_connection(self, name, expect_enabled=True):
+        return self._vpn_verify_connection_core('l2tp', name, expect_enabled)
+
+    def verify_l2tp_full_chain(self, name, expect_enabled=True, expected_fields=None):
+        return self._vpn_verify_full_chain_core('l2tp', name, expect_enabled, expected_fields)
+
+    # ----- OpenVPN客户端 -----
+    def query_openvpn_rules(self) -> List[Dict]:
+        return self._vpn_query_rules('openvpn')
+
+    def verify_openvpn_database(self, name, expected_fields=None, expect_absent=False):
+        return self._vpn_verify_database_core('openvpn', name, expected_fields, expect_absent)
+
+    def verify_openvpn_connection(self, name, expect_enabled=True):
+        return self._vpn_verify_connection_core('openvpn', name, expect_enabled)
+
+    def verify_openvpn_full_chain(self, name, expect_enabled=True, expected_fields=None):
+        return self._vpn_verify_full_chain_core('openvpn', name, expect_enabled, expected_fields)
+
+    # ----- IPSec VPN(site-to-site) -----
+    def query_ipsec_rules(self) -> List[Dict]:
+        return self._vpn_query_rules('ipsec')
+
+    def verify_ipsec_database(self, name, expected_fields=None, expect_absent=False):
+        return self._vpn_verify_database_core('ipsec', name, expected_fields, expect_absent)
+
+    def verify_ipsec_connection(self, name, expect_enabled=True):
+        return self._vpn_verify_connection_core('ipsec', name, expect_enabled)
+
+    def verify_ipsec_full_chain(self, name, expect_enabled=True, expected_fields=None):
+        return self._vpn_verify_full_chain_core('ipsec', name, expect_enabled, expected_fields)
+
+    # ----- IKEv2/IPSec -----
+    def query_ike_rules(self) -> List[Dict]:
+        return self._vpn_query_rules('ike')
+
+    def verify_ike_database(self, name, expected_fields=None, expect_absent=False):
+        return self._vpn_verify_database_core('ike', name, expected_fields, expect_absent)
+
+    def verify_ike_connection(self, name, expect_enabled=True):
+        return self._vpn_verify_connection_core('ike', name, expect_enabled)
+
+    def verify_ike_full_chain(self, name, expect_enabled=True, expected_fields=None):
+        return self._vpn_verify_full_chain_core('ike', name, expect_enabled, expected_fields)
+
+    # ----- WireGuard -----
+    def query_wireguard_rules(self) -> List[Dict]:
+        return self._vpn_query_rules('wireguard')
+
+    def verify_wireguard_database(self, name, expected_fields=None, expect_absent=False):
+        return self._vpn_verify_database_core('wireguard', name, expected_fields, expect_absent)
+
+    def verify_wireguard_connection(self, name, expect_enabled=True):
+        return self._vpn_verify_connection_core('wireguard', name, expect_enabled)
+
+    def verify_wireguard_full_chain(self, name, expect_enabled=True, expected_fields=None):
+        return self._vpn_verify_full_chain_core('wireguard', name, expect_enabled, expected_fields)

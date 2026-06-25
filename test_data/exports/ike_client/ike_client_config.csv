@@ -1,0 +1,3 @@
+id,enabled,name,tagname,comment,remote_addr,interface,mtu,authby,keyexchange,aggressive,secret,leftid,rightid,username,passwd,check_link_mode,check_link_host
+1,"yes","ikededit1","","±à¼­ºó±¸×¢","10.66.0.40","auto",1400,"mschapv2","","","","iketest01","","test","test",1,"www.baidu.com"
+2,"yes","ikedid2","","","10.66.0.40","auto",1400,"mschapv2","","","","iketest02","","test2","test2",1,"www.baidu.com"

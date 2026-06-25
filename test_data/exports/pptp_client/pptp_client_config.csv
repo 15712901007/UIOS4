@@ -1,0 +1,3 @@
+id,enabled,name,tagname,comment,server,server_port,username,passwd,interface,upload,download,mtu,mru,check_link_mode,check_link_host,timing_rst_switch,timing_rst_week,timing_rst_time,cycle_rst_time,qos_switch
+1,"yes","pptpedit1","","±à¼­ºó±¸×¢","10.66.0.40",1723,"test","test","auto","","",1400,1400,1,"www.baidu.com",0,"","",0,0
+2,"yes","pptpmtu1","","","10.66.0.40",1723,"test2","test2","auto","","",1380,1380,1,"www.baidu.com",0,"","",0,0
