@@ -486,6 +486,23 @@ class DmzHostPage(IkuaiTablePage):
                     print(f"  [add_rule] [安全] 外网接口模式未指定安全接口, 强制用wan2(避免interface=all)")
                 self.select_external_interfaces(safe_interfaces)
                 print(f"  [add_rule] external_interfaces={safe_interfaces}")
+                # [安全验证] 选完接口后确认选中了具体接口(wan2/wan3), 而非默认"任意"(all会NETMAP劫持所有WAN含管理流量致设备失联)
+                try:
+                    iface_form = self._find_form_item_by_label("外网地址")
+                    if iface_form is not None:
+                        sel_items = iface_form.locator('.ant-select-selection-item').all_text_contents()
+                        sel_str = '|'.join(t.strip() for t in sel_items if t.strip())
+                        if not sel_str or "任意" in sel_str or "all" in sel_str.lower():
+                            print(f"  [add_rule][!安全阻断] 外网接口仍为'{sel_str}'(应为wan2/wan3), 取消保存避免任意DMZ劫持WAN管理")
+                            try:
+                                self.click_cancel()
+                                self.page.wait_for_timeout(500)
+                            except Exception:
+                                pass
+                            return False
+                        print(f"  [add_rule][安全验证OK] 外网接口已选: {sel_str}")
+                except Exception as e:
+                    print(f"  [add_rule][安全验证] 异常(忽略,继续): {e}")
 
             # 3. 内网地址
             self.fill_lan_addr(lan_addr)
