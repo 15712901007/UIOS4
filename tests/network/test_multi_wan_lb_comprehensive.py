@@ -653,9 +653,16 @@ class TestMultiWanLbComprehensive:
             page.page.wait_for_timeout(1500)
 
             page.page.reload()
-            page.page.wait_for_timeout(500)
+            page.page.wait_for_timeout(1500)
             for rule in test_rules:
-                assert not page.rule_exists(rule["name"]), f"规则 {rule['name']} 仍存在"
+                # 批量删除后UI列表可能刷新慢, 轮询等待规则消失(避免读到旧DOM误判删除失败)
+                deleted = False
+                for _ in range(5):
+                    if not page.rule_exists(rule["name"]):
+                        deleted = True
+                        break
+                    page.page.wait_for_timeout(800)
+                assert deleted, f"规则 {rule['name']} 删除后仍存在(轮询5次UI刷新)"
             print(f"  [OK] 批量删除 {len(test_rules)} 条成功")
             rec.add_detail(f"[结果] [OK] 全部删除")
 
