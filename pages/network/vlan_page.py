@@ -310,10 +310,13 @@ class VlanPage(IkuaiTablePage):
 
     # ==================== VLAN特有操作 ====================
     def cancel_delete(self, vlan_name: str):
-        """取消删除操作"""
-        row = self.page.locator("tr").filter(has_text=vlan_name)
-        row.get_by_role("button", name="删除").click()
-        self.page.get_by_role("button", name="取消").click()
+        """取消删除操作(用基类_click_rule_button点删除处理图标按钮; 再点可见取消)"""
+        self._click_rule_button(vlan_name, "删除")
+        self.page.wait_for_timeout(500)
+        # 点可见取消按钮(规避.ant-modal-confirm隐藏根的strict violation)
+        cancel_btn = self.page.get_by_role("button", name="取消").locator("visible=true")
+        if cancel_btn.count() > 0:
+            cancel_btn.first.click(timeout=3000)
         return self
 
     # ==================== 批量操作便捷方法 ====================
