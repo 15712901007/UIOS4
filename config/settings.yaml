@@ -115,6 +115,12 @@ test_data:
     ipv6_static:
       export_filename: "ipv6_static_config.csv"
       import_filename: "ipv6_static_import.csv"
+    ipv6_wan:
+      export_filename: "ipv6_wan_config.csv"
+      import_filename: "ipv6_wan_import.csv"
+    ipv6_lan:
+      export_filename: "ipv6_lan_config.csv"
+      import_filename: "ipv6_lan_import.csv"
     # 路由对象(6个分组, 导出格式txt)
     route_object_ip:
       export_filename: "route_object_ip_config.txt"

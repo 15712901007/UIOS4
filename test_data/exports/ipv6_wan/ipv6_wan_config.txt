@@ -1,0 +1,3 @@
+id=1 enabled=no tagname=CFWAN_1 interface= internet=dhcp prefix=auto prefix_hint= force_prefix=0 force_gen_duid=1 link_addr= ipv6_addr= ipv6_gateway=
+id=2 enabled=yes tagname=IPV6WAN_E1 interface=wan2 internet=dhcp prefix=auto prefix_hint= force_prefix=0 force_gen_duid=0 link_addr=fe80::e63a:6eff:fe7c:5a1f ipv6_addr= ipv6_gateway=
+id=3 enabled=yes tagname=IPV6WAN_T2 interface=wan3 internet=static prefix= prefix_hint= force_prefix=0 force_gen_duid=1 link_addr=fe80::e63a:6eff:fe7c:5a1e ipv6_addr=2001:db8:1::1/64 ipv6_gateway=fe80::1

@@ -1,0 +1,4 @@
+id,enabled,tagname,interface,internet,prefix,prefix_hint,force_prefix,force_gen_duid,link_addr,ipv6_addr,ipv6_gateway
+1,"no","CFWAN_1","","dhcp","auto","",0,1,"","",""
+2,"yes","IPV6WAN_E1","wan2","dhcp","auto","",0,0,"fe80::e63a:6eff:fe7c:5a1f","",""
+3,"yes","IPV6WAN_T2","wan3","static","","",0,1,"fe80::e63a:6eff:fe7c:5a1e","2001:db8:1::1/64","fe80::1"

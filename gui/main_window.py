@@ -1037,6 +1037,30 @@ class MainWindow(QMainWindow):
                             },
                         }
                     },
+                    "IPv6设置": {
+                        "children": {
+                            "外网设置": {
+                                "testcases": [
+                                    "test_ipv6_wan_comprehensive.py::TestIpv6WanComprehensive::test_ipv6_wan_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_ipv6_wan_comprehensive.py::TestIpv6WanComprehensive::test_ipv6_wan_comprehensive",
+                                    ],
+                                }
+                            },
+                            "内网设置": {
+                                "testcases": [
+                                    "test_ipv6_lan_comprehensive.py::TestIpv6LanComprehensive::test_ipv6_lan_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_ipv6_lan_comprehensive.py::TestIpv6LanComprehensive::test_ipv6_lan_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
                 }
             },
             "监控中心": {

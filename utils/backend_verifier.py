@@ -7559,6 +7559,227 @@ class BackendVerifier:
             logger.warning(f"[清理] IPv6清理失败: {e}")
             return ""
 
+    # ==================== IPv6外网设置(ipv6_wan_config)验证 ====================
+    # 网络配置>内外网设置>IPv6设置>外网设置. 脚本/usr/ikuai/script/ipv6.sh (wan_add/wan_edit/wan_del)
+    # 表ipv6_wan_config: id/enabled/tagname(unique)/interface(unique)/internet(dhcp|static|relay)/
+    #   link_addr(自动生成)/ipv6_addr(static)/ipv6_gateway(static)/prefix/prefix_hint/force_prefix/force_gen_duid
+    # multi_unsupport: 企业版num=3, WAN线路总数上限3. ipv6全局enabled=no时apply侧(odhcp6c/ipset)软断言.
+
+    def query_ipv6_wan_rule(self, tagname: str) -> Optional[Dict]:
+        """查询IPv6外网设置规则(按tagname)"""
+        return self._sqlite_query_line(
+            f"SELECT id,enabled,tagname,interface,internet,prefix,prefix_hint,"
+            f"ipv6_addr,ipv6_gateway,force_prefix,force_gen_duid "
+            f"FROM ipv6_wan_config WHERE tagname='{tagname}'"
+        )
+
+    def count_ipv6_wan(self, enabled_only: bool = False) -> int:
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM ipv6_wan_config {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_ipv6_wan_database(self, tagname: str,
+                                 expected_fields: Dict = None,
+                                 expect_absent: bool = False) -> VerifyResult:
+        """L1: 验证IPv6外网设置数据库(ipv6_wan_config表)
+
+        Args:
+            tagname: 规则名称
+            expected_fields: 期望字段值, 如 {"enabled":"yes","interface":"wan2","internet":"dhcp"}
+            expect_absent: True表示期望不存在(删除验证)
+        """
+        rule = self.query_ipv6_wan_rule(tagname)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=expect_absent,
+                message=f"IPv6外网'{tagname}'不存在"
+                        f"({'符合预期' if expect_absent else '应为存在'})",
+                raw_output="",
+            )
+        if expect_absent:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"IPv6外网'{tagname}'仍存在(期望已删除)",
+                details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False),
+            )
+        details = {
+            "id": rule.get("id"), "enabled": rule.get("enabled"),
+            "tagname": rule.get("tagname"), "interface": rule.get("interface"),
+            "internet": rule.get("internet"), "prefix": rule.get("prefix"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"IPv6外网'{tagname}'存在: iface={details['interface']}, "
+                        f"internet={details['internet']}, enabled={details['enabled']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"IPv6外网'{tagname}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"IPv6外网'{tagname}'数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def verify_ipv6_wan_apply(self, interface: str, enabled: bool = True) -> VerifyResult:
+        """L2软断言: 启用的dhcp/relay WAN应建ipset ipv6_prefix_$interface(全局IPv6关闭时可能缺失, 软断言)
+
+        Args:
+            interface: 外网接口名(wan2/wan3)
+            enabled: 规则是否启用(启用时才期望有ipset)
+        """
+        self.connect_router()
+        try:
+            out = self._router.exec("ipset list -n 2>/dev/null | grep ipv6_prefix || true")
+            has = f"ipv6_prefix_{interface}" in (out or "")
+            if enabled:
+                passed = has
+                msg = f"ipset ipv6_prefix_{interface}{'存在' if has else '缺失(全局IPv6关闭时正常)'}"
+            else:
+                passed = True
+                msg = f"规则未启用, 不期望ipset(ipset列表: {out.strip() or '空'})"
+            return VerifyResult(
+                level="L2-ipset", passed=passed, message=msg,
+                details={"interface": interface, "enabled": enabled, "ipset_list": out.strip()},
+                raw_output=out[:200],
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="L2-ipset", passed=False, message=f"ipset查询失败: {e}", raw_output=str(e),
+            )
+
+    def cleanup_ipv6_wan_test(self, prefix: str = "IPV6WAN") -> str:
+        """清理IPv6外网设置测试规则(按tagname前缀), 同步删缓存/ipset"""
+        self.connect_router()
+        try:
+            # 先查interface用于清理ipset, 再删DB
+            rows = self._sqlite_query_list(
+                f"SELECT id,interface,enabled,internet FROM ipv6_wan_config WHERE tagname LIKE '{prefix}%'"
+            )
+            for r in rows:
+                iface = r.get("interface", "")
+                if iface and r.get("enabled") == "yes" and r.get("internet") in ("dhcp", "relay"):
+                    self._router.exec(f"ipset destroy ipv6_prefix_{iface} 2>/dev/null; true")
+                if iface:
+                    self._router.exec(f"rm -f /tmp/iktmp/dhcp6c/{iface} 2>/dev/null; "
+                                      f"rm -f $IK_DIR_CACHE/config/ipv6_wan_config.{iface} 2>/dev/null; true")
+            out = self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"DELETE FROM ipv6_wan_config WHERE tagname LIKE '{prefix}%';\" 2>&1"
+            )
+            logger.info(f"[清理] IPv6外网({prefix}*): {out}")
+            return out or ""
+        except Exception as e:
+            logger.warning(f"[清理] IPv6外网清理失败: {e}")
+            return ""
+
+    # ==================== IPv6内网设置(ipv6_lan_config)验证 ====================
+    # 网络配置>内外网设置>IPv6设置>内网设置. 脚本/usr/ikuai/script/ipv6.sh (add/edit/del)
+    # 表ipv6_lan_config: id/enabled(默认yes)/tagname(unique)/interface(unique)/parent(绑定外网线路)/
+    #   internet(dhcp|static|relay)/prefix_len/dhcpv6/ipv6_addr/use_dns6/ipv6_dns1/ipv6_dns2/
+    #   ra_flags/ra_static/ra_mtu_set/ra_mtu/leasetime
+    # interface UNIQUE: lan1被默认CFLAN_1占用, 新增仅doc_app_default可用(最多1条).
+
+    def query_ipv6_lan_rule(self, tagname: str) -> Optional[Dict]:
+        """查询IPv6内网设置规则(按tagname)"""
+        return self._sqlite_query_line(
+            f"SELECT id,enabled,tagname,interface,parent,internet,prefix_len,"
+            f"dhcpv6,ra_flags,ra_static,leasetime "
+            f"FROM ipv6_lan_config WHERE tagname='{tagname}'"
+        )
+
+    def count_ipv6_lan(self, enabled_only: bool = False) -> int:
+        where = "WHERE enabled='yes'" if enabled_only else ""
+        result = self._sqlite_query_line(
+            f"SELECT count(*) as cnt FROM ipv6_lan_config {where}"
+        )
+        if result and "cnt" in result:
+            try:
+                return int(result["cnt"])
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
+    def verify_ipv6_lan_database(self, tagname: str,
+                                 expected_fields: Dict = None,
+                                 expect_absent: bool = False) -> VerifyResult:
+        """L1: 验证IPv6内网设置数据库(ipv6_lan_config表)"""
+        rule = self.query_ipv6_lan_rule(tagname)
+        if rule is None:
+            return VerifyResult(
+                level="L1-数据库", passed=expect_absent,
+                message=f"IPv6内网'{tagname}'不存在"
+                        f"({'符合预期' if expect_absent else '应为存在'})",
+                raw_output="",
+            )
+        if expect_absent:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"IPv6内网'{tagname}'仍存在(期望已删除)",
+                details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False),
+            )
+        details = {
+            "id": rule.get("id"), "enabled": rule.get("enabled"),
+            "tagname": rule.get("tagname"), "interface": rule.get("interface"),
+            "parent": rule.get("parent"), "internet": rule.get("internet"),
+            "ra_flags": rule.get("ra_flags"), "leasetime": rule.get("leasetime"),
+        }
+        raw = json.dumps(details, ensure_ascii=False)
+        if expected_fields is None:
+            return VerifyResult(
+                level="L1-数据库", passed=True,
+                message=f"IPv6内网'{tagname}'存在: iface={details['interface']}, "
+                        f"parent={details['parent']}, internet={details['internet']}, "
+                        f"enabled={details['enabled']}",
+                details={"rule": details}, raw_output=raw,
+            )
+        mismatches = {}
+        for fld, expected in expected_fields.items():
+            actual = str(rule.get(fld, ""))
+            if actual != str(expected):
+                mismatches[fld] = {"expected": str(expected), "actual": actual}
+        if mismatches:
+            return VerifyResult(
+                level="L1-数据库", passed=False,
+                message=f"IPv6内网'{tagname}'字段不匹配: {mismatches}",
+                details={"rule": details, "mismatches": mismatches}, raw_output=raw,
+            )
+        return VerifyResult(
+            level="L1-数据库", passed=True,
+            message=f"IPv6内网'{tagname}'数据库验证通过",
+            details={"rule": details}, raw_output=raw,
+        )
+
+    def cleanup_ipv6_lan_test(self, prefix: str = "IPV6LAN") -> str:
+        """清理IPv6内网设置测试规则(按tagname前缀)"""
+        self.connect_router()
+        try:
+            out = self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"DELETE FROM ipv6_lan_config WHERE tagname LIKE '{prefix}%';\" 2>&1"
+            )
+            logger.info(f"[清理] IPv6内网({prefix}*): {out}")
+            return out or ""
+        except Exception as e:
+            logger.warning(f"[清理] IPv6内网清理失败: {e}")
+            return ""
+
     # ==================== 自定义协议(dprotos / dprotos_l7)验证 ====================
     # 两个独立平行子模块(SSH探查确认 2026-06-23):
     #   L4 dprotos: 表dprotos, iptables mangle DPROTO链 + ipset dproto_src/dst/sport/dport_$id
