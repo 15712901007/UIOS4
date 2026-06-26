@@ -283,17 +283,23 @@ class TestStreamControlComprehensive:
             print("\n[步骤14] 优先域名 异常输入...")
             r1 = high_page.try_add_rule_invalid(name="", host="x.example.com",
                                                 expect_fail=True)
-            rec.add_detail(f"  空名称: {'拦截[OK]' if r1['success'] else '未拦截[FAIL]'}")
+            m1 = r1.get('error_message', '') or '(无提示)'
+            rec.add_detail(f"  空名称: {'拦截[OK]' if r1['success'] else '未拦截[FAIL]'} 提示={m1[:40]}")
+            print(f"  空名称: 提示={m1[:50]}")
             if not r1["success"]:
                 ui_failures.append("优先域名: 空名称未拦截")
 
             r2 = high_page.try_add_rule_invalid(name="hpempty", host="",
                                                 expect_fail=True)
-            rec.add_detail(f"  空域名: {'拦截[OK]' if r2['success'] else '未拦截[FAIL]'}")
+            m2 = r2.get('error_message', '') or '(无提示)'
+            rec.add_detail(f"  空域名: {'拦截[OK]' if r2['success'] else '未拦截[FAIL]'} 提示={m2[:40]}")
+            print(f"  空域名: 提示={m2[:50]}")
 
             r3 = high_page.try_add_rule_invalid(name="hp1", host="dup.example.com",
                                                 expect_fail=True)
-            rec.add_detail(f"  重复名称: {'拦截[OK]' if r3['success'] else '未拦截[FAIL]'}")
+            m3 = r3.get('error_message', '') or '(无提示)'
+            rec.add_detail(f"  重复名称: {'拦截[OK]' if r3['success'] else '未拦截[FAIL]'} 提示={m3[:40]}")
+            print(f"  重复名称: 提示={m3[:50]}")
 
         # ========== 步骤15: 优先域名-批量操作 ==========
         with rec.step("步骤15: 优先域名-批量停用/启用", "全选批量停用+启用 + SSH L1断言"):
@@ -465,7 +471,9 @@ class TestStreamControlComprehensive:
 
             r1 = alone_page.try_add_rule_invalid(name="", ip="192.168.148.9",
                                                  expect_fail=True)
-            rec.add_detail(f"  空名称: {'拦截[OK]' if r1['success'] else '未拦截[FAIL]'}")
+            m1 = r1.get('error_message', '') or '(无提示)'
+            rec.add_detail(f"  空名称: {'拦截[OK]' if r1['success'] else '未拦截[FAIL]'} 提示={m1[:40]}")
+            print(f"  空名称: 提示={m1[:50]}")
             if not r1["success"]:
                 ui_failures.append("终端限速: 空名称未拦截")
 
