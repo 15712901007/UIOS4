@@ -7639,32 +7639,67 @@ class BackendVerifier:
             details={"rule": details}, raw_output=raw,
         )
 
-    def verify_ipv6_wan_apply(self, interface: str, enabled: bool = True) -> VerifyResult:
-        """L2软断言: 启用的dhcp/relay WAN应建ipset ipv6_prefix_$interface(全局IPv6关闭时可能缺失, 软断言)
+    def verify_ipv6_wan_kernel(self, interface: str, internet: str = "dhcp",
+                               enabled: bool = True,
+                               ipv6_addr: str = None,
+                               ipv6_gateway: str = None) -> VerifyResult:
+        """L2/L3/L4: IPv6外网内核产物验证(基于ipv6.sh apply原理, 非iptables)
+
+        ipv6.sh wan_add/wan_up启用时apply路径:
+        - __ipset_v6_create ipv6_prefix_$interface (dhcp/relay)         → L2 ipset
+        - ip -6 addr add $ipv6_addr (static) + __ipv6_route_add         → L3 addr/route
+        - __ipv6_rule_add: ip -6 rule add dev $iface table $iface prio 10000 → L4 策略路由
+        !!IPv6不走iptables(与IPv4 NAT/QoS不同), 用ipset+iproute2+odhcp6c/odhcpd进程.
 
         Args:
-            interface: 外网接口名(wan2/wan3)
-            enabled: 规则是否启用(启用时才期望有ipset)
+            interface: 外网接口(wan2/wan3)
+            internet: dhcp/static/relay
+            enabled: 是否启用(未启用无apply, 直接pass)
+            ipv6_addr: static模式IPv6地址(如2001:db8:1::1/64)
+            ipv6_gateway: static模式网关(如fe80::1)
         """
         self.connect_router()
-        try:
-            out = self._router.exec("ipset list -n 2>/dev/null | grep ipv6_prefix || true")
-            has = f"ipv6_prefix_{interface}" in (out or "")
-            if enabled:
-                passed = has
-                msg = f"ipset ipv6_prefix_{interface}{'存在' if has else '缺失(全局IPv6关闭时正常)'}"
-            else:
-                passed = True
-                msg = f"规则未启用, 不期望ipset(ipset列表: {out.strip() or '空'})"
+        if not enabled:
             return VerifyResult(
-                level="L2-ipset", passed=passed, message=msg,
-                details={"interface": interface, "enabled": enabled, "ipset_list": out.strip()},
-                raw_output=out[:200],
-            )
+                level="L234-内核", passed=True,
+                message=f"{interface}未启用, 无apply内核产物(符合预期)", raw_output="")
+        checks = []  # (层级, 通过?, 说明)
+        try:
+            # L2: ipset ipv6_prefix_$interface (dhcp/relay)
+            if internet in ("dhcp", "relay"):
+                ipset_out = self._router.exec("ipset list -n 2>/dev/null")
+                has_ipset = f"ipv6_prefix_{interface}" in (ipset_out or "")
+                checks.append(("L2-ipset", has_ipset,
+                               f"ipv6_prefix_{interface}{'存在' if has_ipset else '缺失'}"))
+            # L3 static: ip -6 addr 全局地址 + ip -6 route 默认路由
+            if internet == "static" and ipv6_addr:
+                addr_short = ipv6_addr.split("/")[0]
+                addr_out = self._router.exec(f"ip -6 addr show dev {interface} 2>/dev/null")
+                has_addr = addr_short in (addr_out or "")
+                checks.append(("L3-addr", has_addr,
+                               f"全局地址{addr_short}{'已下发' if has_addr else '未下发(无上游?)'}"))
+                if ipv6_gateway:
+                    route_out = self._router.exec("ip -6 route show 2>/dev/null")
+                    has_route = ipv6_gateway in (route_out or "")
+                    checks.append(("L3-route", has_route,
+                                   f"默认路由via {ipv6_gateway}{'已下发' if has_route else '未下发'}"))
+            # L4: ip -6 rule lookup $interface (策略路由, __ipv6_rule_add)
+            rule_out = self._router.exec("ip -6 rule show 2>/dev/null")
+            has_rule = f"lookup {interface}" in (rule_out or "")
+            checks.append(("L4-rule", has_rule,
+                           f"策略路由rule lookup {interface}{'存在' if has_rule else '缺失'}"))
+
+            ok_cnt = sum(1 for _, p, _ in checks if p)
+            detail = "; ".join(f"{lvl}:{'[OK]' if p else '[FAIL]'} {msg}" for lvl, p, msg in checks)
+            # static模式所有都应pass; dhcp模式addr/route不查(无上游), ipset+rule应pass
+            passed = ok_cnt == len(checks)
+            return VerifyResult(
+                level="L234-内核", passed=passed,
+                message=f"{interface}({internet})内核验证[{ok_cnt}/{len(checks)}]: {detail}",
+                details={"checks": checks}, raw_output=detail[:250])
         except Exception as e:
             return VerifyResult(
-                level="L2-ipset", passed=False, message=f"ipset查询失败: {e}", raw_output=str(e),
-            )
+                level="L234-内核", passed=False, message=f"内核查询失败: {e}", raw_output=str(e))
 
     def cleanup_ipv6_wan_test(self, prefix: str = "IPV6WAN") -> str:
         """清理IPv6外网设置测试规则(按tagname前缀), 同步删缓存/ipset"""
@@ -7779,6 +7814,38 @@ class BackendVerifier:
         except Exception as e:
             logger.warning(f"[清理] IPv6内网清理失败: {e}")
             return ""
+
+    def verify_ipv6_lan_kernel(self, interface: str, enabled: bool = True) -> VerifyResult:
+        """L2/L3: IPv6内网内核产物验证(基于ipv6.sh __init_odhcpd_config原理)
+
+        ipv6.sh add/up启用时apply路径:
+        - __create_lan_config_to_cache + __lan_odhcpdv6_restart + __init_odhcpd_config
+          → 生成odhcpd配置 /tmp/iktmp/odhcpd/ik_dhcpd.conf, 含 interface=$iface 行
+        - static: ip -6 addr add (本环境IPv6 off, odhcpd进程可能未起, 以配置文件为准)
+
+        Args:
+            interface: 内网接口(doc_app_default/lan1)
+            enabled: 是否启用
+        """
+        self.connect_router()
+        if not enabled:
+            return VerifyResult(
+                level="L23-内核", passed=True,
+                message=f"{interface}未启用, 无apply(符合预期)", raw_output="")
+        try:
+            out = self._router.exec("cat /tmp/iktmp/odhcpd/ik_dhcpd.conf 2>/dev/null")
+            has = f"interface={interface}" in (out or "")
+            # 附加: odhcpd进程是否运行(本环境IPv6 off可能未起, 软参考)
+            proc = self._router.exec("pgrep -x odhcpd >/dev/null && echo running || echo stopped")
+            return VerifyResult(
+                level="L23-内核", passed=has,
+                message=f"odhcpd配置ik_dhcpd.conf{'含' if has else '不含'}interface={interface}"
+                        f"(odhcpd进程={proc.strip()})",
+                details={"interface": interface, "odhcpd_proc": proc.strip()},
+                raw_output=(out or "")[:200])
+        except Exception as e:
+            return VerifyResult(
+                level="L23-内核", passed=False, message=f"内核查询失败: {e}", raw_output=str(e))
 
     def restore_ipv6_wan_default(self) -> bool:
         """恢复IPv6外网默认CFWAN_1(clear-existing导入会删默认, 且CFWAN_1空interface不可导入, 需SQL恢复)"""

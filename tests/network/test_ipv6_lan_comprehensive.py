@@ -144,6 +144,9 @@ class TestIpv6LanComprehensive:
                        T1, must_pass=True,
                        expected_fields={"enabled": "yes", "interface": "doc_app_default",
                                         "internet": "dhcp", "leasetime": "120"})
+            # L2/L3内核验证(odhcpd配置ik_dhcpd.conf含接口; 软断言)
+            ssh_verify(f"L23-内核({T1})", backend_verifier.verify_ipv6_lan_kernel,
+                       "doc_app_default", must_pass=False, enabled=True)
 
         # ========== 步骤4: 编辑(改名+改租期) ==========
         with rec.step(f"步骤4: 编辑规则 {T1}->{T1_EDITED}", "改名+租期改240"):

@@ -120,6 +120,9 @@ class TestIpv6WanComprehensive:
             ssh_verify(f"L1-数据库({T1})", backend_verifier.verify_ipv6_wan_database,
                        T1, must_pass=True,
                        expected_fields={"enabled": "yes", "interface": "wan2", "internet": "dhcp"})
+            # L2/L3/L4内核验证(ipset+ip-6 rule, dhcp模式; 软断言)
+            ssh_verify(f"L234-内核({T1})", backend_verifier.verify_ipv6_wan_kernel,
+                       "wan2", must_pass=False, internet="dhcp", enabled=True)
 
         # ========== 步骤3: 添加规则2 (wan3/static) ==========
         with rec.step(f"步骤3: 添加规则 {T2}", "wan3/静态IP"):
@@ -133,6 +136,10 @@ class TestIpv6WanComprehensive:
             ssh_verify(f"L1-数据库({T2})", backend_verifier.verify_ipv6_wan_database,
                        T2, must_pass=True,
                        expected_fields={"enabled": "yes", "interface": "wan3", "internet": "static"})
+            # L2/L3/L4内核验证(static模式: ip-6 addr+route+rule应全通过; 软断言)
+            ssh_verify(f"L234-内核({T2})", backend_verifier.verify_ipv6_wan_kernel,
+                       "wan3", must_pass=False, internet="static", enabled=True,
+                       ipv6_addr="2001:db8:1::1/64", ipv6_gateway="fe80::1")
 
         # ========== 步骤4: 编辑规则1 (改名) ==========
         with rec.step(f"步骤4: 编辑规则 {T1}->{T1_EDITED}", "改名"):
