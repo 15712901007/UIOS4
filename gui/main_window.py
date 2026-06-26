@@ -244,6 +244,13 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        export_results_action = QAction("导出测试结果(来自最近测试)", self)
+        export_results_action.setShortcut("Ctrl+R")
+        export_results_action.triggered.connect(self._export_test_results)
+        file_menu.addAction(export_results_action)
+
+        file_menu.addSeparator()
+
         exit_action = QAction("退出", self)
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
@@ -966,6 +973,70 @@ class MainWindow(QMainWindow):
                             ],
                         }
                     },
+                    "VPN客户端": {
+                        "children": {
+                            "PPTP": {
+                                "testcases": [
+                                    "test_pptp_client_comprehensive.py::TestPptpClientComprehensive::test_pptp_client_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_pptp_client_comprehensive.py::TestPptpClientComprehensive::test_pptp_client_comprehensive",
+                                    ],
+                                }
+                            },
+                            "L2TP": {
+                                "testcases": [
+                                    "test_l2tp_client_comprehensive.py::TestL2tpClientComprehensive::test_l2tp_client_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_l2tp_client_comprehensive.py::TestL2tpClientComprehensive::test_l2tp_client_comprehensive",
+                                    ],
+                                }
+                            },
+                            "OpenVPN": {
+                                "testcases": [
+                                    "test_openvpn_client_comprehensive.py::TestOpenvpnClientComprehensive::test_openvpn_client_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_openvpn_client_comprehensive.py::TestOpenvpnClientComprehensive::test_openvpn_client_comprehensive",
+                                    ],
+                                }
+                            },
+                            "IPSec VPN": {
+                                "testcases": [
+                                    "test_ipsec_vpn_comprehensive.py::TestIpsecVpnComprehensive::test_ipsec_vpn_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_ipsec_vpn_comprehensive.py::TestIpsecVpnComprehensive::test_ipsec_vpn_comprehensive",
+                                    ],
+                                }
+                            },
+                            "IKEv2/IPSec": {
+                                "testcases": [
+                                    "test_ike_client_comprehensive.py::TestIkeClientComprehensive::test_ike_client_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_ike_client_comprehensive.py::TestIkeClientComprehensive::test_ike_client_comprehensive",
+                                    ],
+                                }
+                            },
+                            "WireGuard": {
+                                "testcases": [
+                                    "test_wireguard_comprehensive.py::TestWireguardComprehensive::test_wireguard_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_wireguard_comprehensive.py::TestWireguardComprehensive::test_wireguard_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
                 }
             },
             "监控中心": {
@@ -1429,6 +1500,56 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             self.config = dialog.get_config()
             self._load_config_to_ui()
+
+    def _export_test_results(self):
+        """从最近一次测试结果(reports/output/test_results.json)导出真实测试结果 Excel"""
+        from PySide6.QtWidgets import QMessageBox, QFileDialog
+        from datetime import datetime
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        json_path = os.path.join(project_root, "reports", "output", "test_results.json")
+        if not os.path.exists(json_path):
+            QMessageBox.warning(
+                self, "无测试结果",
+                "未找到测试结果 JSON。\n请先在 GUI 运行测试, 跑完会自动生成:\n" + json_path
+            )
+            return
+        default_name = f"测试结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_path = os.path.join(project_root, "reports", default_name)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出测试结果", default_path, "Excel 文件 (*.xlsx)")
+        if not path:
+            return
+        try:
+            from utils.test_results_to_excel import export_results_to_excel
+            ok, msg = export_results_to_excel(json_path, path)
+        except Exception as e:
+            QMessageBox.critical(self, "导出异常", str(e))
+            return
+        if ok:
+            self._log("INFO", msg)
+            reply = QMessageBox.question(
+                self, "导出成功", msg + "\n\n是否打开所在文件夹?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self._open_path_in_explorer(path)
+        else:
+            QMessageBox.warning(self, "导出失败", msg)
+            self._log("ERROR", "导出测试结果失败: " + msg)
+
+    @staticmethod
+    def _open_path_in_explorer(path: str):
+        """在系统文件管理器中定位文件(Windows 资源管理器 /select)"""
+        import subprocess
+        try:
+            norm = os.path.normpath(path)
+            if os.name == "nt":
+                subprocess.Popen(["explorer", "/select,", norm])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(norm)])
+        except Exception:
+            pass
 
     def _open_report(self, report_path=None):
         """打开测试报告"""
