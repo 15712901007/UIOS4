@@ -1,0 +1,1 @@
+id= enabled=yes tagname=IPV6WAN_IMP interface=wan2 internet=dhcp prefix=auto prefix_hint= force_prefix=0 force_gen_duid=1 link_addr= ipv6_addr= ipv6_gateway=

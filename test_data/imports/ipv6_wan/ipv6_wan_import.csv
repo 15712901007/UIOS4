@@ -1,0 +1,2 @@
+id,enabled,tagname,interface,internet,prefix,prefix_hint,force_prefix,force_gen_duid,link_addr,ipv6_addr,ipv6_gateway
+,"yes","IPV6WAN_IMP","wan2","dhcp","auto","",0,1,"","",""

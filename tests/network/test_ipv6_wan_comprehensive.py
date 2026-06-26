@@ -4,20 +4,23 @@ IPv6外网设置综合测试用例
 网络配置 > 内外网设置 > IPv6设置 > 外网设置 tab 综合测试
 表格型(IPv6 WAN线路), 添加/编辑独立页面(/ipv6Settings/extranetSetting/add), 表单全#id定位。
 
-一次测试覆盖(13步):
+一次测试覆盖(16步, 参照VLAN/IP限速/port_map全流程):
 1. 检查并清理环境(IPV6WAN*残留)
 2. 添加规则1(wan2/DHCPv6动态获取) + L1数据库验证
 3. 添加规则2(wan3/静态IP) + L1数据库验证
 4. 编辑规则1(改名) + L1验证
 5. 停用/启用规则2 + L1验证enabled字段
-6. 异常输入(空名称/重复名称/非法static IPv6地址/第3条上限multi_unsupport)
+6. 异常输入(空名称/重复名称/非法static IPv6地址/第3条上限multi_unsupport/超长名/特殊字符)
 7. 搜索(精确/部分/不存在/清空)
-8. 导出(CSV/TXT双格式)
-9. 批量停用 + SSH计数验证
-10. 批量启用 + SSH计数验证
-11. 批量删除 + SSH验证(应不存在)
-12. 帮助功能
-13. 最终清理 + L1验证无残留
+8. 排序(外网接口列)
+9. 导出(CSV/TXT双格式)
+10. 批量停用 + SSH计数验证
+11. 批量启用 + SSH计数验证
+12. 批量删除 + SSH验证(应不存在)
+13. 导入(追加) + L1验证
+14. 导入(清空现有) + 验证clear生效 + 恢复默认CFWAN_1
+15. 帮助功能
+16. 最终清理 + L1验证无残留 + 恢复CFWAN_1
 
 !!环境与约束:
 - IPv6全局enabled=no(WAN无真实IPv6上游), 故apply侧(odhcp6c/ipset)软断言(must_pass=False),
@@ -25,10 +28,8 @@ IPv6外网设置综合测试用例
 - WAN线路总数上限3条(企业版multi num=3), 已有默认CFWAN_1, 故本测试加2条(达上限)。
 - 测试规则用wan2/wan3(避开管理口wan1), enabled=yes安全(实测不锁网, 删除即清理ipset)。
 - 批量操作只勾选测试规则(逐条select_rule), 避开默认CFWAN_1。
-
-字段映射: tagname(名称), interface(外网接口wan1/wan2/wan3), internet(接入方式dhcp/static/relay),
-          ipv6_addr/ipv6_gateway(static模式), prefix(请求前缀长度auto/60/62/64),
-          prefix_hint(尝试固定前缀), force_prefix(强行获取前缀), enabled(yes/no)
+- 导入文件只含合法测试规则(IPV6WAN_IMP): 默认CFWAN_1空interface通不过导入校验会致整批中止(code3005),
+  故不能导入含CFWAN_1的导出文件; clear-existing导入会删CFWAN_1且不可导入恢复→测试后SQL恢复。
 """
 import pytest
 import os
@@ -43,8 +44,8 @@ class TestIpv6WanComprehensive:
 
     def test_ipv6_wan_comprehensive(self, ipv6_wan_page_logged_in: Ipv6WanPage,
                                      step_recorder: StepRecorder, request):
-        """综合测试: 添加2条 -> L1验证 -> 编辑 -> 停用启用 -> 异常(含上限) ->
-        搜索 -> 导出 -> 批量停用启用删除 -> 帮助 -> 清理"""
+        """综合测试: 添加2条 -> L1验证 -> 编辑 -> 停用启用 -> 异常 -> 搜索 -> 排序 ->
+        导出 -> 批量停用启用删除 -> 导入追加 -> 导入清空 -> 帮助 -> 清理"""
         page = ipv6_wan_page_logged_in
         rec = step_recorder
 
@@ -80,7 +81,12 @@ class TestIpv6WanComprehensive:
         T1 = "IPV6WAN_T1"          # wan2 / dhcp
         T1_EDITED = "IPV6WAN_E1"
         T2 = "IPV6WAN_T2"          # wan3 / static
-        test_names_all = {T1, T1_EDITED, T2}
+        IMP = "IPV6WAN_IMP"        # 导入测试规则(wan2/dhcp)
+        test_names_all = {T1, T1_EDITED, T2, IMP}
+
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        import_file_csv = os.path.join(project_root, "test_data", "imports", "ipv6_wan", "ipv6_wan_import.csv")
+        import_file_txt = os.path.join(project_root, "test_data", "imports", "ipv6_wan", "ipv6_wan_import.txt")
 
         print("\n" + "=" * 60)
         print("IPv6外网设置综合测试开始")
@@ -98,7 +104,6 @@ class TestIpv6WanComprehensive:
             count = page.get_rule_count()
             print(f"  当前外网设置规则数(含默认CFWAN_1): {count}")
             rec.add_detail(f"清理后规则数: {count}")
-            # 不动默认CFWAN_1, 仅清理测试残留(DB层已清, UI刷新)
             page.page.reload()
             page.page.wait_for_load_state("networkidle")
             page.navigate_to_ipv6_wan()
@@ -114,23 +119,20 @@ class TestIpv6WanComprehensive:
             rec.add_detail(f"[OK] 添加 {T1} (wan2/dhcp)")
             ssh_verify(f"L1-数据库({T1})", backend_verifier.verify_ipv6_wan_database,
                        T1, must_pass=True,
-                       expected_fields={"enabled": "yes", "interface": "wan2",
-                                        "internet": "dhcp"})
+                       expected_fields={"enabled": "yes", "interface": "wan2", "internet": "dhcp"})
 
         # ========== 步骤3: 添加规则2 (wan3/static) ==========
         with rec.step(f"步骤3: 添加规则 {T2}", "wan3/静态IP"):
             print(f"\n[步骤3] 添加规则: {T2} (wan3, static)")
             result = page.add_rule(name=T2, interface="wan3",
                                    internet=Ipv6WanPage.INTERNET_STATIC, enabled=True,
-                                   ipv6_addr="2001:db8:1::1/64",
-                                   ipv6_gateway="fe80::1")
+                                   ipv6_addr="2001:db8:1::1/64", ipv6_gateway="fe80::1")
             assert result is True, f"添加规则 {T2} 失败"
             print(f"  + 已添加: {T2}")
             rec.add_detail(f"[OK] 添加 {T2} (wan3/static)")
             ssh_verify(f"L1-数据库({T2})", backend_verifier.verify_ipv6_wan_database,
                        T2, must_pass=True,
-                       expected_fields={"enabled": "yes", "interface": "wan3",
-                                        "internet": "static"})
+                       expected_fields={"enabled": "yes", "interface": "wan3", "internet": "static"})
 
         # ========== 步骤4: 编辑规则1 (改名) ==========
         with rec.step(f"步骤4: 编辑规则 {T1}->{T1_EDITED}", "改名"):
@@ -173,7 +175,7 @@ class TestIpv6WanComprehensive:
                        T2, must_pass=True, expected_fields={"enabled": "yes"})
 
         # ========== 步骤6: 异常输入测试(含第3条上限) ==========
-        with rec.step("步骤6: 异常输入测试", "空名/重复/非法IPv6/第3条上限"):
+        with rec.step("步骤6: 异常输入测试", "空名/重复/非法IPv6/第3条上限/超长名/特殊字符"):
             print("\n[步骤6] 异常输入测试...")
             rec.add_detail("[异常输入测试]")
 
@@ -209,7 +211,6 @@ class TestIpv6WanComprehensive:
             add3 = page.add_rule(name="IPV6WAN_T3", interface="wan1",
                                  internet=Ipv6WanPage.INTERNET_DHCP, enabled=False)
             rec.add_detail(f"    第3条添加结果: {add3}(期望False=被multi_unsupport拦截)")
-            # SSH铁证: 总数应仍为3, T3不入库
             if backend_verifier:
                 cnt = backend_verifier.count_ipv6_wan()
                 t3 = backend_verifier.query_ipv6_wan_rule("IPV6WAN_T3")
@@ -220,7 +221,21 @@ class TestIpv6WanComprehensive:
                     rec.add_detail("[OK] 第3条上限拦截生效")
                 else:
                     rec.add_detail(f"[WARN] 上限校验异常 add3={add3} cnt={cnt}")
-                    print(f"    [WARN] 上限校验: add3={add3}, cnt={cnt}")
+
+            # 6.5 超长名称(>15字符)
+            rec.add_detail("  超长名称(20字符):")
+            long_name = "a" * 20
+            r = page.try_add_rule_invalid(name=long_name, interface="wan1",
+                                          internet=Ipv6WanPage.INTERNET_DHCP)
+            print(f"    [INFO] 超长名: {r}")
+            rec.add_detail(f"    [INFO] 超长名: {r}")
+
+            # 6.6 特殊字符
+            rec.add_detail("  特殊字符:")
+            r = page.try_add_rule_invalid(name="<script>alert(1)</script>", interface="wan1",
+                                          internet=Ipv6WanPage.INTERNET_DHCP)
+            print(f"    [INFO] 特殊字符: {r}")
+            rec.add_detail(f"    [INFO] 特殊字符: {r}")
 
             page.page.reload()
             page.page.wait_for_load_state("networkidle")
@@ -264,15 +279,31 @@ class TestIpv6WanComprehensive:
             page.clear_search()
             page.page.wait_for_timeout(500)
 
-        # ========== 步骤8: 导出测试(CSV+TXT) ==========
-        export_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "test_data", "exports", "ipv6_wan")
+        # ========== 步骤8: 排序测试 ==========
+        with rec.step("步骤8: 排序测试", "外网接口列排序"):
+            print("\n[步骤8] 排序测试...")
+            rec.add_detail("[排序测试]")
+            try:
+                sorted_ok = page.sort_by_column("外网接口")
+                if sorted_ok:
+                    print(f"  [OK] 外网接口列排序成功")
+                    rec.add_detail("[OK] 外网接口列排序成功")
+                else:
+                    print(f"  [WARN] 外网接口列无排序图标(可能不支持)")
+                    rec.add_detail("[WARN] 无排序图标")
+            except Exception as e:
+                print(f"  [WARN] 排序异常: {e}")
+                rec.add_detail(f"[WARN] 排序异常: {e}")
+            page.clear_search()
+            page.page.wait_for_timeout(300)
+
+        # ========== 步骤9: 导出测试(CSV+TXT) ==========
+        export_dir = os.path.join(project_root, "test_data", "exports", "ipv6_wan")
         export_file_csv = os.path.join(export_dir, "ipv6_wan_config.csv")
         export_file_txt = os.path.join(export_dir, "ipv6_wan_config.txt")
 
-        with rec.step("步骤8: 导出测试", "导出CSV和TXT"):
-            print("\n[步骤8] 导出测试...")
+        with rec.step("步骤9: 导出测试", "导出CSV和TXT"):
+            print("\n[步骤9] 导出测试...")
             rec.add_detail("[导出测试]")
             for fmt, fpath in [("csv", export_file_csv), ("txt", export_file_txt)]:
                 try:
@@ -289,12 +320,13 @@ class TestIpv6WanComprehensive:
                     print(f"  [WARN] {fmt.upper()}导出异常: {e}")
                     rec.add_detail(f"[WARN] {fmt.upper()}导出异常: {e}")
 
-        # ========== 步骤9: 批量停用 ==========
-        with rec.step("步骤9: 批量停用", f"停用{T1_EDITED}+{T2}(避开CFWAN_1)"):
-            print(f"\n[步骤9] 批量停用 {T1_EDITED}, {T2}...")
+        # ========== 步骤10: 批量停用 ==========
+        with rec.step("步骤10: 批量停用", f"停用{T1_EDITED}+{T2}(避开CFWAN_1)"):
+            print(f"\n[步骤10] 批量停用 {T1_EDITED}, {T2}...")
             rec.add_detail(f"[批量停用] 目标: {T1_EDITED}, {T2}")
             batch_names = [T1_EDITED, T2]
             disable_ok = False
+            disabled_cnt = 0
             for attempt in range(3):
                 page.navigate_to_ipv6_wan()
                 page.page.wait_for_timeout(500)
@@ -325,12 +357,13 @@ class TestIpv6WanComprehensive:
                 ui_failures.append(f"批量停用仅{disabled_cnt}/{len(batch_names)}")
                 rec.add_detail(f"[WARN] 批量停用未完全生效")
 
-        # ========== 步骤10: 批量启用 ==========
-        with rec.step("步骤10: 批量启用", f"启用{T1_EDITED}+{T2}"):
-            print(f"\n[步骤10] 批量启用 {T1_EDITED}, {T2}...")
+        # ========== 步骤11: 批量启用 ==========
+        with rec.step("步骤11: 批量启用", f"启用{T1_EDITED}+{T2}"):
+            print(f"\n[步骤11] 批量启用 {T1_EDITED}, {T2}...")
             rec.add_detail(f"[批量启用] 目标: {T1_EDITED}, {T2}")
             batch_names = [T1_EDITED, T2]
             enable_ok = False
+            enabled_cnt = 0
             for attempt in range(3):
                 page.navigate_to_ipv6_wan()
                 page.page.wait_for_timeout(500)
@@ -361,9 +394,9 @@ class TestIpv6WanComprehensive:
                 ui_failures.append(f"批量启用仅{enabled_cnt}/{len(batch_names)}")
                 rec.add_detail(f"[WARN] 批量启用未完全生效")
 
-        # ========== 步骤11: 批量删除 ==========
-        with rec.step("步骤11: 批量删除", f"删除{T1_EDITED}+{T2}(避开CFWAN_1)"):
-            print(f"\n[步骤11] 批量删除 {T1_EDITED}, {T2}...")
+        # ========== 步骤12: 批量删除 ==========
+        with rec.step("步骤12: 批量删除", f"删除{T1_EDITED}+{T2}(避开CFWAN_1)"):
+            print(f"\n[步骤12] 批量删除 {T1_EDITED}, {T2}...")
             rec.add_detail(f"[批量删除] 目标: {T1_EDITED}, {T2}")
             batch_names = [T1_EDITED, T2]
             page.navigate_to_ipv6_wan()
@@ -383,17 +416,76 @@ class TestIpv6WanComprehensive:
                 else:
                     print(f"  [OK] 已删除: {n}")
                     rec.add_detail(f"[OK] 已删除 {n}")
-            # SSH验证应不存在 + CFWAN_1未受影响
             for n in batch_names:
                 ssh_verify(f"L1-删除验证({n})", backend_verifier.verify_ipv6_wan_database,
                            n, must_pass=True, expect_absent=True)
-            if backend_verifier:
-                cfwan = backend_verifier.query_ipv6_wan_rule("CFWAN_1")
-                rec.add_detail(f"    SSH: CFWAN_1仍在={cfwan is not None}(应True, 默认未动)")
 
-        # ========== 步骤12: 帮助功能 ==========
-        with rec.step("步骤12: 帮助功能测试", "测试帮助图标"):
-            print("\n[步骤12] 帮助功能测试...")
+        # ========== 步骤13: 导入测试(追加) ==========
+        with rec.step(f"步骤13: 导入配置(追加)", f"导入{IMP} + L1验证"):
+            print(f"\n[步骤13] 导入配置(追加){IMP}...")
+            rec.add_detail("[导入测试-追加]")
+            count_before = page.get_rule_count()
+            rec.add_detail(f"  导入前: {count_before}条")
+            try:
+                page.import_rules(import_file_csv, clear_existing=False)
+                page.page.wait_for_timeout(1500)
+                page.page.reload()
+                page.navigate_to_ipv6_wan()
+                page.page.wait_for_timeout(800)
+                count_after = page.get_rule_count()
+                rec.add_detail(f"  导入后: {count_after}条")
+                if page.rule_exists(IMP):
+                    print(f"  [OK] 追加导入成功: {IMP} 已存在")
+                    rec.add_detail(f"[OK] 追加导入 {IMP}")
+                    ssh_verify(f"L1-导入后({IMP})", backend_verifier.verify_ipv6_wan_database,
+                               IMP, must_pass=True,
+                               expected_fields={"interface": "wan2", "internet": "dhcp"})
+                else:
+                    print(f"  [WARN] 追加导入后 {IMP} 未找到")
+                    rec.add_detail(f"[WARN] {IMP}未找到")
+                    ui_failures.append("导入追加失败")
+            except Exception as e:
+                print(f"  [WARN] 导入异常: {e}")
+                rec.add_detail(f"[WARN] 导入异常: {e}")
+                ui_failures.append("导入追加异常")
+
+        # ========== 步骤14: 导入测试(清空现有) ==========
+        with rec.step("步骤14: 导入配置(清空现有)", f"清空后导入{IMP} + 验证clear + 恢复CFWAN_1"):
+            print(f"\n[步骤14] 导入配置(清空现有){IMP}...")
+            rec.add_detail("[导入测试-清空现有]")
+            try:
+                page.import_rules(import_file_txt, clear_existing=True)
+                page.page.wait_for_timeout(2000)
+                page.page.reload()
+                page.navigate_to_ipv6_wan()
+                page.page.wait_for_timeout(800)
+                # clear-existing会删CFWAN_1(空interface不可导入恢复), 验证clear生效
+                if backend_verifier:
+                    cfwan = backend_verifier.query_ipv6_wan_rule("CFWAN_1")
+                    imp = backend_verifier.query_ipv6_wan_rule(IMP)
+                    rec.add_detail(f"  SSH: clear后 CFWAN_1存在={cfwan is not None}(期望False=已清), {IMP}存在={imp is not None}(期望True)")
+                    print(f"  SSH: clear后 CFWAN_1={cfwan is not None}, {IMP}={imp is not None}")
+                    if cfwan is None and imp is not None:
+                        print(f"  [OK] 清空现有生效(CFWAN_1被清, {IMP}导入)")
+                        rec.add_detail(f"[OK] 清空现有生效")
+                    else:
+                        rec.add_detail(f"[WARN] clear校验异常")
+                # 恢复默认CFWAN_1(clear删除且不可导入恢复)
+                if backend_verifier:
+                    backend_verifier.restore_ipv6_wan_default()
+                    page.page.wait_for_timeout(500)
+                    cfwan2 = backend_verifier.query_ipv6_wan_rule("CFWAN_1")
+                    rec.add_detail(f"  SSH: 恢复后 CFWAN_1存在={cfwan2 is not None}(应True)")
+                    print(f"  SSH: 恢复后 CFWAN_1={cfwan2 is not None}")
+            except Exception as e:
+                print(f"  [WARN] 清空导入异常: {e}")
+                rec.add_detail(f"[WARN] 清空导入异常: {e}")
+                if backend_verifier:
+                    backend_verifier.restore_ipv6_wan_default()
+
+        # ========== 步骤15: 帮助功能 ==========
+        with rec.step("步骤15: 帮助功能测试", "测试帮助图标"):
+            print("\n[步骤15] 帮助功能测试...")
             rec.add_detail("[帮助功能测试]")
             try:
                 page.navigate_to_ipv6_wan()
@@ -421,34 +513,34 @@ class TestIpv6WanComprehensive:
                 print(f"  [WARN] 帮助异常: {e}")
                 rec.add_detail(f"[WARN] 帮助异常: {e}")
 
-        # ========== 步骤13: 最终清理 + 验证 ==========
-        with rec.step("步骤13: 最终清理", "清理IPV6WAN* + L1验证无残留"):
-            print("\n[步骤13] 最终清理...")
+        # ========== 步骤16: 最终清理 + 验证 ==========
+        with rec.step("步骤16: 最终清理", "清理IPV6WAN* + L1验证无残留 + 恢复CFWAN_1"):
+            print("\n[步骤16] 最终清理...")
             rec.add_detail("[环境清理]")
             if backend_verifier:
                 backend_verifier.cleanup_ipv6_wan_test("IPV6WAN")
+                backend_verifier.restore_ipv6_wan_default()
                 page.page.wait_for_timeout(800)
-            # L1验证所有测试规则应不存在
             for n in test_names_all:
                 ssh_verify(f"L1-无残留({n})", backend_verifier.verify_ipv6_wan_database,
                            n, must_pass=True, expect_absent=True)
-            # CFWAN_1默认应仍在
             if backend_verifier:
                 cfwan = backend_verifier.query_ipv6_wan_rule("CFWAN_1")
                 if cfwan:
-                    print(f"  [OK] 默认CFWAN_1保留未受影响")
-                    rec.add_detail("[OK] 默认CFWAN_1保留")
+                    print(f"  [OK] 默认CFWAN_1保留/已恢复")
+                    rec.add_detail("[OK] 默认CFWAN_1保留/已恢复")
 
         print("\n" + "=" * 60)
         print("IPv6外网设置综合测试完成")
         print("=" * 60)
-        print("测试覆盖:")
+        print("测试覆盖(16步):")
         print("  - 添加: 2条(wan2/dhcp + wan3/static), 受multi-limit=3约束")
         print("  - 编辑/停用/启用: 各1条 + L1 enabled字段验证")
-        print("  - 异常输入: 空名/重复/非法IPv6/第3条上限multi_unsupport")
-        print("  - 搜索: 精确/部分/不存在/清空")
+        print("  - 异常输入: 空名/重复/非法IPv6/第3条上限/超长名/特殊字符")
+        print("  - 搜索: 精确/部分/不存在/清空 + 排序")
         print("  - 导出: CSV+TXT双格式")
         print("  - 批量停用/启用/删除(避开默认CFWAN_1)")
+        print("  - 导入: 追加 + 清空现有(后SQL恢复CFWAN_1)")
         print("  - SSH: L1数据库(ipv6_wan_config)硬断言 + apply侧(ipset)软断言")
 
         all_failures = ssh_failures + ui_failures

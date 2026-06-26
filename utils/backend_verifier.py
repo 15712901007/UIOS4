@@ -7780,6 +7780,36 @@ class BackendVerifier:
             logger.warning(f"[清理] IPv6内网清理失败: {e}")
             return ""
 
+    def restore_ipv6_wan_default(self) -> bool:
+        """恢复IPv6外网默认CFWAN_1(clear-existing导入会删默认, 且CFWAN_1空interface不可导入, 需SQL恢复)"""
+        self.connect_router()
+        try:
+            self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"INSERT OR IGNORE INTO ipv6_wan_config"
+                f"(id,enabled,tagname,interface,internet,prefix,prefix_hint,"
+                f"force_prefix,force_gen_duid,link_addr,ipv6_addr,ipv6_gateway) "
+                f"VALUES(1,'no','CFWAN_1','','dhcp','auto','',0,1,'','','');\" 2>&1"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[恢复] CFWAN_1失败: {e}")
+            return False
+
+    def restore_ipv6_lan_default(self) -> bool:
+        """恢复IPv6内网默认CFLAN_1(clear-existing导入会删默认, CFLAN_1空parent不可导入, 需SQL恢复)"""
+        self.connect_router()
+        try:
+            self._router.exec(
+                f"sqlite3 {self.DNS_DB} \"INSERT OR IGNORE INTO ipv6_lan_config"
+                f"(id,enabled,tagname,interface,parent,internet,prefix_len,dhcpv6,"
+                f"ipv6_addr,use_dns6,ipv6_dns1,ipv6_dns2,ra_flags,ra_static,ra_mtu_set,ra_mtu,leasetime) "
+                f"VALUES(1,'yes','CFLAN_1','lan1','','dhcp','auto',1,'',0,'','','1',0,0,1480,'120');\" 2>&1"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[恢复] CFLAN_1失败: {e}")
+            return False
+
     # ==================== 自定义协议(dprotos / dprotos_l7)验证 ====================
     # 两个独立平行子模块(SSH探查确认 2026-06-23):
     #   L4 dprotos: 表dprotos, iptables mangle DPROTO链 + ipset dproto_src/dst/sport/dport_$id

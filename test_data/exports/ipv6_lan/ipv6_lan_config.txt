@@ -1,1 +1,2 @@
 id=1 enabled=yes tagname=CFLAN_1 interface=lan1 parent= internet=dhcp dhcpv6=1 ipv6_addr= use_dns6=0 ipv6_dns1= ipv6_dns2= prefix_len=auto ra_flags=1 ra_static=0 ra_mtu_set=0 ra_mtu=1480 leasetime=120
+id=2 enabled=yes tagname=IPV6LAN_E1 interface=doc_app_default parent=wan1 internet=dhcp dhcpv6=1 ipv6_addr= use_dns6=0 ipv6_dns1= ipv6_dns2= prefix_len=auto ra_flags=1 ra_static=0 ra_mtu_set=0 ra_mtu=1480 leasetime=240

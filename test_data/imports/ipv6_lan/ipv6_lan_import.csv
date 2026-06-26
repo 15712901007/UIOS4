@@ -1,0 +1,2 @@
+id,enabled,tagname,interface,parent,internet,dhcpv6,ipv6_addr,use_dns6,ipv6_dns1,ipv6_dns2,prefix_len,ra_flags,ra_static,ra_mtu_set,ra_mtu,leasetime
+,"yes","IPV6LAN_IMP","doc_app_default","wan1","dhcp",1,"",0,"","","auto","1",0,0,1480,"120"
