@@ -282,13 +282,14 @@ def run_vpn_comprehensive_test(*, page, rec, request,
     with rec.step(f"步骤{cur}: 异常输入测试", "缺必填/重复/超长/特殊字符"):
         print(f"\n[步骤{cur}] 异常输入...")
         rec.add_detail("[异常输入测试]")
-        # 缺必填(只填name, 其他必填报空)
-        miss_kw = {'name': f"{name_prefix}缺必填"}
+        # 缺必填(name用合法ascii, 其他必填项留空, 测"请输入xxx"必填拦截)
+        miss_kw = {'name': f"{name_prefix}nodata"}
         for k in invalid_base_fields:
             miss_kw[k] = ''
         res = page.try_add_rule_invalid(miss_kw)
-        rec.add_detail(f"缺必填: success={res.get('success')}")
-        print(f"  缺必填拦截: {res.get('success')}")
+        miss_msg = res.get('error_message', '') or '(未拦截)'
+        rec.add_detail(f"缺必填拦截: {miss_msg}")
+        print(f"  缺必填: success={res.get('success')} 提示={miss_msg[:50]}")
         # 重复名称
         existing = test_rules[0]['name']
         try:
@@ -299,9 +300,12 @@ def run_vpn_comprehensive_test(*, page, rec, request,
             page.click_save(); page.page.wait_for_timeout(1500)
             err = page.page.locator('.ant-form-item-explain-error, .ant-message-error')
             if err.count() > 0:
-                print(f"  [OK] 重复名称拦截"); rec.add_detail("[OK] 重复名称拦截")
+                dup_msg = err.first.text_content().strip()
+                rec.add_detail(f"重复名称拦截: {dup_msg}")
+                print(f"  重复名称: 提示={dup_msg[:50]}")
             else:
                 rec.add_detail("[WARN] 重复名称未拦截")
+                print("  [WARN] 重复名称未拦截")
             page.click_cancel(); page.navigate_back_to_list(); page.page.wait_for_timeout(300)
         except Exception as e:
             rec.add_detail(f"重复名称异常: {e}")
@@ -318,9 +322,12 @@ def run_vpn_comprehensive_test(*, page, rec, request,
             page.click_save(); page.page.wait_for_timeout(1200)
             err = page.page.locator('.ant-form-item-explain-error')
             if err.count() > 0:
-                print(f"  [OK] 超长拦截"); rec.add_detail("[OK] 超长拦截")
+                long_msg = err.first.text_content().strip()
+                rec.add_detail(f"超长拦截: {long_msg}")
+                print(f"  超长name: 提示={long_msg[:50]}")
             else:
                 rec.add_detail("[INFO] 超长可能截断")
+                print("  [INFO] 超长可能截断")
             page.click_cancel(); page.navigate_back_to_list(); page.page.wait_for_timeout(300)
         except Exception as e:
             rec.add_detail(f"超长异常: {e}")
@@ -332,7 +339,9 @@ def run_vpn_comprehensive_test(*, page, rec, request,
         spec_kw = {'name': '<script>x</script>'}
         spec_kw.update(invalid_base_fields)
         res = page.try_add_rule_invalid(spec_kw)
-        rec.add_detail(f"特殊字符: success={res.get('success')}")
+        spec_msg = res.get('error_message', '') or '(未拦截)'
+        rec.add_detail(f"特殊字符拦截: {spec_msg}")
+        print(f"  特殊字符: success={res.get('success')} 提示={spec_msg[:50]}")
         page.page.reload(); page.page.wait_for_load_state("networkidle"); page.page.wait_for_timeout(500)
         page.navigate_to_module(); page.page.wait_for_timeout(500)
     cur += 1
