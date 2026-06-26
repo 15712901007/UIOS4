@@ -449,9 +449,22 @@ class TestAdvancedCustomProtocolComprehensive:
             except Exception as e:
                 print(f"  搜索异常: {e}")
 
-        # 步骤6: 异常输入(空名称)
-        with rec.step("步骤6: 异常输入", "空名称/空rule应被拦截"):
-            print("\n[步骤6] 异常输入...")
+        # 步骤6: 删除1条
+        with rec.step("步骤6: 删除DPROTO_L7_2", "删除+SSH验证(对齐L4)"):
+            print("\n[步骤6] 删除DPROTO_L7_2...")
+            try:
+                page.navigate_to_advanced_custom_protocol()
+                page.page.wait_for_timeout(500)
+                page.delete_rule("DPROTO_L7_2")
+                wait_settle()
+            except Exception as e:
+                print(f"  删除异常: {e}")
+            ssh_verify("L1-删除后无L7_2", backend_verifier.verify_dproto_database,
+                       must_pass=True, name="DPROTO_L7_2", proto_type='l7', expect_absent=True)
+
+        # 步骤7: 异常输入(空名称)
+        with rec.step("步骤7: 异常输入", "空名称/空rule应被拦截"):
+            print("\n[步骤7] 异常输入...")
             err = page.try_add_rule_invalid(name="", rule="Protocol=TCP Direction=CLIENT Data=x")
             if err:
                 print(f"  [OK] 空名称拦截: {err[:40]}")
@@ -466,10 +479,10 @@ class TestAdvancedCustomProtocolComprehensive:
             except Exception:
                 pass
 
-        # 步骤7: 导出
+        # 步骤8: 导出
         export_file_l7 = None
-        with rec.step("步骤7: 导出", "导出L7配置(供导入用)"):
-            print("\n[步骤7] 导出...")
+        with rec.step("步骤8: 导出", "导出L7配置(供导入用)"):
+            print("\n[步骤8] 导出...")
             import os as _os
             import re as _re
             from config.config import get_config as _get_cfg
@@ -488,9 +501,9 @@ class TestAdvancedCustomProtocolComprehensive:
             except Exception as e:
                 print(f"  [WARN] 导出异常: {e}")
 
-        # 步骤8: 导入追加(新名DPROTO_L7_IMP)
-        with rec.step("步骤8: 导入追加", "导入新名L7规则, 验证追加+入库"):
-            print("\n[步骤8] 导入追加...")
+        # 步骤9: 导入追加(新名DPROTO_L7_IMP)
+        with rec.step("步骤9: 导入追加", "导入新名L7规则, 验证追加+入库"):
+            print("\n[步骤9] 导入追加...")
             if not (export_file_l7 and _os.path.exists(export_file_l7)):
                 print(f"  [WARN] 无导出文件, 跳过: {export_file_l7}")
                 rec.add_detail("[WARN] 跳过导入追加")
@@ -523,9 +536,9 @@ class TestAdvancedCustomProtocolComprehensive:
                 ssh_verify("L1-导入追加-IMP_1入库", backend_verifier.verify_dproto_database,
                            must_pass=False, name="DPROTO_L7_IMP_1", proto_type='l7')
 
-        # 步骤9: 导入清空(DPROTO_EXTRA标志)
-        with rec.step("步骤9: 导入清空", "加EXTRA标志, 清空导入, 验证清空生效"):
-            print("\n[步骤9] 导入清空...")
+        # 步骤10: 导入清空(DPROTO_EXTRA标志)
+        with rec.step("步骤10: 导入清空", "加EXTRA标志, 清空导入, 验证清空生效"):
+            print("\n[步骤10] 导入清空...")
             if not (export_file_l7 and _os.path.exists(export_file_l7)):
                 print("  [WARN] 无导出文件, 跳过清空导入")
                 rec.add_detail("[WARN] 跳过清空导入")
@@ -546,9 +559,9 @@ class TestAdvancedCustomProtocolComprehensive:
                 ssh_verify("L1-清空后EXTRA消失", backend_verifier.verify_dproto_database,
                            must_pass=True, name="DPROTO_EXTRA", proto_type='l7', expect_absent=True)
 
-        # 步骤10: 帮助
-        with rec.step("步骤10: 帮助", "测试帮助按钮"):
-            print("\n[步骤10] 帮助...")
+        # 步骤11: 帮助
+        with rec.step("步骤11: 帮助", "测试帮助按钮"):
+            print("\n[步骤11] 帮助...")
             page.navigate_to_advanced_custom_protocol()
             page.page.wait_for_timeout(800)
             try:
@@ -568,9 +581,9 @@ class TestAdvancedCustomProtocolComprehensive:
             except Exception as e:
                 print(f"  [WARN] 帮助异常: {e}")
 
-        # 步骤11: 最终清理
-        with rec.step("步骤11: 最终清理", "删除全部DPROTO_L7"):
-            print("\n[步骤11] 最终清理...")
+        # 步骤12: 最终清理
+        with rec.step("步骤12: 最终清理", "删除全部DPROTO_L7"):
+            print("\n[步骤12] 最终清理...")
             for name in L7_NAMES:
                 for attempt in range(2):
                     if backend_verifier and not backend_verifier.find_dproto(name, 'l7'):
