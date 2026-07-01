@@ -159,6 +159,10 @@ test_data:
     wireguard:
       export_filename: "wireguard_config.csv"
       import_filename: "wireguard_import.csv"
+    # 内外网设置(网络配置>内外网设置>内外网设置, 编辑型无导入导出, 仅占位保持配置一致)
+    interface_settings:
+      export_filename: "interface_settings_config.csv"
+      import_filename: "interface_settings_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"

@@ -820,23 +820,41 @@ class TestCrossLayerServiceComprehensive:
             print(f"\n[步骤18] 清理导入的规则...")
             rec.add_detail(f"【环境清理】")
 
+            page.navigate_to_cross_layer_service()
             page.page.reload()
-            page.page.wait_for_timeout(500)
+            page.page.wait_for_timeout(1000)
 
-            current_count = page.get_rule_count()
-            if current_count > 0:
+            # 用SSH验证+重试(参照步骤16), 避免get_rule_count在reload后时序误读0
+            # 导致以为"已干净"跳过清理(2026-06-25实测: 步骤17导入8条后此处误读0残留8条)
+            cleaned = False
+            for attempt in range(3):
+                if backend_verifier is not None:
+                    current_count = len(backend_verifier.query_netsnmpc_rules() or [])
+                else:
+                    current_count = page.get_rule_count()
+                if current_count == 0:
+                    cleaned = True
+                    break
                 page.select_all_rules()
                 page.page.wait_for_timeout(800)
                 page.batch_delete()
                 page.page.wait_for_timeout(2000)
                 page.page.reload()
-                page.page.wait_for_timeout(500)
-                remaining = page.get_rule_count()
-                print(f"  [OK] 清理完成，剩余 {remaining} 条规则")
-                rec.add_detail(f"  清理完成: 剩余{remaining}条规则")
+                page.page.wait_for_timeout(1000)
+                print(f"  第{attempt + 1}次清理后重试...")
+                rec.add_detail(f"  第{attempt + 1}次清理")
+
+            if cleaned:
+                print(f"  [OK] 导入规则已清理干净")
+                rec.add_detail(f"  导入规则清理完成")
             else:
-                print(f"  [OK] 没有需要清理的规则")
-                rec.add_detail(f"  环境已干净，无需清理")
+                if backend_verifier is not None:
+                    remaining = len(backend_verifier.query_netsnmpc_rules() or [])
+                else:
+                    remaining = page.get_rule_count()
+                print(f"  [WARN] 清理后仍剩余 {remaining} 条规则")
+                rec.add_detail(f"  清理未完成: 剩余{remaining}条")
+                ui_failures.append(f"步骤18导入规则清理失败: 剩余{remaining}条")
 
         # ========== 步骤19: 访问频率设置测试 ==========
         with rec.step("步骤19: 访问频率设置测试", "测试访问频率设置并验证保存"):
@@ -934,22 +952,39 @@ class TestCrossLayerServiceComprehensive:
 
             page.navigate_to_cross_layer_service()
             page.page.reload()
-            page.page.wait_for_timeout(500)
+            page.page.wait_for_timeout(1000)
 
-            current_count = page.get_rule_count()
-            if current_count > 0:
+            # 用SSH验证+重试(参照步骤16/18), 确保测试结束环境干净
+            # 避免get_rule_count时序误读0导致残留(2026-06-25实测步骤21误读0残留8条)
+            cleaned = False
+            for attempt in range(3):
+                if backend_verifier is not None:
+                    current_count = len(backend_verifier.query_netsnmpc_rules() or [])
+                else:
+                    current_count = page.get_rule_count()
+                if current_count == 0:
+                    cleaned = True
+                    break
                 page.select_all_rules()
                 page.page.wait_for_timeout(800)
                 page.batch_delete()
                 page.page.wait_for_timeout(2000)
                 page.page.reload()
-                page.page.wait_for_timeout(500)
-                remaining = page.get_rule_count()
-                print(f"  [OK] 测试数据清理完成，剩余 {remaining} 条规则")
-                rec.add_detail(f"  清理完成: 剩余{remaining}条规则")
+                page.page.wait_for_timeout(1000)
+                print(f"  第{attempt + 1}次清理后重试...")
+                rec.add_detail(f"  第{attempt + 1}次清理")
+
+            if cleaned:
+                print(f"  [OK] 测试数据已清理干净")
+                rec.add_detail(f"  测试数据清理完成")
             else:
-                print(f"  [OK] 数据已干净")
-                rec.add_detail(f"  数据已干净")
+                if backend_verifier is not None:
+                    remaining = len(backend_verifier.query_netsnmpc_rules() or [])
+                else:
+                    remaining = page.get_rule_count()
+                print(f"  [WARN] 最终清理后仍剩余 {remaining} 条规则")
+                rec.add_detail(f"  最终清理未完成: 剩余{remaining}条")
+                ui_failures.append(f"步骤21最终清理失败: 剩余{remaining}条规则")
 
             # 清理IP分组残留（路由对象页面）
             rec.add_detail(f"  【清理IP分组】")

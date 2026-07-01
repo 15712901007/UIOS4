@@ -1061,6 +1061,16 @@ class MainWindow(QMainWindow):
                             },
                         }
                     },
+                    "内外网设置": {
+                        "testcases": [
+                            "test_interface_settings_comprehensive.py::TestInterfaceSettingsComprehensive::test_interface_settings_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "test_interface_settings_comprehensive.py::TestInterfaceSettingsComprehensive::test_interface_settings_comprehensive",
+                            ],
+                        }
+                    },
                 }
             },
             "监控中心": {

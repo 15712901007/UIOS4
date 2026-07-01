@@ -234,26 +234,71 @@ class IkuaiTablePage(BasePage):
 
         return self
 
-    def select_all_rules(self):
-        """全选规则"""
-        try:
-            # 策略1: get_by_role Select all
-            select_all = self.page.get_by_role("checkbox", name="Select all")
-            if select_all.count() > 0:
-                if not select_all.is_checked():
-                    select_all.click()
-                    self.page.wait_for_timeout(300)
-                return True
-            # 策略2: 表头checkbox(某些页面Select all不生效)
-            select_all2 = self.page.locator("thead input[type='checkbox']").first
-            if select_all2.count() > 0 and select_all2.is_enabled():
-                if not select_all2.is_checked():
-                    select_all2.click()
-                    self.page.wait_for_timeout(300)
-                return True
-        except Exception as e:
-            print(f"[DEBUG] select_all_rules 异常: {e}")
+    def select_all_rules(self, max_attempts: int = 3):
+        """全选规则(增强: 等待表格渲染 + 验证选中生效)
+
+        根因(2026-06-25 cross_layer批量删除偶发失败): headed模式下reload后表格/
+        全选checkbox渲染需要时间, 原实现count()==0时直接返回False(未选中), 而调用方
+        (test步骤16批量删除/步骤14-15停用启用)忽略返回值, batch_delete在未选中状态
+        执行→底部"已选X条"操作栏不显示→_click_batch_button footer锚点找不到删除按钮
+        →首删失败, 仅靠测试层3次重试挽救; 环境慢时重试也全失败(报告3次剩8条).
+
+        本方法改为: 轮询等待全选checkbox出现→点击→等待"已选X条"出现确认选中生效,
+        返回True时保证底部批量操作栏已就绪, _click_batch_button可稳定命中. 向后兼容:
+        签名加默认参数max_attempts, 原 select_all_rules() 调用不受影响.
+        """
+        for attempt in range(max_attempts):
+            try:
+                # 1. 等待表格渲染: 定位全选checkbox(优先Select all, 回退thead checkbox)
+                select_all = self.page.get_by_role("checkbox", name="Select all")
+                if select_all.count() == 0:
+                    select_all = self.page.locator("thead input[type='checkbox']").first
+                if select_all.count() == 0:
+                    # 表格尚未渲染, 等待后重试
+                    self.page.wait_for_timeout(600)
+                    continue
+
+                # 2. 点击全选(若未选中)
+                try:
+                    if not select_all.is_checked():
+                        select_all.click()
+                        self.page.wait_for_timeout(400)
+                except Exception:
+                    # strict mode多匹配等异常, JS兜底点表头checkbox触发React
+                    self.page.evaluate("""() => {
+                        const cb = document.querySelector('thead input[type=checkbox]')
+                            || document.querySelector('.ant-table-selection input[type=checkbox]');
+                        if (cb && !cb.checked) { cb.click(); }
+                    }""")
+                    self.page.wait_for_timeout(400)
+
+                # 3. 验证选中生效: "已选X条"出现(底部操作栏就绪信号), 超时回退checkbox
+                if self._wait_selection_active(timeout=2000):
+                    return True
+                # 未确认生效, 重试(点击时React状态可能未及时更新)
+                self.page.wait_for_timeout(400)
+            except Exception as e:
+                print(f"[DEBUG] select_all_rules attempt{attempt + 1} 异常: {e}")
+                self.page.wait_for_timeout(400)
+        print(f"[WARN] select_all_rules {max_attempts}次后未确认选中生效")
         return False
+
+    def _wait_selection_active(self, timeout: int = 2000) -> bool:
+        """等待全选生效信号: "已选X条"文本出现(底部批量操作栏就绪), 或表头全选checkbox已勾选"""
+        try:
+            self.page.locator("text=/已选\\s*\\d+\\s*条/").wait_for(state="visible", timeout=timeout)
+            return True
+        except Exception:
+            # 回退: 检查表头全选checkbox checked状态(部分模块可能无"已选X条"提示)
+            try:
+                checked = self.page.evaluate("""() => {
+                    const cb = document.querySelector('thead input[type=checkbox]')
+                        || document.querySelector('.ant-table-selection input[type=checkbox]');
+                    return cb ? cb.checked : false;
+                }""")
+                return bool(checked)
+            except Exception:
+                return False
 
     # ==================== 批量操作 ====================
 

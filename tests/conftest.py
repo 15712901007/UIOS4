@@ -122,6 +122,7 @@ from pages.network.dhcp_acl_mac_page import DhcpAclMacPage
 from pages.network.ipv6_static_page import Ipv6StaticPage
 from pages.network.ipv6_wan_page import Ipv6WanPage
 from pages.network.ipv6_lan_page import Ipv6LanPage
+from pages.network.interface_settings_page import InterfaceSettingsPage
 from pages.network.custom_protocol_page import CustomProtocolPage, AdvancedCustomProtocolPage
 from pages.network.route_object_page import (
     IpGroupPage, MacGroupPage, PortGroupPage, DomainGroupPage,
@@ -209,6 +210,7 @@ TEST_NAME_MAPPING = {
     'test_ipv6_static_comprehensive': 'IPv6前缀静态分配综合测试',
     'test_ipv6_wan_comprehensive': 'IPv6外网设置综合测试',
     'test_ipv6_lan_comprehensive': 'IPv6内网设置综合测试',
+    'test_interface_settings_comprehensive': '内外网设置综合测试',
     'test_custom_protocol_comprehensive': '自定义协议综合测试',
     'test_advanced_custom_protocol_comprehensive': '高级自定义协议综合测试',
     'test_ip_group_comprehensive': 'IP分组综合测试',
@@ -826,6 +828,21 @@ def ipv6_lan_page_logged_in(logged_in_page: Page, config: Config) -> 'Ipv6LanPag
     return pg
 
 
+# ==================== 内外网设置 fixtures ====================
+@pytest.fixture(scope="function")
+def interface_settings_page(page: Page, config: Config) -> InterfaceSettingsPage:
+    """创建内外网设置页面实例"""
+    return InterfaceSettingsPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def interface_settings_page_logged_in(logged_in_page: Page, config: Config) -> InterfaceSettingsPage:
+    """已登录并导航到内外网设置页面(第1个tab)的实例"""
+    pg = InterfaceSettingsPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_interface_settings()
+    return pg
+
+
 @pytest.fixture(scope="function")
 def custom_protocol_page(page: Page, config: Config) -> 'CustomProtocolPage':
     """创建自定义协议(L4)页面实例"""
@@ -1140,6 +1157,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "network: 网络配置模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "interface_settings: 内外网设置模块测试"
     )
     config.addinivalue_line(
         "markers", "slow: 慢速测试"
