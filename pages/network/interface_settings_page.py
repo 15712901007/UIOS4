@@ -396,13 +396,33 @@ class InterfaceSettingsPage(IkuaiTablePage):
         return self._toggle_checkbox("掉线自动切换", enable)
 
     def _toggle_checkbox(self, label_text: str, enable: bool) -> bool:
-        """切换复选框到指定状态. 等待状态稳定(进编辑页React初始化可能延迟false→真实值)再判断是否点击."""
+        """切换复选框到指定状态. label可能在.ant-checkbox-wrapper内(掉线切换,wrapper文本=label)
+        或外(定时重拨/异常IP检测, wrapper文本='开启', label是兄弟元素). 等待状态稳定(React初始化延迟)再判断点击."""
         try:
             cb = self.page.locator(".ant-checkbox-wrapper", has_text=label_text)
-            if cb.count() == 0:
-                return False
-            wrapper = cb.first
-            # 等待checkbox状态稳定(进编辑页初始false, 同步DB真实值需~4s, 轮询5s)
+            tmp_mark = False
+            if cb.count() > 0:
+                wrapper = cb.first
+            else:
+                # label在wrapper外: 找label文本节点, 向上找只有1个checkbox的祖先, 标记该checkbox
+                found = self.page.evaluate("""(kw) => {
+                    const els = [...document.querySelectorAll('*')].filter(e => e.children.length === 0 && (e.innerText||'').trim() === kw);
+                    for (const el of els) {
+                        let p = el.parentElement;
+                        for (let d=0; d<6&&p; d++) {
+                            const cbs = [...p.querySelectorAll('.ant-checkbox-wrapper')].filter(c => c.offsetParent !== null);
+                            if (cbs.length === 1) { cbs[0].setAttribute('data-tmp-cb', '1'); return true; }
+                            if (cbs.length > 1) break;
+                            p = p.parentElement;
+                        }
+                    }
+                    return false;
+                }""", label_text)
+                if not found:
+                    return False
+                wrapper = self.page.locator(".ant-checkbox-wrapper[data-tmp-cb='1']").first
+                tmp_mark = True
+            # 等待checkbox状态稳定(进编辑页初始false, 同步DB真实值需~4s)
             is_checked = wrapper.locator("input").is_checked()
             for _ in range(10):
                 self.page.wait_for_timeout(500)
@@ -413,6 +433,8 @@ class InterfaceSettingsPage(IkuaiTablePage):
             if is_checked != enable:
                 wrapper.click()
                 self.page.wait_for_timeout(300)
+            if tmp_mark:
+                self.page.evaluate("document.querySelector(\".ant-checkbox-wrapper[data-tmp-cb='1']\")?.removeAttribute('data-tmp-cb')")
             return True
         except Exception as e:
             print(f"[DEBUG] _toggle_checkbox({label_text}) error: {e}")

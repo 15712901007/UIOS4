@@ -582,6 +582,7 @@ class TestInterfaceSettingsComprehensive:
                 # ② comment 单独save
                 page.navigate_to_interface_settings()
                 if page.open_edit_page("wan2"):
+                    page.page.wait_for_timeout(2500)  # 等textarea(备注)React同步原值(延迟,同checkbox)
                     page.fill_remark("autotest remark")
                     page.click_save()
                     page.page.wait_for_timeout(2500)
