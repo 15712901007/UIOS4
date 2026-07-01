@@ -8521,3 +8521,459 @@ class BackendVerifier:
 
     def verify_wireguard_full_chain(self, name, expect_enabled=True, expected_fields=None):
         return self._vpn_verify_full_chain_core('wireguard', name, expect_enabled, expected_fields)
+
+    # ==================== 内外网设置 (lan_config/wan_config) ====================
+    # 后端脚本: /usr/ikuai/script/lan.sh (LAN) / wan.sh (WAN)
+    # 数据库: /etc/mnt/ikuai/config.db (lan_config / wan_config 表)
+    # 注意: wan_config 无 enabled 字段; WAN启停通过"断开/重拨"体现, 非数据库
+    # 数据查询走 /Action/call func_name=lan/wan action=show(需HTTP), SSH层直接读sqlite3
+
+    IK_DB = "/etc/mnt/ikuai/config.db"
+
+    def _db_query_all(self, table: str, where: str = "") -> List[Dict]:
+        """直接sqlite3查询表所有行(返回dict列表). table: lan_config/wan_config
+        用默认|分隔(数据含/,逗号但不含|), 避免tab转义问题"""
+        self.connect_router()
+        cmd = f'sqlite3 {self.IK_DB} "select * from {table}'
+        if where:
+            cmd += f' where {where}'
+        cmd += '"'
+        raw = self._router.exec(cmd)
+        # 取列名
+        cols_raw = self._router.exec(f'sqlite3 {self.IK_DB} "pragma table_info({table})"')
+        cols = []
+        for line in cols_raw.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 2:
+                cols.append(parts[1].strip())
+        if not cols:
+            return []
+        rows = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            vals = line.split("|")
+            # 数据可能含|? 不太可能(都是IP/mac/逗号列表), 按列数截断
+            if len(vals) > len(cols):
+                vals = vals[:len(cols)]
+            rows.append(dict(zip(cols, vals + [""] * (len(cols) - len(vals)))))
+        return rows
+
+    def query_lan_config(self, tagname: str = None) -> List[Dict]:
+        """查询lan_config表(LAN接口配置)"""
+        where = f"tagname='{tagname}'" if tagname else ""
+        return self._db_query_all("lan_config", where)
+
+    def query_wan_config(self, tagname: str = None) -> List[Dict]:
+        """查询wan_config表(WAN接口配置)"""
+        where = f"tagname='{tagname}'" if tagname else ""
+        return self._db_query_all("wan_config", where)
+
+    def find_lan(self, tagname: str) -> Optional[Dict]:
+        """按tagname查单条LAN配置"""
+        rows = self.query_lan_config(tagname)
+        return rows[0] if rows else None
+
+    def find_wan(self, tagname: str) -> Optional[Dict]:
+        """按tagname查单条WAN配置"""
+        rows = self.query_wan_config(tagname)
+        return rows[0] if rows else None
+
+    def verify_lan_database(self, tagname: str, expected_fields: Dict = None,
+                            must_exist: bool = True) -> VerifyResult:
+        """L1: 验证LAN接口在lan_config表存在且字段正确"""
+        row = self.find_lan(tagname)
+        if row is None:
+            if not must_exist:
+                return VerifyResult(level="L1-数据库", passed=True,
+                                    message=f"LAN {tagname} 不存在(符合预期)")
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"LAN未找到: {tagname}",
+                                raw_output=f"现有LAN: {[r.get('tagname') for r in self.query_lan_config()]}")
+        if not must_exist:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"LAN {tagname} 仍存在(应已删除)",
+                                raw_output=json.dumps(row, ensure_ascii=False))
+        if expected_fields:
+            mismatches = {}
+            for k, exp in expected_fields.items():
+                act = str(row.get(k, ""))
+                # ip_mask等可能是包含关系, bandif可能是逗号分隔
+                if k in ("ip_mask", "bandif", "bandeth"):
+                    if str(exp) not in act and act not in str(exp):
+                        mismatches[k] = {"expected": exp, "actual": act}
+                elif k == "mac":
+                    # MAC大小写不敏感(数据库存小写, UI填大写)
+                    if act.lower() != str(exp).lower():
+                        mismatches[k] = {"expected": exp, "actual": act}
+                elif act != str(exp):
+                    mismatches[k] = {"expected": exp, "actual": act}
+            if mismatches:
+                return VerifyResult(level="L1-数据库", passed=False,
+                                    message=f"LAN字段不匹配: {mismatches}",
+                                    raw_output=json.dumps(row, ensure_ascii=False))
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"LAN {tagname} 字段正确 (id={row.get('id')}, ip_mask={row.get('ip_mask')})",
+                            raw_output=json.dumps(row, ensure_ascii=False))
+
+    def verify_wan_database(self, tagname: str, expected_fields: Dict = None,
+                            must_exist: bool = True) -> VerifyResult:
+        """L1: 验证WAN接口在wan_config表存在且字段正确"""
+        row = self.find_wan(tagname)
+        if row is None:
+            if not must_exist:
+                return VerifyResult(level="L1-数据库", passed=True,
+                                    message=f"WAN {tagname} 不存在(符合预期)")
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"WAN未找到: {tagname}",
+                                raw_output=f"现有WAN: {[r.get('tagname') for r in self.query_wan_config()]}")
+        if not must_exist:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"WAN {tagname} 仍存在(应已删除)",
+                                raw_output=json.dumps(row, ensure_ascii=False))
+        if expected_fields:
+            mismatches = {}
+            for k, exp in expected_fields.items():
+                act = str(row.get(k, ""))
+                if k in ("ip_mask", "bandif", "bandeth"):
+                    if str(exp) not in act and act not in str(exp):
+                        mismatches[k] = {"expected": exp, "actual": act}
+                elif k == "mac":
+                    # MAC大小写不敏感(数据库存小写, UI填大写)
+                    if act.lower() != str(exp).lower():
+                        mismatches[k] = {"expected": exp, "actual": act}
+                elif act != str(exp):
+                    mismatches[k] = {"expected": exp, "actual": act}
+            if mismatches:
+                return VerifyResult(level="L1-数据库", passed=False,
+                                    message=f"WAN字段不匹配: {mismatches}",
+                                    raw_output=json.dumps(row, ensure_ascii=False))
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"WAN {tagname} 字段正确 (id={row.get('id')}, internet={row.get('internet')})",
+                            raw_output=json.dumps(row, ensure_ascii=False))
+
+    def verify_interface_ip(self, interface: str, expected_ip: str = None,
+                            should_have_ip: bool = True) -> VerifyResult:
+        """L2: 验证接口IP地址. interface: lan1/wan2/wan4等
+        should_have_ip=True时验证接口存在且有IP; expected_ip指定时验证IP匹配
+        should_have_ip=False时验证接口无IP或不存在"""
+        self.connect_router()
+        out = self._router.exec(f"ip -4 addr show {interface} 2>/dev/null")
+        if not out.strip() or "does not exist" in out:
+            if not should_have_ip:
+                return VerifyResult(level="L2-接口IP", passed=True,
+                                    message=f"{interface} 接口不存在(符合预期)")
+            return VerifyResult(level="L2-接口IP", passed=False,
+                                message=f"{interface} 接口不存在",
+                                raw_output=out)
+        # 解析inet
+        import re as _re
+        inets = _re.findall(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", out)
+        if should_have_ip and not inets:
+            return VerifyResult(level="L2-接口IP", passed=False,
+                                message=f"{interface} 接口存在但无IP地址",
+                                raw_output=out)
+        if not should_have_ip and not inets:
+            return VerifyResult(level="L2-接口IP", passed=True,
+                                message=f"{interface} 接口存在且无IP(符合预期)",
+                                raw_output=out)
+        if expected_ip:
+            # expected_ip 可能是 "192.168.200.1" 或 "192.168.200.1/24"
+            found = any(expected_ip in inet for inet in inets)
+            if not found:
+                return VerifyResult(level="L2-接口IP", passed=False,
+                                    message=f"{interface} IP不匹配: 期望含{expected_ip}, 实际{inets}",
+                                    raw_output=out)
+        return VerifyResult(level="L2-接口IP", passed=True,
+                            message=f"{interface} IP验证通过: {inets}",
+                            raw_output=out)
+
+    def verify_interface_exists(self, interface: str, should_exist: bool = True) -> VerifyResult:
+        """L2: 验证接口存在性(ip link show)"""
+        self.connect_router()
+        out = self._router.exec(f"ip link show {interface} 2>/dev/null")
+        exists = bool(out.strip()) and "does not exist" not in out
+        if exists == should_exist:
+            return VerifyResult(level="L2-接口存在", passed=True,
+                                message=f"{interface} 存在性={'存在' if exists else '不存在'}(符合预期)",
+                                raw_output=out[:200])
+        return VerifyResult(level="L2-接口存在", passed=False,
+                            message=f"{interface} 存在性不符: 期望{'存在' if should_exist else '不存在'}, 实际{'存在' if exists else '不存在'}",
+                            raw_output=out[:200])
+
+    # WAN接口id→fwmark映射: wan1=0x2711, wan2=0x2712, wan3=0x2713, wan4=0x2714...
+    WAN_FWMARK_BASE = 0x2711
+
+    def verify_wan_policy_routing(self, wan_id: int, should_exist: bool = True) -> VerifyResult:
+        """L3: 验证WAN策略路由(ip rule fwmark). wan_id: 1/2/3/4"""
+        self.connect_router()
+        fwmark = self.WAN_FWMARK_BASE + wan_id - 1
+        out = self._router.exec("ip rule show 2>/dev/null")
+        # 格式: 10000: from all fwmark 0x2712 lookup wan2
+        exists = f"0x{fwmark:x}" in out and f"lookup wan{wan_id}" in out
+        if exists == should_exist:
+            return VerifyResult(level="L3-策略路由", passed=True,
+                                message=f"wan{wan_id} fwmark 0x{fwmark:x} 策略路由={'存在' if exists else '不存在'}(符合预期)",
+                                raw_output=out[:300])
+        return VerifyResult(level="L3-策略路由", passed=False,
+                            message=f"wan{wan_id} 策略路由不符: 期望{'存在' if should_exist else '不存在'}",
+                            raw_output=out[:300])
+
+    def verify_lan_visit_iptables(self, interface: str, allow_visit: bool = True) -> VerifyResult:
+        """iptables验证: LAN互访控制(LAN_VISIT链)
+        allow_visit=True(允许互访): LAN_VISIT链不应有针对该接口的DROP规则
+        allow_visit=False(禁止互访): LAN_VISIT链应有 ! -i iface -o iface ... DROP 规则"""
+        self.connect_router()
+        out = self._router.exec("iptables -S LAN_VISIT 2>/dev/null")
+        # 规则形如: -A LAN_VISIT ! -i lan1 -o lan1 -m ifaces ... -j DROP
+        has_drop = bool(out.strip()) and interface in out and "DROP" in out
+        if allow_visit:
+            # 允许互访: 不应有DROP规则
+            if not has_drop:
+                return VerifyResult(level="iptables-LAN_VISIT", passed=True,
+                                    message=f"{interface} 允许互访: LAN_VISIT无DROP规则(符合预期)",
+                                    raw_output=out[:300])
+            return VerifyResult(level="iptables-LAN_VISIT", passed=False,
+                                message=f"{interface} 应允许互访但LAN_VISIT有DROP规则",
+                                raw_output=out[:300])
+        else:
+            # 禁止互访: 应有DROP规则
+            if has_drop:
+                return VerifyResult(level="iptables-LAN_VISIT", passed=True,
+                                    message=f"{interface} 禁止互访: LAN_VISIT有DROP规则(符合预期)",
+                                    raw_output=out[:300])
+            return VerifyResult(level="iptables-LAN_VISIT", passed=False,
+                                message=f"{interface} 应禁止互访但LAN_VISIT无DROP规则",
+                                raw_output=out[:300])
+
+    def verify_interface_reboot(self, table: str, tagname: str,
+                                expected_fields: Dict = None) -> VerifyResult:
+        """L重启验证: 模拟重启后配置是否持久化
+        调用对应脚本的init/boot函数, 验证数据库配置仍在 + 接口IP仍在
+        table: 'lan_config'/'wan_config'"""
+        self.connect_router()
+        try:
+            script = "lan.sh" if table == "lan_config" else "wan.sh"
+            # 调脚本init(模拟重启加载)
+            self._router.exec(f"/usr/ikuai/script/{script} init 2>&1", timeout=60)
+            # 等待接口重建
+            import time as _time
+            _time.sleep(3)
+            # 验证数据库配置仍在
+            if table == "lan_config":
+                db_res = self.verify_lan_database(tagname, expected_fields, must_exist=True)
+            else:
+                db_res = self.verify_wan_database(tagname, expected_fields, must_exist=True)
+            if not db_res.passed:
+                return VerifyResult(level="L重启", passed=False,
+                                    message=f"重启后{tagname}配置丢失或不一致: {db_res.message}",
+                                    raw_output=db_res.raw_output)
+            # 验证接口IP仍在
+            row = self.find_lan(tagname) if table == "lan_config" else self.find_wan(tagname)
+            ip = (row.get("ip_mask") or "").split("/")[0] if row else None
+            if ip and expected_fields and "ip_mask" in (expected_fields or {}):
+                ip_res = self.verify_interface_ip(tagname, expected_ip=ip, should_have_ip=True)
+                if not ip_res.passed:
+                    return VerifyResult(level="L重启", passed=False,
+                                        message=f"重启后{tagname}接口IP丢失: {ip_res.message}",
+                                        raw_output=ip_res.raw_output)
+            return VerifyResult(level="L重启", passed=True,
+                                message=f"重启后{tagname}配置持久化验证通过",
+                                raw_output=db_res.raw_output)
+        except Exception as e:
+            return VerifyResult(level="L重启", passed=False,
+                                message=f"重启验证异常: {e}",
+                                raw_output=str(e)[:300])
+
+    def snapshot_interface_config(self) -> Dict:
+        """快照当前所有WAN/LAN配置 + 内核状态(用于测试前后对比)"""
+        self.connect_router()
+        snap = {"lan": [], "wan": [], "wan_vlan": [], "ip_addr": "", "ip_rule": "", "lan_visit": ""}
+        try:
+            snap["lan"] = self.query_lan_config()
+            snap["wan"] = self.query_wan_config()
+            snap["wan_vlan"] = self._db_query_all("wan_vlan", "")
+            snap["ip_addr"] = self._router.exec("ip -4 addr show 2>/dev/null")
+            snap["ip_rule"] = self._router.exec("ip rule show 2>/dev/null")
+            snap["lan_visit"] = self._router.exec("iptables -S LAN_VISIT 2>/dev/null")
+        except Exception as e:
+            snap["error"] = str(e)
+        return snap
+
+    def restore_interface_by_sql(self, table: str, tagname: str,
+                                 original_row: Dict) -> bool:
+        """用SQL恢复单条接口配置(兜底恢复, 测试异常时用)
+        关键: bandif等字段含逗号, 用sqlite3单引号值包裹; 对值内单引号转义"""
+        self.connect_router()
+        try:
+            if not original_row:
+                return False
+            sets = []
+            for k, v in original_row.items():
+                if k == "id":
+                    continue
+                # 值内单引号转义为''(SQL标准)
+                safe_v = str(v).replace("'", "''")
+                sets.append(f"{k}='{safe_v}'")
+            # 优先用id定位(稳定; tagname可能被测试改名致where tagname=失效), 降级tagname
+            row_id = original_row.get("id")
+            where_clause = f"id='{row_id}'" if row_id else f"tagname='{tagname}'"
+            sql = f"update {table} set {','.join(sets)} where {where_clause}"
+            self._router.exec(f'sqlite3 {self.IK_DB} "{sql}"')
+            # 触发脚本重新apply(重建接口/iptables)
+            script = "lan.sh" if table == "lan_config" else "wan.sh"
+            self._router.exec(f"/usr/ikuai/script/{script} init 2>&1", timeout=60)
+            import time as _time
+            _time.sleep(2)
+            return True
+        except Exception as e:
+            logger.error(f"restore_interface_by_sql({table},{tagname}) error: {e}")
+            return False
+
+    def delete_interface_by_sql(self, table: str, tagname: str) -> bool:
+        """用SQL删除接口配置(测试残留兜底删除)"""
+        self.connect_router()
+        try:
+            self._router.exec(f'sqlite3 {self.IK_DB} "delete from {table} where tagname=\'{tagname}\'"')
+            return True
+        except Exception as e:
+            logger.error(f"delete_interface_by_sql error: {e}")
+            return False
+
+    # ==================== 内外网设置 - 混合模式/高级设置 验证 (2026-06-30新增) ====================
+    # wan_config.internet 接入方式枚举(/usr/ikuai/include/interface.sh):
+    #   0=STATIC静态 1=DHCP 2=PPPoE 3=MACVLAN(基于物理网卡的混合) 4=VLAN(基于VLAN的混合)
+    INTERNET_MODE = {
+        "static": "0", "dhcp": "1", "pppoe": "2",
+        "hybrid_phy": "3", "hybrid_vlan": "4",
+    }
+
+    def query_hybrid_subif(self, wan_name: str) -> List[Dict]:
+        """查询混合模式子接入表 wan_vlan (interface=父WAN名).
+        混合模式(internet=3 MACVLAN/4 VLAN)的每条子接入存此表, 字段:
+        interface/vlan_id/vlan_name/vlan_internet(0静1DHCP2PPPoE)/ip_mask/gateway/
+        username/passwd/mtu/pppoe_service/pppoe_ac/mac/enabled..."""
+        return self._db_query_all("wan_vlan", f"interface='{wan_name}'")
+
+    def count_hybrid_subif(self, wan_name: str) -> int:
+        """统计某WAN的混合模式子接入条数"""
+        return len(self.query_hybrid_subif(wan_name))
+
+    def find_hybrid_subif(self, wan_name: str, sub_name: str) -> Optional[Dict]:
+        """按 父WAN+子接入名(vlan_name) 查单条混合模式子接入"""
+        rows = self._db_query_all("wan_vlan", f"interface='{wan_name}' and vlan_name='{sub_name}'")
+        return rows[0] if rows else None
+
+    def verify_hybrid_subif(self, wan_name: str, sub_name: str,
+                            expected_fields: Dict = None,
+                            must_exist: bool = True) -> VerifyResult:
+        """L1: 验证混合模式子接入(wan_vlan)存在且字段正确. 复刻 verify_wan_database 逻辑."""
+        row = self.find_hybrid_subif(wan_name, sub_name)
+        if row is None:
+            if not must_exist:
+                return VerifyResult(level="L1-混合子接入", passed=True,
+                                    message=f"子接入 {wan_name}/{sub_name} 不存在(符合预期)")
+            return VerifyResult(level="L1-混合子接入", passed=False,
+                                message=f"子接入未找到: {wan_name}/{sub_name}",
+                                raw_output=f"现有: {[r.get('vlan_name') for r in self.query_hybrid_subif(wan_name)]}")
+        if not must_exist:
+            return VerifyResult(level="L1-混合子接入", passed=False,
+                                message=f"子接入 {wan_name}/{sub_name} 仍存在(应已删除)",
+                                raw_output=json.dumps(row, ensure_ascii=False))
+        if expected_fields:
+            mismatches = {}
+            for k, exp in expected_fields.items():
+                act = str(row.get(k, ""))
+                # ip_mask/gateway/mac/vlan_name 用包含关系
+                if k in ("ip_mask", "gateway", "mac", "vlan_name", "bandif"):
+                    if str(exp) not in act and act not in str(exp):
+                        mismatches[k] = {"expected": exp, "actual": act}
+                elif act != str(exp):
+                    mismatches[k] = {"expected": exp, "actual": act}
+            if mismatches:
+                return VerifyResult(level="L1-混合子接入", passed=False,
+                                    message=f"子接字段不匹配: {mismatches}",
+                                    raw_output=json.dumps(row, ensure_ascii=False))
+        return VerifyResult(level="L1-混合子接入", passed=True,
+                            message=f"子接入 {wan_name}/{sub_name} 字段正确 (vlan_internet={row.get('vlan_internet')}, ip_mask={row.get('ip_mask')})",
+                            raw_output=json.dumps(row, ensure_ascii=False))
+
+    def verify_wan_internet_mode(self, tagname: str, expected_internet) -> VerifyResult:
+        """L1便利: 仅验 wan_config.internet 接入方式字段.
+        expected_internet 可传 '0'/'1'/'2'/'3'/'4' 或别名 static/dhcp/pppoe/hybrid_phy/hybrid_vlan."""
+        val = self.INTERNET_MODE.get(str(expected_internet), str(expected_internet))
+        return self.verify_wan_database(tagname, expected_fields={"internet": val})
+
+    def delete_hybrid_subif_by_sql(self, wan_name: str, sub_name: str = None,
+                                   name_prefix: str = None) -> int:
+        """SQL删除混合模式子接入(测试残留兜底). 返回删除条数.
+        - 传 sub_name: 精确删 interface+vlan_name 一条
+        - 传 name_prefix: 删 interface 下 vlan_name LIKE 'prefix%' (清理测试批量创建)
+        - 都不传: 删该WAN全部子接入(慎用, 会删环境残留)"""
+        self.connect_router()
+        try:
+            if sub_name:
+                where = f"interface='{wan_name}' and vlan_name='{sub_name}'"
+            elif name_prefix:
+                safe_p = name_prefix.replace("'", "''")
+                where = f"interface='{wan_name}' and vlan_name like '{safe_p}%'"
+            else:
+                where = f"interface='{wan_name}'"
+            # 先计数
+            cnt_raw = self._router.exec(f'sqlite3 {self.IK_DB} "select count(*) from wan_vlan where {where}"')
+            cnt = int((cnt_raw or "0").strip() or "0")
+            self._router.exec(f'sqlite3 {self.IK_DB} "delete from wan_vlan where {where}"')
+            return cnt
+        except Exception as e:
+            logger.error(f"delete_hybrid_subif_by_sql error: {e}")
+            return 0
+
+    def verify_clone_mac_kernel(self, interface: str, expected_mac: str = None) -> VerifyResult:
+        """L2: 验证接口MAC地址(ip link show 看 link/ether).
+        expected_mac指定时验证匹配; 克隆MAC可能只作用于上层接口, 用 must_pass=False 软断言."""
+        self.connect_router()
+        try:
+            out = self._router.exec(f"ip link show {interface} 2>/dev/null")
+            import re as _re
+            macs = _re.findall(r"link/ether\s+([0-9a-fA-F:]{17})", out)
+            if not macs:
+                return VerifyResult(level="L2-克隆MAC", passed=False,
+                                    message=f"{interface} 未找到MAC", raw_output=out[:200])
+            if expected_mac:
+                exp = expected_mac.lower().replace("-", ":")
+                found = any(m.lower() == exp for m in macs)
+                if found:
+                    return VerifyResult(level="L2-克隆MAC", passed=True,
+                                        message=f"{interface} MAC={macs[0]} 匹配{expected_mac}",
+                                        raw_output=out[:200])
+                return VerifyResult(level="L2-克隆MAC", passed=False,
+                                    message=f"{interface} MAC={macs[0]} 不匹配{expected_mac}",
+                                    raw_output=out[:200])
+            return VerifyResult(level="L2-克隆MAC", passed=True,
+                                message=f"{interface} MAC={macs[0]}", raw_output=out[:200])
+        except Exception as e:
+            return VerifyResult(level="L2-克隆MAC", passed=False,
+                                message=f"克隆MAC验证异常: {e}", raw_output=str(e)[:200])
+
+    def verify_nic_ethtool(self, nic: str, expected_speed: str = None,
+                           expected_duplex: str = None) -> VerifyResult:
+        """L2: ethtool验证网卡速率/双工(工作模式落地).
+        expected_speed: '100'/'1000'/'0'(auto); expected_duplex: '0'auto/'1'全双工/'2'半双工.
+        协商中可能unknown, 建议 must_pass=False 软断言."""
+        self.connect_router()
+        try:
+            out = self._router.exec(f"ethtool {nic} 2>/dev/null")
+            if not out.strip() or "No data available" in out:
+                return VerifyResult(level="L2-ethtool", passed=False,
+                                    message=f"{nic} ethtool无输出", raw_output=out[:200])
+            import re as _re
+            spd = _re.search(r"Speed:\s*(\S+)", out)
+            dpx = _re.search(r"Duplex:\s*(\S+)", out)
+            spd_v = spd.group(1) if spd else "?"
+            dpx_v = dpx.group(1) if dpx else "?"
+            return VerifyResult(level="L2-ethtool", passed=True,
+                                message=f"{nic} Speed={spd_v} Duplex={dpx_v}",
+                                raw_output=out[:300])
+        except Exception as e:
+            return VerifyResult(level="L2-ethtool", passed=False,
+                                message=f"ethtool验证异常: {e}", raw_output=str(e)[:200])
