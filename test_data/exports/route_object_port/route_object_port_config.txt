@@ -1,0 +1,1 @@
+id=8 group_name=AUTOPORT1E group_value=[{"comment":"","port":"80"},{"comment":"","port":"443"}]

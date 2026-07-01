@@ -1,0 +1,3 @@
+id,group_name,group_value
+7,"test_mac_group_","[{""comment"":"""",""mac"":""AA:BB:CC:11:00:01""},{""comment"":"""",""mac"":""AA:BB:CC:11:00:02""},{""comment"":"""",""mac"":""AA:BB:CC:11:00:03""}]"
+8,"AUTOMAC1E","[{""mac"":""AA:BB:CC:00:00:01"",""comment"":""""},{""mac"":""AA:BB:CC:00:00:02"",""comment"":""""}]"

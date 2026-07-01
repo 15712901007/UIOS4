@@ -1,0 +1,4 @@
+id,enabled,comment,name,protocol,class,appid,src_addr,dst_addr,src_port,dst_port
+1,"yes","编辑后备注","DPROTO_TCP","tcp",0,1450002,"{""object"":{},""custom"":{}}","{""object"":{},""custom"":{}}","{""object"":{},""custom"":{}}","{""object"":{},""custom"":[""8080""]}"
+2,"yes","源目地址","DPROTO_ADDR","tcp",0,1450003,"{""object"":{},""custom"":[""192.168.10.1""]}","{""object"":{},""custom"":[""10.66.0.40""]}","{""object"":{},""custom"":{}}","{""object"":{},""custom"":{}}"
+3,"yes","UDP端口","DPROTO_UDP","udp",0,1450004,"{""object"":{},""custom"":{}}","{""object"":{},""custom"":{}}","{""object"":{},""custom"":[""1234""]}","{""object"":{},""custom"":[""5678""]}"

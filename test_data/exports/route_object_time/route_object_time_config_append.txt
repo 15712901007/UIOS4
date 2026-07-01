@@ -1,0 +1,1 @@
+group_name=AUTOIMP1 group_value=[{"weekdays":"1234567","end_time":"23:59","type":"weekly","start_time":"00:00"}]

@@ -1,3 +1,3 @@
 id,enabled,name,interface,local_privatekey,local_publickey,local_address,local_listenport,mtu,p_enabled,p_comment,p_peer_publickey,p_presharedkey,p_allowips,p_endpoint,p_endpoint_port,p_keepalive
-1,"yes","wgauto1","auto","wAC4EITyGogdMAXdJAEGq3qwjJRLWoB6IVqyciFbtXU=","GFmSe8XEmeSQmk2RNfH55sKY5m1EH83DpHi+C2FwzU4=","10.0.8.1/24",50000,1360,"","","","","","","",""
-2,"yes","wgport1","auto","oHems1euS1rXusOvPMGNXnIJUVBTZc6dViguftO/a1Q=","IlFYuE3NriNbw8m4lW49nrOiuTXIv/dYIRtpWxG5TXc=","10.0.9.1/24",50001,1420,"","","","","","","",""
+1,"yes","wgauto1","auto","mMwIYzW37//btbUWjhjyTZH7q093jhvoR8zwKsXI4kE=","WlaHlDuGrlMRi7YyzoUgVweMDPtXTJZIP1nYVE9cvx4=","10.0.8.1/24",50000,1360,"","","","","","","",""
+2,"yes","wgport1","auto","YJ5pKkPKSs37r1fcmyGA+e2EkMSU039AiQRRwP2CslE=","7jtIeZsYzlk3mbShWx0eUNUskj7r6vDLqrZoykvUqB0=","10.0.9.1/24",50001,1420,"","","","","","","",""

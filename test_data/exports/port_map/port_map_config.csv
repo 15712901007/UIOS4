@@ -1,7 +1,7 @@
 id,enabled,tagname,comment,interface,lan_addr,protocol,wan_port,lan_port,src_addr
 1,"yes","pm已编辑","编辑后备注","all","192.168.1.10","tcp","8080","80","{""custom"":{},""object"":{}}"
-2,"yes","pm_udp单端口","","all","192.168.1.11","udp","5353","53","{""object"":{},""custom"":{}}"
-3,"yes","pm_tcpudp","","all","192.168.1.12","tcp+udp","9443","443","{""object"":{},""custom"":{}}"
+2,"yes","pm_udp单端口","","all","192.168.1.11","udp","5353","53","{""custom"":{},""object"":{}}"
+3,"yes","pm_tcpudp","","all","192.168.1.12","tcp+udp","9443","443","{""custom"":{},""object"":{}}"
 4,"yes","pm端口范围","","all","192.168.1.13","tcp","3000-4000","1000-2000","{""custom"":{},""object"":{}}"
 5,"yes","pm多端口","","all","192.168.1.14","tcp","8080,8443","80,443","{""object"":{},""custom"":{}}"
 6,"yes","pm指定wan1","","wan1","192.168.1.15","tcp","2222","22","{""custom"":{},""object"":{}}"
