@@ -487,7 +487,11 @@ class InterfaceSettingsPage(IkuaiTablePage):
                 return False
             loc = self.page.locator("[data-tmp-mark='1']")
             loc.fill(value)
-            loc.dispatch_event("blur")  # Ant Form某些字段(DHCP option/备注)要blur才更新state持久化
+            # Ant Form某些字段(DHCP option/备注textarea)要blur才更新state持久化; evaluate dispatch最可靠(loc.dispatch_event对textarea不够)
+            self.page.evaluate("""() => {
+                const el = document.querySelector("[data-tmp-mark='1']");
+                if (el) { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('blur', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }
+            }""")
             self.page.evaluate("document.querySelector(\"[data-tmp-mark='1']\")?.removeAttribute('data-tmp-mark')")
             self.page.wait_for_timeout(300)
             return True
