@@ -583,11 +583,11 @@ class TestInterfaceSettingsComprehensive:
                 page.navigate_to_interface_settings()
                 if page.open_edit_page("wan2"):
                     page.page.wait_for_timeout(2500)  # 等textarea(备注)React同步原值(延迟,同checkbox)
-                    page.fill_remark("autotest remark")
+                    page.fill_remark("autotest_remark")
                     page.click_save()
                     page.page.wait_for_timeout(2500)
                     ssh_verify("L1-wan2(comment)", backend_verifier.verify_wan_database,
-                               "wan2", must_pass=False, expected_fields={"comment": "autotest remark"})
+                               "wan2", must_pass=True, expected_fields={"comment": "autotest_remark"})
                 # 恢复: disc切回原值 + comment清空(分开save)
                 cur_disc = str(backend_verifier.find_wan("wan2").get("disc_auto_switch", "")) if backend_verifier else ""
                 if cur_disc != wan2_orig_disc:

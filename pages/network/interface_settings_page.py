@@ -508,8 +508,17 @@ class InterfaceSettingsPage(IkuaiTablePage):
                 print(f"[DEBUG] _fill_labeled_input_pw 未定位: {label_keyword}")
                 return False
             loc = self.page.locator("[data-tmp-mark='1']")
-            loc.fill(value)
-            # Ant Form某些字段(DHCP option/备注textarea)要blur才更新state持久化; evaluate dispatch最可靠(loc.dispatch_event对textarea不够)
+            # textarea用type逐字符(触发React onChange; MCP验证fill对textarea只改val不更新Form state→save丢值, type逐字符才持久化); input用fill
+            try:
+                tag = str(loc.evaluate("el => el.tagName")).upper()
+            except Exception:
+                tag = "INPUT"
+            if tag == "TEXTAREA":
+                loc.fill("")
+                loc.type(value, delay=20)
+            else:
+                loc.fill(value)
+            # Ant Form某些字段(DHCP option/备注)要blur才更新state持久化; evaluate dispatch最可靠
             self.page.evaluate("""() => {
                 const el = document.querySelector("[data-tmp-mark='1']");
                 if (el) { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('blur', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }
