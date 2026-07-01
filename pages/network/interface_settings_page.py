@@ -430,7 +430,7 @@ class InterfaceSettingsPage(IkuaiTablePage):
         用React原生setter触发onChange(避开'表单不触发onChange'踩坑)."""
         try:
             ok = self.page.evaluate("""({kw, val}) => {
-                const sel = "input[type='text'], input[type='password'], input:not([type])";
+                const sel = "input[type='text'], input[type='password'], input:not([type]), textarea";
                 const inputs = [...document.querySelectorAll(sel)].filter(i => i.offsetParent !== null && !i.closest('.ant-select'));
                 for (const inp of inputs) {
                     let p = inp.parentElement;
@@ -439,7 +439,8 @@ class InterfaceSettingsPage(IkuaiTablePage):
                         if (t.includes(kw)) {
                             const inps = [...p.querySelectorAll(sel)].filter(x => x.offsetParent !== null && !x.closest('.ant-select'));
                             if (inps.length === 1 && inps[0] === inp) {
-                                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                                const proto = inp.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
                                 setter.call(inp, val);
                                 inp.dispatchEvent(new Event('input', {bubbles: true}));
                                 inp.dispatchEvent(new Event('change', {bubbles: true}));
@@ -467,7 +468,7 @@ class InterfaceSettingsPage(IkuaiTablePage):
         JS定位+data-tmp-mark标记+Playwright fill(模拟真实键盘输入)."""
         try:
             found = self.page.evaluate("""(kw) => {
-                const sel = "input[type='text'], input[type='password'], input:not([type])";
+                const sel = "input[type='text'], input[type='password'], input:not([type]), textarea";
                 const inputs = [...document.querySelectorAll(sel)].filter(i => i.offsetParent !== null && !i.closest('.ant-select'));
                 for (const inp of inputs) {
                     let p = inp.parentElement;
@@ -501,7 +502,7 @@ class InterfaceSettingsPage(IkuaiTablePage):
         """读label关键词对应的单input字段当前值(与_fill_labeled_input同定位, 用于恢复/校验)"""
         try:
             val = self.page.evaluate("""(kw) => {
-                const sel = "input[type='text'], input[type='password'], input:not([type])";
+                const sel = "input[type='text'], input[type='password'], input:not([type]), textarea";
                 const inputs = [...document.querySelectorAll(sel)].filter(i => i.offsetParent !== null && !i.closest('.ant-select'));
                 for (const inp of inputs) {
                     let p = inp.parentElement;
@@ -522,16 +523,38 @@ class InterfaceSettingsPage(IkuaiTablePage):
             return ""
 
     def expand_advanced(self) -> bool:
-        """展开'高级设置'折叠面板(已展开则跳过). iKuai编辑页默认展开, 此为保险."""
+        """确保'高级设置'折叠面板展开 且 工作模式select可被_select_labeled定位.
+        iKuai默认展开但select异步渲染(label文本先出, select后出), 轮询等待select真正可定位;
+        2.5s仍不可定位则点.ant-collapse-header展开."""
+        ready_js = """(kw) => {
+            const sels = [...document.querySelectorAll('.ant-select')].filter(s => s.offsetParent !== null);
+            for (const sel of sels) {
+                let p = sel.parentElement;
+                for (let d = 0; d < 6 && p; d++) {
+                    if ((p.innerText||'').includes(kw)) {
+                        const sub = [...p.querySelectorAll('.ant-select')].filter(x => x.offsetParent !== null);
+                        if (sub.length === 1 && sub[0] === sel) return true;
+                        break;
+                    }
+                    p = p.parentElement;
+                }
+            }
+            return false;
+        }"""
         try:
-            wm = self.page.locator("text=工作模式")
-            if wm.count() > 0 and wm.first.is_visible():
-                return True
-            header = self.page.locator("text=高级设置").first
-            if header.count() > 0:
-                header.click()
-                self.page.wait_for_timeout(800)
-            return True
+            for i in range(15):  # 等7.5秒
+                if self.page.evaluate(ready_js, "工作模式"):
+                    return True
+                if i == 5:  # 2.5秒后仍不可定位→尝试点collapse header展开
+                    header = self.page.locator(".ant-collapse-header").filter(has_text="高级设置").first
+                    if header.count() > 0:
+                        try:
+                            header.click()
+                            self.page.wait_for_timeout(1000)
+                        except Exception:
+                            pass
+                self.page.wait_for_timeout(500)
+            return self.page.evaluate(ready_js, "工作模式")
         except Exception as e:
             print(f"[DEBUG] expand_advanced error: {e}")
             return False
@@ -547,7 +570,7 @@ class InterfaceSettingsPage(IkuaiTablePage):
                     for (let d = 0; d < 6 && p; d++) {
                         const t = p.innerText || '';
                         if (t.includes(kw)) {
-                            const sub = [...p.querySelectorAll('.ant-select')].filter(x => x.offsetParent !== null && !x.closest('.ant-select'));
+                            const sub = [...p.querySelectorAll('.ant-select')].filter(x => x.offsetParent !== null);
                             if (sub.length === 1 && sub[0] === sel) {
                                 const s = sel.querySelector('.ant-select-selector');
                                 s.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
