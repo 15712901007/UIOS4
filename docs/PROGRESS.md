@@ -252,11 +252,30 @@
 - [ ] VLAN异常测试性能优化(lan1选择超时30s/子步骤)
 - [ ] DMZ产品bug反馈(netmap.sh select * → select count(*))
 
+## Phase 18: 内外网设置模块 [100%] (2026-07-01 补全5种接入方式, 35步全字段SSH验证)
+
+### 内外网设置 (35步综合测试 + SSH全字段验证 + 设备自动恢复)
+- [x] 5种外网接入方式全覆盖(静态[0]/DHCP[1]/PPPoE[2]/物理混合MACVLAN[3]/VLAN混合[4])+SSH验证internet=0-4
+- [x] PPPoE全字段(internet/username/passwd/mtu/pppoe_service/pppoe_ac/timing_rst_switch定时重拨)+异常空账号拦截
+- [x] 物理混合模式(internet=3)+二级表格UI(导入/导出/3子tab[静态/DHCP/PPPoE]/添加/启用/停用/删除)+drawer抽屉添加
+- [x] VLAN混合模式(internet=4)+VLAN_ID列
+- [x] 高级设置(工作模式/网卡速率speed=100+ethtool Speed=100Mb/s落地)+克隆MAC(DB+内核L2)
+- [x] DHCP选项(option12/60/61=hostname/vendorclass/clientid)+SSH验证
+- [x] 掉线切换disc_auto_switch(两次save+等4s前端同步)+备注comment(type无空格)+SSH验证(must_pass=True)
+- [x] 静态IP+DNS(placeholder定位)+名称15字符截断+列表搜索+状态/LAN扩展只读
+- [x] InterfaceSettingsPage继承IkuaiTablePage(复用混合模式二级表格CRUD/导入导出)
+- [x] _fill_labeled_input(_pw)按label定位+排除ant-select+textarea用type+blur持久化
+- [x] _toggle_checkbox统一label内/外定位(掉线切换wrapper内/定时重拨wrapper外)
+- [x] backend_verifier: verify_hybrid_subif/verify_wan_internet_mode/verify_clone_mac_kernel/verify_nic_ethtool + restore按id + mac大小写不敏感
+- [x] wan1绝对只读保护; LAN互访iptables; 重启持久化; 异常拦截; finally兜底SQL恢复
+- [x] 验证: 1 passed (~8min, 35步全字段SSH must_pass=True全绿无软失败)
+- [x] 发现: 混合模式静态子接入drawer添加报"输入有误"(疑产品bug, 作发现记录非阻断)
+
 ---
 
 **总体进度: 约99%**
 
-**已覆盖模块: 19个** (VLAN/IP限速/MAC限速/静态路由/跨三层服务/多线负载/协议分流/端口分流/域名分流/上下行分离/UPnP设置/NAT规则/端口映射/DMZ主机/IGMP代理/IPTV透传/UDPXY设置)
+**已覆盖模块: 20个** (VLAN/IP限速/MAC限速/静态路由/跨三层服务/多线负载/协议分流/端口分流/域名分流/上下行分离/UPnP设置/NAT规则/端口映射/DMZ主机/IGMP代理/IPTV透传/UDPXY设置/内外网设置)
 
 **已知产品Bug: 1个** (DMZ重启后不生效, netmap.sh init的select*错误)
 
