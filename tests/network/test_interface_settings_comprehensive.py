@@ -554,33 +554,62 @@ class TestInterfaceSettingsComprehensive:
                     rec.add_detail("[WARN] lan1编辑页未打开(LAN扩展只读降级)")
 
             # ==================== 步骤33: 掉线自动切换+备注(wan2) ====================
-            with rec.step("步骤33: 掉线自动切换+备注", "wan2切disc_auto_switch+填备注→SSH验证→恢复"):
+            with rec.step("步骤33: 掉线自动切换+备注", "wan2: ①click掉线切换+save验证disc ②填备注+save验证comment(分开save避免互相干扰)→恢复"):
                 print("\n[步骤33] 掉线自动切换+备注...")
-                wan2_orig_disc = snapshot.get("_wan2", {}).get("disc_auto_switch", "1")
+                wan2_orig_disc = str(snapshot.get("_wan2", {}).get("disc_auto_switch", "1"))
+                wan2_orig_comment = str(snapshot.get("_wan2", {}).get("comment", ""))
+                # ① disc toggle 单独save(fill_remark会干扰checkbox状态, 故disc单独切+save)
+                disc_before = str(backend_verifier.find_wan("wan2").get("disc_auto_switch", "")) if backend_verifier else wan2_orig_disc
                 page.navigate_to_interface_settings()
                 if page.open_edit_page("wan2"):
-                    target_disc = not (str(wan2_orig_disc) == "1")
-                    page.toggle_disc_auto_switch(target_disc)
+                    try:
+                        cb = page.page.locator(".ant-checkbox-wrapper", has_text="掉线自动切换").first
+                        cb.wait_for(timeout=5000)
+                        page.page.wait_for_timeout(4000)  # 等4s前端checkbox同步DB值
+                        cb.click()
+                        page.page.wait_for_timeout(500)
+                    except Exception as e:
+                        rec.add_detail(f"[WARN] 掉线切换click异常: {str(e)[:50]}")
+                    page.click_save()  # 单独save(只切disc)
+                    page.page.wait_for_timeout(2500)
+                    disc_after = str(backend_verifier.find_wan("wan2").get("disc_auto_switch", "")) if backend_verifier else ""
+                    if disc_after and disc_after != disc_before:
+                        rec.add_detail(f"[OK] 掉线切换toggle生效+持久化: {disc_before}→{disc_after}")
+                    else:
+                        ui_failures.append(f"步骤33: 掉线切换未变化 {disc_before}→{disc_after}")
+                else:
+                    ui_failures.append("步骤33: 打开wan2编辑页失败")
+                # ② comment 单独save
+                page.navigate_to_interface_settings()
+                if page.open_edit_page("wan2"):
                     page.fill_remark("autotest remark")
                     page.click_save()
                     page.page.wait_for_timeout(2500)
-                    rec.add_detail(f"[OK] wan2掉线自动切换={target_disc} + 备注")
-                    ssh_verify("L1-wan2(disc_auto_switch)", backend_verifier.verify_wan_database,
-                               "wan2", must_pass=False,
-                               expected_fields={"disc_auto_switch": "1" if target_disc else "0"})
                     ssh_verify("L1-wan2(comment)", backend_verifier.verify_wan_database,
                                "wan2", must_pass=False, expected_fields={"comment": "autotest remark"})
-                else:
-                    ui_failures.append("步骤33: 打开wan2编辑页失败")
+                # 恢复: disc切回原值 + comment清空(分开save)
+                cur_disc = str(backend_verifier.find_wan("wan2").get("disc_auto_switch", "")) if backend_verifier else ""
+                if cur_disc != wan2_orig_disc:
+                    page.navigate_to_interface_settings()
+                    if page.open_edit_page("wan2"):
+                        try:
+                            cb = page.page.locator(".ant-checkbox-wrapper", has_text="掉线自动切换").first
+                            cb.wait_for(timeout=5000)
+                            page.page.wait_for_timeout(4000)
+                            cb.click()
+                            page.page.wait_for_timeout(500)
+                        except Exception:
+                            pass
+                        page.click_save()
+                        page.page.wait_for_timeout(2500)
                 page.navigate_to_interface_settings()
                 if page.open_edit_page("wan2"):
-                    page.toggle_disc_auto_switch(str(wan2_orig_disc) == "1")
-                    page.fill_remark("")
+                    page.fill_remark(wan2_orig_comment)
                     page.click_save()
                     page.page.wait_for_timeout(2500)
                     rec.add_detail("[OK] wan2掉线切换+备注恢复")
                 ssh_verify("L1-wan2恢复(disc_auto_switch)", backend_verifier.verify_wan_database,
-                           "wan2", must_pass=False, expected_fields={"disc_auto_switch": str(wan2_orig_disc)})
+                           "wan2", must_pass=True, expected_fields={"disc_auto_switch": wan2_orig_disc})
 
             # ==================== 步骤34: 静态IP+DNS1/DNS2(wan3) ====================
             with rec.step("步骤34: 静态IP+DNS", "wan3切静态+填IP/掩码/网关/DNS1/DNS2→SSH验证internet=0→恢复"):

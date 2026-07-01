@@ -303,36 +303,24 @@ class InterfaceSettingsPage(IkuaiTablePage):
 
     def fill_static_ip(self, ip: str, netmask: str = "255.255.255.0",
                        gateway: str = "", dns1: str = "", dns2: str = ""):
-        """填写静态IP字段. 切到静态模式后, IP/掩码/网关/DNS按input出现顺序.
-        注意: 这些input无placeholder, 用序号定位(编辑页第3-7个text input)."""
+        """填写静态IP字段(切到静态模式后). IP/网关用placeholder定位.
+        实测(2026-07-01): 静态模式 IP placeholder='请输入IP地址', 网关='请输入网关',
+        掩码是select(默认255.255.255.0(24)), DNS静态模式无独立字段."""
         try:
-            # 收集所有 text input(排除名称和只读)
-            inputs = self.page.locator("input[type=text]")
-            # 静态IP字段位置(经验值): 名称是第2个(input idx1), IP/掩码/网关/DNS1/DNS2 紧随
-            # 用更稳健方式: 找值为IP格式或紧跟在接入方式后的input
-            # 先尝试: 所有 text input 里值为IP的, 依次填
-            vals_to_set = [v for v in [ip, netmask, gateway, dns1, dns2] if v]
-            # 定位IP区: 找第一个值像IP的input作为起点
-            start_idx = -1
-            total = inputs.count()
-            for i in range(total):
-                v = inputs.nth(i).input_value(timeout=1000)
-                if self._looks_like_ip(v) or v == "":
-                    # 确认是IP区(紧跟名称之后)
-                    start_idx = i
-                    break
-            if start_idx < 0:
-                start_idx = 2  # 降级: 第3个
-            # 依次填IP/掩码/网关/DNS1/DNS2
-            fill_order = [(ip, 0), (netmask, 1), (gateway, 2), (dns1, 3), (dns2, 4)]
-            for val, offset in fill_order:
-                if not val:
-                    continue
-                idx = start_idx + offset
-                if idx < total:
-                    inp = inputs.nth(idx)
-                    inp.fill("")
-                    inp.fill(val)
+            ip_inp = self.page.get_by_placeholder("请输入IP地址")
+            try:
+                ip_inp.first.wait_for(timeout=3000)
+                ip_inp.first.fill(ip)
+            except Exception:
+                print("[DEBUG] fill_static_ip: IP字段(请输入IP地址)未就绪")
+            if gateway:
+                gw_inp = self.page.get_by_placeholder("请输入网关")
+                try:
+                    gw_inp.first.wait_for(timeout=2000)
+                    gw_inp.first.fill(gateway)
+                except Exception:
+                    pass
+            # 掩码select默认255.255.255.0; 如非默认用_select_labeled("子网掩码", ...); DNS静态模式无独立字段
             self.page.wait_for_timeout(300)
         except Exception as e:
             print(f"[DEBUG] fill_static_ip error: {e}")
@@ -408,13 +396,20 @@ class InterfaceSettingsPage(IkuaiTablePage):
         return self._toggle_checkbox("掉线自动切换", enable)
 
     def _toggle_checkbox(self, label_text: str, enable: bool) -> bool:
-        """切换复选框到指定状态(读当前状态决定是否点击)"""
+        """切换复选框到指定状态. 等待状态稳定(进编辑页React初始化可能延迟false→真实值)再判断是否点击."""
         try:
             cb = self.page.locator(".ant-checkbox-wrapper", has_text=label_text)
             if cb.count() == 0:
                 return False
             wrapper = cb.first
+            # 等待checkbox状态稳定(进编辑页初始false, 同步DB真实值需~4s, 轮询5s)
             is_checked = wrapper.locator("input").is_checked()
+            for _ in range(10):
+                self.page.wait_for_timeout(500)
+                new_checked = wrapper.locator("input").is_checked()
+                if new_checked == is_checked:
+                    break
+                is_checked = new_checked
             if is_checked != enable:
                 wrapper.click()
                 self.page.wait_for_timeout(300)
@@ -490,8 +485,10 @@ class InterfaceSettingsPage(IkuaiTablePage):
             if not found:
                 print(f"[DEBUG] _fill_labeled_input_pw 未定位: {label_keyword}")
                 return False
-            self.page.locator("input[data-tmp-mark='1']").fill(value)
-            self.page.evaluate("document.querySelector(\"input[data-tmp-mark='1']\")?.removeAttribute('data-tmp-mark')")
+            loc = self.page.locator("[data-tmp-mark='1']")
+            loc.fill(value)
+            loc.dispatch_event("blur")  # Ant Form某些字段(DHCP option/备注)要blur才更新state持久化
+            self.page.evaluate("document.querySelector(\"[data-tmp-mark='1']\")?.removeAttribute('data-tmp-mark')")
             self.page.wait_for_timeout(300)
             return True
         except Exception as e:
@@ -692,8 +689,8 @@ class InterfaceSettingsPage(IkuaiTablePage):
 
     # ==================== 通用字段 ====================
     def fill_remark(self, remark: str) -> bool:
-        """填备注(label='备注', 覆盖基类以适配编辑页label结构)"""
-        return self._fill_labeled_input("备注", remark)
+        """填备注(label='备注', 覆盖基类). 用_pw(Playwright fill+blur)触发Form state持久化(同DHCP option)."""
+        return self._fill_labeled_input_pw("备注", remark)
 
     def fill_online_time_period(self, start: str = "00:00", end: str = "23:59") -> bool:
         """读/填上线时间段控制. iKuai为双input时间字段, 默认值不变即跳过(时间控件复杂, 测试仅读)."""
