@@ -252,7 +252,7 @@
 - [ ] VLAN异常测试性能优化(lan1选择超时30s/子步骤)
 - [ ] DMZ产品bug反馈(netmap.sh select * → select count(*))
 
-## Phase 18: 内外网设置模块 [100%] (2026-07-01 补全5种接入方式, 35步全字段SSH验证)
+## Phase 18: 内外网设置模块 [100%] (2026-07-01 补全5种接入方式35步 + 2026-07-02 混合子接入CRUD全修复每子tab~30步)
 
 ### 内外网设置 (35步综合测试 + SSH全字段验证 + 设备自动恢复)
 - [x] 5种外网接入方式全覆盖(静态[0]/DHCP[1]/PPPoE[2]/物理混合MACVLAN[3]/VLAN混合[4])+SSH验证internet=0-4
@@ -269,7 +269,8 @@
 - [x] backend_verifier: verify_hybrid_subif/verify_wan_internet_mode/verify_clone_mac_kernel/verify_nic_ethtool + restore按id + mac大小写不敏感
 - [x] wan1绝对只读保护; LAN互访iptables; 重启持久化; 异常拦截; finally兜底SQL恢复
 - [x] 验证: 1 passed (~8min, 35步全字段SSH must_pass=True全绿无软失败)
-- [x] 发现: 混合模式静态子接入drawer添加报"输入有误"(疑产品bug, 作发现记录非阻断)
+- [x] **混合模式子接入CRUD全通(2026-07-02)**: static/dhcp/pppoe × 物理混合(3)+VLAN混合(4) 各~30步, add/edit/del/disable/enable/import 全SSH后台验证. 修复8根因(drawer直写库非暂存→去click_save保编辑页/MAC唯一校验+检测已存在/VLAN_ID必填/MTU必填/acct-pwd索引错r[5]r[6]→r[4]r[5]/pppoe名称adsl开头/evaluate空drawer过滤innerText>5/div.ant-table-row虚拟滚动非tr) + A导出导入恢复(hybrid_import_rules set_input_files+导入前删+导入后SSH) + B多条CRUD(第二条编辑+停用启用SSH验enabled). 详见docs/CHANGELOG.md 2026-07-02段.
+- [x] ~~发现: 混合模式静态子接入drawer添加报"输入有误"(疑产品bug)~~ → **更正: 测试代码8根因, 非产品bug, 已修复(PASSED 40min)**
 
 ---
 

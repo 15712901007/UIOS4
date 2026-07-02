@@ -7,6 +7,8 @@ import os
 import sys
 import subprocess
 import re
+import json
+import glob
 import threading
 import queue
 import time
@@ -142,6 +144,12 @@ def _read_output_stream(stream, output_queue):
         stream.close()
 
 
+# pytest -v -s 输出: 测试开始时先打印节点行 "tests/...::test_xxx[chromium] ",
+# 测试结束后在新行单独打印结果词 PASSED/FAILED/SKIPPED/ERROR.
+# 只匹配"整行就是结果词"的行, 避开 traceback 与 short summary 段的 "FAILED tests/...".
+_RESULT_WORD_RE = re.compile(r"^\s*(PASSED|FAILED|SKIPPED|ERROR)\s*(?:\[\s*\d+%\])?\s*$")
+
+
 class TestRunner(QThread):
     """测试执行线程"""
 
@@ -169,6 +177,8 @@ class TestRunner(QThread):
         self.passed = 0
         self.failed = 0
         self.skipped = 0
+        # short test summary info 段已开始的标志(该段会重复列出每个FAILED, 不能再计数)
+        self._summary_started = False
 
         # 开始时间
         self.start_time = None
@@ -176,6 +186,11 @@ class TestRunner(QThread):
     def run(self):
         """执行测试"""
         self.start_time = datetime.now()
+        # 重置计数与标志(支持线程复用/重跑)
+        self.passed = 0
+        self.failed = 0
+        self.skipped = 0
+        self._summary_started = False
         self.log_signal.emit("INFO", f"开始执行 {self.total} 个测试用例...")
 
         # 获取项目根目录（动态计算，不受项目路径变化影响）
@@ -275,6 +290,7 @@ class TestRunner(QThread):
 
             # 测试完成
             if self._is_running:
+                self._read_final_stats(report_dir)  # 用conftest权威JSON校正统计(与HTML报告一致)
                 duration = datetime.now() - self.start_time
                 self.log_signal.emit("INFO", f"测试执行完成，用时: {duration}")
                 self.log_signal.emit("INFO", f"总计: {self.total}, 通过: {self.passed}, 失败: {self.failed}, 跳过: {self.skipped}")
@@ -332,6 +348,7 @@ class TestRunner(QThread):
         reader_thread.join(timeout=3)
 
         if self._is_running:
+            self._read_final_stats(report_dir)  # 用conftest权威JSON校正统计(与HTML报告一致)
             duration = datetime.now() - self.start_time
             self.log_signal.emit("INFO", f"测试执行完成，用时: {duration}")
             self.log_signal.emit("INFO", f"总计: {self.total}, 通过: {self.passed}, 失败: {self.failed}, 跳过: {self.skipped}")
@@ -426,25 +443,64 @@ class TestRunner(QThread):
         return cmd
 
     def _parse_output(self, line: str):
-        """解析pytest输出"""
-        # 解析 PASSED
-        if "PASSED" in line:
-            self.passed += 1
+        """解析pytest输出.
+
+        只匹配"整行就是结果词"的行(PASSED/FAILED/SKIPPED/ERROR), 避免纯子串计数——
+        pytest -v 末尾的 'short test summary info' 段会把每个FAILED再列一遍(形如
+        'FAILED tests/...::test_x'), 纯子串计数会把失败数翻倍(真实2个被数成4个).
+        叠加 summary 段停计标志, 双保险.
+        """
+        # 进入 short test summary info 段后停止计数(该段重复列出每个FAILED)
+        if "short test summary info" in line:
+            self._summary_started = True
+            return
+        if self._summary_started:
+            return
+        m = _RESULT_WORD_RE.match(line)
+        if m:
+            outcome = m.group(1)
+            if outcome == "PASSED":
+                self.passed += 1
+            elif outcome == "FAILED":
+                self.failed += 1
+            elif outcome == "SKIPPED":
+                self.skipped += 1
+            elif outcome == "ERROR":
+                # setup/teardown/collect error 也算未通过(并入failed, progress信号4参数不变)
+                self.failed += 1
+                self.log_signal.emit("ERROR", line)
             self._emit_progress()
 
-        # 解析 FAILED
-        elif "FAILED" in line:
-            self.failed += 1
-            self._emit_progress()
+    def _read_final_stats(self, report_dir: str):
+        """测试结束后读 conftest 落盘的 test_results.json(权威统计)校正计数.
 
-        # 解析 SKIPPED
-        elif "SKIPPED" in line:
-            self.skipped += 1
-            self._emit_progress()
-
-        # 解析错误
-        elif "ERROR" in line:
-            self.log_signal.emit("ERROR", line)
+        conftest.py 的 pytest_sessionfinish 把 _test_results(由 pytest_runtest_logreport
+        的 when=='call' 精确累加)写到 reports/output/test_results.json, 与HTML报告同一
+        数据源, 最权威. 读不到(JSON未生成/异常)时保留 _parse_output 的实时计数, 不阻断.
+        """
+        try:
+            candidates = glob.glob(os.path.join(report_dir, "test_results.json"))
+            if not candidates:
+                candidates = glob.glob(os.path.join(report_dir, "**", "test_results.json"), recursive=True)
+            if not candidates:
+                self.log_signal.emit("WARNING", "未找到 test_results.json, 保留实时计数")
+                return
+            json_path = max(candidates, key=os.path.getmtime)
+            with open(json_path, encoding="utf-8") as f:
+                data = json.load(f)
+            # conftest自定义格式: 顶层 total/passed/failed/skipped
+            if isinstance(data, dict) and "total" in data:
+                self.total = int(data.get("total", self.total))
+                self.passed = int(data.get("passed", self.passed))
+                self.failed = int(data.get("failed", self.failed))
+                self.skipped = int(data.get("skipped", self.skipped))
+                self.log_signal.emit("INFO",
+                    f"已用 {os.path.basename(json_path)} 校正统计: "
+                    f"总计{self.total} 通过{self.passed} 失败{self.failed} 跳过{self.skipped}")
+            else:
+                self.log_signal.emit("WARNING", f"{os.path.basename(json_path)} 格式不符, 保留实时计数")
+        except Exception as e:
+            self.log_signal.emit("WARNING", f"读取test_results.json失败({e}), 保留实时计数")
 
     def _emit_progress(self):
         """发送进度信号"""

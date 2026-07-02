@@ -44,6 +44,8 @@ class InterfaceSettingsPage(IkuaiTablePage):
     (基类行操作基于'文本锚点+JS向上找按钮', 与行是tr还是div.ant-table-row无关).
     保留子类 click_save/click_cancel 覆盖基类(子类版更稳健, 带.first和超时保护).
     """
+    # 导入导出存到 test_data/exports/interface_settings/ (混合模式子接入)
+    MODULE_NAME = "interface_settings"
 
     # 6个物理网卡全分配时"新增配置"disabled; 需先解绑网卡
     # 安全: wan1 绝对只读
@@ -266,6 +268,7 @@ class InterfaceSettingsPage(IkuaiTablePage):
             opt = self.page.locator(".ant-select-dropdown:visible").last.locator(
                 f".ant-select-item[title*='{keyword}'], .ant-select-item-option-content"
             ).filter(has_text=keyword)
+            clicked = False
             if opt.count() > 0:
                 # 点含keyword的option-content(真实选项), 避开数字标签
                 real_opt = self.page.locator(".ant-select-dropdown:visible").last.locator(
@@ -275,28 +278,34 @@ class InterfaceSettingsPage(IkuaiTablePage):
                     real_opt.first.click()
                 else:
                     opt.first.click()
-                self.page.wait_for_timeout(1500)
-                return True
-            # 降级: JS遍历找有title含keyword的option
-            clicked = self.page.evaluate("""(kw) => {
-                let dds = [...document.querySelectorAll('.ant-select-dropdown')];
-                for (let dd of dds) {
-                    let opts = dd.querySelectorAll('.ant-select-item');
-                    for (let o of opts) {
-                        let title = o.getAttribute('title') || '';
-                        let content = o.querySelector('.ant-select-item-option-content');
-                        let txt = content ? content.innerText : '';
-                        if (title.includes(kw) || txt.includes(kw)) {
-                            if (!content || content.innerText !== content.innerText.match(/^[0-9]+$/)) {
-                                o.click(); return true;
+                clicked = True
+            else:
+                # 降级: JS遍历找有title含keyword的option
+                clicked = self.page.evaluate("""(kw) => {
+                    let dds = [...document.querySelectorAll('.ant-select-dropdown')];
+                    for (let dd of dds) {
+                        let opts = dd.querySelectorAll('.ant-select-item');
+                        for (let o of opts) {
+                            let title = o.getAttribute('title') || '';
+                            let content = o.querySelector('.ant-select-item-option-content');
+                            let txt = content ? content.innerText : '';
+                            if (title.includes(kw) || txt.includes(kw)) {
+                                if (!content || content.innerText !== content.innerText.match(/^[0-9]+$/)) {
+                                    o.click(); return true;
+                                }
                             }
                         }
                     }
-                }
-                return false;
-            }""", keyword)
+                    return false;
+                }""", keyword)
             self.page.wait_for_timeout(1500)
-            return bool(clicked)
+            # 回读校验: 点选后 select 显示值必须确实变成目标模式, 否则视为切换失败(防假成功)
+            if clicked:
+                cur = self.get_current_access_mode()
+                if keyword in cur:
+                    return True
+                print(f"[DEBUG] set_access_mode({mode}) 点选后回读不一致: 期望含'{keyword}' 实际'{cur}'")
+            return False
         except Exception as e:
             print(f"[DEBUG] set_access_mode({mode}) error: {e}")
             return False
@@ -736,8 +745,9 @@ class InterfaceSettingsPage(IkuaiTablePage):
     # 切到混合模式后, 编辑页变为二级表格: 导入/导出 + 3子tab(静态IP/DHCP动态IP/ADSL-PPPoE拨号)
     #   + 添加/启用/停用/删除 + 子表格(名称/IP/掩码/网关/MAC/备注/状态/操作).
     # 子接入存 wan_vlan表(interface=父WAN, vlan_id, vlan_name=子接入名, vlan_internet=0静/1DHCP/2PPPoE).
-    # 添加=drawer抽屉表单(placeholder字段: 请输入名称/请输入IP地址/请输入MAC地址/请输入网关),
-    #   drawer保存暂存→页面底部'保存'批量写库.
+    # 添加=drawer抽屉表单(placeholder字段: 请输入名称/请输入IP地址/请输入MAC地址/请输入网关/请输入VLAN_ID[VLAN混合]),
+    #   drawer保存→直接写wan_vlan库(实测非暂存). MAC接口内唯一校验,重复→"已存在相同内容"→drawer不关不写库.
+    # 物理混合(internet=3)二级表格列无VLAN_ID(MACVLAN); VLAN混合(internet=4)列含VLAN_ID且drawer必填.
     HYBRID_SUBTAB = {"static": "静态IP", "dhcp": "DHCP", "pppoe": "PPPoE"}
 
     def switch_hybrid_subtab(self, subtab: str) -> bool:
@@ -767,6 +777,13 @@ class InterfaceSettingsPage(IkuaiTablePage):
         """点混合模式工具栏'添加'→打开drawer. 必须用evaluate精确选main内可见非disabled的添加按钮
         (Playwright filter().first()会选到隐藏按钮导致drawer不开)."""
         try:
+            # 温和清理残留modal/确认弹窗(不强制隐藏drawer—会破坏React state导致后续drawer不开)
+            try:
+                self.close_modal_if_exists()
+                self.page.keyboard.press("Escape")
+                self.page.wait_for_timeout(400)
+            except Exception:
+                pass
             opened = self.page.evaluate("""() => {
                 const btns = [...document.querySelectorAll('main button')]
                     .filter(b => b.innerText.trim() === '添加' && !b.disabled && b.offsetParent !== null);
@@ -782,9 +799,11 @@ class InterfaceSettingsPage(IkuaiTablePage):
             return False
 
     def hybrid_fill_drawer(self, name: str, ip: str = "", mac: str = "",
-                           gateway: str = "", account: str = "", password: str = "") -> bool:
+                           gateway: str = "", account: str = "", password: str = "",
+                           vlan_id: str = "", mtu: str = "") -> bool:
         """在混合模式drawer内填字段(按placeholder, Playwright真实fill触发React form state).
-        静态子tab: name/ip/mac/gateway; PPPoE子tab: name/account/password."""
+        静态子tab: name/ip/mac/gateway; PPPoE子tab: name/account/password + MTU(必填空placeholder按label定位);
+        vlan_id仅VLAN混合(internet=4)drawer有'请输入VLAN_ID'字段时填(物理混合无此字段f()跳过)."""
         try:
             dc = self._get_hybrid_drawer()
             def f(ph, val):
@@ -792,31 +811,77 @@ class InterfaceSettingsPage(IkuaiTablePage):
                     return False
                 loc = dc.locator(f"input[placeholder='{ph}']")
                 if loc.count() > 0:
-                    loc.first.fill(val)
+                    # 用type逐字符(可靠触发React onChange; Ant input的fill对部分子tab字段不触发,
+                    # 导致drawer保存时React Form认为字段空→"输入有误", 见[hybrid-fill-not-trigger-onchange])
+                    loc.first.fill("")
+                    loc.first.type(val, delay=40)
                     return True
                 return False
             ok_name = f("请输入名称", name)
+            f("请输入VLAN_ID", vlan_id)  # VLAN混合必填(物理混合drawer无此input→f()返回False跳过)
             f("请输入IP地址", ip)
             f("请输入MAC地址", mac)
             f("请输入网关", gateway)
             if account:
                 loc = dc.locator("input[placeholder='请输入账号']")
-                if loc.count() == 0:
-                    loc = dc.locator("input").filter(has_text="")  # 降级占位
-                if loc.count() > 0:
-                    loc.first.fill(account)
+                acnt = loc.count()
+                if acnt > 0:
+                    loc.first.fill("")
+                    loc.first.type(account, delay=40)
+                print(f"[DEBUG-fill_drawer] account count={acnt}")
             if password:
                 pw = dc.locator("input[type='password']").first
-                if pw.count() > 0:
-                    pw.fill(password)
+                pcnt = pw.count()
+                if pcnt > 0:
+                    pw.fill("")
+                    pw.type(password, delay=40)
+                print(f"[DEBUG-fill_drawer] password count={pcnt}")
+            # MTU(pppoe必填, 空placeholder): 按"label含MTU"的form-item内input定位
+            if mtu:
+                try:
+                    mtu_input = dc.locator(".ant-form-item:has-text('MTU') input[type='text']").first
+                    if mtu_input.count() > 0:
+                        mtu_input.fill("")
+                        mtu_input.type(str(mtu), delay=40)
+                except Exception as e:
+                    print(f"[DEBUG] fill MTU error: {e}")
             self.page.wait_for_timeout(500)
             return ok_name
         except Exception as e:
             print(f"[DEBUG] hybrid_fill_drawer error: {e}")
             return False
 
+    def _detect_drawer_error(self) -> Optional[str]:
+        """检测drawer内非标准错误提示(MAC'已存在相同内容'/名称格式/不能为空等).
+        has_form_error只认.ant-form-item-explain-error标准错误, 实测MAC'已存在相同内容'用的是
+        .ant-form-item-explain(无-error后缀)或自定义span→被漏检→hybrid_add_row误判success.
+        本方法兜底扫描drawer内所有explain容器+含校验关键词的叶子文本."""
+        try:
+            txt = self.page.evaluate("""() => {
+                const dcs = [...document.querySelectorAll('.ant-drawer')]
+                    .filter(d => getComputedStyle(d).display !== 'none');
+                if (!dcs.length) return '';
+                const dc = dcs[dcs.length - 1];
+                // 1. 所有explain容器(含-error和无-error后缀的)
+                const explains = [...dc.querySelectorAll('[class*="explain"], .ant-form-item-explain-error')];
+                for (const e of explains) { const t = (e.innerText || '').trim(); if (t) return t; }
+                // 2. 兜底: 含校验关键词的叶子文本(限长防误匹配)
+                const leaves = [...dc.querySelectorAll('*')].filter(e => !e.children.length && e.innerText);
+                for (const e of leaves) {
+                    const t = (e.innerText || '').trim();
+                    if (t && t.length < 40 && /已存在|格式错误|格式不正确|输入有误|不能为空|必须|至少|重复/.test(t)) return t;
+                }
+                return '';
+            }""")
+            return txt if txt else None
+        except Exception:
+            return None
+
     def hybrid_save_drawer(self) -> dict:
-        """点drawer内'保存'. 返回 {saved, error}. 静态子tab可能报'输入有误'(疑产品bug), error有值."""
+        """点drawer内'保存'. 返回 {saved, error}.
+        轮询drawer关闭(最多4s, 每0.5s查一次): 保存成功则drawer关闭(关闭动画2-3s); 超时未关则
+        检测错误(MAC已存在等). 根因: 固定wait 2s时drawer关闭动画可能未完成→误判saved=False→
+        hybrid_add_row提前cancel_drawer漏判in_table(行其实已出现). 轮询给足关闭时间, 仅真正未关才报error."""
         result = {"saved": False, "error": ""}
         try:
             dc = self._get_hybrid_drawer()
@@ -825,16 +890,29 @@ class InterfaceSettingsPage(IkuaiTablePage):
                 result["error"] = "drawer无保存按钮"
                 return result
             save_btn.click()
-            self.page.wait_for_timeout(2000)
-            err = self.has_form_error()
-            if err:
-                result["error"] = err
-                return result
-            drawer_open = self.page.evaluate("""() => {
-                return [...document.querySelectorAll('.ant-drawer')]
-                    .filter(d => getComputedStyle(d).display !== 'none').length > 0;
-            }""")
-            result["saved"] = not drawer_open
+            # 轮询drawer关闭(最多10s: headless下Antd drawer关闭动画慢, 实测保存API已写库成功
+            # 但display转none最久需8-10s; MCP headed模式2.5s即关)
+            for _ in range(20):
+                self.page.wait_for_timeout(500)
+                # 过滤空drawer容器(innerText<5字符): Antd drawer关闭后真实drawer内容空/卸载,
+                # 但页面常驻空的.ant-drawer根容器(display:block)会误判为"未关". 仅内容>5的有形drawer才算开
+                drawer_open = self.page.evaluate("""() => {
+                    return [...document.querySelectorAll('.ant-drawer')]
+                        .filter(d => getComputedStyle(d).display !== 'none' && (d.innerText || '').replace(/\\s/g, '').length > 5).length > 0;
+                }""")
+                if not drawer_open:
+                    result["saved"] = True
+                    break
+            if not result["saved"]:
+                # drawer未关(headless动画未完成或真校验失败). 检测明确错误 + 强制Escape关drawer
+                # (避免残留drawer连锁导致后续hybrid_open_add_drawer失败)
+                err = self.has_form_error() or self._detect_drawer_error()
+                try:
+                    self.page.keyboard.press("Escape")
+                    self.page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                result["error"] = err or "保存后drawer未关闭(已强制Escape)"
             return result
         except Exception as e:
             result["error"] = str(e)[:80]
@@ -855,27 +933,46 @@ class InterfaceSettingsPage(IkuaiTablePage):
             pass
 
     def hybrid_add_row(self, name: str, ip: str = "", mac: str = "", gateway: str = "",
-                       subtab: str = "static", account: str = "", password: str = "") -> dict:
+                       subtab: str = "static", account: str = "", password: str = "",
+                       vlan_id: str = "", mtu: str = "") -> dict:
         """混合模式添加子接入(完整流程): 切子tab→开drawer→填→保存.
-        返回 {success, error, in_table}. in_table=drawer保存后表格出现暂存行.
-        ⚠️ 静态子tab添加在该环境报'输入有误'(疑产品bug), 此时success=False, error有值, 不抛异常."""
+        返回 {success, error, in_table}. in_table=drawer保存后子接入行出现在表格(direct写wan_vlan库).
+        vlan_id: VLAN混合(internet=4)drawer必填; 物理混合(internet=3)无此字段忽略.
+        ⚠️ MAC接口内唯一, 重复→'已存在相同内容'→success=False且error有值."""
         result = {"success": False, "error": "", "in_table": False}
         try:
             self.switch_hybrid_subtab(subtab)
             self.page.wait_for_timeout(500)
+            try:
+                activeTab = self.page.evaluate("() => (document.querySelector('main .ant-tabs-tab-active')||{}).innerText || ''")
+                print(f"[DEBUG-add_row] {subtab}/{name}: activeTab={activeTab!r}")
+            except Exception:
+                pass
             if not self.hybrid_open_add_drawer():
                 result["error"] = "打开drawer失败"
+                print(f"[DEBUG-add_row] {subtab}/{name}: 打开drawer失败")
                 return result
             self.hybrid_fill_drawer(name, ip=ip, mac=mac, gateway=gateway,
-                                    account=account, password=password)
+                                    account=account, password=password, vlan_id=vlan_id, mtu=mtu)
             sv = self.hybrid_save_drawer()
-            if sv.get("error"):
-                result["error"] = sv["error"]
+            print(f"[DEBUG-add_row] {subtab}/{name}: sv.saved={sv.get('saved')} sv.error={sv.get('error')!r}")
+            # 仅明确校验错误(MAC已存在/格式/有误)才cancel; "drawer未关闭"时继续判行
+            # (headless下drawer关闭动画慢, 但保存API已成功写库, 列表会刷新出行)
+            sv_err = sv.get("error") or ""
+            if sv_err and "未关闭" not in sv_err and "Escape" not in sv_err:
+                result["error"] = sv_err
                 self.hybrid_cancel_drawer()
                 return result
-            self.page.wait_for_timeout(1000)
-            result["in_table"] = self.hybrid_row_exists(name)
-            result["success"] = True
+            # 轮询前端行出现(写库成功列表会刷新出该行; drawer关慢时多等)
+            for _ in range(8):
+                self.page.wait_for_timeout(600)
+                if self.hybrid_row_exists(name):
+                    result["in_table"] = True
+                    result["success"] = True
+                    break
+            print(f"[DEBUG-add_row] {subtab}/{name}: in_table={result['in_table']} success={result['success']}")
+            if not result["success"]:
+                result["error"] = sv_err or "添加后前端未出现行"
             return result
         except Exception as e:
             result["error"] = str(e)[:80]
@@ -889,16 +986,54 @@ class InterfaceSettingsPage(IkuaiTablePage):
         except Exception:
             return False
 
-    # 混合模式行操作(复用IkuaiTablePage, 基于文本锚点+JS向上找按钮, 与行类型无关)
+    # 混合模式行操作(evaluate找可见行+scrollIntoView+click行内按钮; 基类_click_rule_button用
+    # get_by_text.wait_for在子接入表格易超时—虚拟滚动/隐藏副本, 故override用evaluate按可见tr定位)
+    def _hybrid_click_row_button(self, name: str, button_name: str, need_confirm: bool = False) -> bool:
+        """evaluate找可见子接入行+scrollIntoView+click行内按钮(不依赖get_by_text可见性)."""
+        try:
+            res = self.page.evaluate("""([ruleName, btnName]) => {
+                // 子接入二级表格是Antd虚拟滚动: 行是div.ant-table-row(非tr), 容器.ant-table-tbody-virtual.
+                const rows = [...document.querySelectorAll('main .ant-table-row')];
+                const matchRows = rows.filter(r => r.innerText.includes(ruleName));
+                const visMatch = matchRows.filter(r => r.offsetParent !== null);
+                if (!visMatch.length) return {clicked: false, total: rows.length, match: matchRows.length, texts: rows.slice(0,5).map(r=>(r.innerText||'').replace(/\\s+/g,' ').slice(0,30))};
+                const r = visMatch[0];
+                r.scrollIntoView({block: 'center'});
+                const btns = r.querySelectorAll('button');
+                const btnTexts = [...btns].map(b => b.textContent.trim());
+                for (const b of btns) {
+                    if (b.textContent.includes(btnName) && !b.disabled && b.offsetParent !== null) {
+                        b.click(); return {clicked: true};
+                    }
+                }
+                return {clicked: false, total: rows.length, match: visMatch.length, btnTexts};
+            }""", [name, button_name])
+            clicked = res.get("clicked") if isinstance(res, dict) else bool(res)
+            if not clicked:
+                print(f"[DEBUG] _hybrid_click_row_button({name},{button_name}): 未找到. res={res}")
+                return False
+            self.page.wait_for_timeout(500)
+            if need_confirm:
+                self._click_visible_confirm(timeout=4000)
+                self.page.wait_for_timeout(500)
+            return True
+        except Exception as e:
+            print(f"[DEBUG] _hybrid_click_row_button({name},{button_name}) error: {e}")
+            return False
+
+    def hybrid_edit_row(self, name: str) -> bool:
+        """编辑混合模式子接入行(evaluate版, 规避基类get_by_text在子接入表格超时)"""
+        return self._hybrid_click_row_button(name, "编辑")
+
     def hybrid_delete_row(self, name: str) -> bool:
-        """删除混合模式子接入行(复用基类delete_rule, 带确认弹窗)"""
-        return self.delete_rule(name)
+        """删除混合模式子接入行(evaluate版+确认弹窗)"""
+        return self._hybrid_click_row_button(name, "删除", need_confirm=True)
 
     def hybrid_enable_row(self, name: str) -> bool:
-        return self.enable_rule(name)
+        return self._hybrid_click_row_button(name, "启用")
 
     def hybrid_disable_row(self, name: str) -> bool:
-        return self.disable_rule(name)
+        return self._hybrid_click_row_button(name, "停用", need_confirm=True)
 
     def hybrid_row_exists(self, name: str) -> bool:
         return self.rule_exists(name)
@@ -908,6 +1043,103 @@ class InterfaceSettingsPage(IkuaiTablePage):
             return self.get_rule_count()
         except Exception:
             return 0
+
+    def hybrid_clean_subif(self, name_prefix: str = "vwan") -> int:
+        """前端逐条删除当前子tab表格中prefix开头的子接入行(兜底清理, 不依赖batch_delete).
+        根因: 子接入二级表格的select_all/batch_delete不稳定(select_all不生效+footer批量按钮找不到),
+        helper清理失败→前端残留→下一子tab添加时MAC'已存在'冲突. 本方法用delete_rule逐条删, 稳定."""
+        cnt = 0
+        for _ in range(30):  # 最多删30条防死循环
+            try:
+                names = self.page.evaluate("""(prefix) => {
+                    // 子接入虚拟滚动: 行是div.ant-table-row(非tr), 用innerText找prefix开头的名称词
+                    const rows = [...document.querySelectorAll('main .ant-table-row')];
+                    const found = [];
+                    for (const r of rows) {
+                      const t = (r.innerText || '').trim();
+                      const words = t.split(/[\\s\\n]/);
+                      for (const w of words) {
+                        if (w.startsWith(prefix)) { found.push(w); break; }
+                      }
+                    }
+                    return found;
+                }""", name_prefix)
+                if not names:
+                    break
+                deleted_any = False
+                for name in names[:2]:
+                    try:
+                        if self.hybrid_delete_row(name):
+                            cnt += 1
+                            deleted_any = True
+                            self.page.wait_for_timeout(500)
+                            break  # 删一条后列表变化, 重新收集
+                    except Exception:
+                        pass
+                if not deleted_any:
+                    break
+            except Exception:
+                break
+        return cnt
+
+    def hybrid_import_rules(self, file_path: str, clear_existing: bool = False) -> bool:
+        """混合模式子接入导入(evaluate处理, 规避基类import_rules在子接入的3处不适配:
+        click_import的get_by_role找不到导入按钮/清空checkbox的check()被label拦截pointer/
+        确定按钮是'确定上传'非'确定'). MCP实测弹窗: 点击上传(触发file chooser)+清空现有配置数据+确定上传."""
+        import os
+        try:
+            if not os.path.exists(file_path):
+                return False
+            # 1. 点导入按钮(evaluate绕get_by_role)
+            clicked = self.page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('main button')]
+                    .filter(b => b.innerText.trim() === '导入' && !b.disabled && b.offsetParent !== null);
+                if (btns.length) { btns[0].click(); return true; }
+                return false;
+            }""")
+            if not clicked:
+                print("[DEBUG] hybrid_import: 未找到导入按钮")
+                return False
+            self.page.wait_for_timeout(1000)
+            # 2. 上传文件(直接set_input_files触发Antd Upload onChange, 不点击避免弹窗定位/file chooser问题)
+            try:
+                file_input = self.page.locator("[role='dialog'] input[type='file'], .ant-modal input[type='file']").first
+                file_input.set_input_files(file_path)
+            except Exception as e:
+                print(f"[DEBUG] hybrid_import set_input_files error: {e}")
+                return False
+            self.page.wait_for_timeout(1500)
+            # 3. 清空checkbox(evaluate click绕过label pointer拦截)
+            if clear_existing:
+                self.page.evaluate("""() => {
+                    const ms = [...document.querySelectorAll('.ant-modal, [role="dialog"]')].filter(m => getComputedStyle(m).display !== 'none');
+                    const m = ms[ms.length-1];
+                    if (m) { const cb = m.querySelector('input[type="checkbox"]'); if (cb && !cb.checked) cb.click(); }
+                }""")
+                self.page.wait_for_timeout(500)
+            # 4. 确定上传
+            self.page.locator(".ant-modal button:has-text('确定上传')").first.click(timeout=5000)
+            self.page.wait_for_timeout(2000)
+            # 5. 关导入弹窗(防残留致后续close_modal_if_exists的.ant-modal-wrap strict violation:
+            #   Escape + 轮询验证关闭)
+            for _ in range(3):
+                try:
+                    modal_open = self.page.evaluate("""() => [...document.querySelectorAll('.ant-modal-wrap')].filter(m => getComputedStyle(m).display !== 'none' && (m.innerText||'').replace(/\\s/g,'').length > 5).length > 0""")
+                    if not modal_open:
+                        break
+                    self.page.keyboard.press("Escape")
+                    self.page.wait_for_timeout(500)
+                except Exception:
+                    break
+            return True
+        except Exception as e:
+            print(f"[DEBUG] hybrid_import_rules error: {e}")
+            try:
+                self.page.keyboard.press("Escape")
+                self.page.wait_for_timeout(500)
+            except Exception:
+                pass
+            return False
 
     # ==================== WAN 完整编辑封装 ====================
     def edit_wan(self, interface_name: str, tagname: str = None,
@@ -1180,41 +1412,53 @@ class InterfaceSettingsPage(IkuaiTablePage):
     def create_interface(self, nic_name: str, iftype: str = "lan") -> bool:
         """新增配置: 在addLanWan页面选网卡+类型+保存 → 进入编辑页
         iftype: 'lan'/'wan'
-        返回是否进入editLanWan编辑页(新建成功).
+        返回是否真正进入 editLanWan 编辑页(新建成功). 严格判定: 保存后轮询URL跳转,
+        停在 addLanWan 或出现错误提示即判失败(防'没新建却显示新建成功').
         注: addLanWan页面网卡/类型为卡片式, 用真实click触发"""
         try:
             target = nic_name.upper()
             # addLanWan页面: 网卡是卡片式checkbox(同选择网卡抽屉的_checkbox结构)
             # 1. 选类型(LAN/WAN) - radio或卡片
             type_kw = "内网" if iftype == "lan" else "外网"
-            type_clicked = False
             radios = self.page.locator(".ant-radio-wrapper, .ant-radio-button-wrapper")
             for i in range(min(radios.count(), 6)):
                 try:
                     t = (radios.nth(i).inner_text(timeout=1000) or "").strip()
                     if type_kw in t:
                         radios.nth(i).click()
-                        type_clicked = True
                         self.page.wait_for_timeout(400)
                         break
                 except Exception:
                     continue
-            # 2. 选网卡(卡片式checkbox)
+            # 2. 选网卡(卡片式checkbox) — 必须选中, 否则保存必失败, 不浪费保存
             nic_cb = self.page.locator("[class*=checkbox]").filter(has_text=target)
-            if nic_cb.count() > 0:
-                nic_cb.first.click()
-                self.page.wait_for_timeout(500)
+            if nic_cb.count() == 0:
+                print(f"[DEBUG] create_interface: 未找到网卡 {target}, 新建失败")
+                return False
+            nic_cb.first.click()
+            self.page.wait_for_timeout(500)
             # 3. 点保存/确定
             saved = False
             for btn_name in ["保存", "确定", "下一步"]:
                 btn = self.page.get_by_role("button", name=btn_name)
                 if btn.count() > 0 and btn.first.is_enabled():
                     btn.first.click()
-                    self.page.wait_for_timeout(3500)
                     saved = True
                     break
-            # 4. 新建成功→进入editLanWan编辑页
-            return "editLanWan" in self.page.url or self.page.get_by_role("button", name="保存").count() > 0
+            if not saved:
+                print(f"[DEBUG] create_interface: 未找到可点的保存按钮")
+                return False
+            # 4. 轮询≤6s判定: 进入 editLanWan=成功; 出现错误提示=失败
+            for _ in range(15):
+                self.page.wait_for_timeout(400)
+                if "editLanWan" in self.page.url:
+                    return True  # 跳转到编辑页 = 新建成功
+                err = self.has_form_error()
+                if err:
+                    print(f"[DEBUG] create_interface: 保存报错 '{err}', 新建失败")
+                    return False
+            print(f"[DEBUG] create_interface: 保存后未跳转editLanWan(仍在addLanWan={('addLanWan' in self.page.url)}), 新建失败")
+            return False
         except Exception as e:
             print(f"[DEBUG] create_interface error: {e}")
             return False

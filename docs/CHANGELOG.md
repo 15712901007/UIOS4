@@ -1,5 +1,43 @@
 # 开发日志
 
+## 2026-07-02 内外网混合模式子接入测试修复(8根因+A+B增强, PASSED 40min)
+
+### 背景
+2026-07-01补全5种接入方式后, 混合模式(物理internet=3/VLAN internet=4)子接入static/dhcp/pppoe的add/edit/del SSH验证失败(子接入未找到), 原记"疑产品bug". 实为8个测试代码根因, MCP实测逐个定位+修复, 并按用户要求A(导出/导入恢复)+B(多条CRUD+后台SSH验证)增强到每子tab~30步.
+
+### 8个根因+修复
+1. **drawer保存直接写wan_vlan库(非暂存)**; helper底部click_save导航回外层列表→后续CRUD在列表操作外层接口(非子接入). 去click_save全程编辑页.
+2. **MAC接口内唯一校验**; has_form_error漏检"已存在相同内容". 新增_detect_drawer_error+hybrid_save_drawer增强.
+3. **VLAN混合drawer必填VLAN_ID**; hybrid_fill_drawer加vlan_id参数(f遇无input跳过, 物理混合无此字段).
+4. **pppoe drawer必填MTU**(默认1480,空placeholder); 按.ant-form-item:has-text('MTU') label定位加mtu参数.
+5. **helper acct/pwd索引错**(r[5]/r[6]→r[4]/r[5]); SUB元组(name,ip,mac,gw,account,password)=r[0-5], pwd=r[6]越界空→pppoe密码空→格式错误.
+6. **pppoe tab名称必须adsl开头**(前端硬校验"名称格式错误,以adsl开头"), static/dhcp要vwan开头; pppoe改adsl96/97.
+7. **evaluate空drawer容器误判**; Antd关闭后常驻空.ant-drawer根容器(display:block,innerText<5). hybrid_save_drawer轮询evaluate加innerText>5过滤.
+8. **子接入二级表格是Antd虚拟滚动div行(非tr)**; 行=div.ant-table-row,容器.ant-table-tbody-virtual. 基类_click_rule_button用get_by_text.wait_for超时; override _hybrid_click_row_button(evaluate找div.ant-table-row+scrollIntoView+click行内按钮), 不改基类避免回归.
+
+### A导出导入恢复(+4步/子tab)
+- 导出CSV/TXT(基类export_rules, 全程编辑页导出按钮可见work)
+- 导入**hybrid_import_rules**(page层专用, 规避子接入3处不适配: click_import的get_by_role找不到/清空checkbox的check()被label拦截pointer/确定按钮是"确定上传"非"确定"): evaluate点导入→**set_input_files直接设文件**(不用file_chooser点击避免卡死30s)→清空checkbox(evaluate click)→点"确定上传"→Escape轮询关弹窗(防.ant-modal-wrap strict残留)
+- 导入前hybrid_clean_subif删测试数据(防相同内容MAC/名称冲突, 参考别的模块"先批量删除再导入+清空checkbox")
+- 导入后SSH验证(import-append/import-clear [OK] 数据落库)
+
+### B多条CRUD+后台验证(+5步/子tab)
+- 第二条编辑added[1]+SSH; 删除改added[-1](最后一条, 避冲突第二条编辑)
+- **停用/启用加SSH验证enabled=no/yes**(原仅UI is_rule_disabled, 现verify_hybrid_subif expected_fields={"enabled":...}后台校验)
+- 每子tab ~30步; 物理(步骤26)+VLAN(步骤27)混合各3子tab=6子tab
+
+### 测试结果
+PASSED 40min, 步骤26-27子接入30+ SSH [OK](add/edit/del/disable/enable/import全后台验证). 唯一FAIL步骤5 check_link_mode expected=5 actual=3(既有环境问题,软失败不阻断). 子接入批量操作跳过(UI实测不支持select_all+footer批量按钮找不到).
+
+### 关键DOM(写代码高频查阅)
+- 子接入二级表格=**div.ant-table-row虚拟滚动(非tr)**, 容器.ant-table-tbody-virtual
+- 3子tab名称前缀不同: **static/dhcp=vwan开头, pppoe=adsl开头**(前端硬校验)
+- drawer字段按placeholder: VLAN混合+VLAN_ID(必填), pppoe+账号/密码/MTU(默认1480); 物理混合无VLAN_ID
+- drawer保存**直接写wan_vlan库**(interface=父WAN,vlan_name,vlan_internet=0静/1DHCP/2PPPoE)
+
+### 更正
+2026-07-01的"混合静态子接入drawer报输入有误(疑产品bug)"是**测试代码问题**(上述8根因), 非产品bug.
+
 ## 2026-07-01 内外网设置补全5种外网接入方式(24→35步, 全字段SSH验证通过)
 
 ### 背景

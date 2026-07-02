@@ -11,7 +11,7 @@ device:
 # 浏览器配置
 browser:
   browser_type: "chromium"  # chromium, firefox, webkit
-  headless: false
+  headless: false  # headed模式: 物理混合子接入drawer在headless下关闭动画不完成(UI残留连锁), headed正常(也是用户目标状态)
   slow_mo: 0
   timeout: 30000
   screenshot_on_failure: true
