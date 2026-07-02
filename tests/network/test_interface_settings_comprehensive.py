@@ -55,7 +55,7 @@ def _hybrid_invalid_cases(subtab):
     """混合子接入异常输入用例(应被前端拦截).
 
     名称格式(前端硬性要求, 违反则名称红框): static/dhcp必须vwan开头, pppoe必须adsl开头;
-    字母数字_, 长度15字符内. 本函数主测名称格式拦截, 其他字段给合法值只让名称异常.
+    字母数字_, 长度15字符内. 字段异常(名称合法, IP/MAC/网关/密码非法).
     返回 [(name, ip, mac, gateway, account, password)]
     """
     if subtab == "static":
@@ -66,13 +66,26 @@ def _hybrid_invalid_cases(subtab):
         good = ("", "00:11:22:33:44:50", "", "vwanac", "vwanpw")
     # 名称前缀: pppoe(ADSL)tab必须adsl开头, static/dhcp必须vwan开头
     prefix = "adsl" if subtab == "pppoe" else "vwan"
+    # 名称格式异常(4种: 空名/非前缀开头/含非法字符/超15字符)
     bad_names = [
         "",                      # 空名
         "hatwg1",                # 非{prefix}开头
         f"{prefix}!@#",          # {prefix}开头但含非法字符
         f"{prefix}123456789012", # 超15字符(prefix+12=16字符)
     ]
-    return [(n, good[0], good[1], good[2], good[3], good[4]) for n in bad_names]
+    cases = [(n, good[0], good[1], good[2], good[3], good[4]) for n in bad_names]
+    # 字段异常(名称合法{prefix}iv1, 各子tab特定字段非法, 验证前端字段校验拦截)
+    ln = f"{prefix}iv1"
+    if subtab == "static":
+        cases += [
+            (ln, "999.999.999.999", good[1], good[2], "", ""),   # 非法IP
+            (ln, good[0], good[1], "999.999.999.999", "", ""),   # 非法网关
+        ]
+    elif subtab == "dhcp":
+        cases += [(ln, "", "ZZ:ZZ:ZZ:ZZ:ZZ", "", "", "")]        # 非法MAC格式
+    else:  # pppoe
+        cases += [(ln, "", good[1], "", "vwanac", "")]           # 空密码(账号有密码空)
+    return cases
 
 
 def _hybrid_subtab_full_test(page, rec, ui_failures, ssh_verify, backend_verifier,
