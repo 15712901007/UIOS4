@@ -1,0 +1,40 @@
+# ACL协议矩阵打流用例数据 (6协议全覆盖, P1)
+# 范本: 数据外置YAML + parametrize一场景一用例. 换环境/加协议只改本文件不改代码.
+#
+# 每用例流程: 建规则(dst=10.66.0.40让打流命中) → L2验-p落地(verify_acl_protocol_iptables) → L5打流验命中(verify_acl_flow)
+# - tcp+udp杀手锏: 同端口分tcp/udp两段, 两段Δpkts都>0证ik_core多协议单规则同时匹配tcp+udp
+# - gre: 无对端隧道环境, 仅L2 -p落地(verify_acl_flow自动skip打流)
+# - any: 不下发-p(全协议匹配), 打流用tcp验(any规则必匹配tcp流量)
+# - icmp: ping替代iperf3
+# 打流拓扑: client源192.168.148.2 → 路由器FIREWALL链 → iperf3 server 10.66.0.40:5201 (acl_flow_env fixture保证路由)
+cases:
+  - id: tcp
+    protocol: tcp
+    action: drop
+    flow_port: 5201
+    desc: TCP协议 drop阻断 + iperf3打流验命中(连接失败+Δpkts>0)
+  - id: udp
+    protocol: udp
+    action: drop
+    flow_port: 5201
+    desc: UDP协议 drop阻断 + iperf3 -u打流验命中
+  - id: tcp_udp
+    protocol: tcp+udp
+    action: drop
+    flow_port: 5201
+    desc: TCP+UDP多协议 单规则双匹配(同端口tcp段+udp段两Δpkts都>0, 证ik_core定制)
+  - id: icmp
+    protocol: icmp
+    action: drop
+    flow_port: null
+    desc: ICMP协议 drop阻断 + ping -I内网源验命中(100%丢包+Δpkts>0)
+  - id: gre
+    protocol: gre
+    action: drop
+    flow_port: null
+    desc: GRE协议 仅L2 -p gre落地验证(无对端隧道, 打流skip)
+  - id: any
+    protocol: any
+    action: accept
+    flow_port: 5201
+    desc: ANY任意协议 accept放行(不下发-p全协议匹配, tcp打流验连通+Δpkts>0)

@@ -246,6 +246,65 @@
             border: 1px solid #ffccc7;
         }
 
+        /* 失败原因分析框 */
+        .failure-analysis-box {
+            background: linear-gradient(135deg, #fffbe6 0%, #fff7e6 100%);
+            border: 1px solid #ffd591;
+            border-left: 4px solid #faad14;
+            border-radius: 6px;
+            padding: 14px 18px;
+            margin-top: 4px;
+        }
+
+        .fa-header {
+            font-weight: 600;
+            color: #d46b08;
+            font-size: 14px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .fa-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            margin-bottom: 6px;
+            font-size: 13px;
+            line-height: 1.7;
+        }
+
+        .fa-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .fa-label {
+            color: #8c8c8c;
+            flex-shrink: 0;
+            min-width: 70px;
+        }
+
+        .fa-value {
+            color: #333;
+            flex: 1;
+            word-break: break-all;
+        }
+
+        .fa-category {
+            display: inline-block;
+            background: #ff4d4f;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .fa-suggestion {
+            color: #52c41a;
+        }
+
         /* 测试步骤 - 优化版 */
         .test-steps {
             margin-top: 10px;
@@ -785,6 +844,26 @@
                     <div class="detail-item">
                         <div class="no-steps">
                             📋 暂无详细步骤记录
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    {% if case.failure_analysis %}
+                    <div class="detail-item">
+                        <div class="failure-analysis-box">
+                            <div class="fa-header">🔍 失败原因分析（自动解读，便于快速定位）</div>
+                            <div class="fa-row">
+                                <span class="fa-label">失败类型:</span>
+                                <span class="fa-value"><span class="fa-category">{{ case.failure_analysis.category }}</span></span>
+                            </div>
+                            <div class="fa-row">
+                                <span class="fa-label">可能原因:</span>
+                                <span class="fa-value">{{ case.failure_analysis.reason }}</span>
+                            </div>
+                            <div class="fa-row">
+                                <span class="fa-label">排查建议:</span>
+                                <span class="fa-value fa-suggestion">{{ case.failure_analysis.suggestion }}</span>
+                            </div>
                         </div>
                     </div>
                     {% endif %}

@@ -1027,6 +1027,120 @@ class TestVlanComprehensive:
         print("  - 帮助功能: 右下角帮助图标/面板显示/链接跳转")
 
         # SSH后台验证最终断言
+        # ========== 步骤17: 普通VLAN功能验证（client打VLAN tag实测连通性） ==========
+        # 建VLAN54(lan1) → client ens11.54打tag → ping路由器VLAN接口IP, 验证VLAN真实生效
+        with rec.step("步骤17: 普通VLAN功能验证", "建VLAN54(lan1)→client ens11.54→ping路由器VLAN接口IP验证连通"):
+            print("\n[步骤17] 普通VLAN功能验证...")
+            rec.add_detail("【普通VLAN连通性实测】client ens11.54 ping路由器VLAN54接口")
+            fv_id, fv_name, fv_ip = "54", "vlan_func_54", "192.168.154.1"
+            c_ip, c_sub = "192.168.154.100/24", "ens11.54"
+            rule_added = subif_added = False
+            if backend_verifier is None:
+                rec.add_detail("  SSH未配置，跳过VLAN功能验证")
+                print("  [SKIP] SSH未配置")
+            else:
+                try:
+                    page.navigate_to_vlan_settings()
+                    page.page.wait_for_timeout(500)
+                    if page.vlan_exists(fv_name):
+                        page.delete_vlan(fv_name)
+                        page.page.wait_for_timeout(500)
+                    ok = page.add_vlan(vlan_id=fv_id, vlan_name=fv_name, ip=fv_ip, subnet_mask="255.255.255.0", line="lan1")
+                    if not ok:
+                        rec.add_detail("  ✗ 建VLAN失败，跳过")
+                        print("  [WARN] 建VLAN失败")
+                    else:
+                        rule_added = True
+                        rec.add_detail(f"  ✓ 建VLAN: {fv_name}(id={fv_id}, ip={fv_ip}, line=lan1)")
+                        page.page.wait_for_timeout(1500)
+                        ssh_verify(f"L1-数据库({fv_name})", backend_verifier.verify_vlan_database, fv_name, must_pass=True, expected_fields={"vlan_id": fv_id})
+                        ssh_verify(f"L2-接口({fv_name})", backend_verifier.verify_vlan_interface, fv_name, must_pass=True)
+                        ssh_verify(f"L3-proc({fv_name})", backend_verifier.verify_vlan_proc, fv_name, expected_vlan_id=fv_id)
+                        backend_verifier.client_add_vlan_subif(54, ip_cidr=c_ip)
+                        subif_added = True
+                        rec.add_detail(f"  client建 {c_sub} + {c_ip}")
+                        pr = backend_verifier.client_ping(c_sub, fv_ip)
+                        if pr["connected"]:
+                            rec.add_detail(f"  ✓ ping {fv_ip} 通: {pr['received']}/4 received, rtt={pr['detail']}")
+                            print(f"  [OK] 普通VLAN连通: ping {fv_ip} {pr['received']}/4")
+                        else:
+                            rec.add_detail(f"  ✗ ping {fv_ip} 不通: {pr['raw'][:100]}")
+                            print(f"  [FAIL] 普通VLAN不通")
+                            ssh_failures.append(f"VLAN功能验证-普通VLAN: ping {fv_ip} 不通")
+                finally:
+                    if subif_added:
+                        backend_verifier.client_del_iface(c_sub)
+                    if rule_added:
+                        try:
+                            page.navigate_to_vlan_settings()
+                            page.page.wait_for_timeout(500)
+                            if page.vlan_exists(fv_name):
+                                page.delete_vlan(fv_name)
+                        except Exception:
+                            pass
+
+        # ========== 步骤18: QINQ VLAN功能验证（client双层tag实测连通性） ==========
+        # 建VLAN54(lan1外层) + VLAN55(line=vlan54内层QINQ) → client ens11.54.55双层tag → ping内层VLAN接口IP
+        with rec.step("步骤18: QINQ VLAN功能验证", "建VLAN54(外层)+VLAN55(line=vlan54内层)→client双层tag→ping内层VLAN接口IP"):
+            print("\n[步骤18] QINQ VLAN功能验证...")
+            rec.add_detail("【QINQ连通性实测】client ens11.54.55 ping路由器VLAN55接口")
+            o_id, i_id = "54", "55"
+            o_name, i_name = "vlan_qinq_54", "vlan_qinq_55"
+            o_ip, i_ip = "192.168.154.1", "192.168.155.1"
+            ci_ip, ci_sub = "192.168.155.100/24", "ens11.54.55"
+            o_added = i_added = subif_added = False
+            if backend_verifier is None:
+                rec.add_detail("  SSH未配置，跳过QINQ验证")
+            else:
+                try:
+                    page.navigate_to_vlan_settings()
+                    page.page.wait_for_timeout(500)
+                    for nm in (i_name, o_name):
+                        if page.vlan_exists(nm):
+                            page.delete_vlan(nm)
+                            page.page.wait_for_timeout(400)
+                    if page.add_vlan(vlan_id=o_id, vlan_name=o_name, ip=o_ip, subnet_mask="255.255.255.0", line="lan1"):
+                        o_added = True
+                        rec.add_detail(f"  ✓ 外层VLAN: {o_name}(id={o_id}, lan1, ip={o_ip})")
+                        page.page.wait_for_timeout(1500)
+                        if page.add_vlan(vlan_id=i_id, vlan_name=i_name, ip=i_ip, subnet_mask="255.255.255.0", line=o_name):
+                            i_added = True
+                            rec.add_detail(f"  ✓ 内层VLAN(QINQ): {i_name}(id={i_id}, line={o_name}, ip={i_ip})")
+                            page.page.wait_for_timeout(1500)
+                            ssh_verify(f"L1-外层数据库({o_name})", backend_verifier.verify_vlan_database, o_name, must_pass=True, expected_fields={"vlan_id": o_id})
+                            ssh_verify(f"L1-内层数据库({i_name})", backend_verifier.verify_vlan_database, i_name, must_pass=True, expected_fields={"vlan_id": i_id, "interface": o_name})
+                            ssh_verify(f"L2-外层接口({o_name})", backend_verifier.verify_vlan_interface, o_name, must_pass=True)
+                            ssh_verify(f"L2-内层接口({i_name})", backend_verifier.verify_vlan_interface, i_name, must_pass=False)
+                            backend_verifier.client_add_qinq_subif(54, 55, ip_cidr=ci_ip)
+                            subif_added = True
+                            rec.add_detail(f"  client建双层tag {ci_sub} + {ci_ip}")
+                            pr = backend_verifier.client_ping(ci_sub, i_ip)
+                            if pr["connected"]:
+                                rec.add_detail(f"  ✓ QINQ ping {i_ip} 通: {pr['received']}/4, rtt={pr['detail']}")
+                                print(f"  [OK] QINQ连通: ping {i_ip} {pr['received']}/4")
+                            else:
+                                rec.add_detail(f"  ✗ QINQ ping {i_ip} 不通: {pr['raw'][:100]}")
+                                print(f"  [FAIL] QINQ不通")
+                                ssh_failures.append(f"VLAN功能验证-QINQ: ping {i_ip} 不通")
+                        else:
+                            rec.add_detail("  ✗ 内层VLAN(QINQ)建失败")
+                    else:
+                        rec.add_detail("  ✗ 外层VLAN建失败")
+                finally:
+                    if subif_added:
+                        backend_verifier.client_del_iface("ens11.54.55")
+                        backend_verifier.client_del_iface("ens11.54")
+                    try:
+                        page.navigate_to_vlan_settings()
+                        page.page.wait_for_timeout(500)
+                        for nm in (i_name, o_name):
+                            if page.vlan_exists(nm):
+                                page.delete_vlan(nm)
+                                page.page.wait_for_timeout(400)
+                    except Exception:
+                        pass
+
+        # ========== SSH后台验证汇总断言 ==========
         all_failures = ssh_failures + ui_failures
         if ssh_failures:
             print(f"\n[断言] 共 {len(ssh_failures)} 项后台验证失败:")

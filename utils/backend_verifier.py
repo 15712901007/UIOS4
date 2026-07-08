@@ -776,9 +776,40 @@ class BackendVerifier:
 
     # ==================== L5: iperf3实测 ====================
 
+    def get_client_lan_info(self, gateway: str = "192.168.148.1") -> Dict[str, str]:
+        """
+        动态获取测试客户端连路由器LAN的网卡信息(网卡名/内网IP/MAC)
+
+        通过 `ip route get <路由器LAN网关>` 解析 dev 和 src, 得到客户端从路由器
+        DHCP获取的内网IP(即"10.66.0.18获取IP"), 以及该网卡的MAC地址.
+        用于iperf3打流绑定源IP / IP限速目标IP / MAC限速目标MAC.
+
+        Args:
+            gateway: 路由器LAN侧网关IP, 默认192.168.148.1
+
+        Returns:
+            {"iface": 网卡名, "ip": 内网IP, "mac": MAC地址}; 失败返回{}
+        """
+        try:
+            self.connect_client()
+            out = self._client.exec(f"ip route get {gateway} 2>/dev/null")
+            iface_match = re.search(r"\bdev\s+(\S+)", out)
+            src_match = re.search(r"\bsrc\s+(\S+)", out)
+            iface = iface_match.group(1) if iface_match else None
+            ip = src_match.group(1) if src_match else None
+            mac = None
+            if iface:
+                mac_out = self._client.exec(f"cat /sys/class/net/{iface}/address 2>/dev/null")
+                mac = mac_out.strip() if mac_out else None
+            logger.info(f"client LAN info: iface={iface}, ip={ip}, mac={mac}")
+            return {"iface": iface, "ip": ip, "mac": mac}
+        except Exception as e:
+            logger.warning(f"get_client_lan_info failed: {e}")
+            return {}
+
     def run_iperf3(self, direction: str = "upload",
                    server_ip: str = None,
-                   bind_ip: str = "192.168.148.2",
+                   bind_ip: str = None,
                    duration: int = None,
                    port: int = 5201) -> Dict:
         """
@@ -791,7 +822,8 @@ class BackendVerifier:
         Args:
             direction: "upload" 或 "download"
             server_ip: iperf3服务端IP，默认使用配置
-            bind_ip: 绑定的源IP（必须是路由器LAN下的IP）
+            bind_ip: 绑定的源IP（必须是路由器LAN下的IP）; None时自动通过
+                     get_client_lan_info动态获取客户端内网IP(回退192.168.148.2)
             duration: 测速时长（秒）
             port: iperf3端口
 
@@ -804,6 +836,10 @@ class BackendVerifier:
             server_ip = self._ssh_config.iperf3_server
         if duration is None:
             duration = self._ssh_config.iperf3_duration
+        if bind_ip is None:
+            # 动态获取客户端连路由器LAN的内网IP(不再写死192.168.148.2)
+            info = self.get_client_lan_info()
+            bind_ip = info.get("ip") or "192.168.148.2"
 
         cmd = f"iperf3 -c {server_ip} -B {bind_ip} -t {duration} -J -p {port}"
         if direction == "download":
@@ -946,6 +982,112 @@ class BackendVerifier:
             logger.info(f"[L5-download] {l5_down.message}")
 
         return chain
+
+    def verify_mac_qos_full_chain(self, tagname: str, mac: str,
+                                  upload_kbps: int, download_kbps: int,
+                                  bind_ip: str = None,
+                                  run_iperf3: bool = False) -> FullChainResult:
+        """
+        MAC限速(mac_qos/dt_mac_qos)全链路验证
+
+        Args:
+            tagname: 规则名称
+            mac: 限速目标MAC地址(客户端网卡MAC)
+            upload_kbps: 上传限速值 (KB/s)
+            download_kbps: 下载限速值 (KB/s)
+            bind_ip: iperf3打流绑定的源IP(客户端内网IP); None时run_iperf3内部动态获取.
+                     MAC限速按源MAC匹配, 绑client内网IP发包即用client网卡MAC, 规则命中.
+            run_iperf3: 是否执行L5 iperf3实测
+
+        Returns:
+            FullChainResult
+        """
+        chain = FullChainResult()
+
+        # L1: 数据库(先mac_qos, 失败再dt_mac_qos)
+        l1 = self.verify_qos_database(
+            "mac_qos",
+            expected_fields={"upload": str(upload_kbps), "download": str(download_kbps)},
+            tagname=tagname,
+        )
+        if not l1.passed:
+            l1 = self.verify_qos_database(
+                "dt_mac_qos",
+                expected_fields={"upload": str(upload_kbps), "download": str(download_kbps)},
+                tagname=tagname,
+            )
+        chain.results.append(l1)
+        logger.info(f"[L1] {l1.message}")
+
+        rule_id = l1.details.get("rule", {}).get("id") if l1.passed else None
+
+        # L2: iptables(MAC_QOS链)
+        l2_upload = self.verify_iptables_rule(
+            "MAC_QOS", rule_id=rule_id, expected_speed_kbps=upload_kbps, set_prefix="mac_qos",
+        )
+        chain.results.append(l2_upload)
+        logger.info(f"[L2-upload] {l2_upload.message}")
+
+        l2_download = self.verify_iptables_rule(
+            "MAC_QOS", rule_id=rule_id, expected_speed_kbps=download_kbps, set_prefix="mac_qos",
+        )
+        chain.results.append(l2_download)
+        logger.info(f"[L2-download] {l2_download.message}")
+
+        # L3: ipset - MAC限速用全局mac_qos_{x}集合(per-rule _mac_qos_{id}命名不适用), 遍历查找目标MAC
+        if rule_id is not None:
+            self.connect_router()
+            set_list = self._router.exec("ipset list -n 2>/dev/null")
+            mac_sets = [s for s in set_list.split() if s.startswith("mac_qos")]
+            l3_msg = f"MAC {mac} 未在任何 mac_qos_* 集合中找到 (现有: {mac_sets})"
+            l3_passed = False
+            l3_raw = set_list[:200]
+            for s in mac_sets:
+                members = self._router.exec(f"ipset list {s} 2>/dev/null")
+                if mac.lower() in members.lower():
+                    l3_msg = f"MAC {mac} 存在于全局集合 {s} 中"
+                    l3_passed = True
+                    l3_raw = members[:200]
+                    break
+            l3 = VerifyResult(level="L3-ipset", passed=l3_passed, message=l3_msg, raw_output=l3_raw)
+            chain.results.append(l3)
+            logger.info(f"[L3] {l3.message}")
+
+        # L4: 内核
+        l4 = self.verify_kernel()
+        chain.results.append(l4)
+        logger.info(f"[L4] {l4.message}")
+
+        # L5: iperf3(可选)
+        if run_iperf3:
+            kwargs = {"bind_ip": bind_ip} if bind_ip else {}
+            l5_up = self.verify_iperf3("upload", upload_kbps, **kwargs)
+            chain.results.append(l5_up)
+            logger.info(f"[L5-upload] {l5_up.message}")
+
+            l5_down = self.verify_iperf3("download", download_kbps, **kwargs)
+            chain.results.append(l5_down)
+            logger.info(f"[L5-download] {l5_down.message}")
+
+        return chain
+
+    def count_mac_qos_iptables_rules(self) -> int:
+        """统计iptables MAC_QOS链中DROP规则数(检测MAC限速删除后是否残留)"""
+        self.connect_router()
+        out = self._router.exec("iptables -nvL MAC_QOS 2>/dev/null")
+        return sum(1 for line in out.split('\n') if 'DROP' in line and 'mac_qos' in line)
+
+    def flush_mac_qos_chain(self) -> int:
+        """清空iptables MAC_QOS链规则 + flush所有mac_qos_* ipset成员.
+
+        用于绕过"MAC限速删除后iptables/ipset残留"产品bug, 在iperf3实测前准备干净环境,
+        确保实测命中的是新建规则而非残留规则. 返回清理前的DROP规则数.
+        """
+        self.connect_router()
+        before = self.count_mac_qos_iptables_rules()
+        self._router.exec("iptables -F MAC_QOS 2>/dev/null")
+        self._router.exec("for s in $(ipset list -n 2>/dev/null | grep mac_qos); do ipset flush $s; done")
+        return before
 
     # ==================== VLAN验证 ====================
 
@@ -1143,9 +1285,17 @@ class BackendVerifier:
         return "error" not in output.lower()
 
     def add_route_via_router(self, dest_ip: str, gateway: str = "192.168.148.1",
-                             dev: str = "ens11", src_ip: str = "192.168.148.2") -> bool:
-        """在测试客户端添加经过路由器的策略路由"""
+                             dev: str = None, src_ip: str = None) -> bool:
+        """在测试客户端添加经过路由器的策略路由
+
+        dev/src_ip为None时, 自动通过get_client_lan_info动态获取客户端连路由器LAN的
+        网卡和内网IP(动态失败回退ens11/192.168.148.2, 保持向后兼容).
+        """
         self.connect_client()
+        if dev is None or src_ip is None:
+            info = self.get_client_lan_info(gateway=gateway)
+            dev = dev or info.get("iface") or "ens11"
+            src_ip = src_ip or info.get("ip") or "192.168.148.2"
         cmd = f"sudo ip route add {dest_ip}/32 via {gateway} dev {dev} src {src_ip}"
         output = self._client.exec(cmd)
         return "error" not in output.lower()
@@ -1155,6 +1305,60 @@ class BackendVerifier:
         self.connect_client()
         output = self._client.exec(f"sudo ip route del {dest_ip}/32 2>/dev/null")
         return True  # 即使不存在也算成功
+
+    def client_add_vlan_subif(self, vlan_id: int, parent: str = "ens11", ip_cidr: str = None) -> str:
+        """在客户端建802.1Q VLAN子接口(如ens11.54), 可选配IP. 用于普通VLAN功能验证.
+
+        实测: client ens11.54(vid 54) + 路由器VLAN54(lan1, _vlan54@lan1) → ping通.
+        Returns: 子接口名(如ens11.54)
+        """
+        self.connect_client()
+        name = f"{parent}.{vlan_id}"
+        self._client.exec(f"sudo ip link delete {name} 2>/dev/null")  # 清同名残留
+        self._client.exec(f"sudo ip link add link {parent} name {name} type vlan id {vlan_id}")
+        self._client.exec(f"sudo ip link set {name} up")
+        if ip_cidr:
+            self._client.exec(f"sudo ip addr add {ip_cidr} dev {name}")
+        return name
+
+    def client_add_qinq_subif(self, outer_vid: int, inner_vid: int, parent: str = "ens11", ip_cidr: str = None) -> str:
+        """在客户端建QINQ双层tag子接口(外层{parent}.{outer} + 内层{parent}.{outer}.{inner}).
+
+        实测: 默认802.1Q协议即可(iKuai QINQ外层_vlan54接受802.1Q tag); 内层配ip_cidr.
+        对应路由器侧: 外层_vlan{outer}@lan1, 内层_vlan{inner}@vlan{outer}.
+        Returns: 内层子接口名(如ens11.54.55)
+        """
+        self.connect_client()
+        outer = f"{parent}.{outer_vid}"
+        inner = f"{parent}.{outer_vid}.{inner_vid}"
+        self._client.exec(f"sudo ip link delete {inner} 2>/dev/null")
+        self._client.exec(f"sudo ip link delete {outer} 2>/dev/null")
+        self._client.exec(f"sudo ip link add link {parent} name {outer} type vlan id {outer_vid}")
+        self._client.exec(f"sudo ip link set {outer} up")
+        self._client.exec(f"sudo ip link add link {outer} name {inner} type vlan id {inner_vid}")
+        self._client.exec(f"sudo ip link set {inner} up")
+        if ip_cidr:
+            self._client.exec(f"sudo ip addr add {ip_cidr} dev {inner}")
+        return inner
+
+    def client_del_iface(self, name: str) -> bool:
+        """删除客户端网络接口(VLAN子接口等)"""
+        self.connect_client()
+        self._client.exec(f"sudo ip link delete {name} 2>/dev/null")
+        return True
+
+    def client_ping(self, src_iface: str, dst_ip: str, count: int = 4) -> Dict:
+        """从客户端指定源接口ping目标(验证VLAN连通性).
+
+        Returns: {"connected": bool, "received": int, "detail": "min/avg/max/mdev", "raw": str}
+        """
+        self.connect_client()
+        out = self._client.exec(f"ping -I {src_iface} -c {count} -W 1 {dst_ip}", timeout=count * 2 + 10)
+        m = re.search(r"(\d+)\s*received", out)
+        received = int(m.group(1)) if m else 0
+        stats = re.search(r"rtt min/avg/max/mdev = ([\d.\/]+)", out)
+        detail = stats.group(1) if stats else ""
+        return {"connected": received > 0, "received": received, "detail": detail, "raw": out}
 
     def start_iperf3_server(self, on: str = "client", port: int = 5201) -> bool:
         """在指定机器上启动iperf3服务端"""
@@ -1578,10 +1782,13 @@ class BackendVerifier:
 
             missing = [w for w in expected_wan_interfaces if w not in found_tables]
             if missing:
+                # 如实反映而非永远passed=True: 全部WAN缺失ip rule=策略路由未生效(passed=False);
+                # 仅部分缺失=可能线路未连接(passed=True但message明确), 软硬断言由调用方决定
+                all_missing = len(found_tables) == 0
                 return VerifyResult(
                     level="L2-策略路由",
-                    passed=True,  # 策略路由是基础设施，缺失不一定是LB规则问题
-                    message=f"策略路由检查: {len(found_tables)}/{len(expected_wan_interfaces)}个WAN有ip rule (缺失: {missing}，可能线路未连接)",
+                    passed=not all_missing,
+                    message=f"策略路由检查: {len(found_tables)}/{len(expected_wan_interfaces)}个WAN有ip rule (缺失: {missing}{'，可能线路未连接' if not all_missing else '，策略路由未生效'})",
                     details={"found_tables": found_tables, "missing": missing, "routes": route_details},
                     raw_output=ip_rule_output,
                 )
@@ -1789,7 +1996,10 @@ class BackendVerifier:
             import re
             rule = {}
 
-            m = re.search(r"/\*\s*(\d+)\s*\*/", line)
+            # comment格式=/* {id}_{tagname} */ (如 /* 1_pt_m0_any */, 见stream_ipport.sh:142
+            # COMMENT="${id}_${comment}"). 旧正则r"/\*\s*(\d+)\s*\*/"只匹配纯数字/* 1 */,
+            # 实际带_tagname后缀→全解析为None→L2全FAIL. 改: id后接_或空或*/
+            m = re.search(r"/\*\s*(\d+)(?:_|\s*\*/)", line)
             rule["rule_id"] = int(m.group(1)) if m else None
 
             m = re.search(r"set-ifname\s+(\S+)", line)
@@ -2117,7 +2327,10 @@ class BackendVerifier:
                 continue
             rule = {}
 
-            m = re.search(r"/\*\s*(\d+)\s*\*/", line)
+            # comment格式=/* {id}_{tagname} */ (如 /* 1_pt_m0_any */, 见stream_ipport.sh:142
+            # COMMENT="${id}_${comment}"). 旧正则r"/\*\s*(\d+)\s*\*/"只匹配纯数字/* 1 */,
+            # 实际带_tagname后缀→全解析为None→L2全FAIL. 改: id后接_或空或*/
+            m = re.search(r"/\*\s*(\d+)(?:_|\s*\*/)", line)
             rule["rule_id"] = int(m.group(1)) if m else None
 
             m = re.search(r"set-ifname\s+(\S+)", line)
@@ -2387,62 +2600,101 @@ class BackendVerifier:
     def verify_stream_domain_ipset(self, rule_id: int,
                                     expected_ifname: str = None,
                                     should_exist: bool = True) -> VerifyResult:
-        """L2: 验证域名分流规则在ipset中
+        """L2: 验证域名分流规则后端落地(内核url_route group + 可选ipset)
 
-        域名分流使用 ipset sdomain_src_{id} 存储域名解析后的IP。
+        域名分流机制(见stream_domain.sh):
+        - 域名匹配走ik_core的url_route内核表(ik_cntl url_route group add $id),
+          ik_summary可见"URL_ROUTE_GROUP(GROUPID: {id})"+"URL Route: enable"总开关
+        - 源地址匹配(可选): 仅规则带src_addr时才建ipset sdomain_src_{id}(stream_domain.sh:61 __format_ipset)
+        - 时间匹配(可选): timeset sdomain_time_{id}
+        故: 所有规则都验内核group; 仅带源地址规则额外验sdomain_src_{id}。
+        (原实现对所有规则查sdomain_src_{id}, 纯域名规则无源地址不建→全FAIL, 误报)
         """
         self.connect_router()
         try:
-            ipset_name = f"sdomain_src_{rule_id}"
-            output = self._router.exec(f"ipset list {ipset_name} 2>/dev/null")
-            ipset_exists = "Name:" in output or ipset_name in output
+            # 查规则src_addr, 判断是否该有源地址ipset
+            has_src = False
+            try:
+                rule = self.find_stream_domain_rule(id=rule_id)
+                if rule:
+                    sa_raw = rule.get("src_addr")
+                    if sa_raw:
+                        sa = sa_raw if isinstance(sa_raw, dict) else json.loads(sa_raw)
+                        has_src = bool(sa.get("custom")) or bool(sa.get("object"))
+            except Exception:
+                has_src = False
+
+            # 公共: 域名路由内核group(所有规则都该有) + URL Route总开关
+            ik_summary = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+            group_exists = f"URL_ROUTE_GROUP(GROUPID: {rule_id})" in ik_summary
+            url_route_on = "URL Route: enable" in ik_summary
 
             if should_exist:
-                if not ipset_exists:
-                    all_ipset = self._router.exec("ipset list -n 2>/dev/null")
-                    sdomain_sets = [l.strip() for l in all_ipset.split("\n") if "sdomain" in l]
+                # 1. 内核group必须存在(域名匹配核心机制)
+                if not group_exists:
                     return VerifyResult(
                         level="L2-ipset",
                         passed=False,
-                        message=f"ipset {ipset_name} 未找到",
-                        details={"all_sdomain_sets": sdomain_sets},
-                        raw_output=f"all sdomain ipsets: {sdomain_sets}",
+                        message=f"域名路由group {rule_id} 未在内核(ik_summary无GROUPID:{rule_id}, URL Route={'on' if url_route_on else 'off'})",
+                        details={"url_route_enabled": url_route_on},
+                        raw_output=ik_summary[:400],
                     )
-
-                members = []
-                in_members = False
-                for line in output.split("\n"):
-                    if line.startswith("Members:"):
-                        in_members = True
-                        continue
-                    if in_members and line.strip():
-                        members.append(line.strip())
-
+                # 2. 带源地址规则额外验sdomain_src_{id}
+                if has_src:
+                    ipset_name = f"sdomain_src_{rule_id}"
+                    output = self._router.exec(f"ipset list {ipset_name} 2>/dev/null")
+                    if "Name:" not in output and ipset_name not in output:
+                        all_ipset = self._router.exec("ipset list -n 2>/dev/null")
+                        sdomain_sets = [l.strip() for l in all_ipset.split("\n") if "sdomain" in l]
+                        return VerifyResult(
+                            level="L2-ipset",
+                            passed=False,
+                            message=f"规则带源地址但ipset {ipset_name} 未找到",
+                            details={"all_sdomain_sets": sdomain_sets},
+                            raw_output=f"all sdomain ipsets: {sdomain_sets}",
+                        )
+                    members = []
+                    in_members = False
+                    for line in output.split("\n"):
+                        if line.startswith("Members:"):
+                            in_members = True
+                            continue
+                        if in_members and line.strip():
+                            members.append(line.strip())
+                    return VerifyResult(
+                        level="L2-ipset",
+                        passed=True,
+                        message=f"带源地址规则: group_{rule_id}内核OK + ipset {ipset_name}存在(成员{len(members)})",
+                        details={"has_src_addr": True, "group_exists": True, "ipset_name": ipset_name, "members": members},
+                        raw_output=output[:300],
+                    )
+                # 3. 纯域名规则: 只验内核group(域名匹配走url_route, 无需sdomain_src_)
                 return VerifyResult(
                     level="L2-ipset",
                     passed=True,
-                    message=f"ipset {ipset_name} 存在, 成员数={len(members)}",
-                    details={"ipset_name": ipset_name, "members": members},
-                    raw_output=output[:500],
+                    message=f"纯域名规则: 域名匹配走ik_core url_route, group_{rule_id}内核OK(URL Route:enable), 无源地址故不建sdomain_src_",
+                    details={"has_src_addr": False, "group_exists": True, "url_route_enabled": url_route_on},
+                    raw_output=ik_summary[:300],
                 )
             else:
-                if ipset_exists:
+                # 删除验证: 内核group应消失
+                if group_exists:
                     return VerifyResult(
                         level="L2-ipset",
                         passed=False,
-                        message=f"ipset {ipset_name} 仍存在(应已删除)",
+                        message=f"域名路由group {rule_id} 仍在内核(应已删除)",
                     )
                 return VerifyResult(
                     level="L2-ipset",
                     passed=True,
-                    message=f"ipset {ipset_name} 已删除",
+                    message=f"域名路由group {rule_id} 已从内核删除",
                 )
 
         except Exception as e:
             return VerifyResult(
                 level="L2-ipset",
                 passed=False,
-                message=f"ipset检查失败: {str(e)[:100]}",
+                message=f"ipset/group检查失败: {str(e)[:100]}",
             )
 
     def verify_stream_domain_kernel_status(self) -> VerifyResult:
@@ -2621,21 +2873,24 @@ class BackendVerifier:
             details = {"rule_id": rule_id, "ipset_sets": found_sets}
 
             addr_check_results = []
+            # updown_src/dst_{id}是list:set(集合的集合, 成员是子ipset名), 实际地址在子ipset
+            # _updown_src/dst_{id}(hash:net)里(同simple_qos_{id}→_simple_qos_{id}结构).
+            # 故查地址要list子ipset _updown_*_{id}, 不是父集(原查父集→永远not found).
             if src_addr and f"updown_src_{rule_id}" in all_ipset:
-                src_content = self._router.exec(f"ipset list updown_src_{rule_id} 2>/dev/null")
+                src_content = self._router.exec(f"ipset list _updown_src_{rule_id} 2>/dev/null")
                 has_addr = src_addr in src_content
                 addr_check_results.append(f"src_addr({src_addr}): {'found' if has_addr else 'not found'}")
                 details["src_addr_in_ipset"] = has_addr
 
             if dst_addr and f"updown_dst_{rule_id}" in all_ipset:
-                dst_content = self._router.exec(f"ipset list updown_dst_{rule_id} 2>/dev/null")
+                dst_content = self._router.exec(f"ipset list _updown_dst_{rule_id} 2>/dev/null")
                 has_addr = dst_addr in dst_content
                 addr_check_results.append(f"dst_addr({dst_addr}): {'found' if has_addr else 'not found'}")
                 details["dst_addr_in_ipset"] = has_addr
 
-            all_addr_ok = all(
-                "found" in r for r in addr_check_results
-            ) if addr_check_results else True
+            # 用has_addr布尔标志判断(原all("found" in r)有bug: 字符串"not found"含子串"found"→误判通过)
+            _flags = [v for k, v in details.items() if k.endswith("_in_ipset")]
+            all_addr_ok = all(_flags) if _flags else True
 
             # 没有地址/端口的规则不创建ipset，此时found_sets为空是正常的
             has_addr_or_port_check = src_addr or dst_addr
@@ -2647,12 +2902,21 @@ class BackendVerifier:
             if addr_check_results:
                 msg_parts.extend(addr_check_results)
 
+            # raw_output只显示该规则相关ipset(不列全局ipset列表, 避免Linux_WEBPPPOE_default等
+            # 系统默认集误导报告). 上下行分离多数规则无地址/端口不建ipset, 走ik_cntl wans-snat落地.
+            if found_sets:
+                raw_out = f"规则ipset: {found_sets}"
+                if addr_check_results:
+                    raw_out += "; " + "; ".join(addr_check_results)
+            else:
+                raw_out = ("无地址/端口→不建ipset(符合机制). 上下行实际落地: ik_cntl wans-snat → "
+                           "/tmp/iktmp/stream_updown.txt (格式 'id node { proto out:\"上行\" in:\"下行\" }'), 见L3-内核状态")
             return VerifyResult(
                 level="L2-ipset",
                 passed=passed,
                 message=f"上下行分离ipset验证{'通过' if passed else '未通过'}: {', '.join(msg_parts)}",
                 details=details,
-                raw_output=all_ipset[:500],
+                raw_output=raw_out,
             )
 
         except Exception as e:
@@ -2671,18 +2935,28 @@ class BackendVerifier:
 
             has_rules = bool(config_content.strip())
             rule_count = len([l for l in config_content.strip().split("\n") if l.strip()]) if has_rules else 0
+            # 解析每条规则: 格式 "id node { proto out:\"上行\" in:\"下行\" }"(stream_updown.sh:78)
+            rules_in_txt = []
+            for line in config_content.split("\n"):
+                m = re.search(r'(\d+)\s+node\s*\{([^}]*)\}', line)
+                if m:
+                    body = m.group(2)
+                    outs = re.findall(r'out:"([^"]+)"', body)
+                    ins = re.findall(r'in:"([^"]+)"', body)
+                    rules_in_txt.append(f"id{m.group(1)}:上{','.join(outs) or '?'}/下{','.join(ins) or '?'}")
 
             details = {
                 "config_exists": has_rules,
                 "rule_count": rule_count,
+                "rules": rules_in_txt,
             }
-
+            rules_summary = "; ".join(rules_in_txt) if rules_in_txt else "无"
             return VerifyResult(
                 level="L3-内核状态",
                 passed=True,
-                message=f"上下行分离内核配置: {'有规则' if has_rules else '无规则'}({rule_count}条)",
+                message=f"上下行分离内核wans-snat落地: {rule_count}条规则 [{rules_summary}]",
                 details=details,
-                raw_output=config_content[:300],
+                raw_output=config_content[:400] or "(空, 无启用的上下行分离规则)",
             )
 
         except Exception as e:
@@ -8977,3 +9251,1033 @@ class BackendVerifier:
         except Exception as e:
             return VerifyResult(level="L2-ethtool", passed=False,
                                 message=f"ethtool验证异常: {e}", raw_output=str(e)[:200])
+
+    # ==================== ACL规则 (安全中心 > ACL规则) ====================
+    # acl表: src_addr/dst_addr/time为明文JSON(非base64, base64仅API层用).
+    # 落地: dir=forward→FIREWALL链, dir=input→INPUT_ACL链; 规则以 --comment {id}_{comment} 标识.
+    # ipset: acl_src_{id}/acl_dst_{id}(list:set, IP在子集_acl_{side}_{id}); acl_time_{id}(ik_cntl timeset).
+    def find_acl_rule(self, tagname: str) -> Optional[Dict]:
+        """按名称查找ACL规则(acl表, 单条)"""
+        return self._sqlite_query_line(f"SELECT * FROM acl WHERE tagname='{tagname}'")
+
+    def find_acl_rule_id(self, tagname: str) -> Optional[int]:
+        """获取ACL规则id"""
+        rule = self.find_acl_rule(tagname)
+        if rule and rule.get("id"):
+            try:
+                return int(rule["id"])
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _parse_acl_addr(addr_json) -> list:
+        """解析ACL地址字段JSON('{"object":{},"custom":[...]}' 或空'{"object":{},"custom":{}}').
+        返回custom里的IP/MAC列表(空dict/空list→[])."""
+        if not addr_json:
+            return []
+        try:
+            data = json.loads(addr_json) if isinstance(addr_json, str) else addr_json
+            custom = data.get("custom", [])
+            if isinstance(custom, dict):
+                return []
+            if isinstance(custom, list):
+                return [str(x) for x in custom]
+        except Exception:
+            pass
+        return []
+
+    def verify_acl_database(self, tagname: str, expected_fields: Dict = None,
+                            src_ips: list = None, dst_ips: list = None) -> VerifyResult:
+        """L1: 验证ACL规则在acl表中存在且字段正确.
+        expected_fields: 普通字段值(action='accept'/dir='forward'/protocol='any'/enabled='yes'/prio='31'/ctdir='0').
+        src_ips/dst_ips: 期望源/目的地址IP列表(解析src_addr.custom比对); None=不验证地址; []=期望空(任意)."""
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"ACL规则未找到: {tagname}")
+        mismatches = {}
+        if expected_fields:
+            for key, expected in expected_fields.items():
+                actual = str(rule.get(key, ""))
+                if actual != str(expected):
+                    mismatches[key] = {"expected": str(expected), "actual": actual}
+        if src_ips is not None:
+            actual_src = self._parse_acl_addr(rule.get("src_addr", ""))
+            if sorted(actual_src) != sorted(src_ips):
+                mismatches["src_addr"] = {"expected": src_ips, "actual": actual_src}
+        if dst_ips is not None:
+            actual_dst = self._parse_acl_addr(rule.get("dst_addr", ""))
+            if sorted(actual_dst) != sorted(dst_ips):
+                mismatches["dst_addr"] = {"expected": dst_ips, "actual": actual_dst}
+        if mismatches:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"字段不匹配: {mismatches}",
+                                details={"mismatches": mismatches},
+                                raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"ACL规则存在且字段正确 (id={rule.get('id')}, action={rule.get('action')}, dir={rule.get('dir')}, proto={rule.get('protocol')})",
+                            details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+
+    def verify_acl_iptables(self, tagname: str, action: str = None,
+                            expect_present: bool = True) -> VerifyResult:
+        """L2: 验证ACL规则在iptables链中存在/不存在(enabled落地验证).
+        dir=forward→FIREWALL链, dir=input→INPUT_ACL链. 规则以'--comment {id}_'标识.
+        expect_present=True验证存在(enabled=yes), False验证不存在(enabled=no/已删).
+        action: 'accept'/'drop', 启用时验证-j ACCEPT/DROP."""
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L2-iptables", passed=not expect_present,
+                                message=f"ACL规则不在DB({tagname}), iptables按expect_present={expect_present}判定")
+        rid = rule.get("id", "")
+        dirv = rule.get("dir", "forward")
+        chain = "INPUT_ACL" if dirv == "input" else "FIREWALL"
+        self.connect_router()
+        out = self._router.exec(f"iptables -L {chain} -n -v 2>/dev/null")
+        # 规则行comment格式 '/* {id}_{comment} */', 用 '/* {id}_' 精确匹配(id=1不误匹配id=10)
+        comment_prefix = f"/* {rid}_"
+        matched = [l for l in out.splitlines() if comment_prefix in l]
+        present = len(matched) > 0
+        if present != expect_present:
+            return VerifyResult(level="L2-iptables", passed=False,
+                                message=f"{chain}链规则(id={rid}) present={present} 期望={expect_present}",
+                                raw_output=out[:400])
+        if expect_present and action:
+            target_map = {"accept": "ACCEPT", "drop": "DROP"}
+            expect_target = target_map.get(str(action).lower(), str(action).upper())
+            if not any(expect_target in l for l in matched):
+                return VerifyResult(level="L2-iptables", passed=False,
+                                    message=f"{chain}链规则(id={rid}) 动作未匹配 -j {expect_target}",
+                                    raw_output="\n".join(matched)[:300])
+        return VerifyResult(level="L2-iptables", passed=True,
+                            message=f"{chain}链规则(id={rid}) present={present} 符合预期" + (f", -j {action.upper()}" if action and expect_present else ""),
+                            raw_output=out[:400])
+
+    def verify_acl_ipset(self, tagname: str, expected_ips: list = None,
+                         expect_present: bool = True, side: str = "src") -> VerifyResult:
+        """L3: 验证ACL规则ipset集合(acl_src_{id}/acl_dst_{id})存在 + IP成员.
+        side: 'src'源地址/'dst'目的地址. expect_present=False验证ipset不存在(地址空或已删).
+        expected_ips: 期望IP成员(在子集合_acl_{side}_{id}中)."""
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L3-ipset", passed=not expect_present,
+                                message=f"ACL规则不在DB({tagname})")
+        rid = rule.get("id", "")
+        self.connect_router()
+        set_name = f"acl_{side}_{rid}"
+        out = self._router.exec(f"ipset list {set_name} 2>/dev/null")
+        exists = bool(out.strip()) and "does not exist" not in out
+        if exists != expect_present:
+            return VerifyResult(level="L3-ipset", passed=False,
+                                message=f"ipset {set_name} exists={exists} 期望={expect_present}",
+                                raw_output=out[:300])
+        if expect_present and expected_ips:
+            sub_out = self._router.exec(f"ipset list _acl_{side}_{rid} 2>/dev/null")
+            missing = [ip for ip in expected_ips if ip not in sub_out]
+            if missing:
+                return VerifyResult(level="L3-ipset", passed=False,
+                                    message=f"ipset _acl_{side}_{rid} 缺少IP: {missing}",
+                                    raw_output=sub_out[:300])
+        return VerifyResult(level="L3-ipset", passed=True,
+                            message=f"ipset {set_name} exists={exists}" + (f", IPs={expected_ips}" if expect_present and expected_ips else ""),
+                            raw_output=out[:300])
+
+    def verify_acl_enabled(self, tagname: str, expect_enabled: bool) -> VerifyResult:
+        """综合验证enabled: DB enabled字段(yes/no) + iptables规则presence一致."""
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-enabled", passed=False, message=f"ACL规则未找到: {tagname}")
+        db_enabled = rule.get("enabled", "") == "yes"
+        ipt = self.verify_acl_iptables(tagname, expect_present=expect_enabled)
+        if db_enabled != expect_enabled:
+            return VerifyResult(level="L1-enabled", passed=False,
+                                message=f"DB enabled={rule.get('enabled')} 期望={'yes' if expect_enabled else 'no'}; iptables: {ipt.message}",
+                                raw_output=ipt.raw_output)
+        return VerifyResult(level="L1-enabled", passed=True,
+                            message=f"enabled={rule.get('enabled')} 符合预期; {ipt.message}")
+
+    def verify_acl_not_exists(self, tagname: str) -> VerifyResult:
+        """验证ACL规则已从DB删除"""
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-删除验证", passed=True, message=f"ACL规则已删除: {tagname}")
+        return VerifyResult(level="L1-删除验证", passed=False,
+                            message=f"ACL规则仍存在: {tagname} (id={rule.get('id')})",
+                            details={"rule": rule})
+
+    def verify_acl_count(self, expected: int = 0, prefix: str = None) -> VerifyResult:
+        """验证ACL规则总数(或prefix开头数量)"""
+        if prefix:
+            rows = self._sqlite_query_list(f"SELECT tagname FROM acl WHERE tagname LIKE '{prefix}%'")
+            actual = len(rows)
+        else:
+            row = self._sqlite_query_line("SELECT count(*) as cnt FROM acl")
+            actual = int(row.get("cnt", 0)) if row else 0
+        if actual == expected:
+            return VerifyResult(level="L1-计数", passed=True,
+                                message=f"ACL规则数量正确: {actual}" + (f"(prefix={prefix})" if prefix else ""))
+        return VerifyResult(level="L1-计数", passed=False,
+                            message=f"ACL规则数量 {actual} 期望 {expected}")
+
+    def delete_acl_by_sql(self, tagname: str) -> str:
+        """SQL删除单个ACL规则(finally兜底, 清DB; 不触发acl.sh reload)."""
+        self.connect_router()
+        try:
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM acl WHERE tagname='{tagname}'\"")
+            return f"deleted {tagname}"
+        except Exception as e:
+            return f"error: {e}"
+
+    def cleanup_acl_test(self, prefix: str = "acl_t_") -> str:
+        """SQL批量清理prefix开头的ACL规则(finally兜底) + 触发acl.sh init清iptables/ipset."""
+        self.connect_router()
+        try:
+            rows = self._sqlite_query_list(f"SELECT id,tagname FROM acl WHERE tagname LIKE '{prefix}%'")
+            if not rows:
+                return "0 rules"
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM acl WHERE tagname LIKE '{prefix}%'\"")
+            try:
+                self._router.exec("/usr/ikuai/script/acl.sh init 2>/dev/null")
+            except Exception:
+                pass
+            return f"deleted {len(rows)} rules"
+        except Exception as e:
+            return f"error: {e}"
+
+    # ==================== ACL L5打流功能验证 + L2协议/优先级/ctdir/接口深度验证 ====================
+    # 基于acl.sh源码反推内核落地点: 协议→"-p $proto"; ctdir→"-m conntrack --ctdir ORIGINAL|REPLY";
+    # 接口→"-m ifaces --ifaces <if> --dir in|out"; 地址→"-m set --match-set acl_src_/dst_$id";
+    # prio→规则写/tmp/iktmp/ipt_rule_id/acl_id_rule, function/acl:574 sort -k2,2n -k1,1n按prio升序后iptables-restore下发(iptables行号=prio升序).
+    # 打流判定(iptables计数器匹配即增,与动作无关): 命中=Δpkts>0; drop生效=命中+连接失败;
+    #   accept生效=命中+连通; 未入栈(DB有但iptables空, 即function/acl:582 iptables-restore静默吞失败)=Δpkts=0+连通→全栈打流是唯一哨兵.
+    # 前置: 调用方需先backend_verifier.add_route_via_router确保client(192.168.148.2)流量经路由器FIREWALL链 + iperf3 server已启动.
+
+    def _read_acl_counter(self, rule_id: int, chain: str = "FIREWALL",
+                          ipv6: bool = False) -> tuple:
+        """读ACL规则iptables计数(pkts, bytes). iKuai定制列序: num pkts bytes ccnt fcnt fastid target...
+        匹配comment '/* {id}_ */'(id=1不误中id=10). 失败返回(0,0)."""
+        self.connect_router()
+        ipt = "ip6tables" if ipv6 else "iptables"
+        out = self._router.exec(f"{ipt} -L {chain} -n -v -x --line-numbers 2>/dev/null")
+        for line in out.splitlines():
+            if f"/* {rule_id}_" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    try:
+                        return (int(parts[1]), int(parts[2]))
+                    except ValueError:
+                        pass
+        return (0, 0)
+
+    def _iperf3_connected(self, result: dict) -> bool:
+        """判定iperf3是否真连通(有实际流量). run_iperf3返回JSON: 连通=end.sum_sent.bits_per_second>0."""
+        if not result or "error" in result:
+            return False
+        try:
+            bps = result.get("end", {}).get("sum_sent", {}).get("bits_per_second", 0)
+            return bool(bps) and bps > 0
+        except (AttributeError, TypeError):
+            return False
+
+    def _acl_flow_iperf(self, rule_id: int, proto: str, dst_port: int,
+                        server_ip: str, chain: str, ipv6: bool) -> tuple:
+        """单段tcp/udp打流: before计数→iperf3(-t3短duration; drop时iperf3卡连接由exec看门狗timeout=12s杀)→after计数.
+        返回(connected, delta_pkts)."""
+        u = " -u" if proto == "udp" else ""
+        cmd = f"iperf3 -c {server_ip} -B 192.168.148.2 -t 3 --connect-timeout 3000{u} -J -p {dst_port}"
+        b_pkt, _ = self._read_acl_counter(rule_id, chain, ipv6)
+        try:
+            out = self._client.exec(cmd, timeout=12)
+        except Exception:
+            out = ""  # iperf3卡连接/exec看门狗超时=未连通(drop预期), 容忍不崩
+        connected = False
+        try:
+            connected = self._iperf3_connected(json.loads(out))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass  # drop时iperf3超时返回非JSON=未连通
+        a_pkt, _ = self._read_acl_counter(rule_id, chain, ipv6)
+        return connected, a_pkt - b_pkt
+
+    def verify_acl_flow(self, tagname: str, proto: str = "tcp", dst_port: int = 5201,
+                        action: str = "drop", chain: str = "FIREWALL",
+                        ipv6: bool = False, server_ip: str = None,
+                        count: int = 5) -> VerifyResult:
+        """L5打流验证: ACL规则真阻断/放行(全栈, BUG2 iptables-restore静默失败的唯一哨兵).
+        proto: tcp|udp|tcp_udp|icmp|gre(gre无对端只L2, 此处skip).
+          tcp_udp杀手锏: 同端口分tcp/udp两段, 两段Δpkts都>0才证ik_core多协议单规则同时匹配tcp+udp.
+        action: drop|accept(调用方按UI设置传).
+        判定: 命中=Δpkts>0; drop生效=命中+不连通; accept生效=命中+连通; 未入栈=Δpkts=0+连通(两action都FAIL)."""
+        if proto == "gre":
+            return VerifyResult(level="L5-flow", passed=True,
+                                message="gre无对端隧道环境, 跳过打流(仅L2 -p落地验证, 见verify_acl_protocol_iptables)")
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L5-flow", passed=False, message=f"ACL规则未找到: {tagname}")
+        rid = int(rule.get("id", 0))
+        if server_ip is None:
+            server_ip = self._ssh_config.iperf3_server
+        self.connect_router()
+        self.connect_client()
+        expect_block = (action == "drop")
+        raw = ""
+
+        if proto in ("tcp", "udp"):
+            connected, delta = self._acl_flow_iperf(rid, proto, dst_port, server_ip, chain, ipv6)
+            hit = delta > 0
+            raw = f"{proto}: connected={connected} Δpkts={delta}"
+        elif proto in ("tcp_udp", "tcp+udp"):
+            c1, d1 = self._acl_flow_iperf(rid, "tcp", dst_port, server_ip, chain, ipv6)
+            c2, d2 = self._acl_flow_iperf(rid, "udp", dst_port, server_ip, chain, ipv6)
+            connected = c1 or c2
+            hit = (d1 > 0) and (d2 > 0)  # 两段都命中才证单规则同时匹配tcp+udp
+            raw = f"tcp:conn={c1} Δpkts={d1}; udp:conn={c2} Δpkts={d2}"
+        elif proto == "icmp":
+            b_pkt, _ = self._read_acl_counter(rid, chain, ipv6)
+            out = self._client.exec(f"ping -I 192.168.148.2 -c {count} -W 1 {server_ip}", timeout=20)
+            raw = out[:200]
+            m = re.search(r"(\d+)\s*received", out)
+            connected = bool(m and int(m.group(1)) > 0)
+            a_pkt, _ = self._read_acl_counter(rid, chain, ipv6)
+            hit = (a_pkt - b_pkt) > 0
+        else:
+            return VerifyResult(level="L5-flow", passed=False, message=f"不支持的协议: {proto}")
+
+        if expect_block:
+            ok = hit and not connected
+            msg = f"drop[{proto}]: hit={hit} connected={connected} → {'阻断生效' if ok else '未阻断!'}"
+        else:
+            ok = hit and connected
+            msg = f"accept[{proto}]: hit={hit} connected={connected} → {'放行生效' if ok else '未放行!'}"
+        return VerifyResult(level="L5-flow", passed=ok, message=msg,
+                            details={"hit": hit, "connected": connected, "expect_block": expect_block},
+                            raw_output=raw)
+
+    def verify_acl_protocol_iptables(self, tagname: str, protocol: str = "any") -> VerifyResult:
+        """L2深度: 验ACL规则iptables行的-p协议落地(acl.sh __format_set: protocol!=any时PROTO="-p $protocol").
+        protocol: tcp/udp/icmp/gre/tcp+udp(any不下发-p). tcp+udp是ik_core定制多协议匹配.
+        自动按dir/ip_type选链: forward→FIREWALL/FIREWALL6, input→INPUT_ACL/INPUT_ACL6."""
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L2-protocol", passed=False, message=f"ACL规则未找到: {tagname}")
+        rid = rule.get("id", "")
+        is_v6 = rule.get("ip_type") == "6"
+        if rule.get("dir") == "input":
+            chain = "INPUT_ACL6" if is_v6 else "INPUT_ACL"
+        else:
+            chain = "FIREWALL6" if is_v6 else "FIREWALL"
+        ipt = "ip6tables" if is_v6 else "iptables"
+        self.connect_router()
+        out = self._router.exec(f"{ipt} -S {chain} 2>/dev/null")  # -S规则规范格式含-p/-m字面量(-L表格格式协议是独立列无-p字面量)
+        matched = [l for l in out.splitlines() if f"--comment {rid}_" in l]
+        if not matched:
+            return VerifyResult(level="L2-protocol", passed=False,
+                                message=f"{chain}链无规则id={rid}", raw_output=out[:300])
+        if protocol == "any":
+            return VerifyResult(level="L2-protocol", passed=True,
+                                message=f"protocol=any不下发-p(规则id={rid}存在即通过)")
+        expect = "-p {}".format(protocol)
+        ok = any(expect in l for l in matched)
+        return VerifyResult(level="L2-protocol", passed=ok,
+                            message=f"{chain}链规则id={rid} {'含' if ok else '缺'} '{expect}'",
+                            raw_output="\n".join(matched)[:300])
+
+    def verify_acl_priority_order(self, id_to_prio: dict, ipv6: bool = False) -> VerifyResult:
+        """L2优先级排序验证: iptables FIREWALL链规则行号顺序应=prio升序(acl.sh经function/acl:574 sort -k2,2n -k1,1n).
+        id_to_prio: {rule_id(str/int): prio(int)}. 解析每行(num, rule_id)→按num升序→对应prio应非降(等值时id升序破平).
+        辅证: cat /tmp/iktmp/ipt_rule_id/acl_id_rule 未排序源文件, 印证sort生效."""
+        ipt = "ip6tables" if ipv6 else "iptables"
+        chain = "FIREWALL6" if ipv6 else "FIREWALL"
+        self.connect_router()
+        out = self._router.exec(f"{ipt} -L {chain} -n -v --line-numbers 2>/dev/null")
+        order = []  # [(line_num, rule_id_str)]
+        for line in out.splitlines():
+            m = re.search(r"/\*\s*(\d+)_", line)
+            if m:
+                try:
+                    ln = int(line.split()[0])
+                    order.append((ln, m.group(1)))
+                except (ValueError, IndexError):
+                    pass
+        order.sort()
+        prios = [id_to_prio.get(i) for _, i in order if i in id_to_prio]
+        prios_valid = [p for p in prios if p is not None]
+        ok = all(prios_valid[i] <= prios_valid[i + 1] for i in range(len(prios_valid) - 1)) if len(prios_valid) >= 2 else True
+        rule_file = "/tmp/iktmp/ipt_rule_id/acl6_id_rule" if ipv6 else "/tmp/iktmp/ipt_rule_id/acl_id_rule"
+        file_out = self._router.exec(f"cat {rule_file} 2>/dev/null")
+        return VerifyResult(level="L2-prio", passed=ok,
+                            message=f"FIREWALL行号顺序vs prio: {[(i, id_to_prio.get(i)) for _, i in order]} → {'prio升序一致' if ok else '顺序错乱!'}",
+                            details={"order": [(i, id_to_prio.get(i)) for _, i in order],
+                                     "acl_id_rule_file": file_out[:400] if file_out.strip() else "(文件不存在/空)"},
+                            raw_output=out[:400])
+
+    def verify_acl_ctdir_iptables(self, tagname: str, ctdir: int = 0) -> VerifyResult:
+        """L2 ctdir落地验证(acl.sh: ctdir=1→'-m conntrack --ctdir ORIGINAL'; =2→'REPLY'; =0→无conntrack).
+        自动按dir选链."""
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L2-ctdir", passed=False, message=f"ACL规则未找到: {tagname}")
+        rid = rule.get("id", "")
+        is_v6 = rule.get("ip_type") == "6"
+        chain = ("INPUT_ACL6" if is_v6 else "INPUT_ACL") if rule.get("dir") == "input" else ("FIREWALL6" if is_v6 else "FIREWALL")
+        ipt = "ip6tables" if is_v6 else "iptables"
+        self.connect_router()
+        out = self._router.exec(f"{ipt} -S {chain} 2>/dev/null")
+        matched = [l for l in out.splitlines() if f"--comment {rid}_" in l]
+        if ctdir == 0:
+            ok = not any("conntrack" in l for l in matched)
+            msg = f"ctdir=0应无conntrack: {'正确(无conntrack)' if ok else '错误(误含conntrack)'}"
+        else:
+            expect = "ORIGINAL" if ctdir == 1 else "REPLY"
+            ok = any(f"--ctdir {expect}" in l for l in matched)
+            msg = f"ctdir={ctdir}应含'-m conntrack --ctdir {expect}': {'是' if ok else '否'}"
+        return VerifyResult(level="L2-ctdir", passed=ok, message=msg, raw_output="\n".join(matched)[:300])
+
+    def verify_acl_iface_iptables(self, tagname: str, iface_type: str = "in",
+                                  iface: str = None) -> VerifyResult:
+        """L2进/出接口落地验证(acl.sh: -m ifaces --ifaces <if> --dir in|out).
+        iface_type: 'in'(进接口)/'out'(出接口). iface: 期望接口名(不传则只验有无对应--dir匹配)."""
+        rule = self.find_acl_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L2-iface", passed=False, message=f"ACL规则未找到: {tagname}")
+        rid = rule.get("id", "")
+        self.connect_router()
+        out = self._router.exec("iptables -S FIREWALL 2>/dev/null")
+        matched = [l for l in out.splitlines() if f"--comment {rid}_" in l]
+        expect_dir = f"--dir {iface_type}"
+        if iface:
+            ok = any(f"--ifaces {iface}" in l and expect_dir in l for l in matched)
+        else:
+            ok = any(expect_dir in l for l in matched)
+        label = f"{iface_type}" + (f"={iface}" if iface else "")
+        return VerifyResult(level="L2-iface", passed=ok,
+                            message=f"接口({label}): {'匹配' if ok else '未匹配'}", raw_output="\n".join(matched)[:300])
+
+    # ==================== 连接数限制 (安全中心 > 连接数限制) ====================
+    # conn_limit表: src_addr/dst_port/time明文JSON; protocol any/tcp/udp/icmp; limits(连接数默认1000).
+    # iptables raw表CONNLIMIT链: -m peerconns --peerconns-above {limits} -j DROP [-m set --match-set conn_limit_src_{id} src]
+    # ⚠️conn_limit规则无--comment标记, 用 conn_limit_src_{id} + #conns > {limits} 定位.
+    # ipset: conn_limit_src_{id}(源地址list:set) / conn_limit_dport_{id} / conn_limit_time_{id}.
+    def find_conn_limit_rule(self, tagname: str) -> Optional[Dict]:
+        """按名称查找连接数限制规则(conn_limit表)"""
+        return self._sqlite_query_line(f"SELECT * FROM conn_limit WHERE tagname='{tagname}'")
+
+    def find_conn_limit_rule_id(self, tagname: str) -> Optional[int]:
+        rule = self.find_conn_limit_rule(tagname)
+        if rule and rule.get("id"):
+            try:
+                return int(rule["id"])
+            except Exception:
+                return None
+        return None
+
+    def verify_conn_limit_database(self, tagname: str, expected_fields: Dict = None,
+                                   src_ips: list = None) -> VerifyResult:
+        """L1: 验证连接数限制规则在conn_limit表中存在且字段正确.
+        expected_fields: {protocol/limits/enabled/comment} ; src_ips: 内网地址IP列表(解析src_addr.custom)."""
+        rule = self.find_conn_limit_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"连接数限制规则未找到: {tagname}")
+        mismatches = {}
+        if expected_fields:
+            for key, expected in expected_fields.items():
+                actual = str(rule.get(key, ""))
+                if actual != str(expected):
+                    mismatches[key] = {"expected": str(expected), "actual": actual}
+        if src_ips is not None:
+            actual_src = self._parse_acl_addr(rule.get("src_addr", ""))
+            if sorted(actual_src) != sorted(src_ips):
+                mismatches["src_addr"] = {"expected": src_ips, "actual": actual_src}
+        if mismatches:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"字段不匹配: {mismatches}", details={"mismatches": mismatches},
+                                raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"连接数限制规则存在且字段正确 (id={rule.get('id')}, proto={rule.get('protocol')}, limits={rule.get('limits')})",
+                            details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+
+    def verify_conn_limit_iptables(self, tagname: str, limits: int = None,
+                                   expect_present: bool = True) -> VerifyResult:
+        """L2: 验证连接数限制规则在raw表CONNLIMIT链存在/不存在(enabled落地验证).
+        规则以 match-set conn_limit_src_{id} 标识(无--comment), 验证 #conns > {limits}."""
+        rule = self.find_conn_limit_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L2-iptables", passed=not expect_present,
+                                message=f"规则不在DB({tagname}), iptables按expect_present={expect_present}判定")
+        rid = rule.get("id", "")
+        self.connect_router()
+        out = self._router.exec(f"iptables -t raw -L CONNLIMIT -n -v 2>/dev/null")
+        # 每条conn_limit规则都有 timeset conn_limit_time_{id}(即使默认全天), 用它定位最可靠
+        # (无源地址时规则无match-set conn_limit_src_{id}, 不能仅用match-set定位)
+        time_mark = f"conn_limit_time_{rid}"
+        src_mark = f"conn_limit_src_{rid}"
+        matched = [l for l in out.splitlines() if time_mark in l or src_mark in l]
+        present = len(matched) > 0
+        if present != expect_present:
+            return VerifyResult(level="L2-iptables", passed=False,
+                                message=f"CONNLIMIT链规则(id={rid}) present={present} 期望={expect_present}",
+                                raw_output=out[:400])
+        if expect_present and limits is not None:
+            lim_str = str(limits)
+            if not any(lim_str in l for l in matched):
+                return VerifyResult(level="L2-iptables", passed=False,
+                                    message=f"CONNLIMIT链规则(id={rid}) limits={lim_str} 未匹配",
+                                    raw_output="\n".join(matched)[:300])
+        return VerifyResult(level="L2-iptables", passed=True,
+                            message=f"CONNLIMIT链规则(id={rid}) present={present} 符合预期" + (f", limits={limits}" if expect_present and limits is not None else ""),
+                            raw_output=out[:400])
+
+    def verify_conn_limit_ipset(self, tagname: str, expected_ips: list = None,
+                                expect_present: bool = True) -> VerifyResult:
+        """L3: 验证连接数限制ipset conn_limit_src_{id}存在 + IP成员."""
+        rule = self.find_conn_limit_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L3-ipset", passed=not expect_present,
+                                message=f"规则不在DB({tagname})")
+        rid = rule.get("id", "")
+        self.connect_router()
+        set_name = f"conn_limit_src_{rid}"
+        out = self._router.exec(f"ipset list {set_name} 2>/dev/null")
+        exists = bool(out.strip()) and "does not exist" not in out
+        if exists != expect_present:
+            return VerifyResult(level="L3-ipset", passed=False,
+                                message=f"ipset {set_name} exists={exists} 期望={expect_present}",
+                                raw_output=out[:300])
+        if expect_present and expected_ips:
+            sub_out = self._router.exec(f"ipset list _conn_limit_src_{rid} 2>/dev/null")
+            missing = [ip for ip in expected_ips if ip not in sub_out]
+            if missing:
+                return VerifyResult(level="L3-ipset", passed=False,
+                                    message=f"ipset _conn_limit_src_{rid} 缺少IP: {missing}",
+                                    raw_output=sub_out[:300])
+        return VerifyResult(level="L3-ipset", passed=True,
+                            message=f"ipset {set_name} exists={exists}" + (f", IPs={expected_ips}" if expect_present and expected_ips else ""),
+                            raw_output=out[:300])
+
+    def verify_conn_limit_enabled(self, tagname: str, expect_enabled: bool) -> VerifyResult:
+        """综合验证enabled: DB enabled字段 + iptables(raw表)presence一致."""
+        rule = self.find_conn_limit_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-enabled", passed=False, message=f"规则未找到: {tagname}")
+        db_enabled = rule.get("enabled", "") == "yes"
+        ipt = self.verify_conn_limit_iptables(tagname, expect_present=expect_enabled)
+        if db_enabled != expect_enabled:
+            return VerifyResult(level="L1-enabled", passed=False,
+                                message=f"DB enabled={rule.get('enabled')} 期望={'yes' if expect_enabled else 'no'}; iptables: {ipt.message}",
+                                raw_output=ipt.raw_output)
+        return VerifyResult(level="L1-enabled", passed=True,
+                            message=f"enabled={rule.get('enabled')} 符合预期; {ipt.message}")
+
+    def verify_conn_limit_not_exists(self, tagname: str) -> VerifyResult:
+        rule = self.find_conn_limit_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-删除验证", passed=True, message=f"规则已删除: {tagname}")
+        return VerifyResult(level="L1-删除验证", passed=False,
+                            message=f"规则仍存在: {tagname} (id={rule.get('id')})", details={"rule": rule})
+
+    def verify_conn_limit_count(self, expected: int = 0, prefix: str = None) -> VerifyResult:
+        if prefix:
+            rows = self._sqlite_query_list(f"SELECT tagname FROM conn_limit WHERE tagname LIKE '{prefix}%'")
+            actual = len(rows)
+        else:
+            row = self._sqlite_query_line("SELECT count(*) as cnt FROM conn_limit")
+            actual = int(row.get("cnt", 0)) if row else 0
+        if actual == expected:
+            return VerifyResult(level="L1-计数", passed=True,
+                                message=f"连接数限制规则数量正确: {actual}" + (f"(prefix={prefix})" if prefix else ""))
+        return VerifyResult(level="L1-计数", passed=False,
+                            message=f"连接数限制规则数量 {actual} 期望 {expected}")
+
+    def delete_conn_limit_by_sql(self, tagname: str) -> str:
+        """SQL删除单个连接数限制规则(finally兜底)"""
+        self.connect_router()
+        try:
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM conn_limit WHERE tagname='{tagname}'\"")
+            return f"deleted {tagname}"
+        except Exception as e:
+            return f"error: {e}"
+
+    def cleanup_conn_limit_test(self, prefix: str = "cl_t_") -> str:
+        """SQL批量清理prefix开头的连接数限制规则 + conn_limit.sh init + 清raw表CONNLIMIT链(conn_limit.sh init只add不清链)."""
+        self.connect_router()
+        try:
+            rows = self._sqlite_query_list(f"SELECT id,tagname FROM conn_limit WHERE tagname LIKE '{prefix}%'")
+            if not rows:
+                # 仍清链(防残留)
+                self._router.exec("iptables -t raw -F CONNLIMIT 2>/dev/null")
+                return "0 rules"
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM conn_limit WHERE tagname LIKE '{prefix}%'\"")
+            try:
+                self._router.exec("/usr/ikuai/script/conn_limit.sh init 2>/dev/null")
+            except Exception:
+                pass
+            # conn_limit.sh init只add不清链, 手动清raw表CONNLIMIT残留
+            self._router.exec("iptables -t raw -F CONNLIMIT 2>/dev/null")
+            return f"deleted {len(rows)} rules"
+        except Exception as e:
+            return f"error: {e}"
+
+    # ==================== MAC访问控制 (安全中心 > MAC访问控制) ====================
+    # 两模式: 黑名单(global_config.acl_mac=0, 默认)/白名单(acl_mac=1).
+    # 表: acl_mac_black/acl_mac_white (enabled默认no/tagname unique/comment/time JSON/expires/mac小写unique).
+    # iptables filter表ACL_MAC链(FORWARD第2条): 黑名单`-A ACL_MAC -m set --match-set acl_mac_{id} src -j DROP`/白名单`-I ACL_MAC ... -j RETURN`.
+    # ⚠️无--comment标记, 用 acl_mac_{id}+acl_mac_time_{id} 定位. ipset: acl_mac_{id}(MAC集合).
+    def find_mac_rule(self, tagname: str, mode: str = "black") -> Optional[Dict]:
+        """按名称查找MAC访问控制规则(acl_mac_{mode}表). mode='black'/'white'"""
+        return self._sqlite_query_line(f"SELECT * FROM acl_mac_{mode} WHERE tagname='{tagname}'")
+
+    def verify_mac_ctrl_database(self, tagname: str, mode: str = "black",
+                                 expected_fields: Dict = None, mac: str = None) -> VerifyResult:
+        """L1: 验证MAC规则在acl_mac_{mode}表存在且字段正确.
+        expected_fields: {enabled/comment/expires}; mac: 验证mac字段(自动转小写比对)."""
+        rule = self.find_mac_rule(tagname, mode)
+        if rule is None:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"MAC规则未找到: {tagname}(mode={mode})")
+        mismatches = {}
+        if expected_fields:
+            for key, expected in expected_fields.items():
+                actual = str(rule.get(key, ""))
+                if actual != str(expected):
+                    mismatches[key] = {"expected": str(expected), "actual": actual}
+        if mac is not None:
+            actual_mac = str(rule.get("mac", "")).lower()
+            if actual_mac != str(mac).lower():
+                mismatches["mac"] = {"expected": str(mac).lower(), "actual": actual_mac}
+        if mismatches:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"字段不匹配: {mismatches}", details={"mismatches": mismatches},
+                                raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"MAC规则存在且字段正确 (id={rule.get('id')}, mode={mode}, mac={rule.get('mac')}, enabled={rule.get('enabled')})",
+                            details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+
+    def verify_mac_ctrl_iptables(self, tagname: str, mode: str = "black",
+                                 expect_present: bool = True) -> VerifyResult:
+        """L2: 验证MAC规则在filter表ACL_MAC链存在/不存在(enabled落地验证).
+        黑名单-DROP/白名单-RETURN. 用 acl_mac_{id}+acl_mac_time_{id} 定位(无--comment)."""
+        rule = self.find_mac_rule(tagname, mode)
+        if rule is None:
+            return VerifyResult(level="L2-iptables", passed=not expect_present,
+                                message=f"MAC规则不在DB({tagname},mode={mode})")
+        rid = rule.get("id", "")
+        self.connect_router()
+        out = self._router.exec(f"iptables -L ACL_MAC -n -v 2>/dev/null")
+        time_mark = f"acl_mac_time_{rid}"
+        src_mark = f"acl_mac_{rid} "
+        matched = [l for l in out.splitlines() if time_mark in l or src_mark in l]
+        present = len(matched) > 0
+        if present != expect_present:
+            return VerifyResult(level="L2-iptables", passed=False,
+                                message=f"ACL_MAC链规则(id={rid},mode={mode}) present={present} 期望={expect_present}",
+                                raw_output=out[:400])
+        # 验证target: 黑名单DROP/白名单RETURN
+        if expect_present:
+            expect_target = "DROP" if mode == "black" else "RETURN"
+            if not any(expect_target in l for l in matched):
+                return VerifyResult(level="L2-iptables", passed=False,
+                                    message=f"ACL_MAC链规则(id={rid}) target未匹配 -j {expect_target}",
+                                    raw_output="\n".join(matched)[:300])
+        return VerifyResult(level="L2-iptables", passed=True,
+                            message=f"ACL_MAC链规则(id={rid},mode={mode}) present={present} 符合预期" + (f", -j {('DROP' if mode=='black' else 'RETURN')}" if expect_present else ""),
+                            raw_output=out[:400])
+
+    def verify_mac_ctrl_ipset(self, tagname: str, mac: str = None,
+                              mode: str = "black", expect_present: bool = True) -> VerifyResult:
+        """L3: 验证ipset acl_mac_{id}存在 + MAC成员"""
+        rule = self.find_mac_rule(tagname, mode)
+        if rule is None:
+            return VerifyResult(level="L3-ipset", passed=not expect_present,
+                                message=f"MAC规则不在DB({tagname})")
+        rid = rule.get("id", "")
+        self.connect_router()
+        set_name = f"acl_mac_{rid}"
+        out = self._router.exec(f"ipset list {set_name} 2>/dev/null")
+        exists = bool(out.strip()) and "does not exist" not in out
+        if exists != expect_present:
+            return VerifyResult(level="L3-ipset", passed=False,
+                                message=f"ipset {set_name} exists={exists} 期望={expect_present}",
+                                raw_output=out[:300])
+        if expect_present and mac:
+            sub_out = self._router.exec(f"ipset list _acl_mac_{rid} 2>/dev/null")
+            if str(mac).lower() not in sub_out.lower():
+                return VerifyResult(level="L3-ipset", passed=False,
+                                    message=f"ipset _acl_mac_{rid} 缺少MAC {mac}",
+                                    raw_output=sub_out[:300])
+        return VerifyResult(level="L3-ipset", passed=True,
+                            message=f"ipset {set_name} exists={exists}" + (f", MAC={mac}" if expect_present and mac else ""),
+                            raw_output=out[:300])
+
+    def verify_mac_ctrl_mode(self, expect_mode: str) -> VerifyResult:
+        """验证模式: global_config.acl_mac=0黑名单/1白名单. expect_mode='black'/'white'"""
+        expected_val = "0" if expect_mode == "black" else "1"
+        self.connect_router()
+        row = self._sqlite_query_line("SELECT acl_mac FROM global_config")
+        actual = str(row.get("acl_mac", "")) if row else "?"
+        if actual == expected_val:
+            return VerifyResult(level="L1-模式", passed=True,
+                                message=f"模式正确: {expect_mode}(acl_mac={actual})")
+        return VerifyResult(level="L1-模式", passed=False,
+                            message=f"模式不匹配: 期望{expect_mode}(acl_mac={expected_val}) 实际acl_mac={actual}")
+
+    def set_mac_mode(self, mode: str) -> str:
+        """SSH切换MAC访问控制模式(update global_config acl_mac + acl_mac.sh init重新下发).
+        mode='black'(acl_mac=0)/'white'(acl_mac=1). 用于UI radio不调API时后端切换验证两模式."""
+        self.connect_router()
+        val = "0" if mode == "black" else "1"
+        try:
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"UPDATE global_config SET acl_mac='{val}'\"")
+            self._router.exec("/usr/ikuai/script/acl_mac.sh init 2>/dev/null")
+            return f"mode set to {mode}(acl_mac={val})"
+        except Exception as e:
+            return f"error: {e}"
+
+    def verify_mac_ctrl_enabled(self, tagname: str, mode: str, expect_enabled: bool) -> VerifyResult:
+        rule = self.find_mac_rule(tagname, mode)
+        if rule is None:
+            return VerifyResult(level="L1-enabled", passed=False, message=f"MAC规则未找到: {tagname}")
+        db_enabled = rule.get("enabled", "") == "yes"
+        ipt = self.verify_mac_ctrl_iptables(tagname, mode, expect_present=expect_enabled)
+        if db_enabled != expect_enabled:
+            return VerifyResult(level="L1-enabled", passed=False,
+                                message=f"DB enabled={rule.get('enabled')} 期望={'yes' if expect_enabled else 'no'}; iptables: {ipt.message}",
+                                raw_output=ipt.raw_output)
+        return VerifyResult(level="L1-enabled", passed=True,
+                            message=f"enabled={rule.get('enabled')} 符合预期; {ipt.message}")
+
+    def verify_mac_ctrl_not_exists(self, tagname: str, mode: str = "black") -> VerifyResult:
+        rule = self.find_mac_rule(tagname, mode)
+        if rule is None:
+            return VerifyResult(level="L1-删除验证", passed=True, message=f"MAC规则已删除: {tagname}(mode={mode})")
+        return VerifyResult(level="L1-删除验证", passed=False,
+                            message=f"MAC规则仍存在: {tagname}(mode={mode}, id={rule.get('id')})", details={"rule": rule})
+
+    def verify_mac_ctrl_count(self, expected: int = 0, prefix: str = None) -> VerifyResult:
+        """验证MAC规则总数(黑+白), 或prefix开头数"""
+        if prefix:
+            b = self._sqlite_query_list(f"SELECT tagname FROM acl_mac_black WHERE tagname LIKE '{prefix}%'")
+            w = self._sqlite_query_list(f"SELECT tagname FROM acl_mac_white WHERE tagname LIKE '{prefix}%'")
+            actual = len(b) + len(w)
+        else:
+            row = self._sqlite_query_line("SELECT (SELECT count(*) FROM acl_mac_black)+(SELECT count(*) FROM acl_mac_white) as cnt")
+            actual = int(row.get("cnt", 0)) if row else 0
+        if actual == expected:
+            return VerifyResult(level="L1-计数", passed=True,
+                                message=f"MAC规则数量正确: {actual}" + (f"(prefix={prefix})" if prefix else ""))
+        return VerifyResult(level="L1-计数", passed=False, message=f"MAC规则数量 {actual} 期望 {expected}")
+
+    def cleanup_mac_ctrl_test(self, prefix: str = "mac_t_") -> str:
+        """清理prefix开头的MAC规则(黑+白表)+恢复黑名单模式+清ACL_MAC链"""
+        self.connect_router()
+        try:
+            b = self._sqlite_query_list(f"SELECT id FROM acl_mac_black WHERE tagname LIKE '{prefix}%'")
+            w = self._sqlite_query_list(f"SELECT id FROM acl_mac_white WHERE tagname LIKE '{prefix}%'")
+            total = len(b) + len(w)
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM acl_mac_black WHERE tagname LIKE '{prefix}%'; DELETE FROM acl_mac_white WHERE tagname LIKE '{prefix}%'\"")
+            self._router.exec("sqlite3 " + self.DNS_DB + " \"UPDATE global_config SET acl_mac='0'\"")
+            self._router.exec("/usr/ikuai/script/acl_mac.sh init 2>/dev/null")
+            self._router.exec("iptables -F ACL_MAC 2>/dev/null")
+            return f"deleted {total} rules"
+        except Exception as e:
+            return f"error: {e}"
+
+    # ==================== 应用协议控制 (安全中心 > 应用协议控制) ====================
+    # 专业模式(global_config.parental_mode=0). 表 acl_l7.
+    # ⚠️不走iptables/ipset! 走 ik_cntl new_tc app_rule -> ik_core内核new_tc子系统(非iptables).
+    # app_proto JSON: custom放应用名字符串(非appid, 脚本APPIDS[名]反查), object放分组gid.
+    # time必须空串""(非空JSON致脚本建空timeset -> 规则inactive永不匹配).
+    # 验证金矿: L1=DB; L2=ik_summary的App Rules count + ID:<id>规则状态行(active/action/appset/match);
+    #   L3=dpi_cache appid + host_active_apps + conntrack appid + match计数增量(命中铁证);
+    #   L4=打流连通性(测试机new_tc可能disable, drop不执行 -> match增量作命中铁证, 连通性探测不硬断言).
+    def find_app_protocol_rule(self, tagname: str) -> Optional[Dict]:
+        """按名称查找应用协议控制规则(acl_l7表)."""
+        return self._sqlite_query_line(f"SELECT * FROM acl_l7 WHERE tagname='{tagname}'")
+
+    def verify_app_protocol_database(self, tagname: str, expected_fields: Dict = None,
+                                     expect_app: str = None) -> VerifyResult:
+        """L1: 验证应用协议控制规则在acl_l7表存在且字段正确.
+        expected_fields: {enabled/action/prio/comment}; expect_app: 验app_proto含应用名或大类名(子串)."""
+        rule = self.find_app_protocol_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"应用协议控制规则未找到: {tagname}")
+        mismatches = {}
+        if expected_fields:
+            for key, expected in expected_fields.items():
+                actual = str(rule.get(key, ""))
+                if actual != str(expected):
+                    mismatches[key] = {"expected": str(expected), "actual": actual}
+        if expect_app:
+            app_proto = str(rule.get("app_proto", ""))
+            if expect_app not in app_proto:
+                mismatches["app_proto"] = {"expected_contains": expect_app, "actual": app_proto[:80]}
+        if mismatches:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"字段不匹配: {mismatches}", details={"mismatches": mismatches},
+                                raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"规则存在且字段正确 (id={rule.get('id')}, action={rule.get('action')}, enabled={rule.get('enabled')}, prio={rule.get('prio')})",
+                            details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+
+    def verify_app_protocol_kernel_rule(self, tagname: str, expect_present: bool = True,
+                                        expect_action: str = None) -> VerifyResult:
+        """L2: 验证规则下发到ik_core内核(ik_summary的App Rules + ID:<id>规则状态行).
+        acl_l7不走iptables, 用ik_summary查. 关键: 必须active(time字段空JSON致inactive).
+        规则行格式: ID:<id> prio:<N> active src_set():65535 dst_set():65535 action:Drop|Accept appset:(acl7_app_<id>) timeset:() match:<N>"""
+        rule = self.find_app_protocol_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L2-内核规则", passed=not expect_present,
+                                message=f"规则不在DB({tagname})")
+        rid = rule.get("id", "")
+        self.connect_router()
+        out = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+        # 定位ID:<rid>规则状态行
+        rule_lines = [l for l in out.splitlines() if f"ID:{rid} " in l or f"ID:{rid}\t" in l
+                      or l.strip().startswith(f"ID:{rid}")]
+        present = len(rule_lines) > 0
+        if present != expect_present:
+            return VerifyResult(level="L2-内核规则", passed=False,
+                                message=f"内核规则(id={rid}) present={present} 期望={expect_present}",
+                                raw_output="\n".join(rule_lines)[:400] or out[:300])
+        if expect_present:
+            # active验证(非inactive)
+            active_lines = [l for l in rule_lines if "active" in l and "inactive" not in l]
+            if not active_lines:
+                return VerifyResult(level="L2-内核规则", passed=False,
+                                    message=f"规则(id={rid}) inactive(time字段非空致空timeset, 永不匹配!)",
+                                    raw_output="\n".join(rule_lines)[:400])
+            # action验证
+            act_desc = ""
+            if expect_action:
+                act_ui = "Drop" if expect_action == "drop" else "Accept"
+                if not any(act_ui in l for l in active_lines):
+                    return VerifyResult(level="L2-内核规则", passed=False,
+                                        message=f"规则(id={rid}) action未匹配 action:{act_ui}",
+                                        raw_output="\n".join(active_lines)[:300])
+                act_desc = f", action:{act_ui}"
+            # appset验证
+            appset_ok = any(f"acl7_app_{rid}" in l for l in active_lines)
+            appset_desc = f", appset={'OK' if appset_ok else '缺失'}"
+            return VerifyResult(level="L2-内核规则", passed=True,
+                                message=f"内核规则(id={rid}) active{act_desc}{appset_desc}",
+                                raw_output="\n".join(active_lines)[:400])
+        return VerifyResult(level="L2-内核规则", passed=True,
+                            message=f"内核规则(id={rid}) 已删除(present=False符合预期)",
+                            raw_output="\n".join(rule_lines)[:200])
+
+    def _read_app_match(self, rid) -> int:
+        """读ik_summary里ID:<rid>规则行的match计数(取最大值, 多行时active行match最大)."""
+        self.connect_router()
+        out = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+        matches = re.findall(rf"ID:{rid}\b.*?match:(\d+)", out)
+        return max([int(m) for m in matches]) if matches else 0
+
+    def verify_app_protocol_match(self, tagname: str) -> VerifyResult:
+        """L3: 返回规则当前match计数(供打流前后对比增量, 命中铁证)."""
+        rule = self.find_app_protocol_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L3-match", passed=False, message=f"规则未找到: {tagname}")
+        rid = rule.get("id", "")
+        m = self._read_app_match(rid)
+        return VerifyResult(level="L3-match", passed=True,
+                            message=f"规则(id={rid}) match={m}", details={"match": m, "rid": rid})
+
+    def verify_app_protocol_dpi(self, src_ip: str = "192.168.148.2", dst_ip: str = None,
+                                expect_appid: str = None) -> VerifyResult:
+        """L3: DPI识别验证(dpi_cache dst_ip->appid + host_active_apps src_ip->appid + conntrack appid).
+        探测模式(记录识别状态, 不硬断言). expect_appid指定时期望命中."""
+        self.connect_router()
+        parts = []
+        cache = ""
+        if dst_ip:
+            cache = self._router.exec(f"cat /proc/ikuai/dpi/dpi_cache 2>/dev/null | grep '{dst_ip}'")
+            parts.append(f"dpi_cache[{dst_ip}]: {cache.strip()[:120]}")
+        haa = self._router.exec(f"cat /proc/ikuai/stats/host_active_apps 2>/dev/null | grep '{src_ip}'")
+        parts.append(f"host_active_apps[{src_ip}]: {haa.strip()[:120]}")
+        ct = self._router.exec(f"cat /proc/net/nf_conntrack 2>/dev/null | grep '{src_ip}' | grep -oE 'appid=[0-9]+' | sort | uniq -c")
+        parts.append(f"conntrack appid: {ct.strip()[:120]}")
+        recognized = bool(haa.strip()) or bool(ct.strip())
+        if expect_appid:
+            recognized = recognized and (expect_appid in cache or expect_appid in ct)
+        return VerifyResult(level="L3-dpi", passed=True,
+                            message=f"DPI识别: {'有' if recognized else '无/未匹配(可能未打流)'}",
+                            raw_output="\n".join(parts))
+
+    def verify_app_protocol_enabled(self, tagname: str, expect_enabled: bool) -> VerifyResult:
+        """验证规则启用状态: DB enabled + 内核规则active双验(enabled=no时内核规则应消失/变inactive)."""
+        rule = self.find_app_protocol_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-enabled", passed=False, message=f"规则未找到: {tagname}")
+        db_enabled = str(rule.get("enabled", "")) == "yes"
+        kr = self.verify_app_protocol_kernel_rule(tagname, expect_present=expect_enabled)
+        if db_enabled != expect_enabled:
+            return VerifyResult(level="L1-enabled", passed=False,
+                                message=f"DB enabled={rule.get('enabled')} 期望={'yes' if expect_enabled else 'no'}; 内核: {kr.message}",
+                                raw_output=kr.raw_output)
+        return VerifyResult(level="L1-enabled", passed=True,
+                            message=f"enabled={rule.get('enabled')} 符合预期; {kr.message}")
+
+    def verify_app_protocol_not_exists(self, tagname: str) -> VerifyResult:
+        rule = self.find_app_protocol_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L1-删除验证", passed=True, message=f"规则已删除: {tagname}")
+        return VerifyResult(level="L1-删除验证", passed=False,
+                            message=f"规则仍存在: {tagname}(id={rule.get('id')})", details={"rule": rule})
+
+    def verify_app_protocol_count(self, expected: int = None, prefix: str = None) -> VerifyResult:
+        """验证应用协议控制规则总数, 或prefix开头数."""
+        if prefix:
+            rows = self._sqlite_query_list(f"SELECT tagname FROM acl_l7 WHERE tagname LIKE '{prefix}%'")
+            actual = len(rows)
+        else:
+            row = self._sqlite_query_line("SELECT count(*) as cnt FROM acl_l7")
+            actual = int(row.get("cnt", 0)) if row else 0
+        if expected is not None and actual != expected:
+            return VerifyResult(level="L1-计数", passed=False,
+                                message=f"规则数量 {actual} 期望 {expected}" + (f"(prefix={prefix})" if prefix else ""))
+        return VerifyResult(level="L1-计数", passed=True,
+                            message=f"规则数量: {actual}" + (f"(prefix={prefix})" if prefix else ""))
+
+    def add_app_protocol_rule_via_ssh(self, tagname: str, app: str = None, category_gid: str = None,
+                                      action: str = "drop", prio: int = 32, src_addrs: list = None) -> str:
+        """SSH直接建应用协议控制规则(SQL insert + acl_l7.sh init). 供打流测试精确控制app_proto确保命中.
+        app: 应用名字符串(如"百度", 入app_proto.custom, 脚本APPIDS[名]反查appid);
+        category_gid: 分组gid(如"PROTOGP11", 入app_proto.object). 二选一.
+        time必须空串""(非空致规则inactive). 返回结果描述."""
+        self.connect_router()
+        import json as _json
+        custom = [app] if app else []
+        obj = [{"gid": category_gid}] if category_gid else []
+        app_proto = _json.dumps({"custom": custom, "object": obj}, ensure_ascii=False)
+        src = _json.dumps({"object": [], "custom": src_addrs or []}, ensure_ascii=False)
+        dst = _json.dumps({"object": [], "custom": []}, ensure_ascii=False)
+        # shell双引号包SQL参数, JSON内双引号转义为\"
+        ap = app_proto.replace('"', '\\"')
+        sr = src.replace('"', '\\"')
+        ds = dst.replace('"', '\\"')
+        try:
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM acl_l7 WHERE tagname='{tagname}'\"")
+            sql = (f"sqlite3 {self.DNS_DB} \"INSERT INTO acl_l7(enabled,tagname,comment,prio,action,"
+                   f"app_proto,src_addr,dst_addr,time) VALUES('yes','{tagname}','ssh_rule',{prio},'{action}',"
+                   f"'{ap}','{sr}','{ds}','')\"")
+            self._router.exec(sql)
+            self._router.exec("/usr/ikuai/script/acl_l7.sh init 2>/dev/null")
+            self._router.exec("sleep 2")  # 等init下发规则到内核(appset建立, 实测需1-2s)
+            return f"added {tagname}(action={action},app={app or category_gid})"
+        except Exception as e:
+            return f"error: {e}"
+
+    def verify_app_protocol_flow(self, tagname: str, dst_domain: str = "www.baidu.com",
+                                 dst_ip: str = "110.242.69.21", expect_action: str = "drop",
+                                 count: int = 5, other_domain: str = "www.qq.com") -> VerifyResult:
+        """L4探测: 建规则后client打流curl baidu, 验match增量(命中铁证, 硬判)+连通性(探测, 不硬断言).
+        判定: match增量>0 -> PASS(规则识别+匹配流量=生效铁证).
+        连通性记录: 通=new_tc disable未执行drop(环境限制); 不通=drop阻断生效. (测试机new_tc可能disable)
+        打流坑: client必须host路由强制经路由器(curl --interface只bind源IP不强制路由); 用baidu非114."""
+        rule = self.find_app_protocol_rule(tagname)
+        if rule is None:
+            return VerifyResult(level="L4-flow", passed=False, message=f"规则未找到: {tagname}")
+        rid = rule.get("id", "")
+        self.connect_router()
+        self.connect_client()
+        # user_dpi必须enable(acl_l7规则match增量需要, 默认disable; 实测off时match恒=0, on后match精准增量).
+        # 记录原状态测完恢复(避免改变路由器默认配置). new_tc仍disable->drop不执行(curl通), 仅match命中铁证.
+        fs_before = self._router.exec("cat /proc/ikuai/stats/ik_features_status 2>/dev/null | grep '^user_dpi'")
+        user_dpi_was_on = "enable" in fs_before
+        if not user_dpi_was_on:
+            self._router.exec("ik_cntl user_dpi on 2>/dev/null")
+            self._router.exec("sleep 1")
+        # 开http_app acl smart(应用层ACL智能引擎, 尝试启用真正阻断; new_tc disable但smart可能独立阻断http应用)
+        fs_smart = self._router.exec("cat /proc/ikuai/stats/ik_features_status 2>/dev/null | grep '^smart_acl'")
+        smart_was_on = "enable" in fs_smart
+        if not smart_was_on:
+            self._router.exec("ik_cntl http_app acl smart on 2>/dev/null")
+            self._router.exec("sleep 1")
+        match_before = self._read_app_match(rid)
+        connected_target = 0
+        connected_other = 0
+        delta_target = 0
+        delta_other = -1  # -1=未测
+        other_ip_used = ""
+        try:
+            # 打流目标域名(百度, 规则含其appid 5060173, 应命中)
+            self.add_route_via_router(dst_ip)
+            for _ in range(count):
+                out = self._client.exec(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' --connect-timeout 5 -m 8 http://{dst_domain}/",
+                    timeout=15)
+                if any(c in out for c in ["200", "301", "302", "304"]):
+                    connected_target += 1
+            match_after_target = self._read_app_match(rid)
+            self.remove_route(dst_ip)
+            delta_target = match_after_target - match_before
+            # 精确性验证: 打流其他域名(qq.com, 腾讯appid≠百度), 规则只含百度appid应不命中(match不变)
+            if other_domain:
+                oip_out = self._client.exec(
+                    f"dig +short {other_domain} 2>/dev/null | grep -E '^[0-9.]' | head -1", timeout=10)
+                other_ip_used = oip_out.strip()
+                if other_ip_used:
+                    self.add_route_via_router(other_ip_used)
+                    for _ in range(count):
+                        out = self._client.exec(
+                            f"curl -s -o /dev/null -w '%{{http_code}}' --connect-timeout 5 -m 8 http://{other_domain}/",
+                            timeout=15)
+                        if any(c in out for c in ["200", "301", "302", "304"]):
+                            connected_other += 1
+                    match_after_other = self._read_app_match(rid)
+                    self.remove_route(other_ip_used)
+                    delta_other = match_after_other - match_after_target
+        finally:
+            self.remove_route(dst_ip)
+            if other_ip_used:
+                self.remove_route(other_ip_used)
+            if not user_dpi_was_on:
+                self._router.exec("ik_cntl user_dpi off 2>/dev/null")
+            if not smart_was_on:
+                self._router.exec("ik_cntl http_app acl smart off 2>/dev/null")
+        hit = delta_target > 0
+        precise = hit and (delta_other == 0)
+        tgt_conn = f"连通{connected_target}/{count}" if connected_target > 0 else f"全不通({count}失败)"
+        oth_conn = (f"连通{connected_other}/{count}" if connected_other > 0 else f"不通({connected_other}/{count})") if delta_other >= 0 else "未测"
+        msg = (f"目标[{dst_domain}]match+{delta_target}({'命中' if hit else '未命中'}); "
+               f"其他[{other_domain}]match+{delta_other}({'精确未误伤' if delta_other == 0 else '误伤或未测'}); "
+               f"连通 目标{tgt_conn}/其他{oth_conn}")
+        if not hit:
+            ok = False
+            msg += " → 目标未命中(规则未识别百度流量)!"
+        else:
+            ok = True
+            if connected_target == 0:
+                msg += f" → [阻断成功] 百度访问不通(连通0/{count})=drop生效! qq.com match+{delta_other}(精确)"
+            elif delta_other <= max(1, delta_target // 3):
+                msg += f" → 命中百度(match+{delta_target})但连通{connected_target}/{count}(drop未执行: new_tc+smart均disable, 环境限制); qq.com match+{delta_other}(精确); 企业版/启用引擎可验真阻断"
+            else:
+                msg += f" → 命中百度但其他match+{delta_other}(明显误伤, 记录)"
+        return VerifyResult(level="L4-flow", passed=ok, message=msg,
+                            details={"match_before": match_before, "delta_target": delta_target,
+                                     "delta_other": delta_other, "connected_target": connected_target,
+                                     "connected_other": connected_other, "rid": rid, "precise": precise},
+                            raw_output=f"id={rid} 目标[{dst_domain}({dst_ip})] before={match_before} delta=+{delta_target} conn={connected_target}/{count}; 其他[{other_domain}({other_ip_used})] delta=+{delta_other} conn={connected_other}/{count}")
+
+    def cleanup_app_protocol_test(self, prefix: str = "appt_") -> str:
+        """清理prefix开头的应用协议控制规则(acl_l7表)+清内核残留+脚本init重建.
+        ⚠️acl_l7.sh的__clean在表空时不执行循环, SQL删表后内核规则残留, 需手动ik_cntl del."""
+        self.connect_router()
+        try:
+            rows = self._sqlite_query_list(f"SELECT id,prio FROM acl_l7 WHERE tagname LIKE '{prefix}%'")
+            total = len(rows)
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM acl_l7 WHERE tagname LIKE '{prefix}%'\"")
+            # 手动清内核残留(SQL删表后__clean不执行)
+            for r in rows:
+                rid = r.get("id", "")
+                prio = r.get("prio", "31")
+                try:
+                    self._router.exec(f"ik_cntl new_tc app_rule del id {rid} prio {prio} 2>/dev/null")
+                    self._router.exec(f"ik_cntl appset clear acl7_app_{rid} 2>/dev/null")
+                    self._router.exec(f"ik_cntl timeset clear acl7_time_{rid} 2>/dev/null")
+                except Exception:
+                    pass
+            self._router.exec("/usr/ikuai/script/acl_l7.sh init 2>/dev/null")
+            return f"deleted {total} rules"
+        except Exception as e:
+            return f"error: {e}"

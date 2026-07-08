@@ -183,12 +183,15 @@
 - [x] SSH后台验证（L1数据库+L2 iptables+L3策略路由+L4内核）
 - [x] 8条测试规则+1条复制规则，扩展字段全覆盖验证
 
-## Phase 12: 全链路测试 [80%]
+## Phase 12: 全链路测试 [100%] (iperf3实测已并入综合测试)
 
-- [x] test_ip_rate_limit_full_chain.py 框架
-- [x] 前端UI操作 + SSH后台验证
-- [ ] iperf3实测集成（需Ubuntu客户端环境）
-- [ ] MAC限速全链路测试
+- [x] iperf3实测集成到IP/MAC限速综合测试(步骤22)
+- [x] 动态获取客户端内网IP/MAC(get_client_lan_info) + iperf3打流验证限速实测生效
+- [x] MAC限速全链路(verify_mac_qos_full_chain: L1数据库→L2iptables→L3ipset→L4内核→L5iperf3)
+- [x] 原 test_ip_rate_limit_full_chain.py 已删除(功能并入综合测试), GUI「全链路验证」菜单移除
+- [x] VLAN功能验证(综合测试步骤17/18): 普通VLAN+QINQ连通性实测(client ens11.54/ens11.54.55双层tag ping路由器VLAN接口IP, 默认802.1Q). +4 client方法 +select_line option定位修复
+- [x] ACL功能验证(独立TestAclFlowVerification, acl_flow_env干净环境): drop阻断+accept放行打流实测(verify_acl_flow全栈L5, iperf3+Δpkts). 不并入综合测试(22步状态干扰add_rule)
+- [x] MAC限速2产品bug发现(报禅道): 删除iptables间歇残留 + 下载方向不限速(内核6.12 ik_core dir:in匹配失效, iptables pkts=0)
 
 ## Phase 13: 公共基类重构 [100%] (2026-03-06)
 
@@ -272,15 +275,90 @@
 - [x] **混合模式子接入CRUD全通(2026-07-02)**: static/dhcp/pppoe × 物理混合(3)+VLAN混合(4) 各~30步, add/edit/del/disable/enable/import 全SSH后台验证. 修复8根因(drawer直写库非暂存→去click_save保编辑页/MAC唯一校验+检测已存在/VLAN_ID必填/MTU必填/acct-pwd索引错r[5]r[6]→r[4]r[5]/pppoe名称adsl开头/evaluate空drawer过滤innerText>5/div.ant-table-row虚拟滚动非tr) + A导出导入恢复(hybrid_import_rules set_input_files+导入前删+导入后SSH) + B多条CRUD(第二条编辑+停用启用SSH验enabled). 详见docs/CHANGELOG.md 2026-07-02段.
 - [x] ~~发现: 混合模式静态子接入drawer添加报"输入有误"(疑产品bug)~~ → **更正: 测试代码8根因, 非产品bug, 已修复(PASSED 40min)**
 
+## Phase 19: 安全中心-ACL规则模块 [100%] (2026-07-02, 首个安全中心模块)
+
+### ACL规则 (21步综合测试 + SSH 27 PASS/0 FAIL)
+- [x] 后端机制探查: acl.sh + acl表(src_addr/dst_addr/time明文JSON) + iptables(FIREWALL/INPUT_ACL链, -j ACCEPT/DROP /* {id}_{comment} */) + ipset(acl_src_/acl_dst_/acl_time_)
+- [x] 前端DOM实测(MCP): URL 列表/securityCenter/aclRules 配置/aclRulesConfig; div.ant-table-row虚拟滚动; 配置页select按form-item-label精确匹配; 源/目的地址"点添加+行type IP"; 端口是选端口分组(需预建,超范围)
+- [x] 10规则场景全覆盖: 源IP单/网段CIDR/目的IP/源+目的多地址/TCP/UDP/ICMP/动作drop/方向input/备注+优先级+ctdir, 每场景SSH L1库+L2 iptables+L3 ipset
+- [x] CRUD: 计数/搜索(存在/清空)/编辑备注/停用(SSH验enabled=no+iptables无)/启用/删除(SSH验不存在+iptables无)
+- [x] 异常输入拦截(空名称/非法IP999.999.999.999被前端阻止保存); 导出CSV+TXT; 导入; 批量停用/启用/删除(SSH验enabled)
+- [x] AclPage继承IkuaiTablePage + _select_by_label(精确form-item-label+标记+Playwright真实click) + save_and_wait(轮询URL跳转)
+- [x] backend_verifier +9方法(verify_acl_database解析JSON地址/verify_acl_iptables `/* {id}_`精确/verify_acl_ipset/verify_acl_enabled/cleanup_acl_test)
+- [x] 6次迭代修复: select includes歧义/JS mousedown不可靠→Playwright click/iptables comment误判/open_add_page SPA残留/端口modal遮挡click_save/click_save Escape关modal
+- [x] 验证: 1 passed (~6min, 21步 SSH 27 PASS/0 FAIL)
+- [x] finally清理(前端逐条删+SQL delete+acl.sh init), 环境恢复(acl表0条, FIREWALL链空). 详见docs/CHANGELOG.md 2026-07-02段.
+
+## Phase 20: 安全中心-连接数限制模块 [100%] (2026-07-02, 安全中心第2模块)
+
+### 连接数限制 (20步综合测试 + SSH 25 PASS/0 FAIL)
+- [x] 后端机制探查: conn_limit.sh + conn_limit表(src_addr明文JSON/protocol/limits连接数) + iptables **raw表CONNLIMIT链**(-m peerconns --peerconns-above N -j DROP) + ipset(conn_limit_src_/dport_/time_)
+- [x] 前端DOM实测: URL 列表/connectionLimit 配置/connectionLimit/add; 内网地址点"添加"+行type IP(placeholder"请输入IP"非ACL的"请输入IP或MAC"); 连接数spinbutton; 复制功能
+- [x] 8规则场景全覆盖: 内网IP单/网段CIDR/多地址/协议any,tcp,udp,icmp/连接数大10000,小10/备注, 每场景SSH L1库+L2 raw表CONNLIMIT+L3 ipset
+- [x] CRUD: 计数/搜索/编辑备注/停用(SSH验enabled=no+iptables无)/启用/删除(SSH验不存在)
+- [x] 复制功能(行操作复制→改名保存→SSH验字段一致); 异常输入拦截(空名/非法IP); 导出CSV+TXT; **导入不清空+清空两种**; 批量停用/启用/删除(SSH验enabled)
+- [x] ConnLimitPage**继承AclPage**复用(_select_by_label/地址添加/CRUD/复制/导入导出) + 覆盖_mark_area_block(内网地址边界)
+- [x] backend_verifier +9方法(verify_conn_limit_iptables用`conn_limit_time_{id}`定位, 因无源地址规则无match-set+无--comment; cleanup清raw表CONNLIMIT链, conn_limit.sh init只add不清链)
+- [x] 2次迭代修复: placeholder不匹配(IP或MAC→IP兼容, 改AclPage)/iptables定位(match-set→conn_limit_time_{id})/test误传side参数
+- [x] 验证: 1 passed (~7min, 20步 SSH 25 PASS/0 FAIL)
+- [x] finally清理(conn_limit表0条, CONNLIMIT空, 磁盘8%). 报告中文用例名+90 details. 详见docs/CHANGELOG.md 2026-07-02段.
+
+---
+
+## Phase 21: 安全中心-MAC访问控制模块 [100%] (2026-07-02, 安全中心第3模块)
+
+### MAC访问控制 (15步综合测试 + SSH 21 PASS/0 FAIL)
+- [x] 后端机制探查(F12+SSH): acl_mac.sh + acl_mac_black/white表(enabled默认no/mac小写unique) + iptables filter表ACL_MAC链(黑名单DROP/白名单RETURN, 无--comment) + 模式global_config.acl_mac=0黑/1白
+- [x] 前端DOM实测: URL 列表/macAccessControl 配置/macAccessControlConfig; 左上角radio"使用黑名单模式"/"使用白名单模式"; 配置页名称/终端名称/MAC/周期/备注; 行操作编辑/停用/删除(无复制)
+- [x] 两模式全覆盖: 黑名单(acl_mac_black+-j DROP)+白名单(acl_mac_white+-j RETURN), 每场景SSH L1库+L2 ACL_MAC链+L3 ipset+模式验证
+- [x] CRUD+异常(空名/非法MAC)+导出CSV/TXT+导入不清空+清空+批量停用启用删除
+- [x] MacAccessControlPage继承AclPage复用; backend_verifier +9方法(verify_mac_ctrl_database/iptables/ipset/mode + set_mac_mode SSH切换/not_exists/count/cleanup)
+- [x] 2次迭代修复: radio click不调API(仅改前端state, network无mac-mode请求)→test用backend set_mac_mode切换验证两模式/reload后radio异步渲染→wait_for+evaluate定位click
+- [x] 验证: 1 passed (~5min, 15步 SSH 21 PASS/0 FAIL)
+- [x] finally清理(black/white表0条, 恢复黑名单acl_mac=0, ACL_MAC空, 磁盘8%). 报告中文用例名+76 details. 详见docs/CHANGELOG.md 2026-07-02段.
+
+---
+
+## Phase 22: 测试报告"失败原因分析"+多模块失败根因修复 [100%] (2026-07-07, 12项全PASSED)
+
+- [x] **报告失败原因分析**: `report_generator._analyze_failure`按error文本归类7类(code2006磁盘满/添加按钮超时/添加规则失败/元素超时/后端SSH/网络/兜底)注入failure_analysis + 模板"🔍失败原因分析"黄卡片(失败类型+原因+建议). 让assert/Timeout类错误看得懂.
+- [x] **GUI统计修复**: `test_runner._read_final_stats`校正JSON权威值后补`_emit_progress()`推GUI(原只更新self没emit, GUI卡实时计数, 实时扫stdout漏算→39例显34/JSON权威35, 少1).
+- [x] **IKEv2/WireGuard企业版skip**: `vpn_client_base._detect_enterprise_block`+navigate后设enterprise_blocked + `vpn_test_helper`开头skip(免费版不渲染添加按钮→click超时误FAIL). SKIPPED 10s(原FAIL 40s).
+- [x] **select下拉通用坑**(选项title"{接口名}({备注})"如"wan2(ed_vwan94)"): UPnP `select_line` + IPv6 `_select_combobox` 改JS拆括号parts匹配(原精确[title="wan2"]失效). 两模块PASSED(UPnP 28步/IPv6外网全).
+- [x] **静态路由导入路径**: 步骤17 `downloads_dir`上溯3级到项目根(原2级=tests/downloads, 而export_rules在pages/上溯2级=项目根/downloads, **不一致**→找不到→跳过假通过) + 跳过分支诚实诊断. PASSED真导入8条.
+- [x] **多线负载L2-L4**: L3/L4改`must_pass=True`(ik_core必加载, 原软断言被吞像只L1) + `verify_lb_pcc_policy_routing`缺失时`passed=not全缺失`(原永远True自欺). PASSED L1+L2+L3/L4全明确.
+- [x] **端口/协议分流iptables comment**: `query_stream_ipport/layer7_iptables` rule_id正则改`/\*\s*(\d+)(?:_|\s*\*/)`(原纯数字`/* 1 */`, 实际`/* 1_pt_m0_any */`带_tagname→全None→L2全FAIL). 端口分流L2 9条全通过.
+- [x] **域名分流L2机制**: `verify_stream_domain_ipset`重写为验**ik_core url_route内核表**(ik_summary URL_ROUTE_GROUP), 非ipset; 仅带src_addr规则建sdomain_src_{id}(原对纯域名规则查→8/10全FAIL). L2 10条全通过.
+- [x] **上下行分离报告**: `verify_stream_updown_ipset` raw_output只显规则ipset(原all_ipset[:500]含Linux_WEBPPPOE_default等系统默认集误导) + `verify_stream_updown_kernel_status`解析`/tmp/iktmp/stream_updown.txt`(`{id} node { proto out:"上行" in:"下行" }`, ik_cntl wans-snat下发)显每条规则上下行.
+- [x] **端口/域名分流崩溃(headed长跑)**: `conftest.browser_context_args` headless时强制viewport=1920x1080(原no_viewport, headless无窗口无效→默认小viewport→Ant Table虚拟滚动10条只渲染8漏行); 两模块用headless跑(headed长跑Chromium渲染进程Target crashed); 撤回每步reload包装(频繁goto反加剧). 两模块headless全19步PASSED(~450s).
+- [x] **ipv6_static环境探测**: 步骤5改环境探测(SSH查IPV6TEST_1实际状态: 入库=环境具备/不入库=不具备两种都符合, 原硬断言"被拦不入库"因用户开通IPv6环境变化而FAIL). PASSED 69s.
+- [x] **5条通用教训记memory**: ①select title"{接口名}({备注})"精确匹配必失效→拆括号parts ②iptables comment`/* {id}_{tagname} */`正则带_后缀 ③verify层raw_output只显规则相关别塞全局列表 ④测试假设环境状态别硬断言, 改探测+记录两种结果 ⑤解析pytest结果用conftest JSON别扫stdout, 校正后须emit推GUI.
+
+**已覆盖模块: 27个**(在原23个基础上, 本次修复涉及UPnP设置/IPv6外网+内网+静态/静态路由/多线负载/端口分流/协议分流/域名分流/上下行分离/内外网设置VPN客户端6模块 的失败回归全部转为PASSED/SKIPPED). 详见docs/CHANGELOG.md 2026-07-07段 + topic `test-failure-2026-07-06-and-report-analysis`.
+
+---
+
+## Phase 23: 安全中心-应用协议控制模块 [100%] (2026-07-07, 安全中心第4模块, L7 DPI)
+
+### 应用协议控制 (20步综合测试: 8场景批量+每条SSH+排序+异常分类+帮助+精确打流, 1 PASSED 10min37s)
+- [x] 后端机制探查(SSH+打流实测): **不走iptables/ipset**, 走 `ik_cntl new_tc app_rule` 内核(acl_l7表, app_proto JSON custom应用名/object gid, time必须""). 下发: SQL+acl_l7.sh init. 验证金矿: ik_summary App Rules+ID行(active/action/appset/match) + dpi_cache appid + match增量(命中铁证)
+- [x] 前端DOM实测: URL applicationProtocolControl/Config; 协议字段**modal树dialog**(13大类, .ant-tree-checkbox勾选+确定); 配置页名称/协议/协议分组/动作/源地址(IP设置)/目的地址/优先级/生效时间(3radio)/备注; 免费版可用, 无模式切换radio
+- [x] AppProtocolPage继承AclPage + select_protocol树dialog核心; 覆写save_and_wait(父类硬编码aclRulesConfig)/_mark_area_block(stop边界:源地址→目的地址,目的地址→优先级,无进接口)/is_on_config_page
+- [x] backend_verifier +9方法: verify_app_protocol_{database,kernel_rule,match,dpi,enabled,not_exists,count,flow} + add_app_protocol_rule_via_ssh(SQL建规则,精确app_proto含百度) + cleanup_app_protocol_test(SQL+ik_cntl del残留)
+- [x] 功能打流(步骤20): 建drop百度规则→curl百度(命中match+4)+curl qq.com(精确不命中match=0)+连通性探测. **命中+精确性证规则识别+匹配逻辑正确**; new_tc engine不可用户态启用(ik_cntl无命令/basic无字段/proc无接口)致drop未执行(连通,环境限制)
+- [x] 参考VLAN/IP限速扩充到20步: 8场景批量(协议大类×动作×地址×优先级×备注)+每条SSH L1/L2+排序+异常分类(空名/未选协议/非法源IP/超长备注)+帮助按钮(test_help_functionality成功跳转)
+- [x] 关键踩坑(3次调试定位): **user_dpi必须enable**(默认disable→match恒0, ik_cntl user_dpi on后match+3); new_tc disable(drop不执行); DPI给具体应用appid非大类(百度5060173); appset建立时序(sleep 2)
+- [x] 验证: 1 passed (~5min24s, 15步 headless). 全CRUD+L1-L4+功能打流PASS. 报告中文用例名+step. 详见docs/CHANGELOG.md 2026-07-07段 + topic `app-protocol-control`.
+
 ---
 
 **总体进度: 约99%**
 
-**已覆盖模块: 20个** (VLAN/IP限速/MAC限速/静态路由/跨三层服务/多线负载/协议分流/端口分流/域名分流/上下行分离/UPnP设置/NAT规则/端口映射/DMZ主机/IGMP代理/IPTV透传/UDPXY设置/内外网设置)
+**已覆盖模块: 24个** (VLAN/IP限速/MAC限速/静态路由/跨三层服务/多线负载/协议分流/端口分流/域名分流/上下行分离/UPnP设置/NAT规则/端口映射/DMZ主机/IGMP代理/IPTV透传/UDPXY设置/内外网设置/**安全中心-ACL规则**/安全中心-连接数限制/安全中心-MAC访问控制/**安全中心-应用协议控制**)
 
 **已知产品Bug: 1个** (DMZ重启后不生效, netmap.sh init的select*错误)
 
-**最后更新: 2026-06-16**
+**最后更新: 2026-07-07**
 
 ### 重要经验教训
 1. **DMZ的NETMAP是全流量劫持**: interface=all或wan1会导致设备失联, 必须用wan2/wan3或外网IP模式

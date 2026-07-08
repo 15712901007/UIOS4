@@ -134,6 +134,10 @@ from pages.network.openvpn_client_page import OpenvpnClientPage
 from pages.network.ipsec_vpn_page import IpsecVpnPage
 from pages.network.ike_client_page import IkeClientPage
 from pages.network.wireguard_page import WireguardPage
+from pages.security.acl_page import AclPage
+from pages.security.conn_limit_page import ConnLimitPage
+from pages.security.mac_access_control_page import MacAccessControlPage
+from pages.security.app_protocol_page import AppProtocolPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -207,6 +211,10 @@ TEST_NAME_MAPPING = {
     'test_dhcp_static_comprehensive': 'DHCP静态分配综合测试',
     'test_dhcp_lease_comprehensive': 'DHCP客户端综合测试',
     'test_dhcp_acl_mac_comprehensive': 'DHCP黑白名单综合测试',
+    'test_acl_comprehensive': '安全中心-ACL规则综合测试',
+    'test_conn_limit_comprehensive': '安全中心-连接数限制综合测试',
+    'test_mac_access_control_comprehensive': '安全中心-MAC访问控制综合测试',
+    'test_app_protocol_comprehensive': '安全中心-应用协议控制综合测试',
     'test_ipv6_static_comprehensive': 'IPv6前缀静态分配综合测试',
     'test_ipv6_wan_comprehensive': 'IPv6外网设置综合测试',
     'test_ipv6_lan_comprehensive': 'IPv6内网设置综合测试',
@@ -306,18 +314,18 @@ def browser_context_args(config: Config):
     # 从环境变量读取是否启用自适应屏幕模式
     auto_adapt = os.environ.get("AUTO_ADAPT_SCREEN", "true").lower() == "true"
 
-    if auto_adapt:
-        # 自适应模式：使用 no_viewport=True 让窗口大小决定viewport
-        # 这是让Playwright浏览器像原生浏览器一样自适应屏幕的关键
+    if auto_adapt and not config.browser.headless:
+        # headed自适应：no_viewport=True让窗口大小决定viewport(混合子接入drawer动画需headed)
         return {
             "no_viewport": True,  # 不限制视口，让窗口大小决定viewport
             "ignore_https_errors": True,
             # 不设置device_scale_factor，让系统自动处理DPI缩放
         }
     else:
-        # 固定分辨率模式：从环境变量读取分辨率（GUI传递）
-        viewport_width = int(os.environ.get("VIEWPORT_WIDTH", getattr(config.browser, 'viewport_width', 1400)))
-        viewport_height = int(os.environ.get("VIEWPORT_HEIGHT", getattr(config.browser, 'viewport_height', 850)))
+        # headless或固定模式：大viewport(1920x1080)避免Ant Table虚拟滚动漏行
+        # (headless无窗口时no_viewport无效→默认小viewport→10条规则只渲染8条; 域名/端口分流曾中招)
+        viewport_width = int(os.environ.get("VIEWPORT_WIDTH", 1920))
+        viewport_height = int(os.environ.get("VIEWPORT_HEIGHT", 1080))
 
         return {
             "viewport": {"width": viewport_width, "height": viewport_height},
@@ -843,6 +851,63 @@ def interface_settings_page_logged_in(logged_in_page: Page, config: Config) -> I
     return pg
 
 
+# ==================== 安全中心 fixtures ====================
+@pytest.fixture(scope="function")
+def acl_page(page: Page, config: Config) -> AclPage:
+    """创建ACL规则页面实例(安全中心>ACL规则)"""
+    return AclPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def acl_page_logged_in(logged_in_page: Page, config: Config) -> AclPage:
+    """已登录并导航到ACL规则列表页的实例(安全中心>ACL规则)"""
+    pg = AclPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_acl()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def conn_limit_page(page: Page, config: Config) -> ConnLimitPage:
+    """创建连接数限制页面实例(安全中心>连接数限制)"""
+    return ConnLimitPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def conn_limit_page_logged_in(logged_in_page: Page, config: Config) -> ConnLimitPage:
+    """已登录并导航到连接数限制列表页的实例(安全中心>连接数限制)"""
+    pg = ConnLimitPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_conn_limit()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def mac_access_control_page(page: Page, config: Config) -> MacAccessControlPage:
+    """创建MAC访问控制页面实例(安全中心>MAC访问控制)"""
+    return MacAccessControlPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def mac_access_control_page_logged_in(logged_in_page: Page, config: Config) -> MacAccessControlPage:
+    """已登录并导航到MAC访问控制列表页的实例(安全中心>MAC访问控制)"""
+    pg = MacAccessControlPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_mac_ctrl()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def app_protocol_page(page: Page, config: Config) -> AppProtocolPage:
+    """创建应用协议控制页面实例(安全中心>应用协议控制)"""
+    return AppProtocolPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def app_protocol_page_logged_in(logged_in_page: Page, config: Config) -> AppProtocolPage:
+    """已登录并导航到应用协议控制列表页的实例(安全中心>应用协议控制)"""
+    pg = AppProtocolPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_app_proto()
+    return pg
+
+
 @pytest.fixture(scope="function")
 def custom_protocol_page(page: Page, config: Config) -> 'CustomProtocolPage':
     """创建自定义协议(L4)页面实例"""
@@ -1008,6 +1073,52 @@ def backend_verifier():
         yield verifier
     finally:
         verifier.close()
+
+
+@pytest.fixture(scope="function")
+def acl_flow_env(backend_verifier):
+    """ACL打流验证环境(function级): client策略路由 + iperf3 server探活(失败skip不FAIL) + teardown清理.
+    探活在加路由后(yield前FIREWALL链干净, 不受本用例待建规则干扰). 复用add_route_via_router
+    确保client 192.168.148.2流量经路由器FIREWALL链(否则绕开→规则永不命中)."""
+    if backend_verifier is None:
+        pytest.skip("paramiko未安装, 跳过ACL打流验证")
+    backend_verifier.connect_router()
+    backend_verifier.connect_client()
+    backend_verifier.add_route_via_router(backend_verifier._ssh_config.iperf3_server)
+    probe = backend_verifier.run_iperf3(direction='upload', duration=1, port=5201)
+    if "error" in probe or not probe.get("end"):
+        pytest.skip(f"iperf3 server不可达或路由不通, 跳过打流: {str(probe)[:80]}")
+    yield backend_verifier
+    try:
+        backend_verifier._client.exec("pkill -f 'iperf3 -c' 2>/dev/null")
+    except Exception:
+        pass
+
+
+@pytest.fixture(scope="function")
+def app_proto_flow_env(backend_verifier):
+    """应用协议控制打流环境(function级): client host路由到baidu(确保经路由器DPI) + baidu可达探活(失败skip不FAIL) + teardown删路由.
+    iperf3不触发L7 DPI, 用HTTP curl baidu打流(baidu appid=5060173).
+    host路由坑: curl --interface只bind源IP不强制路由, 必须ip route add via路由器LAN口."""
+    if backend_verifier is None:
+        pytest.skip("paramiko未安装, 跳过应用协议控制打流验证")
+    baidu_ip = "110.242.69.21"
+    backend_verifier.connect_router()
+    backend_verifier.connect_client()
+    backend_verifier.add_route_via_router(baidu_ip)
+    probe = backend_verifier._client.exec(
+        "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 -m 8 http://www.baidu.com/", timeout=15)
+    if not any(c in probe for c in ["200", "301", "302"]):
+        try:
+            backend_verifier.remove_route(baidu_ip)
+        except Exception:
+            pass
+        pytest.skip(f"baidu经路由器不可达, 跳过应用协议控制打流: {str(probe)[:80]}")
+    yield backend_verifier
+    try:
+        backend_verifier.remove_route(baidu_ip)
+    except Exception:
+        pass
 
 
 @pytest.fixture(scope="session")
@@ -1278,6 +1389,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "wireguard: WireGuard客户端模块测试"
     )
+    config.addinivalue_line("markers", "p0: P0冒烟-核心CRUD/导入导出/批量(必跑)")
+    config.addinivalue_line("markers", "p1: P1功能-全协议/全动作/优先级排序(常规回归)")
+    config.addinivalue_line("markers", "p2: P2边界-异常输入/越界/极端值(可选)")
 
     # 记录开始时间
     _test_results['start_time'] = datetime.now()

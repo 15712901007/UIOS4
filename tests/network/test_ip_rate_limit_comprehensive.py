@@ -1422,6 +1422,100 @@ class TestIpRateLimitComprehensive:
         print("  - 帮助功能: 右下角帮助图标")
         print("  - 清理IP分组和时间计划")
 
+        # ========== 步骤22: iperf3实测限速功能验证 ==========
+        # 通过客户端10.66.0.18(从路由器DHCP获取内网IP)iperf3打流，实测限速是否生效
+        # 环境不通(IPerf3 server不可达/SSH不通)→软记录跳过，不阻断综合测试
+        with rec.step("步骤22: iperf3实测限速功能验证", "动态获取客户端内网IP→建规则→iperf3打流→验证实测带宽达标"):
+            print("\n[步骤22] iperf3实测限速功能验证...")
+            rec.add_detail("【iperf3实测限速】客户端10.66.0.18打流验证限速实测生效")
+
+            flow_rule_name = "ip_flow_iperf3"
+            flow_upload = 2048    # KB/s (约16Mbps)
+            flow_download = 4096  # KB/s (约32Mbps)
+            flow_rule_added = False
+            flow_route_added = False
+
+            if backend_verifier is None:
+                rec.add_detail("  SSH未配置，跳过iperf3实测")
+                print("  [SKIP] SSH未配置，跳过iperf3实测")
+            else:
+                iperf3_server = get_config().ssh.iperf3_server
+                try:
+                    # 1. 动态获取客户端连路由器LAN的内网IP(即"10.66.0.18获取IP")
+                    info = backend_verifier.get_client_lan_info()
+                    client_ip = info.get("ip") or "192.168.148.2"
+                    rec.add_detail(f"  客户端内网IP: {client_ip} (iface={info.get('iface')})")
+                    print(f"  客户端内网IP: {client_ip}")
+
+                    # 2. 新建专用IP限速规则(目标=客户端内网IP)
+                    page.navigate_to_ip_rate_limit()
+                    page.page.wait_for_timeout(500)
+                    if page.rule_exists(flow_rule_name):  # 清理同名残留
+                        page.delete_rule(flow_rule_name)
+                        page.page.wait_for_timeout(500)
+                    success = page.add_rule(
+                        name=flow_rule_name,
+                        ip=client_ip,
+                        line="任意",
+                        protocol="tcp",
+                        rate_mode="独立限速",
+                        upload_speed=flow_upload,
+                        download_speed=flow_download,
+                        remark="iperf3实测限速",
+                    )
+                    if not success:
+                        rec.add_detail("  ✗ 建规则失败，跳过实测")
+                        print("  [WARN] 建规则失败，跳过iperf3实测")
+                    else:
+                        flow_rule_added = True
+                        rec.add_detail(f"  ✓ 建规则成功: {flow_rule_name} ip={client_ip} 上行{flow_upload}/下行{flow_download} KB/s")
+                        page.page.wait_for_timeout(1500)
+
+                        # 3. 加策略路由让客户端流量经路由器(命中IP_QOS链)
+                        backend_verifier.add_route_via_router(iperf3_server)
+                        flow_route_added = True
+                        rec.add_detail(f"  策略路由已加: 客户端→路由器→{iperf3_server}")
+
+                        # 4. 探活(1秒; 不通则软跳过，不计入ssh_failures)
+                        probe = backend_verifier.run_iperf3(direction="upload", duration=1)
+                        if "error" in probe or not probe.get("end"):
+                            rec.add_detail(f"  iperf3环境不可达，软跳过实测(不阻断): {str(probe)[:80]}")
+                            print(f"  [SKIP] iperf3环境不可达，软跳过: {str(probe)[:80]}")
+                        else:
+                            rec.add_detail("  iperf3探活通过，开始全链路实测(L1数据库→L2iptables→L3ipset→L4内核→L5实测)")
+                            # 5. 全链路实测(含L5 iperf3)
+                            result = backend_verifier.verify_ip_qos_full_chain(
+                                tagname=flow_rule_name,
+                                ip=client_ip,
+                                upload_kbps=flow_upload,
+                                download_kbps=flow_download,
+                                run_iperf3=True,
+                            )
+                            for r in result.results:
+                                tag = "✓" if r.passed else "✗"
+                                rec.add_detail(f"  {tag} {r.level}: {r.message}")
+                                print(f"  [{tag}] {r.level}: {r.message}")
+                                # L5实测带宽不达标→硬失败(环境已通，不达标是真实问题)
+                                if not r.passed and "iperf3" in r.level:
+                                    ssh_failures.append(f"SSH-{r.level}: {r.message}")
+                finally:
+                    # 6. 清理: 删规则 + 移除路由
+                    try:
+                        if flow_rule_added:
+                            page.navigate_to_ip_rate_limit()
+                            page.page.wait_for_timeout(500)
+                            if page.rule_exists(flow_rule_name):
+                                page.delete_rule(flow_rule_name)
+                                rec.add_detail(f"  清理: 已删除规则 {flow_rule_name}")
+                    except Exception as e:
+                        rec.add_detail(f"  清理规则异常: {str(e)[:60]}")
+                    try:
+                        if flow_route_added:
+                            backend_verifier.remove_route(iperf3_server)
+                            rec.add_detail("  清理: 已移除策略路由")
+                    except Exception as e:
+                        rec.add_detail(f"  清理路由异常: {str(e)[:60]}")
+
         # ========== SSH后台验证汇总断言 ==========
         all_failures = ssh_failures + ui_failures
         if ssh_failures:

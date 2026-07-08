@@ -1,0 +1,4 @@
+id,tagname,enabled,mac,comment,time,termname
+2,"mac_t_b2","yes","aa:bb:cc:dd:ee:02","","{""object"":{},""custom"":[{""comment"":"""",""end_time"":""23:59"",""type"":""weekly"",""weekdays"":""1234567"",""start_time"":""00:00""}]}",""
+3,"mac_t_b3","yes","aa:bb:cc:dd:ee:03","","{""object"":{},""custom"":[{""comment"":"""",""end_time"":""23:59"",""type"":""weekly"",""weekdays"":""1234567"",""start_time"":""00:00""}]}",""
+4,"mac_t_b4","yes","aa:bb:cc:dd:ee:04","ºÚÃûµ¥±¸×¢","{""object"":{},""custom"":[{""start_time"":""00:00"",""end_time"":""23:59"",""type"":""weekly"",""weekdays"":""1234567"",""comment"":""""}]}","²âÊÔÖÕ¶Ë"

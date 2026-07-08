@@ -11,7 +11,7 @@ device:
 # 浏览器配置
 browser:
   browser_type: "chromium"  # chromium, firefox, webkit
-  headless: false  # headed模式: 物理混合子接入drawer在headless下关闭动画不完成(UI残留连锁), headed正常(也是用户目标状态)
+  headless: false  # headed模式: 物理混合子接入drawer在headless下关闭动画不完成(UI残留连锁), headed正常
   slow_mo: 0
   timeout: 30000
   screenshot_on_failure: true
@@ -163,6 +163,18 @@ test_data:
     interface_settings:
       export_filename: "interface_settings_config.csv"
       import_filename: "interface_settings_import.csv"
+    # 安全中心>ACL规则
+    acl:
+      export_filename: "acl_config.csv"
+      import_filename: "acl_import.csv"
+    # 安全中心>连接数限制
+    conn_limit:
+      export_filename: "conn_limit_config.csv"
+      import_filename: "conn_limit_import.csv"
+    # 安全中心>MAC访问控制
+    mac_access_control:
+      export_filename: "mac_access_control_config.csv"
+      import_filename: "mac_access_control_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"

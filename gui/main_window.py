@@ -689,22 +689,6 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
-                            "全链路验证": {
-                                "testcases": [
-                                    # IP限速全链路验证（UI + 后台数据库/iptables/ipset/内核验证）
-                                    "test_ip_rate_limit_full_chain.py::TestIpRateLimitFullChain::test_full_chain_verification",
-                                    # IP限速全链路验证 + iperf3实测（较耗时）
-                                    "test_ip_rate_limit_full_chain.py::TestIpRateLimitFullChain::test_full_chain_with_iperf3",
-                                ],
-                                "groups": {
-                                    "全链路验证（推荐）": [
-                                        "test_ip_rate_limit_full_chain.py::TestIpRateLimitFullChain::test_full_chain_verification",
-                                    ],
-                                    "全链路验证 + iperf3实测": [
-                                        "test_ip_rate_limit_full_chain.py::TestIpRateLimitFullChain::test_full_chain_with_iperf3",
-                                    ],
-                                }
-                            },
                         }
                     },
                     "静态路由": {
@@ -1083,7 +1067,44 @@ class MainWindow(QMainWindow):
             "安全中心": {
                 "children": {
                     "ACL规则": {
-                        "testcases": []
+                        "testcases": [
+                            "security/test_acl_comprehensive.py::TestAclComprehensive::test_acl_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "security/test_acl_comprehensive.py::TestAclComprehensive::test_acl_comprehensive",
+                            ]
+                        }
+                    },
+                    "连接数限制": {
+                        "testcases": [
+                            "security/test_conn_limit_comprehensive.py::TestConnLimitComprehensive::test_conn_limit_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "security/test_conn_limit_comprehensive.py::TestConnLimitComprehensive::test_conn_limit_comprehensive",
+                            ]
+                        }
+                    },
+                    "MAC访问控制": {
+                        "testcases": [
+                            "security/test_mac_access_control_comprehensive.py::TestMacAccessControlComprehensive::test_mac_access_control_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "security/test_mac_access_control_comprehensive.py::TestMacAccessControlComprehensive::test_mac_access_control_comprehensive",
+                            ]
+                        }
+                    },
+                    "应用协议控制": {
+                        "testcases": [
+                            "security/test_app_protocol_comprehensive.py::TestAppProtocolComprehensive::test_app_protocol_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "security/test_app_protocol_comprehensive.py::TestAppProtocolComprehensive::test_app_protocol_comprehensive",
+                            ]
+                        }
                     },
                 }
             },

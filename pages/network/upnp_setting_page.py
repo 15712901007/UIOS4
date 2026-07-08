@@ -219,10 +219,21 @@ class UpnpSettingPage(IkuaiTablePage):
                         self.page.wait_for_timeout(1000)
                         print(f"    [select_line] opened dropdown via combobox role")
 
-                # 策略1: 点击 .ant-select-item-option[title] (实测有效)
-                option = self.page.locator(f'.ant-select-item-option[title="{line_name}"]')
-                if option.count() > 0:
-                    option.first.click()
+                # 策略1: JS定位选项索引 + Playwright nth click (实测有效, 可靠触发React选中)
+                # title格式因配置而异: "wan1" / "wan1(wan1)"(默认) / "wan2(ed_vwan94)"(备注非接口名) /
+                # "电信线路(wan2)"(带描述). 拆括号后任意部分==line_name即命中; 精确比较不误中wan10/wan11
+                idx = self.page.evaluate("""(name) => {
+                    const opts = document.querySelectorAll('.ant-select-item-option');
+                    for (let i = 0; i < opts.length; i++) {
+                        const t = (opts[i].getAttribute('title') || '').trim();
+                        if (!t || t === '全选') continue;
+                        const parts = t.split(/[()（）]/).map(s => s.trim()).filter(Boolean);
+                        if (t === name || parts.includes(name)) return i;
+                    }
+                    return -1;
+                }""", line_name)
+                if idx >= 0:
+                    self.page.locator('.ant-select-item-option').nth(idx).click()
                     self.page.wait_for_timeout(500)
                     print(f"    [select_line] clicked option for {line_name}")
                 else:

@@ -173,14 +173,18 @@ class Ipv6WanPage(IkuaiTablePage):
             sel.first.click()
             self.page.wait_for_timeout(700)
             # JS点击可见下拉中匹配的选项
+            # 拆括号兜底: title/textContent可能是"wan2(ed_vwan94)"(接口名+备注), 精确匹配会漏
             clicked = self.page.evaluate("""(text) => {
                 const dd = Array.from(document.querySelectorAll('.ant-select-dropdown'))
                     .filter(d => d.offsetHeight > 0);
+                const splitParts = s => (s || '').split(/[()（）]/).map(x => x.trim()).filter(Boolean);
                 for (const d of dd) {
                     const opts = d.querySelectorAll('.ant-select-item-option');
                     for (const o of opts) {
-                        if (o.textContent.trim() === text ||
-                            o.getAttribute('title') === text) {
+                        const t = o.getAttribute('title') || '';
+                        const tx = o.textContent.trim();
+                        if (t === text || tx === text ||
+                            splitParts(t).includes(text) || splitParts(tx).includes(text)) {
                             o.click(); return true;
                         }
                     }

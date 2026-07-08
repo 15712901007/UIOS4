@@ -599,7 +599,10 @@ class TestStaticRouteComprehensive:
 
             # 如果配置路径没有，尝试downloads目录
             if import_file is None:
-                downloads_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "downloads")
+                # 须与ikuai_table_page.export_rules的download_dir一致(=项目根/downloads);
+                # 本文件在tests/network/, 需上溯3级到项目根(export_rules在pages/只上溯2级)
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                downloads_dir = os.path.join(project_root, "downloads")
                 if os.path.exists(downloads_dir):
                     for f in sorted(os.listdir(downloads_dir), reverse=True):
                         if f.startswith("static_route_export") and (f.endswith(".csv") or f.endswith(".txt")):
@@ -622,8 +625,16 @@ class TestStaticRouteComprehensive:
                     print(f"  [WARN] 导入操作未成功")
                     rec.add_detail("  ✗ 导入失败")
             else:
-                print(f"  [SKIP] 无导出文件可用于导入测试")
-                rec.add_detail("  - 导入测试跳过（无导出文件）")
+                # 诚实诊断: 导出成功却找不到文件=导出/导入路径不一致(代码bug,应FAIL); 导出本身失败=WARN
+                diag = f"导出csv={csv_success}/txt={txt_success}"
+                if csv_success or txt_success:
+                    msg = f"无导出文件可用于导入({diag}) - 导出成功却丢文件, 导出/导入路径不一致"
+                    print(f"  [FAIL] {msg}")
+                    rec.add_detail(f"  ✗ 导入失败: {msg}")
+                    ui_failures.append(f"步骤17导入: {msg}")
+                else:
+                    print(f"  [SKIP] 无导出文件可用于导入测试 ({diag})")
+                    rec.add_detail(f"  ⚠ 导入跳过: 无导出文件({diag})")
 
         # ========== 步骤18: 清理导入的数据 ==========
         with rec.step("步骤18: 清理导入数据", "清理导入测试产生的数据"):

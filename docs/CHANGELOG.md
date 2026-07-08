@@ -1,5 +1,231 @@
 # 开发日志
 
+## 2026-07-08 终端限速/VLAN/ACL 功能验证(打流实测)并入自动化
+
+### 背景
+第一轮UI+SSH全链路自动化完成后, 补充"功能验证"(client 10.66.0.18打流实测配置真实生效, 非仅静态SSH验证), 给限速/VLAN/ACL三个模块加端到端实测.
+
+### 改动
+1. **IP/MAC限速 iperf3实测并入综合测试步骤22**(删除独立 test_ip_rate_limit_full_chain.py + GUI「全链路验证」菜单):
+   - backend_verifier 新增 `get_client_lan_info`(动态获取client内网IP/MAC via `ip route get`) + `verify_mac_qos_full_chain` + `count/flush_mac_qos_iptables`; 改造 `add_route_via_router`/`run_iperf3` 动态 bind_ip
+   - IP限速步骤22 L5硬验证(上下行iperf3实测达标); MAC限速步骤22 L5软记录(下行不限=产品bug) + 步骤17.5删除残留检测 + 建规则前flush清残留
+2. **VLAN功能验证(普通+QINQ连通性)并入综合测试步骤17/18**:
+   - backend_verifier 新增4个client方法(`client_add_vlan_subif`/`client_add_qinq_subif`/`client_del_iface`/`client_ping`)
+   - 普通VLAN=client ens11.54 ping路由器VLAN接口IP; QINQ=client ens11.54.55双层tag ping内层VLAN接口IP(默认802.1Q即可)
+   - `vlan_page.select_line` 改进(option定位, 修QINQ选VLAN名 nth(1)失效)
+3. **ACL功能验证独立 TestAclFlowVerification**(acl_flow_env干净环境):
+   - 复用 `verify_acl_flow`(drop阻断/accept放行打流实测, L5全栈); drop先验证→删→accept验证
+   - 不并入综合测试步骤(22步累积状态致add_rule不稳定, accept未入库); prio=1最高优先; 不设dst_port(端口分组modal坑)
+
+### 发现MAC限速2个产品bug(报禅道)
+1. WEB删除规则后 iptables MAC_QOS链/ipset 间歇残留(IP限速正常)
+2. 下载方向不限速(干净环境上行生效下行跑满939Mbps, 疑6.12内核ik_core dir:in方向匹配失效, iptables pkts=0未命中)
+
+### 关键踩坑
+- QINQ无单独类型字段, 内层VLAN通过"线路下拉选已建VLAN名"实现
+- 综合测试末尾加功能验证步骤不稳(状态干扰add_rule)→ACL改独立test
+- ACL端口是"端口分组选择modal", 直接输数字设不上→不设dst_port(tcp任意端口仍匹配5201)
+- MAC限速iptables机制: 每条规则2条(dst dir:in下载 + src dir:out上传), 共用全局mac_qos_{x}集合(非per-rule)
+
+### 结果
+IP限速PASSED(iperf3上下行限速生效, 17/34Mbps被限); MAC限速PASSED(上行生效, 下行软记录产品bug); VLAN PASSED(普通+QINQ ping 4/4通); ACL功能验证独立test PASSED(drop阻断+accept放行双通过, 1.5min). 详见topic mac-qos-product-bugs/vlan-func-verify/acl-func-verify.
+
+## 2026-07-07 安全中心-应用协议控制模块开发完成(PASSED 5min24s, L7 DPI+功能打流)
+
+### 背景
+安全中心第4模块(继ACL规则/连接数限制/MAC访问控制). 基于**L7应用层协议识别(DPI)+终端地址**控制应用流量. 与已有3模块**本质差异**: 规则不走iptables/ipset, 走ik_cntl new_tc app_rule内核. 本次重点含**功能打流验证**(iperf3不触发DPI, 需真实协议流量).
+
+### 底层机制(SSH+打流实测确认, 非推测)
+- 表acl_l7(专业模式global_config.parental_mode=0): id/enabled/tagname/comment/prio(0-63,Web默认31)/action(accept|drop)/app_proto(JSON)/src_addr(JSON)/dst_addr(JSON)/time(**必须空串""**, 非空JSON致脚本建空timeset→规则inactive永不匹配)
+- app_proto={"custom":["百度"],"object":[{"gid":"PROTOGPxx"}]}, **custom放应用名字符串**(脚本APPIDS[名]反查appid建appset), 非appid数字
+- 下发: SQL insert + /usr/ikuai/script/acl_l7.sh init(**直接执行, 不能sh调**) → ik_cntl new_tc app_rule add → ik_core内核. dmesg [NEWTC]:Add
+- 验证金矿: L1=acl_l7表; L2=ik_summary的App Rules count + ID:<id>行(active/action:Drop|Accept/appset/match); L3=dpi_cache dst→appid + host_active_apps + match增量(命中铁证); L4=打流连通性
+
+### 改动
+- `pages/security/app_protocol_page.py`(AppProtocolPage继承AclPage): `select_protocol`树dialog核心(点协议select弹"请选择"树, .ant-tree-checkbox勾选13大类+确定); 覆写`save_and_wait`(父类硬编码aclRulesConfig)/`_mark_area_block`(stop:源地址→目的地址,目的地址→优先级)/`is_on_config_page`
+- `tests/security/test_app_protocol_comprehensive.py`(15步): 场景(网络协议drop/传输下载+休闲娱乐accept/备注)+CRUD+异常(空名/未选协议)+导出CSV/TXT+导入+批量+**步骤15功能打流**
+- `utils/backend_verifier.py` +9方法: verify_app_protocol_{database,kernel_rule,match,dpi,enabled,not_exists,count,flow} + add_app_protocol_rule_via_ssh(SQL建规则精确app_proto含百度) + cleanup_app_protocol_test(SQL+ik_cntl del残留, 表空时__clean不执行)
+- conftest +2fixture(app_protocol_page/logged_in) + app_proto_flow_env(baidu探活+host路由) + 中文映射('安全中心-应用协议控制综合测试'); gui/main_window.py 安全中心>应用协议控制; pytest.ini +app_protocol mark
+
+### 关键踩坑(3次调试定位, 均记memory)
+1. **user_dpi必须enable(match增量关键!)**: 默认disable(/proc/ikuai/stats/ik_features_status), **off时match恒=0**(规则不匹配流量, 即使appset+DPI都正常); `ik_cntl user_dpi on`后match精准增量(5次curl百度→match 0→3). verify_app_protocol_flow自动on/测完off恢复. ←第一二次test match=0根因, 调试最久
+2. **new_tc disable(drop不执行)**: 测试机(150, 4.0.304 Deve)new_tc引擎disable, 规则只统计match不drop(curl全通)→**match增量作命中铁证(硬验PASS)+连通性探测(不硬断言)**. 符合"验证规则真正生效"(match=识别+匹配流量). 同ipv6_static环境探测教训
+3. **打流不用iperf3**: 裸TCP/UDP不触发DPI. 用curl baidu(appid=5060173). client必须host路由(`sudo ip route add 110.242.69.21/32 via 192.168.148.1 dev ens11 src 192.168.148.2`; curl --interface只bind源IP不强制路由). 用baidu非114(114该环境被屏蔽)
+4. **DPI给具体应用appid非大类**: 百度→5060173(休闲娱乐范围5000000-5499999), 不是HTTP大类1000016. app_proto custom=["百度"]精确命中
+5. **appset建立时序**: SQL建规则init后appset建立需1-2s(add_app_protocol_rule_via_ssh加sleep 2)
+
+### 结果
+1 passed (~10min37s, 20步 headless). 全CRUD(8场景批量+每条SSH L1/L2)+排序+异常分类+导入导出+批量+帮助按钮+功能打流(百度命中match+4+qq.com精确不命中match+0)PASS. 已覆盖模块24个. 详见topic `app-protocol-control`.
+
+### 扩充(参考VLAN/IP限速丰富度, 2026-07-07)
+用户反馈初版15步太简单+报告不明确+缺帮助按钮, 参考VLAN(16步)/IP限速(21步)扩充到20步:
+- **8场景批量**(协议大类×动作×源/目的地址×优先级×备注组合)+每条SSH L1/L2全链路
+- **排序**(名称/动作/优先级; 应用协议控制列无排序图标, 记录不支持)
+- **异常输入分类**(空名/未选协议/非法源IP 999.999.999.999/超长备注300字符; 备注无长度限制)
+- **帮助按钮**(test_help_functionality基类继承, 成功跳转)
+- **功能打流加精确性**(verify_app_protocol_flow加other_domain=qq.com: 百度命中match+4 + qq.com不误伤match+0, 证规则精确)
+- **new_tc不可启用确认**: 深挖ik_cntl(无new_tc on命令)/basic表(无字段)/proc(只读ik_features_status)/dmesg(只Add-Remove)/脚本(core_control只user_dpi), 确认new_tc engine无用户态启用方式, drop动作在150(4.0.304 Deve)无法真正执行→match命中+精确性验证规则逻辑正确
+- **备注字段限制**: 只允许中文/英文/数字(无特殊字符/下划线, "备注_测试!@#"被拒)
+
+## 2026-07-07 测试报告"失败原因分析"+多模块失败根因修复(12项全PASSED)
+
+### 背景
+用户重跑报告反馈: ①失败信息太技术化看不懂(assert False/Timeout) ②4模块失败(IKE/WG/UPnP/IPv6) ③GUI统计少算1(39例显34/JSON权威35) ④端口/域名分流L2异常(IDs全None/全系统ipset) ⑤上下行分离SSH数据全是Linux_WEBPPPOE_default等系统默认集 ⑥ipv6_static"被拦不入库"断言失败. 本次集中定位+修复, 全部PASSED.
+
+### 改动
+
+**报告可读性** — `utils/report_generator.py` +`_analyze_failure(case)`按error文本归类7类(code2006磁盘满/添加按钮超时/添加规则失败/元素超时/后端SSH/网络/兜底)渲染层注入failure_analysis; `reports/templates/report_template.html`加"🔍失败原因分析"黄卡片(失败类型标签+可能原因+排查建议). 让技术化错误看得懂.
+
+**GUI统计** — `gui/test_runner.py` `_read_final_stats`末尾补`_emit_progress()`: 校正JSON权威值后推GUI(原只更新self没emit, GUI卡实时计数; 实时_parse_output扫stdout漏算个别用例→少1).
+
+**企业版授权** — `pages/network/vpn_client_base.py` +`_detect_enterprise_block()`(检测页面"此功能只企业版支持")+navigate后设enterprise_blocked; `tests/network/vpn_test_helper.py`开头skip. IKEv2/WireGuard企业版专属, 免费版不渲染添加按钮→click超时误FAIL; SKIPPED 10s(原FAIL 40s).
+
+**select下拉通用坑**(选项title格式"{接口名}({备注})"如"wan2(ed_vwan94)"):
+- `pages/network/upnp_setting_page.py` `select_line`改JS拆括号parts匹配(原精确[title="wan2"]失效). UPnP全28步PASSED.
+- `pages/network/ipv6_wan_page.py` `_select_combobox`拆括号parts匹配. IPv6外网interface选错(wan2存成wan1)修复, PASSED.
+
+**静态路由导入** — `tests/network/test_static_route_comprehensive.py` 步骤17`downloads_dir`上溯3级到项目根(原2级=tests/downloads, 而export_rules在pages/上溯2级=项目根/downloads, **不一致**→永远找不到→跳过假通过); 跳过分支诚实诊断(导出成功却丢文件=ui_failures FAIL). PASSED真导入8条.
+
+**多线负载L2-L4** — `test_multi_wan_lb_comprehensive.py` L3/L4改`must_pass=True`(ik_core必加载, 原软断言被吞像只L1); `utils/backend_verifier.py` `verify_lb_pcc_policy_routing`缺失时`passed=not全缺失`(原永远True自欺). PASSED L1+L2+L3/L4全明确.
+
+**端口/协议分流iptables** — `utils/backend_verifier.py` `query_stream_ipport/layer7_iptables` rule_id正则改`/\*\s*(\d+)(?:_|\s*\*/)`(原只纯数字`/* 1 */`, 实际`/* 1_pt_m0_any */`带_tagname→全None→L2全FAIL). 端口分流L2 9条全通过.
+
+**域名分流L2机制** — `utils/backend_verifier.py` `verify_stream_domain_ipset`重写: 域名匹配走**ik_core url_route内核表**(ik_summary的URL_ROUTE_GROUP), 非ipset; 仅带src_addr规则建sdomain_src_{id}(原对所有规则查→纯域名8/10全FAIL). L2 10条全通过.
+
+**上下行分离报告** — `utils/backend_verifier.py` `verify_stream_updown_ipset` raw_output只显规则ipset(原all_ipset[:500]含Linux_WEBPPPOE_default等系统默认集误导); `verify_stream_updown_kernel_status`解析`/tmp/iktmp/stream_updown.txt`(格式`{id} node { proto out:"上行" in:"下行" }`, ik_cntl wans-snat下发)显每条规则上下行接口.
+
+**端口/域名分流崩溃(headed长跑)** — `tests/conftest.py` `browser_context_args` headless时强制viewport=1920x1080(原no_viewport, headless无窗口无效→默认小viewport→Ant Table虚拟滚动10条只渲染8漏行); 两模块用headless跑(headed长跑Chromium渲染进程Target crashed). 撤回每步reload包装(频繁goto反加剧崩溃). 两模块headless全19步PASSED(~450s).
+
+**ipv6_static环境探测** — `tests/network/test_ipv6_static_comprehensive.py` 步骤5改环境探测(SSH查IPV6TEST_1实际状态: 入库=环境具备/不入库=不具备两种都符合, 原硬断言"被拦不入库"因用户开通IPv6环境变化而FAIL). PASSED 69s.
+
+### 通用教训(已记memory)
+- **select下拉选项title"{接口名}({备注})"格式**: 精确匹配[title="wan2"]必失效→统一拆括号parts匹配(UPnP/IPv6/多线负载)
+- **iptables规则comment`/* {id}_{tagname} */`**(ACL/端口/协议/连接数限制): 提取rule_id正则要带_后缀, 不能只纯数字
+- **verify层raw_output只显规则相关数据**(规则ipset/comment/表项), 别塞全局列表(ipset -n全部/iptables全部), 否则一堆系统默认集看不懂
+- **测试假设环境状态(IPv6具备/线路数/磁盘)别硬断言**, 环境会变, 改探测实际状态+记录两种结果
+- **解析pytest结果用conftest JSON**(test_results.json), 别扫stdout(summary段重复列FAILED翻倍); 校正后须emit推GUI
+
+### 结果
+全PASSED(IKE/WG SKIPPED, UPnP/IPv6外网/静态路由/多线负载/端口分流/域名分流/上下行分离/ipv6_static均通过). 报告加失败原因分析黄卡片. 详见topic `test-failure-2026-07-06-and-report-analysis`.
+
+## 2026-07-02 安全中心-MAC访问控制模块开发完成(PASSED 5min, SSH 21 PASS/0 FAIL)
+
+### 背景
+安全中心第3模块(继ACL规则/连接数限制). **两模式: 黑名单/白名单(左上角radio切换)**. 参考VLAN步骤全. 行操作无复制(编辑/停用/删除). 复用ACL的AclPage.
+
+### 后端机制(acl_mac.sh探查, F12确认)
+- **URL**: 列表 `/login#/securityCenter/macAccessControl`, 配置 `/login#/securityCenter/macAccessControlConfig`
+- **两表**: acl_mac_black/acl_mac_white (id/enabled默认no/tagname unique/comment/time JSON/expires/mac小写unique)
+- **iptables filter表ACL_MAC链**(FORWARD第2条引用): 黑名单`-A ACL_MAC -m set --match-set acl_mac_{id} src -j DROP`/白名单`-I ACL_MAC ... -j RETURN`(白名单放行+默认DROP). ⚠️**无--comment标记**, 用`acl_mac_{id}`+`acl_mac_time_{id}`定位
+- **模式**: global_config.acl_mac=0黑名单(默认)/1白名单. seting API更新. 黑名单模式添加MAC插acl_mac_black(DROP), 白名单插acl_mac_white(RETURN)
+- **ipset**: acl_mac_{id}(MAC集合list:set, 含_acl_mac_{id})
+
+### 前端交互(MCP实测DOM)
+- 列表表格 div.ant-table-row; 工具栏 **设置**/添加/批量添加/导入/导出/帮助; 行操作 编辑/停用(启用)/删除(无复制)
+- **左上角模式radio**: "使用黑名单模式"/"使用白名单模式"(ant-radio-wrapper). ⚠️**radio click不调API**(network无mac-mode请求, global_config不变, 仅改前端state)→test模式切换用backend SSH切换(set_mac_mode: update global_config + acl_mac.sh init)
+- 配置页字段: 名称*/终端名称(placeholder请输入终端名称)/**MAC*(placeholder请输入MAC)**/周期/备注(无协议/端口/连接数, 比ACL/连接数限制简单)
+- 列: 名称/MAC/周期/终端名称/备注/操作
+
+### 产物(复用ACL)
+- `pages/security/mac_access_control_page.py`(MacAccessControlPage**继承AclPage**): navigate_to_mac_ctrl/open_add_page/fill_mac/fill_termname/set_mode(等radio渲染+evaluate定位+click)/get_current_mode/add_rule/try_add_rule_invalid + 覆盖is_on_config_page/clean_test_rules(prefix mac_t_)
+- `tests/security/test_mac_access_control_comprehensive.py`(15步): 黑名单场景(单条/多条/备注+终端名称)+模式切换(黑→白backend+白名单规则-j RETURN)+CRUD+异常(空名/非法MAC)+导出CSV/TXT+导入不清空+清空+批量, 每步SSH软收集+details
+- `utils/backend_verifier.py` +9方法: verify_mac_ctrl_database(mode+mac小写)/iptables(用acl_mac_time_{id}+acl_mac_{id}定位, -j DROP黑/RETURN白)/ipset/mode/set_mac_mode(SSH切换模式)/enabled/not_exists/count/cleanup(恢复黑名单+清ACL_MAC链)
+- conftest +2fixture + 中文映射('安全中心-MAC访问控制综合测试'); gui/main_window.py 安全中心>MAC访问控制; config +mac_access_control module; pytest.ini +mac_access_control mark
+
+### 2次迭代修复
+1. **模式切换radio不调API**: radio click仅改前端state不发请求(global_config不变), MCP实测network无mac-mode请求. 修: test模式切换用backend set_mac_mode(update global_config + acl_mac.sh init), radio UI行为单独记录
+2. **radio定位失败**: reload后radio异步渲染, locator直接click超时. 修: set_mode加wait_for radio渲染(15×0.5s)+evaluate标记+Playwright真实click
+
+### 结果
+PASSED 5min, **SSH 21 PASS/0 FAIL**. 黑名单(acl_mac_black+-j DROP)+白名单(acl_mac_white+-j RETURN)两模式全SSH验证. CRUD/异常/导出CSV+TXT/导入不清空+清空/批量全PASS. 报告中文用例名+76 details. finally清理(black/white表0条, 恢复黑名单acl_mac=0, ACL_MAC空, 磁盘8%).
+
+## 2026-07-02 安全中心-连接数限制模块开发完成(PASSED 7min, SSH 25 PASS/0 FAIL)
+
+### 背景
+安全中心第2个模块(继ACL规则). 参考VLAN步骤全, 含复制功能. 复用ACL的AclPage通用方法(ConnLimitPage继承AclPage).
+
+### 后端机制(conn_limit.sh探查)
+- **URL**: 列表 `/login#/securityCenter/connectionLimit`, 配置 `/login#/securityCenter/connectionLimit/add`
+- **conn_limit表**: src_addr明文JSON; protocol any/tcp/udp/icmp; **limits(连接数默认1000)**; enabled yes/no; dst_port/time
+- **iptables raw表CONNLIMIT链**(FORWARD第3条引用, raw表非filter): `-m peerconns --peerconns-above {limits} -j DROP [match-set conn_limit_src_{id} src]`
+  ⚠️**conn_limit规则无--comment标记**(ACL有), 用 `conn_limit_time_{id}`(每条都有)+`#conns > {limits}` 定位
+- **ipset**: conn_limit_src_{id}(源地址) / conn_limit_dport_{id} / conn_limit_time_{id}
+- 4种模式: 无协议无端口(--peerconns-iksaddr)/有协议(--peerconns-saddr-prot)/端口范围/固定端口
+
+### 前端交互(MCP实测)
+- 列表表格 div.ant-table-row; 行操作 编辑/停用(启用)/**复制**/删除; 列: 名称/内网地址/协议/外网端口/连接数/周期/备注
+- 配置页字段: 名称*/内网地址(点"添加"按钮→新增空IP输入行→行type IP, **placeholder"请输入IP"非ACL的"请输入IP或MAC"**)/协议*(任意tcp/udp/icmp)/连接数*(spinbutton默认1000)/外网端口(端口分组需预建)/生效时间/备注
+- 比ACL简单: 无动作(固定DROP超限)/方向/优先级/目的地址
+
+### 产物(复用ACL)
+- `pages/security/conn_limit_page.py`(ConnLimitPage**继承AclPage**): navigate_to_conn_limit/open_add_page/add_src_address(内网地址)/set_limits(连接数spinbutton)/set_protocol/add_rule/try_add_rule_invalid + 覆盖_mark_area_block(内网地址边界到协议)
+- `tests/security/test_conn_limit_comprehensive.py`(20步): 8规则场景(内网IP单/网段/多地址/协议any,tcp,udp,icmp/连接数大10000,小10/备注)+CRUD+**复制**+异常+导出CSV/TXT+**导入不清空+清空**+批量, 每步SSH软收集+details丰富
+- `utils/backend_verifier.py` +9方法: verify_conn_limit_database/iptables(`conn_limit_time_{id}`定位)/ipset/enabled/not_exists/count/delete_by_sql/cleanup(clear_raw表CONNLIMIT链, conn_limit.sh init只add不清链)
+- conftest +2fixture + 中文映射('安全中心-连接数限制综合测试'); gui/main_window.py 安全中心>连接数限制; config +conn_limit module; pytest.ini +conn_limit mark
+
+### 2次迭代修复
+1. **placeholder不匹配**: ACL的IP输入框"请输入IP或MAC地址", 连接数限制是"请输入IP(IP段...)". _type_addr_row的`includes('请输入IP或MAC')`找不到连接数限制框→改`includes('请输入IP')`兼容两者(改AclPage, ConnLimitPage继承受益)
+2. **iptables定位**: 无源地址规则无match-set conn_limit_src_{id}, verify用match-set定位失败→改用`conn_limit_time_{id}`(每条规则都有时间集合)定位
+3. test调verify_conn_limit_ipset误传`side`参数(连接数限制无side)→去掉
+
+### 结果
+PASSED 7min, **SSH 25 PASS/0 FAIL**. 8规则场景全SSH[OK](L1库+L2 raw表CONNLIMIT -j DROP peerconns+L3 ipset). CRUD/复制/异常/导出CSV+TXT/导入不清空+清空/批量全PASS. 报告中文用例名+90 details. finally清理(conn_limit表0条, CONNLIMIT空, 磁盘8%).
+
+## 2026-07-02 安全中心-ACL规则 GUI集成修复(3问题, PASSED 7min, SSH 29 PASS/0 FAIL)
+
+GUI点"安全中心>ACL规则"后用户反馈3问题, MCP+pytest定位修复+验证.
+
+### 问题1: GUI瞬间完成假象(没真跑测试, collected 0 items却显示"通过1")
+- **根因**: gui/test_runner.py `_build_args`硬编码`tests/network/`目录(`os.path.join(tests_root,"tests","network",tc)`), ACL在`tests/security/`→pytest报`file or directory not found: tests/network/test_acl_comprehensive.py`+`collected 0 items`; GUI用旧`test_results.json`误判"通过1"
+- **修复**: test_runner支持子目录前缀(tc含"/"拼`tests/tc`如`tests/security/test_acl.py::...`, 否则默认`tests/network/`向后兼容其他20模块); main_window.py ACL testcases+groups加`security/`前缀
+
+### 问题2: 测试报告内容比之前少
+- **根因**: 同问题1, 没真跑测试→conftest没生成新HTML报告→显示旧/空报告
+- **修复**: 问题1修复后GUI真跑, conftest生成完整21步HTML报告(10规则场景+CRUD+异常+导出+导入+批量, 每步SSH PASS/FAIL详情)
+
+### 问题3: 导入只测了"不清空", 缺"清空配置"
+- **补充**: 步骤20拆20a(不清空clear_existing=False)+20b(清空clear_existing=True), 各SSH软验证导入后acl_t_数>0
+- **附带bug**: 步骤20 export_dir少一层dirname(test在`tests/security/`需dirname×3到项目根, 原×2=`tests/`找不到导出文件→导入走"跳过"分支); 修复后导入两种都执行, SSH验导入9条数据落库
+
+### 结果
+PASSED 7min17s, **SSH 29 PASS/0 FAIL**(原27+导入不清空/清空2). GUI点ACL规则现在真跑测试+完整报告. 环境恢复(acl表0条, FIREWALL空).
+
+## 2026-07-02 安全中心-ACL规则模块开发完成(PASSED 6min, SSH 27 PASS/0 FAIL)
+
+### 背景
+首个安全中心模块(此前27模块全在网络配置). 完整自主开发: 探索(acl.sh+sqlite+iptables/ipset+MCP实测DOM)→page/test/backend_verifier/conftest/GUI→6次迭代修复→PASSED.
+
+### 后端机制(acl.sh探查)
+- **URL**: 列表 `/login#/securityCenter/aclRules`, 配置(add/edit共用) `/login#/securityCenter/aclRulesConfig` (edit点行编辑按钮进入, id经React state传不在URL)
+- **acl表**: src_addr/dst_addr/time为**明文JSON**(非base64, base64仅API层): `{"object":{},"custom":["10.66.0.18"]}` / 空`{"object":{},"custom":{}}`; action accept/drop; dir forward/input; protocol any/tcp/udp/tcp+udp/icmp/gre; enabled yes/no; prio 0-63; ctdir 0/1/2
+- **iptables落地**: dir=forward→**FIREWALL链**, dir=input→**INPUT_ACL链**(FORWARD引用FIREWALL); 规则 `-j ACCEPT/DROP [-m set --match-set acl_src_{id} src] timeset acl_time_{id} /* {id}_{comment} */`; enabled=yes才下发, down→del规则, up→add规则
+- **ipset**: acl_src_{id}/acl_dst_{id}(list:set, IP在子集_acl_{side}_{id}); acl_time_{id}(ik_cntl timeset)
+
+### 前端交互(MCP实测DOM)
+- 列表表格 **div.ant-table-row**(虚拟滚动非tr); 行操作 编辑/停用(启用)/复制/删除; 删除确认 ant-modal(非popconfirm)
+- 添加/编辑**独立配置页**(路由跳转非drawer); select的label在.ant-form-item-label内(协议栈/协议/动作/方向/连接方向匹配/地址类型/端口分组/进接口/出接口)
+- **源/目的地址**: 点区域"添加"按钮→**新增空IP输入行→在行type IP**(非顶部输入框; 顶部填值点添加产生空行致"请填写IP")
+- **端口**: 协议tcp/udp后出"端口分组"select, 点击弹**端口选择modal**(选端口分组, 非数字输入, 需预建路由对象端口分组, 超出ACL模块范围)
+- UI值: 动作允许/阻断, 方向转发/进, 连接方向匹配关闭/原始/应答; placeholder含中文引号"-"→evaluate含'请输入IP或MAC'匹配
+
+### 产物
+- `pages/security/acl_page.py`(AclPage继承IkuaiTablePage): navigate/open_add_page/fill_name/set_protocol_stack|protocol|action|dir|ctdir/priority/add_src|dst_address(点添加+行type)/toggle_invert/fill_remark/save_and_wait(轮询URL跳转)/add_rule/try_add_rule_invalid/edit/disable/enable/delete/copy/clean_test_rules + _select_by_label(精确form-item-label+标记+Playwright真实click)
+- `tests/security/test_acl_comprehensive.py`(21步): 10规则场景(源IP单/网段/目的IP/源+目的/TCP/UDP/ICMP/drop/input/备注+优先级+ctdir)+CRUD(计数/搜索/编辑/停用/启用/删除)+异常(空名/非法IP)+导出CSV/TXT+导入+批量停用/启用/删除, 每步SSH软收集
+- `utils/backend_verifier.py` +9方法: find/verify_acl_database(expected_fields+解析src/dst_ips JSON)/verify_acl_iptables(`/* {id}_`精确)/verify_acl_ipset/verify_acl_enabled/verify_acl_not_exists/count/delete_acl_by_sql/cleanup_acl_test
+- conftest +2fixture(acl_page/acl_page_logged_in); gui/main_window.py 安全中心>ACL规则testcases(骨架已存在填值); config/settings.yaml +acl module; pytest.ini +security/acl mark
+
+### 6次迭代修复(关键踩坑)
+1. `_select_by_label` includes匹配让"协议"误中"协议栈"→精确form-item-label匹配
+2. `_select_by_label` evaluate JS mousedown打开dropdown不可靠→标记+Playwright真实click
+3. `verify_acl_iptables` "comment" in l误判(comment显示`/* */`无"comment"词)→`/* {id}_`精确匹配
+4. `open_add_page` goto同URL不清SPA表单→残留地址行致"地址已存在"→先回列表再goto配置页
+5. 端口select误用type数字→端口分组弹modal遮挡click_save 30s超时→去掉端口场景(超范围)+_set_port_input关modal兜底
+6. `click_save`被modal遮挡→Escape+点页面header关残留dropdown/modal
+7. test步骤20 `_os.dirname`笔误(少.path)→用顶部import os
+
+### 结果
+PASSED 6min, **SSH 27 PASS/0 FAIL**. 10规则场景全SSH[OK](L1库+L2 iptables -j ACCEPT/DROP+L3 ipset). CRUD/异常拦截/导出CSV+TXT/导入/批量全PASS. finally清理(前端逐条删+SQL delete+acl.sh init), 环境恢复(acl表0条, FIREWALL链空).
+
 ## 2026-07-02 内外网混合模式子接入测试修复(8根因+A+B增强, PASSED 40min)
 
 ### 背景

@@ -237,10 +237,11 @@ class TestMultiWanLbComprehensive:
             )
 
             # L3/L4: 内核验证(ik_core + dmesg + conntrack)
+            # ik_core是多线负载的内核基础必须加载, 改硬断言(must_pass=True)避免软断言被吞(原只L1生效)
             ssh_verify(
                 "L3/L4-内核",
                 backend_verifier.verify_lb_pcc_kernel,
-                must_pass=False,
+                must_pass=True,
                 expect_enabled=True,
             )
         else:

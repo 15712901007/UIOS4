@@ -376,7 +376,14 @@ class TestRunner(QThread):
         # 添加测试用例
         for tc in self.testcases:
             if ".py::" in tc:
-                args.append(os.path.join(tests_root, "tests", "network", tc))
+                # tc可能含子目录前缀(security/test_xxx.py::...)或纯文件名(test_xxx.py::...)
+                file_part = tc.split("::")[0]
+                if "/" in file_part or "\\" in file_part:
+                    # 带子目录前缀(如security/), 拼到 tests/ 下对应子目录
+                    args.append(os.path.join(tests_root, "tests", tc.replace("\\", "/")))
+                else:
+                    # 旧格式纯文件名, 默认 tests/network/
+                    args.append(os.path.join(tests_root, "tests", "network", tc))
             else:
                 args.append(os.path.join(tests_root, "tests", "network", f"test_vlan.py::{tc}"))
 
@@ -432,12 +439,16 @@ class TestRunner(QThread):
         for tc in self.testcases:
             # 判断测试用例格式
             if ".py::" in tc:
-                # 新格式: 包含文件名和类名，如 "test_vlan.py::TestVlanAdd::test_add_min_vlan_id"
-                # 或 "test_vlan_comprehensive.py::TestVlanComprehensive::test_comprehensive_flow"
-                cmd.append(os.path.join(tests_root, "tests", "network", tc))
+                # tc可能含子目录前缀(security/test_xxx.py::...)或纯文件名(test_xxx.py::...)
+                file_part = tc.split("::")[0]
+                if "/" in file_part or "\\" in file_part:
+                    # 带子目录前缀(如security/), 拼到 tests/ 下对应子目录
+                    cmd.append(os.path.join(tests_root, "tests", tc.replace("\\", "/")))
+                else:
+                    # 旧格式纯文件名, 默认 tests/network/
+                    cmd.append(os.path.join(tests_root, "tests", "network", tc))
             else:
                 # 旧格式: 只有函数名，假设在 test_vlan.py 中（兼容处理）
-                # 但这种格式不支持类内的测试函数，建议使用新格式
                 cmd.append(os.path.join(tests_root, "tests", "network", f"test_vlan.py::{tc}"))
 
         return cmd
@@ -501,6 +512,10 @@ class TestRunner(QThread):
                 self.log_signal.emit("WARNING", f"{os.path.basename(json_path)} 格式不符, 保留实时计数")
         except Exception as e:
             self.log_signal.emit("WARNING", f"读取test_results.json失败({e}), 保留实时计数")
+
+        # 校正(或读失败保留实时值)后, 统一再推一次进度, 确保GUI显示权威统计
+        # (实时计数_parse_output可能漏算个别用例, 例: 39例实时34通过、JSON权威35通过)
+        self._emit_progress()
 
     def _emit_progress(self):
         """发送进度信号"""

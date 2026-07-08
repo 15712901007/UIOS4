@@ -22,10 +22,25 @@
       "mcp__ssh__ssh_disconnect",
       "mcp__ssh__ssh_list_sessions",
       "mcp__ssh__sftp_list",
-      "mcp__zread__get_repo_structure"
+      "mcp__zread__get_repo_structure",
+      "mcp__zai-mcp-server__analyze_image",
+      "mcp__playwright__browser_evaluate",
+      "Bash(git add *)",
+      "Bash(git commit -m 'feat: 添加UPnP/NAT设置综合测试\\(28步全量覆盖+SSH L1-L4验证\\) *)",
+      "mcp__ssh__ssh_shell_start",
+      "mcp__ssh__ssh_shell_read"
     ],
     "additionalDirectories": [
       "c:\\Users\\51355\\.claude\\projects\\c--Users-51355-Desktop-4-0--UI-----\\memory"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "figma-developer-mcp",
+    "playwright",
+    "ssh",
+    "web-reader",
+    "web-search-prime",
+    "zai-mcp-server",
+    "zread"
+  ]
 }

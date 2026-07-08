@@ -84,13 +84,22 @@ class VlanPage(IkuaiTablePage):
         return self
 
     def select_line(self, line: str):
-        """选择线路"""
+        """选择线路(lan1/wan1等物理口, 或已建VLAN名用于QINQ内层)"""
         self.page.get_by_role("combobox", name="线路").click(force=True)
-        self.page.wait_for_timeout(300)
-        # nth(1)取dropdown里的选项项(第0个多为combobox内显示项)。异常输入场景下combobox/dropdown
-        # portal未正常渲染, 默认30秒超时×步骤10的13个子项会累积>9分钟卡死整个测试(被外层timeout杀)。
-        # 用短超时+降级: nth(1)失败→first→跳过。正常添加场景nth(1)即时成功不受影响;
-        # 异常测试不依赖line是否选中(字段校验独立判定), 跳过不影响测试有效性。
+        self.page.wait_for_timeout(500)
+        # 优先用Ant Select下拉选项定位(option角色/.ant-select-item-option), 选VLAN名(QINQ)更可靠;
+        # 异常输入场景combobox/dropdown portal未渲染, 默认30s超时×多子项会累积卡死, 用短超时.
+        for loc in (
+            self.page.get_by_role("option", name=line, exact=True),
+            self.page.locator(f".ant-select-item-option[title='{line}']"),
+        ):
+            try:
+                if loc.count() > 0:
+                    loc.first.click(force=True, timeout=5000)
+                    return self
+            except Exception:
+                continue
+        # 降级: get_by_title nth(1)→first→跳过(原逻辑, 兼容)
         title_items = self.page.get_by_title(line, exact=True)
         try:
             title_items.nth(1).click(force=True, timeout=5000)

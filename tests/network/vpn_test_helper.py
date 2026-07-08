@@ -29,6 +29,12 @@ def run_vpn_comprehensive_test(*, page, rec, request,
         ssh_failures: list 传入累积SSH硬失败
         ui_failures: list 传入累积UI失败
     """
+    # 企业版专属功能(IKEv2/WireGuard)在非企业版固件上页面提示"此功能只企业版支持"且不
+    # 渲染"添加"按钮 → click_add_button会超时误报FAIL。检测到则skip(非测试/产品bug, 环境授权限制)
+    if getattr(page, 'enterprise_blocked', False):
+        import pytest
+        pytest.skip(f"{page.SUBTAB}为企业版专属功能, 当前测试机非企业版固件, 跳过")
+
     try:
         backend_verifier = request.getfixturevalue('backend_verifier')
     except Exception:

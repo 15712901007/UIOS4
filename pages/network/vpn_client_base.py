@@ -44,6 +44,9 @@ class VpnClientBasePage(IkuaiTablePage):
         if self.SUBTAB:
             self._click_tab(self.SUBTAB)
             self.page.wait_for_timeout(800)
+        # 检测企业版专属功能限制(IKEv2/WireGuard在非企业版固件上只提示"此功能只企业版支持",
+        # 不渲染列表与"添加"按钮 → click_add_button会超时误报FAIL; 检测后由测试skip)
+        self.enterprise_blocked = self._detect_enterprise_block()
         return self
 
     def navigate_back_to_list(self):
@@ -60,6 +63,21 @@ class VpnClientBasePage(IkuaiTablePage):
                 });
                 return clicked;
             }""", name)
+        except Exception:
+            return False
+
+    def _detect_enterprise_block(self) -> bool:
+        """检测当前子tab是否因非企业版被限制。
+
+        IKEv2/IPSec、WireGuard 等企业版专属功能在非企业版固件上, 进入子tab后页面只
+        显示"此功能只企业版支持"提示, 不渲染表格与"添加"按钮。此时 add_rule 第一步
+        click_add_button 会 30s 超时, 被误报为 FAIL(实为授权限制, 非测试/产品bug)。
+        检测到提示则返回True, 供测试开头 pytest.skip。
+        """
+        try:
+            txt = self.page.evaluate("() => (document.body && document.body.innerText) || ''") or ''
+            keywords = ["此功能只企业版支持", "企业版支持", "需要企业版", "仅支持企业版", "升级企业版"]
+            return any(k in txt for k in keywords)
         except Exception:
             return False
 
