@@ -918,6 +918,7 @@ class MainWindow(QMainWindow):
                             "DHCP静态分配": {
                                 "testcases": [
                                     "test_dhcp_static_comprehensive.py::TestDhcpStaticComprehensive::test_dhcp_static_comprehensive",
+                                    "test_dhcp_static_comprehensive.py::TestDhcpStaticFlowVerification::test_dhcp_static_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -1113,6 +1114,7 @@ class MainWindow(QMainWindow):
                     "应用协议控制": {
                         "testcases": [
                             "security/test_app_protocol_comprehensive.py::TestAppProtocolComprehensive::test_app_protocol_comprehensive",
+                            "security/test_app_protocol_comprehensive.py::TestAppProtocolFlowVerification::test_app_protocol_flow_verification",
                         ],
                         "groups": {
                             "综合测试（推荐）": [

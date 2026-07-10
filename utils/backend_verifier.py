@@ -10669,6 +10669,17 @@ class BackendVerifier:
         matches = re.findall(rf"ID:{rid}\b.*?match:(\d+)", out)
         return max([int(m) for m in matches]) if matches else 0
 
+    def _app_rule_is_active(self, rid) -> bool:
+        """读ik_summary的ID:<rid>规则行, 判断是否active(inactive或消失=False).
+        停用BUG排查: 停用(down=del app_rule)后内核规则应消失; 残留active=停用BUG铁证.
+        用\\b词边界避免ID:1误匹配ID:10/ID:100."""
+        self.connect_router()
+        out = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+        rule_lines = [l for l in out.splitlines() if re.search(rf"ID:{rid}\b", l)]
+        if not rule_lines:
+            return False  # 规则消失
+        return any("active" in l and "inactive" not in l for l in rule_lines)
+
     def verify_app_protocol_match(self, tagname: str) -> VerifyResult:
         """L3: 返回规则当前match计数(供打流前后对比增量, 命中铁证)."""
         rule = self.find_app_protocol_rule(tagname)
@@ -10855,6 +10866,120 @@ class BackendVerifier:
         self.connect_router()
         out = self._router.exec(f"cat /proc/ikuai/stats/ik_summary 2>/dev/null | grep -A1 'acl7_app_{rid}:'")
         return "appid" in out
+
+    def verify_app_protocol_block_effect(self, tagname: str, dst_domain: str,
+                                         count: int = 5, enable_user_dpi: bool = True) -> Dict:
+        """阻断生效判定(match+连通结合, 硬判定). 建drop规则后调用, 替代旧软判定verify_app_protocol_flow.
+
+        流程: 记录user_dpi原状态→(如关则ik_cntl user_dpi on+sleep3)→清conntrack→读match_before→
+          curl dst_domain ×count经ens11→读match_after→恢复user_dpi.
+        判定: dpi_hit=match_delta>0(DPI识别并命中规则, 不依赖new_tc/drop); blocked=connected==0(端到端阻断).
+          dpi_hit&&blocked=阻断生效(PASS); dpi_hit&&!blocked=匹配但new_tc未drop(记录); !dpi_hit=DPI未识别(软降级).
+        user_dpi自管(开+恢复), 调用方无需管时序, 每次调用独立."""
+        rule = self.find_app_protocol_rule(tagname)
+        if rule is None:
+            return {"match_delta": 0, "connected": 0, "blocked": False, "dpi_hit": False,
+                    "user_dpi_was_on": False, "rid": "", "detail": f"规则未找到: {tagname}", "error": True}
+        rid = rule.get("id", "")
+        self.connect_router()
+        self.connect_client()
+        fs_before = self._router.exec("cat /proc/ikuai/stats/ik_features_status 2>/dev/null | grep '^user_dpi'")
+        user_dpi_was_on = "enable" in fs_before
+        turned_on = False
+        if enable_user_dpi and not user_dpi_was_on:
+            self._router.exec("ik_cntl user_dpi on 2>/dev/null")
+            self._router.exec("sleep 3")  # DPI引擎初始化
+            turned_on = True
+        try:
+            self.clear_client_conntrack("192.168.148.2")
+            match_before = self._read_app_match(rid)
+            connected = 0
+            for _ in range(count):
+                out = self._client.exec(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' --interface ens11 --connect-timeout 3 -m 8 http://{dst_domain}/",
+                    timeout=15)
+                code = out.strip().strip("'").strip()
+                # 任何HTTP响应(2xx/3xx/4xx/5xx, 非超时拒绝000)=连通; 仅000(无响应=路由器drop)=阻断.
+                # 避免目标服务器反爬403被误判为阻断(403是服务器响应=连通, 非路由器drop).
+                if code and code != "000":
+                    connected += 1
+            match_after = self._read_app_match(rid)
+        finally:
+            if turned_on:
+                self._router.exec("ik_cntl user_dpi off 2>/dev/null")
+        match_delta = match_after - match_before
+        blocked = connected == 0
+        dpi_hit = match_delta > 0
+        if dpi_hit and blocked:
+            verdict = "阻断生效(match+>0且不通)"
+        elif dpi_hit and not blocked:
+            verdict = "规则匹配但new_tc未drop(match+>0但连通)"
+        else:
+            verdict = "DPI未识别curl流量(match=0, 软降级)"
+        return {"match_delta": match_delta, "connected": connected, "blocked": blocked,
+                "dpi_hit": dpi_hit, "user_dpi_was_on": user_dpi_was_on, "rid": rid,
+                "detail": f"id={rid} match+{match_delta} conn={connected}/{count} → {verdict}"}
+
+    def verify_app_protocol_disable_effect(self, tagname: str, dst_domain: str,
+                                           baseline_blocked: bool, count: int = 5) -> Dict:
+        """停用后阻断是否消失(三重信号抓停用BUG). 停用规则后调用.
+
+        停用BUG现象(报禅道): 停用后阻断仍生效, 须删除才彻底. 根因acl_l7.sh down()只del一条app_rule,
+        累积重复内核条目残留active仍匹配+drop. 三重信号任一异常=BUG:
+          信号1 连通: 停用后curl仍不通(connected==0 且 baseline_blocked)
+          信号2 match: 停用后规则仍匹配(match_delta>0, 不依赖new_tc/drop是否执行)
+          信号3 内核: 停用后内核规则仍active(应消失; 残留active=停用BUG铁证, 不依赖DPI/curl)
+        信号2/3不依赖baseline阻断可复现, 即便端到端drop未执行也能抓停用BUG."""
+        rule = self.find_app_protocol_rule(tagname)
+        if rule is None:
+            return {"still_blocked": False, "match_still_inc": False, "still_active": False,
+                    "bug_detected": False, "signals": [], "connected": 0, "match_delta": 0,
+                    "rid": "", "detail": f"规则未找到: {tagname}", "error": True}
+        rid = rule.get("id", "")
+        self.connect_router()
+        self.connect_client()
+        # user_dpi开(给信号2 match最佳探测; 记录恢复)
+        fs_before = self._router.exec("cat /proc/ikuai/stats/ik_features_status 2>/dev/null | grep '^user_dpi'")
+        user_dpi_was_on = "enable" in fs_before
+        turned_on = False
+        if not user_dpi_was_on:
+            self._router.exec("ik_cntl user_dpi on 2>/dev/null")
+            self._router.exec("sleep 3")
+            turned_on = True
+        try:
+            self.clear_client_conntrack("192.168.148.2")
+            match_before = self._read_app_match(rid)
+            connected = 0
+            for _ in range(count):
+                out = self._client.exec(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' --interface ens11 --connect-timeout 3 -m 8 http://{dst_domain}/",
+                    timeout=15)
+                code = out.strip().strip("'").strip()
+                # 任何HTTP响应(2xx/3xx/4xx/5xx, 非超时拒绝000)=连通; 仅000(无响应=路由器drop)=阻断.
+                # 避免目标服务器反爬403被误判为阻断(403是服务器响应=连通, 非路由器drop).
+                if code and code != "000":
+                    connected += 1
+            match_after = self._read_app_match(rid)
+        finally:
+            if turned_on:
+                self._router.exec("ik_cntl user_dpi off 2>/dev/null")
+        match_delta = match_after - match_before
+        still_blocked = baseline_blocked and connected == 0
+        match_still_inc = match_delta > 0
+        still_active = self._app_rule_is_active(rid)
+        signals = []
+        if still_blocked:
+            signals.append(f"连通仍不通(conn={connected}/{count})")
+        if match_still_inc:
+            signals.append(f"规则仍匹配(match+{match_delta})")
+        if still_active:
+            signals.append("内核规则仍active(应消失)")
+        bug_detected = bool(signals)
+        detail = (f"id={rid} 停用后: conn={connected}/{count} match+{match_delta} active={still_active}"
+                  f" → {'停用BUG(' + '; '.join(signals) + ')' if bug_detected else '停用正常(阻断消失)'}")
+        return {"still_blocked": still_blocked, "match_still_inc": match_still_inc,
+                "still_active": still_active, "bug_detected": bug_detected, "signals": signals,
+                "connected": connected, "match_delta": match_delta, "rid": rid, "detail": detail}
 
     def cleanup_app_protocol_test(self, prefix: str = "appt_") -> str:
         """清理prefix开头的应用协议控制规则(acl_l7表)+清内核残留+脚本init重建.

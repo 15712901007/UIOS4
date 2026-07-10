@@ -531,3 +531,243 @@ class TestAppProtocolComprehensive:
             for f in all_failures:
                 print(f"  - {f}")
         assert not all_failures, f"应用协议控制验证失败({len(all_failures)}项): {'; '.join(all_failures[:15])}"
+
+
+class TestAppProtocolFlowVerification:
+    """应用协议控制功能验证(端到端drop闭环 + 停用BUG三重信号).
+
+    仿ACL TestAclFlowVerification, 解决综合测试步骤20的两个问题:
+    - 阻断生效判定: match增量+连通性硬判定(替代旧软判定verify_app_protocol_flow恒passed=True),
+      不再硬编码百度; 动态探测候选目标中curl能命中(match>0且阻断)的, 用其做端到端闭环.
+    - 停用BUG(停用后阻断仍生效, 须删除才彻底): 三重信号(连通仍不通/match仍增加/内核规则仍active)
+      任一即BUG, 硬FAIL+报禅道. 信号2/3不依赖"阻断可复现"前置, 即便端到端drop未执行(DPI未识别curl)
+      也能靠内核规则残留铁证抓BUG.
+    软降级: DPI引擎不可用/无候选命中/基线不通时端到端阻断判定软记录不硬FAIL, L1/L2配置层+停用BUG仍验.
+    探测已确认curl经路由器被DPI识别为具体应用appid(如百度5060173), 故curl端到端闭环可行(同ACL模式)."""
+
+    PREFIX = "apptflow_"
+    CLIENT_IP = "192.168.148.2"
+    # 可配置候选目标(UI协议树根节点大类, 选择可靠避深层应用; "所有协议"保底验证drop引擎必生效).
+    # 用户手机163场景→休闲娱乐大类覆盖; 具体应用(网易通用协议等APPIDS有效key)可扩展配置.
+    CANDIDATE_TARGETS = [
+        {"category": "所有协议", "domain": "www.163.com"},
+        {"category": "休闲娱乐", "domain": "www.163.com"},
+    ]
+
+    def test_app_protocol_flow_verification(self, app_protocol_page_logged_in, step_recorder: StepRecorder, request):
+        """应用协议控制功能验证: 动态探测目标→建drop→验阻断生效→停用抓BUG→启用恢复→删除彻底恢复."""
+        page = app_protocol_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过应用协议控制功能验证")
+
+        failures = []
+
+        def ssh_verify(label, func, *args, must_pass=True, **kwargs):
+            try:
+                r = func(*args, **kwargs)
+                rec.add_detail(f"[SSH-{label}] {'PASS' if r.passed else 'FAIL'}: {r.message}")
+                rec.add_detail(f"    数据: {(r.raw_output or '')[:160]}")
+                if must_pass and not r.passed:
+                    failures.append(f"{label}: {r.message}")
+            except Exception as e:
+                rec.add_detail(f"[SSH-{label}] 异常: {str(e)[:80]}")
+                failures.append(f"{label}异常: {str(e)[:80]}")
+
+        print("\n" + "=" * 50)
+        print("应用协议控制功能验证(端到端drop闭环 + 停用BUG三重信号)")
+        print("=" * 50)
+
+        chosen = None           # 探测到的可用目标 {app, domain}
+        baseline_blocked = False  # 建规则后是否阻断(供停用BUG信号1用)
+        build_success = False
+        end_to_end = False
+
+        try:
+            # ==================== 步骤1: 环境清理 ====================
+            with rec.step("步骤1: 环境清理", "清apptflow_残留+内核残留, 确保new_tc干净"):
+                try:
+                    bv.cleanup_app_protocol_test(self.PREFIX)
+                except Exception:
+                    pass
+                page.navigate_to_app_proto()
+                page.page.wait_for_timeout(1500)
+                try:
+                    page.clean_test_rules(self.PREFIX)
+                except Exception:
+                    pass
+                page.page.wait_for_timeout(1000)
+                rec.add_detail("[清理] acl_l7表apptflow_ + 内核app_rule/appset清空")
+
+            # ==================== 步骤2: DPI引擎探活 ====================
+            with rec.step("步骤2: DPI引擎探活", "读ik_features_status的dpi(基础DPI识别引擎)"):
+                try:
+                    bv.connect_router()
+                    dpi_line = bv._router.exec("cat /proc/ikuai/stats/ik_features_status 2>/dev/null | grep '^dpi'")
+                    user_dpi_line = bv._router.exec("cat /proc/ikuai/stats/ik_features_status 2>/dev/null | grep '^user_dpi'")
+                    rec.add_detail(f"[DPI状态] {dpi_line.strip()} | {user_dpi_line.strip()}")
+                    dpi_engine_ok = "enable" in dpi_line
+                    rec.add_detail(f"  基础DPI引擎: {'可用(能识别应用appid)' if dpi_engine_ok else '不可用(端到端软降级)'}")
+                except Exception as e:
+                    rec.add_detail(f"  DPI探活异常: {str(e)[:80]}")
+                    dpi_engine_ok = False
+
+            # ==================== 步骤3: 动态探测可用目标 ====================
+            with rec.step("步骤3: 动态探测可用目标", "候选列表逐个UI建临时drop规则→curl→找能阻断的目标"):
+                if not dpi_engine_ok:
+                    rec.add_detail("[探测] 基础DPI引擎不可用, 跳过探测(端到端将软降级)")
+                else:
+                    for cand in self.CANDIDATE_TARGETS:
+                        tname = f"{self.PREFIX}probe"
+                        try:
+                            page.navigate_to_app_proto(); page.page.wait_for_timeout(1200)
+                            rr = page.add_rule(tname, protocol_category=cand["category"], action="drop", prio=32)
+                            page.page.wait_for_timeout(2000)
+                            if rr["success"]:
+                                res = bv.verify_app_protocol_block_effect(tname, cand["domain"], count=5)
+                                rec.add_detail(f"  [{cand['category']}/{cand['domain']}] {res['detail']}")
+                                if res.get("blocked"):
+                                    chosen = cand
+                                    rec.add_detail(f"  ✓ 选定: {cand['category']}({cand['domain']}) 端到端阻断生效")
+                            else:
+                                rec.add_detail(f"  [{cand['category']}] UI建规则失败: {rr.get('error', '')[:60]}")
+                        except Exception as e:
+                            rec.add_detail(f"  [{cand['category']}] 探测异常: {str(e)[:80]}")
+                        finally:
+                            try:
+                                page.navigate_to_app_proto(); page.page.wait_for_timeout(1000)
+                                page.delete_rule(tname)
+                            except Exception:
+                                pass
+                            try:
+                                bv.cleanup_app_protocol_test(tname)
+                            except Exception:
+                                pass
+                        if chosen:
+                            break
+                    if chosen is None:
+                        rec.add_detail("[探测] 无候选被curl命中阻断 → 端到端软降级, 停用BUG仍验(内核信号)")
+
+            target = chosen if chosen else self.CANDIDATE_TARGETS[0]
+            end_to_end = chosen is not None
+
+            # ==================== 步骤4: 基线连通 ====================
+            with rec.step("步骤4: 基线连通", f"curl {target['domain']} 经ens11应可达(无规则; 非000即可达, 403反爬也算)"):
+                bv.connect_client()
+                bv.clear_client_conntrack("192.168.148.2")
+                base_out = bv._client.exec(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' --interface ens11 --connect-timeout 3 -m 8 http://{target['domain']}/",
+                    timeout=15)
+                base_code = (base_out or "").strip().strip("'").strip()
+                base_reachable = bool(base_code) and base_code != "000"
+                rec.add_detail(f"  基线: curl {target['domain']} http_code={base_code} → {'可达' if base_reachable else '不可达(000)'}")
+                if not base_reachable:
+                    rec.add_detail("  ⚠ 基线不可达(000, 环境问题); 端到端软降级")
+                    end_to_end = False
+
+            # ==================== 步骤5: 建drop规则 + 验证阻断生效 ====================
+            flow_name = f"{self.PREFIX}flow"
+            with rec.step("步骤5: 建drop规则 + 验证阻断生效", f"UI建drop {target['category']}→L1/L2→curl阻断判定"):
+                # UI建规则走API完整下发(含new_tc引擎启用); SSH直接建SQL不触发引擎→drop不执行.
+                # 停用/启用/删除用UI触发down()/del()(正是停用BUG的触发动作).
+                page.navigate_to_app_proto(); page.page.wait_for_timeout(1500)
+                r = page.add_rule(flow_name, protocol_category=target["category"], action="drop", prio=32)
+                page.page.wait_for_timeout(2000)
+                if not r["success"]:
+                    failures.append(f"步骤5建drop失败: {r.get('error', '')}")
+                    rec.add_detail(f"  ✗ UI建规则失败: {r.get('error', '')}")
+                else:
+                    build_success = True
+                    rec.add_detail(f"  [UI] 建 {flow_name}(drop {target['category']}): 成功")
+                    ssh_verify("步骤5-L1数据库", bv.verify_app_protocol_database, flow_name,
+                               expected_fields={"enabled": "yes", "action": "drop"})
+                    ssh_verify("步骤5-L2内核active", bv.verify_app_protocol_kernel_rule, flow_name,
+                               expect_present=True, expect_action="drop")
+                    blk = bv.verify_app_protocol_block_effect(flow_name, target["domain"], count=5)
+                    baseline_blocked = blk.get("blocked", False)
+                    rec.add_detail(f"  [阻断判定] {blk['detail']}")
+                    if end_to_end:
+                        if blk.get("blocked"):
+                            rec.add_detail(f"  ✓ 阻断生效(curl不通) match+{blk.get('match_delta')}")
+                        else:
+                            failures.append(f"步骤5阻断未生效(curl仍通) {blk['detail']}")
+                            rec.add_detail(f"  ✗ 阻断未生效(curl通) {blk['detail'][:60]}")
+                    else:
+                        rec.add_detail("  [软降级] 端到端不硬判定, 配置层L1/L2已验")
+
+            # ==================== 步骤6-8: 仅建规则成功时执行 ====================
+            if build_success:
+                # 步骤6: 停用 + 抓停用BUG
+                with rec.step("步骤6: 停用规则 + 抓停用BUG", "停用→三重信号(连通/match/内核active), 任一异常=BUG报禅道"):
+                    page.navigate_to_app_proto()
+                    page.page.wait_for_timeout(1500)
+                    disabled = page.disable_rule(flow_name)
+                    page.page.wait_for_timeout(2000)
+                    rec.add_detail(f"  [UI] 停用 {flow_name}: {'成功' if disabled else '失败'}")
+                    rule6 = bv.find_app_protocol_rule(flow_name)
+                    db_disabled = bool(rule6) and str(rule6.get("enabled", "")) == "no"
+                    rec.add_detail(f"  [DB] enabled={rule6.get('enabled') if rule6 else 'N/A'}")
+                    if not db_disabled:
+                        failures.append("步骤6停用后DB enabled未变no")
+                    dis = bv.verify_app_protocol_disable_effect(flow_name, target["domain"],
+                                                                baseline_blocked=baseline_blocked, count=5)
+                    rec.add_detail(f"  [停用判定] {dis['detail']}")
+                    if dis.get("bug_detected"):
+                        failures.append(f"步骤6停用BUG: 停用后阻断仍生效({'; '.join(dis['signals'])}), 须删除才彻底(报禅道)")
+                        rec.add_detail(f"  ✗ 停用BUG检出(报禅道): {'; '.join(dis['signals'])}")
+                    else:
+                        rec.add_detail("  ✓ 停用正常(阻断消失)")
+
+                # 步骤7: 启用 + 恢复阻断
+                with rec.step("步骤7: 启用规则 + 验证恢复阻断", "启用→阻断应恢复(match>0+不通)"):
+                    page.navigate_to_app_proto()
+                    page.page.wait_for_timeout(1500)
+                    enabled = page.enable_rule(flow_name)
+                    page.page.wait_for_timeout(2000)
+                    rec.add_detail(f"  [UI] 启用 {flow_name}: {'成功' if enabled else '失败'}")
+                    rule7 = bv.find_app_protocol_rule(flow_name)
+                    db_enabled = bool(rule7) and str(rule7.get("enabled", "")) == "yes"
+                    rec.add_detail(f"  [DB] enabled={rule7.get('enabled') if rule7 else 'N/A'}")
+                    if not db_enabled:
+                        failures.append("步骤7启用后DB enabled未变yes")
+                    if end_to_end:
+                        blk2 = bv.verify_app_protocol_block_effect(flow_name, target["domain"], count=5)
+                        rec.add_detail(f"  [恢复阻断] {blk2['detail']}")
+                        if blk2.get("dpi_hit") and blk2.get("blocked"):
+                            rec.add_detail("  ✓ 启用后阻断恢复")
+                        else:
+                            rec.add_detail("  - 启用后阻断未完全恢复")
+                    else:
+                        rec.add_detail("  [软降级] 恢复阻断软记录")
+
+                # 步骤8: 删除 + 彻底恢复
+                with rec.step("步骤8: 删除规则 + 验证彻底恢复", "删除→连通恢复+内核无规则+appset清空"):
+                    page.navigate_to_app_proto()
+                    page.page.wait_for_timeout(1500)
+                    deleted = page.delete_rule(flow_name)
+                    page.page.wait_for_timeout(2000)
+                    rec.add_detail(f"  [UI] 删除 {flow_name}: {'成功' if deleted else '失败'}")
+                    restore = bv.verify_connectivity(dst_domain=target["domain"])
+                    rec.add_detail(f"  [恢复连通] {restore['detail']}")
+                    ssh_verify("步骤8-内核无规则", bv.verify_app_protocol_kernel_rule, flow_name, expect_present=False)
+                    if bv.app_protocol_appset_has_appid(flow_name):
+                        rec.add_detail("  - appset仍有appid残留(删除后应清空)")
+                    else:
+                        rec.add_detail("  ✓ appset已清空")
+
+        finally:
+            try:
+                page.navigate_to_app_proto()
+                page.page.wait_for_timeout(1000)
+                page.clean_test_rules(self.PREFIX)
+            except Exception:
+                pass
+            try:
+                bv.cleanup_app_protocol_test(self.PREFIX)
+            except Exception:
+                pass
+
+        print(f"\n[应用协议控制功能验证] {'通过' if not failures else '失败' + str(len(failures)) + '项'}")
+        assert not failures, f"应用协议控制功能验证失败({len(failures)}项): {'; '.join(failures[:10])}"

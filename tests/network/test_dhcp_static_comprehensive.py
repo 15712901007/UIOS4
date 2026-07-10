@@ -709,3 +709,178 @@ class TestDhcpStaticComprehensive:
                 print(f"  - {f}")
         assert not ssh_failures, \
             f"SSH验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+
+
+@pytest.mark.dhcp_static
+@pytest.mark.network
+class TestDhcpStaticFlowVerification:
+    """DHCP静态分配功能验证(L5): edit既有绑定IP→down/up验client拿新IP(硬)→恢复原IP(环境还原).
+
+    关键坑: client MAC环境已有lan1→固定IP绑定(用户手动加固定IP, 如tagname=ubuntu→192.168.148.2),
+    新建auto绑定会被lan1精确接口匹配覆盖(同MAC两条绑定, lan1优先给2). 故edit既有绑定IP→STATIC_IP,
+    down/up验client拿新IP, 测完恢复原IP(既有绑定最终不变).
+    强制DISCOVER: down→rm /run/systemd/netif/leases/*→up(单纯down/up走REQUEST续约旧lease绕过绑定;
+    networkctl reconfigure会打乱networkd时序不用). restart ik_dhcpd强制重载(delayed_restart可能未真restart).
+    对齐'每模块1综合+1功能验证'双测试模式(参考 test_dhcp_server_flow)."""
+
+    GATEWAY = "192.168.148.1"
+    CLIENT_IFACE = "ens11"
+    PREFIX = "dhstflow"  # tagname≤15字符(iKuai限制)
+    STATIC_IP = "192.168.148.70"  # DHS_1池内(2-151.200), 避开综合测试占用的50/51/60-64(ip_addr唯一约束)
+
+    def test_dhcp_static_flow(self, dhcp_static_page_logged_in: DhcpStaticPage,
+                              step_recorder: StepRecorder, request):
+        """功能验证: 建MAC→IP绑定→client down/up→验获取绑定IP(硬)→删恢复池IP."""
+        page = dhcp_static_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过DHCP静态分配功能验证")
+        failures = []
+        print("\n" + "=" * 50)
+        print("DHCP静态分配功能验证(L5 MAC→IP绑定生效)")
+        print("=" * 50)
+
+        def _release_renew():
+            """client 强制DISCOVER拿绑定IP: down→删networkd lease缓存→up.
+            单纯down/up后networkd走REQUEST续约旧lease(2)绕过静态绑定(ik_dhcpd对REQUEST不查绑定直接ACK旧IP).
+            down后rm /run/systemd/netif/leases/*清缓存, up时networkd无lease→DISCOVER→查静态绑定OFFER绑定IP.
+            (注: networkctl reconfigure会打乱networkd时序致拿不到IP, 不用; 仅down+rm lease+up)."""
+            bv.connect_client()
+            bv._client.exec(f"sudo ip link set {self.CLIENT_IFACE} down", timeout=10)
+            bv._client.exec("sleep 2", timeout=5)
+            bv._client.exec("sudo rm -f /run/systemd/netif/leases/* 2>/dev/null", timeout=5)
+            bv._client.exec(f"sudo ip link set {self.CLIENT_IFACE} up", timeout=10)
+            for _ in range(10):
+                bv._client.exec("sleep 2", timeout=5)
+                out = bv._client.exec(f"ip -4 addr show {self.CLIENT_IFACE} 2>/dev/null | grep -oP 'inet \\K[0-9.]+'")
+                ip = out.strip()
+                if ip:
+                    return ip
+            return ""
+
+        client_mac = None
+        orig_tagname = None  # client MAC既有绑定tagname(环境固定IP), 测完必恢复
+        orig_ip = None
+        try:
+            # 步骤1: 清理本测试残留(不动既有lan1→固定IP绑定)
+            with rec.step("步骤1: 清理测试残留", f"删{self.PREFIX}前缀残留(不动既有绑定)"):
+                page.navigate_to_dhcp_static()
+                page.page.wait_for_timeout(1000)
+                try:
+                    page.clean_test_rules(self.PREFIX)
+                except Exception:
+                    pass
+                try:
+                    bv.cleanup_dhcp_static_test_rules(self.PREFIX)
+                except Exception:
+                    pass
+
+            # 步骤2: 获取client真实MAC
+            with rec.step("步骤2: 获取client真实MAC", "get_client_lan_info读ens11 MAC"):
+                info = bv.get_client_lan_info()
+                client_mac = info.get("mac")
+                rec.add_detail(f"  client: iface={info.get('iface')} ip={info.get('ip')} mac={client_mac}")
+                if not client_mac:
+                    pytest.skip("未获取到client MAC, 跳过DHCP静态功能验证")
+
+            # 步骤3: edit既有绑定的IP(client MAC环境已有lan1→固定IP绑定, 新建auto会被lan1精确接口覆盖;
+            #        故edit既有绑定IP→STATIC_IP, down/up验client拿新IP, 测完恢复原IP)
+            with rec.step("步骤3: edit既有绑定IP+L1-L3验下发",
+                          f"client MAC既有绑定IP→{self.STATIC_IP}(测完恢复) + SSH验下发"):
+                all_static = bv.query_all_dhcp_static() or []
+                existing = [s for s in all_static
+                            if (s.get("mac", "") or "").lower() == client_mac.lower()]
+                if not existing:
+                    pytest.skip(f"client MAC {client_mac} 无既有静态绑定, 无法edit(环境应有固定IP绑定)")
+                orig = existing[0]
+                orig_tagname = orig.get("tagname")
+                orig_ip = orig.get("ip_addr")
+                rec.add_detail(f"  既有绑定: tagname={orig_tagname} ip={orig_ip} interface={orig.get('interface')}")
+                # edit IP → STATIC_IP(不改mac/interface/name)
+                ok = page.edit_dhcp_static(orig_tagname, ip=self.STATIC_IP)
+                rec.add_detail(f"  [UI] edit {orig_tagname} IP {orig_ip}→{self.STATIC_IP}: {'成功' if ok else '失败'}")
+                if not ok:
+                    failures.append("edit既有绑定IP失败: UI返回失败")
+                page.page.wait_for_timeout(3500)  # __dhcp_static_update + delayed_restart
+                # restart ik_dhcpd强制重载static.conf(delayed_restart可能未真正restart进程)
+                try:
+                    bv.connect_router()
+                    bv._router.exec("/usr/ikuai/script/dhcp_server.sh restart 2>&1")
+                    rec.add_detail("  [SSH] dhcp_server.sh restart(强制重载)")
+                    page.page.wait_for_timeout(2000)
+                except Exception as e:
+                    rec.add_detail(f"  [SSH] restart异常: {str(e)[:60]}")
+                # L1-L3 后端验证(DB dhcp_static + ik_dhcpd进程 + static.conf)
+                chain = bv.verify_dhcp_static_full_chain(name=orig_tagname, mac=client_mac, expect_in_conf=True)
+                for r in chain.results:
+                    rec.add_detail(f"  {r.level}: {'[OK]' if r.passed else '[FAIL]'} {r.message}")
+                    if not r.passed:
+                        failures.append(f"{r.level}: {r.message}")
+
+            # 步骤4: down/up ens11 → 验client拿到edit后的绑定IP(硬, 核心断言)
+            with rec.step("步骤4: down/up验绑定生效",
+                          f"ens11 down/rm lease/up→client应拿到edit后IP={self.STATIC_IP}(硬)"):
+                new_ip = _release_renew()
+                if new_ip == self.STATIC_IP:
+                    rec.add_detail(f"  ✓ client获取edit后IP={new_ip}(静态绑定IP修改真实生效)")
+                else:
+                    rec.add_detail(f"  ✗ client IP={new_ip}, 期望={self.STATIC_IP}")
+                    failures.append(f"绑定IP未生效: client IP={new_ip}≠{self.STATIC_IP}")
+                # 路由器租约存在(辅助)
+                lease = bv.verify_lease_in_db(mac=client_mac)
+                rec.add_detail(f"  路由器租约: {lease.message}")
+
+            # 步骤5: 恢复既有绑定IP(orig_ip) → down/up验client恢复原IP
+            with rec.step("步骤5: 恢复既有绑定IP", f"edit {orig_tagname} IP→{orig_ip}(恢复环境) + down/up"):
+                page.navigate_to_dhcp_static()
+                page.page.wait_for_timeout(800)
+                try:
+                    page.edit_dhcp_static(orig_tagname, ip=orig_ip)
+                    rec.add_detail(f"  [UI] 恢复 {orig_tagname} IP→{orig_ip}")
+                except Exception as e:
+                    rec.add_detail(f"  ✗ 恢复edit失败: {str(e)[:60]}")
+                    failures.append(f"恢复既有绑定失败: {str(e)[:60]}")
+                try:
+                    bv._router.exec("/usr/ikuai/script/dhcp_server.sh restart 2>&1")
+                except Exception:
+                    pass
+                page.page.wait_for_timeout(2000)
+                restore_ip = _release_renew()
+                rec.add_detail(f"  恢复后client IP={restore_ip}(期望{orig_ip})")
+        finally:
+            # 兜底1: 恢复既有绑定IP(若步骤5未执行/失败, 确保环境还原)
+            if orig_tagname and orig_ip:
+                try:
+                    page.navigate_to_dhcp_static()
+                    page.page.wait_for_timeout(500)
+                    page.edit_dhcp_static(orig_tagname, ip=orig_ip)
+                    bv._router.exec("/usr/ikuai/script/dhcp_server.sh restart 2>&1")
+                except Exception:
+                    pass
+            # 兜底2: 删测试残留 + 确保client恢复IP
+            try:
+                page.navigate_to_dhcp_static()
+                page.page.wait_for_timeout(500)
+                try:
+                    page.clean_test_rules(self.PREFIX)
+                except Exception:
+                    pass
+                try:
+                    bv.cleanup_dhcp_static_test_rules(self.PREFIX)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                bv.connect_client()
+                bv._client.exec(
+                    f"sudo ip link set {self.CLIENT_IFACE} down; sleep 2; sudo ip link set {self.CLIENT_IFACE} up",
+                    timeout=15)
+                bv._client.exec("sleep 5", timeout=10)
+            except Exception:
+                pass
+
+        print(f"\n[DHCP静态功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"DHCP静态分配功能验证失败({len(failures)}项): {'; '.join(failures)}"
