@@ -206,8 +206,9 @@ class TestUpnpSettingComprehensive:
                         rule["name"],
                         must_pass=True,
                     )
-                # L3+L4
-                ssh_verify("L3-运行时配置", backend_verifier.verify_upnpd_runtime_config, must_pass=False)
+                # L3+L4: 步骤9在步骤24(开启UPnP)之前, 开关未开→marker文件不存在/miniupnpd未运行,
+                # L3/L4均期望"未启用"(与L4 expect_enabled=False一致), 否则L3默认expect_exists=True会误FAIL
+                ssh_verify("L3-运行时配置", backend_verifier.verify_upnpd_runtime_config, must_pass=False, expect_exists=False)
                 ssh_verify("L4-守护进程", backend_verifier.verify_upnpd_daemon, must_pass=False, expect_enabled=False)
             else:
                 print("  [INFO] SSH验证: 跳过（未配置SSH）")
@@ -742,9 +743,12 @@ class TestUpnpSettingComprehensive:
                     rec.add_detail(f"  [OK] 设置保存成功")
 
                     if backend_verifier is not None:
+                        page.page.wait_for_timeout(1500)  # 等miniupnpd启动建MINIUPNPD链
                         ssh_verify("L1-UPnP启用", backend_verifier.verify_upnpd_conf,
                                    must_pass=True, expected_fields={"enabled": "yes"})
-                        ssh_verify("L2-进程", backend_verifier.verify_upnpd_process,
+                        ssh_verify("L2-iptables", backend_verifier.verify_upnpd_iptables,
+                                   must_pass=False, expect_chains=True)
+                        ssh_verify("L3-进程", backend_verifier.verify_upnpd_process,
                                    must_pass=False, expect_running=True)
                         ssh_verify("L3-运行时配置", backend_verifier.verify_upnpd_runtime_config,
                                    must_pass=False, expect_exists=True)

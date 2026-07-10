@@ -1,3 +1,3 @@
 id=1 enabled=yes comment=编辑后备注 name=DPROTO_TCP src_addr={"custom":{},"object":{}} dst_addr={"custom":{},"object":{}} protocol=tcp src_port={"custom":{},"object":{}} dst_port={"custom":["8080"],"object":{}} class=0 appid=1450002 
-id=2 enabled=yes comment=源目地址 name=DPROTO_ADDR src_addr={"custom":["192.168.10.1"],"object":{}} dst_addr={"custom":["10.66.0.40"],"object":{}} protocol=tcp src_port={"custom":{},"object":{}} dst_port={"custom":{},"object":{}} class=0 appid=1450003 
+id=2 enabled=yes comment=源目地址 name=DPROTO_ADDR src_addr={"object":{},"custom":["192.168.10.1"]} dst_addr={"object":{},"custom":["10.66.0.40"]} protocol=tcp src_port={"object":{},"custom":{}} dst_port={"object":{},"custom":{}} class=0 appid=1450003 
 id=3 enabled=yes comment=UDP端口 name=DPROTO_UDP src_addr={"custom":{},"object":{}} dst_addr={"custom":{},"object":{}} protocol=udp src_port={"custom":["1234"],"object":{}} dst_port={"custom":["5678"],"object":{}} class=0 appid=1450004 

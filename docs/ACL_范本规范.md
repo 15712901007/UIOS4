@@ -1,6 +1,8 @@
 # ACL 规则测试范本规范（iKuai 4.0 UI 自动化）
 
 > 2026-07-03 定稿。ACL 模块作为**全模块测试范本**，落地「数据驱动 + 协议全覆盖 + 优先级排序 + 5 层后端验证 + 打流功能验证」。其他模块照抄本规范。
+>
+> **2026-07-10 变更**：ACL 功能验证由原 `test_acl_protocol_matrix`（6 协议 parametrize）+ `test_acl_flow_drop`（端到端 curl drop 闭环）**合并为单测试** `TestAclFlowVerification::test_acl_flow_verification`——6 协议矩阵循环 + 端到端 drop 闭环合一，单协议失败软收集不连坐、末尾聚合硬断言，iperf3 不可达时矩阵 L5 软降级（curl 闭环照跑）。ACL 模块由此收敛为「1 综合(L1-L4) + 1 功能验证」双测试（对齐连接数限制节点）。下文 parametrize/数据驱动范本理念仍适用于其他模块。
 
 ## 1. 范本定位与成果
 
@@ -98,7 +100,7 @@ tests/conftest.py             +acl_flow_env fixture +p0/p1/p2 marker
 pytest.ini                    +p0/p1/p2 marker
 test_data/acl/protocol_cases.yaml    数据外置范本
 tests/security/acl_test_data.py      YAML loader
-tests/security/test_acl_protocol_matrix.py   6协议parametrize(P1)
+tests/security/test_acl_comprehensive.py::TestAclFlowVerification   ACL功能验证(6协议矩阵循环+端到端drop闭环, 2026-07-10合并旧test_acl_protocol_matrix+test_acl_flow_drop)
 tests/security/test_acl_priority_order.py    优先级排序(P1)
 tests/security/test_acl_comprehensive.py     综合CRUD(P0, 现有保留未重构)
 ```

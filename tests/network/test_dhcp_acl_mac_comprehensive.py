@@ -626,3 +626,136 @@ class TestDhcpAclMacComprehensive:
                 print(f"  - {f}")
         assert not ssh_failures, \
             f"SSH验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+
+
+@pytest.mark.dhcp_acl_mac
+@pytest.mark.network
+class TestDhcpAclMacFlowVerification:
+    """DHCP黑白名单功能验证(L5 dhclient, 硬断言): 黑名单client MAC→client拿不到IP→删恢复.
+
+    黑名单模式(mode=0): 建黑名单(client MAC)→client dhclient被拒拿不到IP. 删规则(空黑名单=不限制)→client重新获取→拿到IP.
+    iKuai DHCP acl mode: 0=黑名单(ipset里的MAC被拒)/1=白名单(仅ipset里的能获取)/2=同步MAC访问控制.
+    L5铁证=黑名单后client释放+获取无IP(被拒). client ens11免密sudo可dhclient. SSH经外网不受ens11断IP影响."""
+
+    PREFIX = "dhflow_"
+    CLIENT_IFACE = "ens11"
+
+    def test_dhcp_acl_mac_flow(self, dhcp_acl_mac_page_logged_in, step_recorder: StepRecorder, request):
+        page = dhcp_acl_mac_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过DHCP黑白名单功能验证")
+        failures = []
+        rule_name = f"{self.PREFIX}black"
+        print("\n" + "=" * 50)
+        print("DHCP黑白名单功能验证(L5 dhclient)")
+        print("=" * 50)
+
+        def _get_ip():
+            bv.connect_client()
+            out = bv._client.exec(f"ip -4 addr show {self.CLIENT_IFACE} 2>/dev/null | grep -oP 'inet \\K[0-9.]+'")
+            return out.strip()
+
+        def _release_renew():
+            """client down/up ens11触发systemd-networkd重新DHCP(强制DISCOVER), 轮询等获取, 返回IP.
+            不用dhclient(ISC 4.4.1不支持-t, 与systemd-networkd冲突). down/up后networkd重新DISCOVER;
+            黑名单时DISCOVER被DROP拿不到IP(空), 正常时获取192.168.148.x."""
+            bv._client.exec(f"sudo ip link set {self.CLIENT_IFACE} down; sleep 2; sudo ip link set {self.CLIENT_IFACE} up", timeout=15)
+            for _ in range(8):
+                bv._client.exec("sleep 2", timeout=5)
+                ip = _get_ip()
+                if ip:
+                    return ip
+            return ""
+
+        try:
+            info = bv.get_client_lan_info()
+            client_mac = info.get("mac")
+            if not client_mac:
+                pytest.skip("未获取到client MAC, 跳过DHCP黑白名单功能验证")
+            rec.add_detail(f"  client MAC={client_mac}")
+
+            # 基线: client能获取IP(确认DHCP正常)
+            with rec.step("基线: client能获取IP", "释放+获取, 验证有IP(确认DHCP正常)"):
+                ip = _release_renew()
+                if ip and ip.startswith("192.168.1"):
+                    rec.add_detail(f"  ✓ 基线获取IP={ip}")
+                else:
+                    pytest.skip(f"基线client无法DHCP获取(={ip}), 环境问题跳过")
+
+            # 建黑名单 + 切黑名单模式(mode=0=黑名单; docstring:0黑名单/1白名单/2同步)
+            with rec.step("建黑名单+切黑名单模式", f"黑名单{client_mac} + mode=0(黑名单)"):
+                page.navigate_to_dhcp_acl_mac()
+                page.page.wait_for_timeout(800)
+                try:
+                    page.delete_rule(rule_name)
+                    page.page.wait_for_timeout(300)
+                except Exception:
+                    pass
+                bv.cleanup_dhcp_acl_test(prefix=self.PREFIX)
+                page.add_rule(rule_name, mac=client_mac, comment="L5黑名单测试")
+                page.page.wait_for_timeout(1000)
+                page.select_mode("0", ip_version="v4")  # mode=0黑名单(ipset里的MAC被拒)
+                page.page.wait_for_timeout(2500)
+                # L1-L4 后端验证(报告体现: 数据库+模式+ipset+iptables DHCP_ACL链)
+                r_db = bv.verify_dhcp_acl_database(name=rule_name, mac=client_mac, table="black", ip_version="v4")
+                rec.add_detail(f"  {r_db.level}: {'[OK]' if r_db.passed else '[FAIL]'} {r_db.message}")
+                if not r_db.passed:
+                    failures.append(f"{r_db.level}: {r_db.message}")
+                r_mode = bv.verify_dhcp_acl_mode(expected_mode=0, ip_version="v4")
+                rec.add_detail(f"  {r_mode.level}: {'[OK]' if r_mode.passed else '[FAIL]'} {r_mode.message}")
+                if not r_mode.passed:
+                    failures.append(f"{r_mode.level}: {r_mode.message}")
+                # 查ipset是否含client MAC(黑名单DROP的前提, iptables -m set --match-set)
+                # select_mode后ipset异步重建, 轮询等待MAC入集(L5证明最终会入, 避免早查误FAIL)
+                r_ipset = None
+                for _ in range(6):
+                    r_ipset = bv.verify_dhcp_acl_ipset(client_mac, should_in_ipset=True, ip_version="v4")
+                    if r_ipset.passed:
+                        break
+                    page.page.wait_for_timeout(2000)
+                rec.add_detail(f"  {r_ipset.level}: {'[OK]' if r_ipset.passed else '[FAIL]'} {r_ipset.message}")
+                if not r_ipset.passed:
+                    failures.append(f"{r_ipset.level}: {r_ipset.message}")
+                # L4: iptables DHCP_ACL链规则符合mode=0黑名单(--match-set src -j DROP, 无!)
+                r_ipt = bv.verify_dhcp_acl_iptables(mode=0, ip_version="v4")
+                rec.add_detail(f"  {r_ipt.level}: {'[OK]' if r_ipt.passed else '[FAIL]'} {r_ipt.message}")
+                if not r_ipt.passed:
+                    failures.append(f"{r_ipt.level}: {r_ipt.message}")
+                rec.add_detail(f"  ✓ 黑名单{client_mac}已建, mode=0(黑名单)")
+
+            # L5: client释放+获取 → 拿不到IP(被黑名单拒)
+            with rec.step("L5黑名单验证", "client释放+获取→应拿不到IP(被黑名单拒)"):
+                ip = _release_renew()
+                if ip:
+                    rec.add_detail(f"  ✗ 黑名单未生效(client仍获取IP={ip})")
+                    failures.append(f"黑名单未拒绝: client仍获取IP={ip}")
+                else:
+                    rec.add_detail(f"  ✓ 黑名单生效(client拿不到IP, 被拒)")
+        finally:
+            # 恢复: 删黑名单 + 恢复mode=0 + client重新获取(确保不影响后续测试)
+            try:
+                page.navigate_to_dhcp_acl_mac()
+                page.page.wait_for_timeout(500)
+                page.select_mode("0", ip_version="v4")  # mode=0黑名单(删规则后空=不限制)
+                page.page.wait_for_timeout(2000)
+                try:
+                    page.delete_rule(rule_name)
+                except Exception:
+                    pass
+                bv.cleanup_dhcp_acl_test(prefix=self.PREFIX)
+            except Exception:
+                pass
+            try:
+                bv.connect_client()
+                bv._client.exec(f"sudo ip link set {self.CLIENT_IFACE} down; sleep 2; sudo ip link set {self.CLIENT_IFACE} up", timeout=15)
+                for _ in range(10):
+                    bv._client.exec("sleep 2", timeout=5)
+                    if _get_ip():
+                        break
+            except Exception:
+                pass
+        print(f"\n[DHCP黑白名单功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"DHCP黑白名单功能验证失败({len(failures)}项): {'; '.join(failures)}"

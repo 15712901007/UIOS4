@@ -1,5 +1,47 @@
 # 开发日志
 
+## 2026-07-10 ACL功能验证合并(3→2) + check_link_mode假成功修复 + iperf3探活优化
+
+### 背景
+用户反馈报告里 `test_acl_protocol_matrix[chromium-*]` 6个英文用例看不懂且不该拆成5条; 跑内外网综合测试发现步骤5"编辑wan2线路检测模式"假成功(check_link_mode期望5实际3). 经多轮诊断定位+修复3个问题.
+
+### 改动
+1. **ACL功能验证合并(3测试→2, 对齐"每模块1综合+1功能验证"双测试模式)**:
+   - `test_acl_flow_drop` + `test_acl_protocol_matrix`(6协议parametrize,报告显英文nodeid) 合并为 `TestAclFlowVerification::test_acl_flow_verification` 单测试(10步: 清理+基线curl+iperf3软探活+6协议矩阵循环L1/L2/L5+TCP端到端drop闭环). 单协议失败软收集不连坐+末尾聚合硬断言. 删 `test_acl_protocol_matrix.py`. GUI ACL节点3→2(对齐连接数限制节点). `TEST_NAME_MAPPING` 加中文映射(英文nodeid根因=映射表未收录method名). 实测PASSED(243s).
+   - **tagname 15字符坑**: 合并首用 `acl_flow_`(9字符)前缀, `acl_flow_tcp_udp`=16字符超iKuai tagname限制→后端**静默截断**成15→`find_acl_rule`按完整名查不到→误判"建规则失败"(规则其实建成,极易误判产品bug). 改 `acl_pm_`(6字符,≤14). 诊断铁证=DB全表看tagname被截断. (iKuai通用约束, 混合子接入vwan前缀同源)
+2. **check_link_mode 假成功修复(自动化代码bug,非产品bug)**:
+   - 步骤5 期望check_link_mode=5(PING)实际3(原值). 根因 `set_check_link_mode`(interface_settings_page.py:345) `if mode_keyword in val` **includes判断**: wan2原始值"HTTP+PING+网关"组合含"PING"字符串→误判"已选"return True不操作→DB留原值3(`[OK]`假成功; CHANGELOG:279曾误标"既有环境问题").
+   - 修复: 全程精确`===`匹配option文本+滚动`rc-virtual-list-holder`点击(虚拟列表option)+回读`val===kw`. 实测 set PING→DB 3→5✓, 恢复"HTTP+PING+网关"→DB 5→3✓.
+   - 步骤5 `must_pass=False→True`(硬断言): 修复后PASS; 将来`set_check_link_mode`退化或产品保存不生效→硬FAIL测出真问题, 不再被软失败掩盖.
+   - mode值=option序号(诊断实测DB=3↔第3项"HTTP+PING+网关", "PING"第5项→DB=5; page原mode映射注释过时已更正).
+3. **iperf3探活卡顿优化(60s→0.2s)**: 步骤3探活用 `run_iperf3` 首次连接卡60s(paramiko `channel.settimeout` Windows下偶发不生效→`stdout.read`阻塞→exec看门狗51s+重连; `--connect-timeout`/`timeout`包裹都管不到iperf3的D状态卡顿). 改用 bash `/dev/tcp` 轻量探端口(3s,不走iperf3进程). `run_iperf3` 命令加 `--connect-timeout 3000`. 总耗时基本不变(首次iperf3卡顿从探活转移至L5各协议打流, 环境硬约束无法完全消除).
+
+### 结果
+ACL功能验证合并PASSED(10步全绿, 中文书"安全中心-ACL功能验证(多协议打流+端到端drop)"); check_link_mode修复+硬断言→内外网综合测试35步全绿(步骤5硬PASS); iperf3探活60s→0.2s. 2个通用坑记memory: iKuai tagname/名称15字符静默截断 / Ant Select单选组合option必须精确===匹配非includes.
+
+## 2026-07-09 智能流控测试报告4失败修复 + QoS限速机制探明(SSH读qos.sh)
+
+### 背景
+报告 `test_report_20260709_171235` 智能流控4个失败步骤; 用户问"配置外网线路速率是否决定客户端速率". SSH读 `/usr/ikuai/script/utils/qos.sh` 探明底层QoS机制, 并修复自动化代码4处误判/盲区.
+
+### 探明的QoS机制(回答"线路速率是否决定客户端速率")
+- **流量路径**: 所有转发流量→FORWARD→`LAYER7_OUT/IN`→`-j IMQ --todev 0/1`送imq0(上行)/imq1(下行)→imq挂HTB整形. stream_ctl_mode>0才建(start():33-37), 关则stop()删qdisc.
+- **root class(线路, `create_tc_iface_class:109`)**: `rate=ceil=qos_upload×MULRIPLE_ROOT(85/10=8.5)`≈**配置带宽×1.06**(配置值先经get_bandwidth_limit打折>10M×98%). 对**所有**经imq流量整形→**线路速率能限所有终端**(ik_core自实现内核模块, 非标准HTB default; 用户戎士显实测确认). 是全线路总整形墙, **非单终端限速**.
+- **alone子class(终端独立限速, `alone_rule:757`)**: `rate=配置×MULRIPLE×10/100`(=配置×10%保证), `ceil=配置×MULRIPLE`(=配置值bit/s). **才是单终端硬上限**, 挂parent 10:${root_id}.
+- **终端测速"超线路速率"=正常现象**: root实际限速点=配置×1.06(6%余量)+HTB burst短时突发, 非bug.
+- **限速=整形(HTB令牌桶, 靠丢包retransmit), 非iptables DROP**.
+- 修正认知[[stream-control-alone-limit-bug]]: alone的qos.sh `local $config`破坏JSON→iptables EMARK不生成, **只致alone子class限速不生效**(终端跑到线路root速率而非alone配置值), **线路级root限速仍生效**(非完全不限速).
+
+### 改动(4文件5处, py_compile通过)
+1. **`utils/backend_verifier.py:871`** `run_iperf3` 加 `retries=2` 偶发重试(iperf3连接抖动/限速class挂载时序返回error, 单次判FAIL太脆弱; error重试, JSON解析失败重试)
+2. **`tests/network/test_stream_control_comprehensive.py`** 步骤3上下行None时记录iperf3 error原文(原`_throughput`吞error致None无法诊断) + 步骤19 ipset停用改中性`[记录]`(产品停用保留ipset删除才清, 原断言should_exist=False过严)
+3. **`pages/ikuai_table_page.py:128`** `disable_rule/enable_rule` 改"找到按钮+点击=返回True"(原硬等"X成功"文案/ant-message-success时序误判; **真实生效交SSH L1权威验证**)
+4. **`pages/network/stream_control_page.py:561`** `enable_line/disable_line` 加幂等(is_line_enabled已启用直接True, 避免"enable_all_lines后再enable_line"找不到"启用"按钮误判)
+- **核心思路**: UI操作返回值=操作是否成功发起, 真实生效交SSH L1(原步骤3/19/25三个FAIL全是SSH通过、UI返回值被成功提示文案/时序拖累).
+
+### 结果
+4失败归因: 3处自动化误判(已消除) + 1处iperf3偶发(加重试+记录error). 综合测试步骤3/19/25启用停用误FAIL消除, 步骤19 ipset中性记录. 独立Test打流None: 加iperf3重试+error记录, 待重跑确认error定性(iperf3偶发 vs alone class挂载时序). QoS机制记memory topic `stream-control-qos-mechanism`.
+
 ## 2026-07-08 终端限速/VLAN/ACL 功能验证(打流实测)并入自动化
 
 ### 背景

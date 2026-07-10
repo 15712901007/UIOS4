@@ -483,7 +483,7 @@ class TestInterfaceSettingsComprehensive:
                         page.page.wait_for_timeout(2500)
                     rec.add_detail(f"[OK] wan2线路检测改PING" if ok else "[WARN] 切换失败")
                     ssh_verify(f"L1-wan2(check_link_mode)", backend_verifier.verify_wan_database,
-                               "wan2", must_pass=False, expected_fields={"check_link_mode": "5"})
+                               "wan2", must_pass=True, expected_fields={"check_link_mode": "5"})
 
             # ==================== 步骤6: 编辑wan2检测域名 ====================
             with rec.step("步骤6: 编辑wan2检测域名", "baidu→qq + SSH L1验证"):

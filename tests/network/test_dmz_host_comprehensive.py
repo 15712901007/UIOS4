@@ -914,3 +914,138 @@ class TestDmzHostComprehensive:
             for f in all_failures:
                 print(f"  - {f}")
             assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
+
+
+@pytest.mark.dmz_host
+@pytest.mark.network
+class TestDmzHostFlowVerification:
+    """DMZ主机功能验证(L5 NETMAP打流, 硬断言): 建DMZ→外网访问wan3口→conntrack DNAT条目=生效.
+
+    DMZ=NETMAP全端口DNAT(外网访问路由器WAN口任意端口→DMZ主机同端口). 用wan3(避开wan1管理网段, page强制).
+    L5铁证=conntrack DNAT条目(orig dst=wan_ip:端口, reply src=DMZ主机IP:同端口), SYN即触发不依赖hairpin."""
+
+    PREFIX = "dmzflow_"
+    WAN_IFACE = "wan3"
+    WAN_IP = "10.66.0.43"      # wan3外网IP(环境变化改此常量)
+    LAN_IP = "192.168.148.2"   # client ens11内网IP(DMZ主机)
+    TEST_PORT = "15201"        # 验证端口(DMZ全端口, 用某端口验DNAT)
+
+    def test_dmz_host_flow(self, dmz_host_page_logged_in, step_recorder: StepRecorder, request):
+        page = dmz_host_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过DMZ功能验证")
+        rule_name = f"{self.PREFIX}netmap"
+        failures = []
+        print("\n" + "=" * 50)
+        print("DMZ主机功能验证(L5 NETMAP打流)")
+        print("=" * 50)
+
+        def _force_clean():
+            try:
+                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM one_one_map WHERE tagname LIKE '{self.PREFIX}%'\"")
+                bv._router.exec("/usr/ikuai/script/netmap.sh init 2>/dev/null")
+            except Exception:
+                pass
+
+        def _trigger_dnat():
+            """client外网侧(10.66.0.18)发SYN到wan3:TEST_PORT, 触发NETMAP DNAT建conntrack条目."""
+            bv.connect_client()
+            for _ in range(3):
+                bv._client.exec(
+                    f"curl -s -o /dev/null --connect-timeout 2 -m 3 http://{self.WAN_IP}:{self.TEST_PORT}/ 2>/dev/null",
+                    timeout=8)
+
+        try:
+            # 环境检查: 动态获取wan3 IP + client外网侧可达
+            with rec.step("环境检查", "动态获取wan3 IP + client可达"):
+                bv.connect_router()
+                import re
+                wan_ip_out = bv._router.exec("ip -4 addr show wan3 2>/dev/null")
+                m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', wan_ip_out)
+                wan_ip = m.group(1) if m else ""
+                if not wan_ip:
+                    pytest.skip("未获取到wan3 IP(路由器无wan3接口?), 跳过DMZ功能验证")
+                self.WAN_IP = wan_ip
+                bv.connect_client()
+                ping = bv._client.exec(f"ping -c 1 -W 2 {wan_ip} 2>/dev/null | grep -c '1 received'")
+                if ping.strip() == "0":
+                    pytest.skip(f"client无法访问wan3 {wan_ip}, 跳过DMZ功能验证")
+                rec.add_detail(f"  ✓ wan3={wan_ip} 可达")
+
+            # 建DMZ: wan3, DMZ主机=192.168.148.2, 全端口NETMAP
+            with rec.step("建DMZ规则", f"{self.WAN_IFACE}→DMZ主机{self.LAN_IP}(全端口NETMAP)"):
+                page.navigate_to_dmz()
+                page.page.wait_for_timeout(800)
+                try:
+                    page.delete_rule(rule_name)
+                    page.page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                _force_clean()
+                ok = page.add_rule(rule_name, lan_addr=self.LAN_IP,
+                                   map_type="外网接口", external_interfaces=[self.WAN_IFACE],
+                                   protocol="不限")
+                if not ok:
+                    failures.append(f"建规则失败: {rule_name}")
+                    rec.add_detail("  ✗ 建规则失败")
+                else:
+                    page.page.wait_for_timeout(2000)
+                    rule = bv.find_dmz_rule(rule_name)
+                    rec.add_detail(f"  ✓ 建规则 id={rule.get('id') if rule else '?'}")
+
+            if not failures:
+                # L1-L4 后端验证(报告体现全链路: 数据库→iptables(NETNAT链+PREROUTING引用)→运行时→nf_nat内核模块)
+                with rec.step("L1-L4后端验证", "数据库+iptables(NETNAT链+PREROUTING引用)+运行时+nf_nat内核模块"):
+                    chain = bv.verify_dmz_full_chain(
+                        rule_name,
+                        expected_fields={"lan_addr": self.LAN_IP},
+                        lan_addr=self.LAN_IP,
+                    )
+                    for r in chain.results:
+                        rec.add_detail(f"  {r.level}: {'[OK]' if r.passed else '[FAIL]'} {r.message}")
+                        if not r.passed:
+                            failures.append(f"{r.level}: {r.message}")
+
+                # L5: 触发NETMAP DNAT + 查conntrack DNAT条目(铁证)
+                with rec.step("L5 NETMAP验证", f"外网访问{self.WAN_IP}:{self.TEST_PORT}→conntrack DNAT到{self.LAN_IP}:{self.TEST_PORT}"):
+                    _trigger_dnat()
+                    res = bv.verify_dnat_conntrack(self.WAN_IP, self.TEST_PORT, self.LAN_IP, self.TEST_PORT)
+                    rec.add_detail(f"  {res.message}")
+                    if res.raw_output:
+                        rec.add_detail(f"  conntrack: {res.raw_output}")
+                    if res.passed:
+                        rec.add_detail("  ✓ DMZ NETMAP生效(数据平面)")
+                    else:
+                        rec.add_detail("  ✗ DMZ未生效(无DNAT条目, 疑PREROUTING未引用NETNAT链)")
+                        failures.append(f"DMZ NETMAP未生效: {res.message}")
+
+                # 删规则→验证DNAT消失(恢复)
+                with rec.step("删规则恢复", "删DMZ→再访问→DNAT应消失"):
+                    page.navigate_to_dmz()
+                    page.page.wait_for_timeout(500)
+                    try:
+                        page.delete_rule(rule_name)
+                    except Exception:
+                        pass
+                    _force_clean()
+                    page.page.wait_for_timeout(1500)
+                    _trigger_dnat()
+                    res2 = bv.verify_dnat_conntrack(self.WAN_IP, self.TEST_PORT, self.LAN_IP, self.TEST_PORT)
+                    if res2.passed:
+                        rec.add_detail("  ✗ 删规则后仍有DNAT(规则残留)")
+                        failures.append("删规则后DNAT仍存在(残留)")
+                    else:
+                        rec.add_detail("  ✓ 删规则后DNAT消失(恢复)")
+        finally:
+            try:
+                page.navigate_to_dmz()
+                page.page.wait_for_timeout(500)
+                page.delete_rule(rule_name)
+            except Exception:
+                pass
+            _force_clean()
+        print(f"\n[DMZ功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"DMZ功能验证失败({len(failures)}项): {'; '.join(failures)}"

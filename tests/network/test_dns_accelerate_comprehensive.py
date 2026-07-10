@@ -632,3 +632,106 @@ class TestDnsAccelerateComprehensive:
         print("=" * 60)
 
         assert not all_failures, f"DNS加速服务测试失败 {len(all_failures)} 项: {all_failures}"
+
+
+@pytest.mark.dns_accelerate
+@pytest.mark.network
+class TestDnsAccelerateFlowVerification:
+    """DNS加速功能验证(L5 dig解析, 硬断言): 开启DNS加速→client dig @路由器 域名→解析到A记录=生效.
+
+    DNS加速=ikdnsd监听UDP53代理转发DNS(上游dns1). 关闭时路由器53不监听→dig connection refused;
+    开启后ikdnsd代理→client dig @192.168.148.1 www.baidu.com 解析到A记录IP=加速生效.
+    cachemode=UDP(ikdnsd/53). L5铁证=client经路由器DNS拿到域名A记录IP(非systemd-resolved本地)."""
+
+    ROUTER_DNS = "192.168.148.1"   # 路由器LAN口(DNS加速ikdnsd监听53)
+    TEST_DOMAIN = "www.baidu.com"
+
+    def test_dns_accelerate_flow(self, dns_accelerate_page_logged_in, step_recorder: StepRecorder, request):
+        page = dns_accelerate_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过DNS加速功能验证")
+        failures = []
+        print("\n" + "=" * 50)
+        print("DNS加速功能验证(L5 dig解析)")
+        print("=" * 50)
+
+        def _dig_router():
+            """client dig路由器DNS解析TEST_DOMAIN, 返回(成功, 解析IP列表)."""
+            bv.connect_client()
+            out = bv._client.exec(
+                f"dig @{self.ROUTER_DNS} {self.TEST_DOMAIN} +short +time=3 +tries=2 2>/dev/null",
+                timeout=15)
+            ips = [l.strip() for l in (out or "").splitlines()
+                   if l.strip() and l.strip()[0].isdigit()]
+            return bool(ips), ips, (out or "").strip()[:120]
+
+        orig_enabled = None
+        try:
+            # 保存原始开启状态(测试后恢复)
+            try:
+                page.navigate_to_dns_accelerate()
+                page.page.wait_for_timeout(800)
+                orig_enabled = page.get_basic_config().get("enabled", False)
+            except Exception:
+                orig_enabled = None
+
+            # 基线: 关闭DNS加速 → dig路由器应无解析(53不监听)
+            with rec.step("基线: 关闭DNS加速", "dig @路由器 应无解析(53不监听)"):
+                page.navigate_to_dns_accelerate()
+                page.page.wait_for_timeout(800)
+                page.save_basic_config(enable=False)
+                page.page.wait_for_timeout(2500)
+                ok, ips, raw = _dig_router()
+                rec.add_detail(f"  dig @{self.ROUTER_DNS} {self.TEST_DOMAIN}: {raw or '无输出'}")
+                if ok:
+                    rec.add_detail(f"  ⚠️基线即解析({ips}), 可能53有其他监听, 记录")
+                else:
+                    rec.add_detail(f"  ✓ 基线无解析(关闭DNS加速符合预期)")
+
+            # 开启DNS加速(UDP + 标准DNS + 强制代理)
+            with rec.step("开启DNS加速", f"cachemode=UDP dns1=114.114.114.114 proxy_force=1"):
+                page.navigate_to_dns_accelerate()
+                page.page.wait_for_timeout(800)
+                ok = page.save_basic_config(enable=True, dns1="114.114.114.114",
+                                            cachemode="UDP", proxy_force=True)
+                if not ok:
+                    failures.append("开启DNS加速失败")
+                    rec.add_detail("  ✗ 开启失败")
+                else:
+                    rec.add_detail("  ✓ 开启DNS加速成功")
+                    page.page.wait_for_timeout(2500)
+
+            # L1-L4 后端验证(数据库+ikdnsd.conf+iptables DNSPROXY+ikdnsd进程/UDP53)
+            if not failures:
+                with rec.step("L1-L4后端验证", "数据库(dns_config)+ikdnsd.conf+iptables DNSPROXY+ikdnsd进程/UDP53"):
+                    chain = bv.verify_dns_basic_full_chain(expect_enabled=True, proxy_force=True)
+                    for r in chain.results:
+                        rec.add_detail(f"  {r.level}: {'[OK]' if r.passed else '[FAIL]'} {r.message}")
+                        if not r.passed:
+                            failures.append(f"{r.level}: {r.message}")
+
+            # L5: client dig路由器 → 解析到A记录
+            if not failures:
+                with rec.step("L5 dig解析验证", f"client dig @{self.ROUTER_DNS} {self.TEST_DOMAIN} 应解析到A记录"):
+                    ok, ips, raw = _dig_router()
+                    rec.add_detail(f"  dig结果: {raw or '无输出'}")
+                    if ok:
+                        rec.add_detail(f"  ✓ DNS加速生效(client经路由器解析到{len(ips)}个IP: {ips[:3]})")
+                    else:
+                        rec.add_detail("  ✗ DNS加速未生效(dig无解析)")
+                        failures.append(f"DNS加速dig未解析: {raw or '空'}")
+        finally:
+            # 恢复原始开启状态
+            try:
+                page.navigate_to_dns_accelerate()
+                page.page.wait_for_timeout(500)
+                if orig_enabled is not None:
+                    page.save_basic_config(enable=orig_enabled)
+            except Exception:
+                pass
+        print(f"\n[DNS加速功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"DNS加速功能验证失败({len(failures)}项): {'; '.join(failures)}"
+

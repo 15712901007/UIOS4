@@ -1269,3 +1269,130 @@ class TestPortRouteComprehensive:
             for f in ssh_failures:
                 print(f"  - {f}")
         assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
+
+
+@pytest.mark.port_route
+@pytest.mark.network
+class TestPortRouteFlowVerification:
+    """端口分流功能验证(命中+选路, 硬断言): 两场景(指定IP/不指定)×多端口→mangle Δpkts>0+conntrack含目标WAN.
+
+    分流=选路非阻断(流量仍通,从指定WAN出). 命中铁证=mangle STREAM_IPPORT_NEW counter Δpkts>0;
+    选路铁证=conntrack client流 remote_if含目标WAN. iptables L4可靠(不走DPI)→6.12下应正常硬PASS.
+    两场景: ①src_addr=client_ip(仅该IP生效) ②src_addr空(全IP生效). 多端口(80=http/443=https)逐个curl验."""
+
+    PREFIX = "prflow_"
+    TARGET_WAN = "wan2"
+    # (端口, 协议标签, curl URL)
+    TEST_PORTS = [("80", "http", "http://www.baidu.com/"),
+                  ("443", "https", "https://www.baidu.com/")]
+
+    def test_port_route_flow(self, port_route_page_logged_in, step_recorder: StepRecorder, request):
+        page = port_route_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过端口分流功能验证")
+        client_ip = "192.168.148.2"
+        target_wan = self.TARGET_WAN
+        failures = []
+        print("\n" + "=" * 50)
+        print(f"端口分流功能验证(两场景×{len(self.TEST_PORTS)}端口)")
+        print("=" * 50)
+
+        def _force_clean():
+            try:
+                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM stream_ipport WHERE tagname LIKE '{self.PREFIX}%'\"")
+                bv._router.exec("/usr/ikuai/script/stream_ipport.sh init 2>/dev/null")
+            except Exception:
+                pass
+
+        def _verify_port(rule_name, rid, dport, url):
+            """单端口命中+选路: 清conntrack→curl×3→mangle Δpkts(命中)+conntrack含目标WAN(选路)."""
+            cnt_before = bv.read_mangle_counter("STREAM_IPPORT_NEW", int(rid))
+            bv.clear_client_conntrack(client_ip)
+            bv.connect_client()
+            curl_cmd = "curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 "
+            if url.startswith("https"):
+                curl_cmd += "-k "
+            curl_cmd += url
+            for _ in range(3):
+                bv._client.exec(curl_cmd, timeout=15)
+            cnt_after = bv.read_mangle_counter("STREAM_IPPORT_NEW", int(rid))
+            delta = cnt_after - cnt_before
+            # 选路铁证: client连接mark==规则--set-mark(NTH_CONNMARK的remote_if不可靠, 同协议分流:
+            # baidu:80连接mark=规则值=被匹配+打标+--set-ifname选路; 未匹配的DNS等mark=0走默认WAN,
+            # 混入conntrack remote_if→wans误读成默认WAN. 故用mark判定, remote_if仅辅助展示)
+            rule_mark = bv.read_mangle_rule_mark("STREAM_IPPORT_NEW", int(rid))
+            client_marks = bv.conntrack_client_marks(client_ip)
+            wans = bv.conntrack_client_wans(client_ip, proto="tcp")  # 辅助参考(时序不可靠)
+            hit = delta > 0
+            selected = rule_mark > 0 and rule_mark in client_marks
+            ok = hit and selected
+            rec.add_detail(f"    {'✓' if ok else '✗'} dport={dport}: Δpkts={delta} mark={rule_mark}(命中:{rule_mark in client_marks}) remote_if={wans}")
+            if not hit:
+                failures.append(f"{rule_name}/dport={dport} 未命中(Δpkts={delta})")
+            if not selected:
+                failures.append(f"{rule_name}/dport={dport} 未选路(规则mark={rule_mark}不在client连接mark{client_marks})")
+
+        def _run_scenario(scenario_label, rule_prefix, src_addr):
+            src_desc = src_addr or "空(全IP生效)"
+            with rec.step(scenario_label, f"{len(self.TEST_PORTS)}端口(80/443) line={target_wan} src_addr={src_desc}"):
+                for dport, proto_label, url in self.TEST_PORTS:
+                    rname = f"{rule_prefix}{dport}"
+                    page.navigate_to_port_route()
+                    page.page.wait_for_timeout(500)
+                    try:
+                        page.delete_rule(rname)
+                        page.page.wait_for_timeout(300)
+                    except Exception:
+                        pass
+                    _force_clean()
+                    ok = page.add_rule(rname, diversion_type="外网线路", line=target_wan,
+                                       protocol="tcp", dst_port=dport, src_addr=src_addr, priority=1)
+                    if not ok:
+                        failures.append(f"{scenario_label}/dport={dport} 建规则失败")
+                        rec.add_detail(f"  ✗ 建规则失败 dport={dport}")
+                        continue
+                    page.page.wait_for_timeout(1500)
+                    rule = bv.find_stream_ipport_rule(tagname=rname)
+                    rid = rule.get("id") if rule else None
+                    rec.add_detail(f"  ✓ 建规则 dport={dport}({proto_label}) id={rid} src_addr={src_desc}")
+                    if rid:
+                        # L1-L4 后端验证(报告体现: 数据库→iptables(STREAM_IPPORT_NEW)→策略路由→ik_core模块)
+                        for _r in (
+                            bv.verify_stream_ipport_database(rname, expected_fields={"enabled": "yes"}),
+                            bv.verify_stream_ipport_iptables(rid),
+                            bv.verify_stream_ipport_policy_routing(),
+                            bv.verify_stream_ipport_kernel(),
+                        ):
+                            rec.add_detail(f"  {_r.level}: {'[OK]' if _r.passed else '[FAIL]'} {_r.message}")
+                            if not _r.passed:
+                                failures.append(f"{_r.level}-{rname}: {_r.message}")
+                        _verify_port(rname, rid, dport, url)
+                    try:
+                        page.navigate_to_port_route()
+                        page.page.wait_for_timeout(300)
+                        page.delete_rule(rname)
+                    except Exception:
+                        pass
+                    _force_clean()
+
+        try:
+            with rec.step("基线探活", "curl baidu --interface ens11 应通(确认环境经路由器)"):
+                bv.connect_client()
+                base = bv.verify_connectivity(dst_domain="www.baidu.com")
+                rec.add_detail(f"  基线: {base['detail']}")
+                if not base["connected"]:
+                    pytest.skip(f"基线baidu经ens11不可达, 跳过端口分流功能验证: {base['detail']}")
+            _run_scenario("场景1: 指定内网IP(仅该IP生效)", f"{self.PREFIX}srcip_", client_ip)
+            _run_scenario("场景2: 不指定内网IP(全IP生效)", f"{self.PREFIX}allip_", None)
+        finally:
+            try:
+                page.navigate_to_port_route()
+                page.page.wait_for_timeout(500)
+            except Exception:
+                pass
+            _force_clean()
+        print(f"\n[端口分流功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"端口分流功能验证失败({len(failures)}项): {'; '.join(failures)}"

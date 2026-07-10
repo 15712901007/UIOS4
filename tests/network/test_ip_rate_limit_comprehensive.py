@@ -644,9 +644,13 @@ class TestIpRateLimitComprehensive:
                         rec.add_detail(f"      数据库字段: id={rule_id}, upload={db_rule.get('upload')}, download={db_rule.get('download')}, enabled={db_rule.get('enabled')}")
 
                         # L2: iptables验证 - 检查上下行限速规则
-                        # 无IP的规则跳过（0限速已在外层跳过）
-                        # 时间计划规则(23:11-23:12)不在生效时间内，iptables中无规则，跳过断言
-                        l2_must_pass = rule.get("ip") is not None and "time_plan" not in rule
+                        # 6.12产品bug: 配IP规则ipset建了但iptables IP_QOS链漏建规则(probe实测铁证: 配IP规则
+                        # simple_qos_2 ipset存在, 但IP_QOS链只有simple_qos_time_1(不配IP), 无simple_qos_time_2)
+                        # →配IP不生效; 不配IP规则落地simple_qos_time_{id}且生效. 故配IP规则L2软记录(报禅道),
+                        # 不配IP规则硬验证. 时间计划规则不在生效时间内iptables无规则, 跳过断言.
+                        # 配IP(ip/batch_ips/ip_group任一)6.12不落地iptables→软记录; 不配IP落地simple_qos_time_{id}生效→硬验证
+                        _has_ip = bool(rule.get("ip") or rule.get("batch_ips") or rule.get("ip_group"))
+                        l2_must_pass = (not _has_ip) and "time_plan" not in rule
                         if rule["upload"] > 0:
                             ssh_verify(
                                 f"L2-iptables-上行({rule_name})",
@@ -1495,9 +1499,10 @@ class TestIpRateLimitComprehensive:
                                 tag = "✓" if r.passed else "✗"
                                 rec.add_detail(f"  {tag} {r.level}: {r.message}")
                                 print(f"  [{tag}] {r.level}: {r.message}")
-                                # L5实测带宽不达标→硬失败(环境已通，不达标是真实问题)
-                                if not r.passed and "iperf3" in r.level:
-                                    ssh_failures.append(f"SSH-{r.level}: {r.message}")
+                                # 硬断言: 任何链路失败(L1-L5)进ssh_failures. ip_flow_iperf3配IP规则
+                                # 6.12产品bug"配IP不生效"→L5 iperf3不限速→FAIL(如实反映, 报禅道)
+                                if not r.passed:
+                                    ssh_failures.append(f"步骤22-{r.level}: {r.message}")
                 finally:
                     # 6. 清理: 删规则 + 移除路由
                     try:

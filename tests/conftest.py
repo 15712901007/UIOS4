@@ -191,27 +191,40 @@ TEST_NAME_MAPPING = {
     'test_ip_rate_limit_comprehensive': 'IP限速综合测试',
     'test_mac_rate_limit_comprehensive': 'MAC限速综合测试',
     'test_static_route_comprehensive': '静态路由综合测试',
+    'test_static_route_flow': '静态路由功能验证(ping环回)',
     'test_cross_layer_service_comprehensive': '跨三层服务综合测试',
     'test_multi_wan_lb_comprehensive': '多线负载综合测试',
     'test_protocol_route_comprehensive': '协议分流综合测试',
     'test_port_route_comprehensive': '端口分流综合测试',
     'test_domain_route_comprehensive': '域名分流综合测试',
     'test_updown_route_comprehensive': '上下行分离综合测试',
+    'test_port_route_flow': '端口分流功能验证(命中+选路)',
+    'test_protocol_route_flow': '协议分流功能验证(命中+选路)',
+    'test_multi_wan_lb_flow': '多线负载功能验证(分布)',
+    'test_updown_route_flow': '上下行分流功能验证(双向)',
+    'test_domain_route_flow': '域名分流功能验证(选路)',
     'test_upnp_setting_comprehensive': 'UPnP/NAT设置综合测试',
     'test_igmp_proxy_comprehensive': 'IGMP代理综合测试',
     'test_iptv_comprehensive': 'IPTV透传综合测试',
     'test_udp_proxy_comprehensive': 'UDPXY设置综合测试',
     'test_nat_rule_comprehensive': 'NAT规则综合测试',
+    'test_snat_flow': 'NAT规则-源地址NAT功能验证(命中打流)',
     'test_port_map_comprehensive': '端口映射综合测试',
     'test_dmz_host_comprehensive': 'DMZ主机综合测试',
+    'test_port_map_flow': '端口映射功能验证(DNAT打流)',
+    'test_dmz_host_flow': 'DMZ功能验证(NETMAP打流)',
     'test_dns_accelerate_comprehensive': 'DNS加速服务综合测试',
     'test_dns_multi_line_comprehensive': '多线路DNS服务综合测试',
     'test_stream_control_comprehensive': '智能流控综合测试',
+    'test_alone_limit_flow': '智能流控-终端独立限速功能验证(打流实测)',
     'test_dhcp_server_comprehensive': 'DHCP服务端综合测试',
     'test_dhcp_static_comprehensive': 'DHCP静态分配综合测试',
     'test_dhcp_lease_comprehensive': 'DHCP客户端综合测试',
     'test_dhcp_acl_mac_comprehensive': 'DHCP黑白名单综合测试',
+    'test_dhcp_server_flow': 'DHCP服务端功能验证(dhclient获取)',
+    'test_dhcp_acl_mac_flow': 'DHCP黑白名单功能验证(黑名单拒获取)',
     'test_acl_comprehensive': '安全中心-ACL规则综合测试',
+    'test_acl_flow_verification': '安全中心-ACL功能验证(多协议打流+端到端drop)',
     'test_conn_limit_comprehensive': '安全中心-连接数限制综合测试',
     'test_mac_access_control_comprehensive': '安全中心-MAC访问控制综合测试',
     'test_app_protocol_comprehensive': '安全中心-应用协议控制综合测试',
@@ -1096,6 +1109,41 @@ def acl_flow_env(backend_verifier):
 
 
 @pytest.fixture(scope="function")
+def stream_control_flow_env(backend_verifier):
+    """智能流控打流验证环境(function级): uname探活(6.12仅记录不skip) + client策略路由经路由器QoS链 +
+    iperf3 server探活(失败skip不FAIL) + teardown清理.
+
+    复用add_route_via_router确保client内网IP流量经路由器imq/QoS链(限速才生效).
+    6.12不skip: 智能流控QoS(sch_htb)路径≠peerconns(连接跟踪宕机)≠L7 DPI(坏),
+    分流5模块6.12打流全跑完未宕机→预期智能流控打流也不触发宕机."""
+    if backend_verifier is None:
+        pytest.skip("paramiko未安装, 跳过智能流控打流验证")
+    backend_verifier.connect_router()
+    backend_verifier.connect_client()
+    # uname探活(6.12仅记录, 不skip: QoS路径与peerconns/DPI不同, 预期不宕机)
+    try:
+        kver = backend_verifier._router.exec("uname -r").strip()
+        if kver:
+            note = " (6.12: 留意QoS是否生效, 限速不生效则软记录)" if "6.12" in kver else ""
+            print(f"[智能流控打流] 内核 {kver}{note}")
+    except Exception:
+        pass
+    backend_verifier.add_route_via_router(backend_verifier._ssh_config.iperf3_server)
+    probe = backend_verifier.run_iperf3(direction='upload', duration=1, port=5201)
+    if "error" in probe or not probe.get("end"):
+        try:
+            backend_verifier.remove_route(backend_verifier._ssh_config.iperf3_server)
+        except Exception:
+            pass
+        pytest.skip(f"iperf3 server不可达或路由不通, 跳过打流: {str(probe)[:80]}")
+    yield backend_verifier
+    try:
+        backend_verifier._client.exec("pkill -f 'iperf3 -c' 2>/dev/null")
+    except Exception:
+        pass
+
+
+@pytest.fixture(scope="function")
 def app_proto_flow_env(backend_verifier):
     """应用协议控制打流环境(function级): client host路由到baidu(确保经路由器DPI) + baidu可达探活(失败skip不FAIL) + teardown删路由.
     iperf3不触发L7 DPI, 用HTTP curl baidu打流(baidu appid=5060173).
@@ -1545,6 +1593,14 @@ def pytest_runtest_logreport(report):
         # 获取步骤记录器中的步骤
         recorder = get_step_recorder()
         steps = recorder.get_steps()
+
+        # 步骤details含FAIL/✗时, 强制step status=failed(让报告一眼看出失败步骤,
+        # 原rec.step无异常自动标passed, ssh_verify的FAIL只在details不反映到status)
+        for _step in steps:
+            if _step.get('status') == 'passed':
+                _details_text = ' '.join(_step.get('details', []))
+                if 'FAIL' in _details_text or '✗' in _details_text:
+                    _step['status'] = 'failed'
 
         # 统计步骤数
         step_count = len(steps)

@@ -49,7 +49,9 @@ def run_vpn_comprehensive_test(*, page, rec, request,
             return None
         try:
             result = func(*args, **kwargs)
-            status = '[OK]' if result.passed else '[FAIL]'
+            # 软断言(must_pass=False)的FAIL显示[软断言]而非[FAIL], 避免报告误标步骤失败
+            # (L2连接等软记录: 拨号依赖VPN服务端, 环境无服务器时未连接属预期, 不应让步骤标红)
+            status = '[OK]' if result.passed else ('[软断言]' if not must_pass else '[FAIL]')
             print(f"    SSH-{label}: {status} - {result.message}")
             rec.add_detail(f"    SSH-{label}: {status} {result.message}")
             if getattr(result, 'raw_output', ''):

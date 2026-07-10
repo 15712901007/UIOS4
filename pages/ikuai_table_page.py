@@ -126,26 +126,39 @@ class IkuaiTablePage(BasePage):
             return False
 
     def disable_rule(self, rule_name: str) -> bool:
-        """停用指定规则（有确认弹窗, 确认点击短超时快速失败）"""
-        self._click_rule_button(rule_name, "停用")
+        """停用指定规则（有确认弹窗）.
+
+        返回值语义=停用操作是否成功发起(找到并点击"停用"按钮+点确认).
+        产品是否真生效由调用方用SSH L1(enabled=no)权威验证——UI成功提示文案/时序不稳,
+        硬等"停用成功"会把已生效的操作误判为失败(见智能流控步骤19/25: UI报FAIL但SSH enabled=no [OK]).
+        """
+        clicked = self._click_rule_button(rule_name, "停用")
+        if not clicked:
+            return False
         self.page.wait_for_timeout(500)
         self._click_visible_confirm(timeout=4000)
-
+        # 成功提示为辅(短超时不影响返回值), 真实生效由SSH L1判定
         try:
-            self.page.wait_for_selector("text=停用成功", timeout=5000)
-            return True
+            self.page.wait_for_selector(".ant-message-success", timeout=3000)
         except Exception:
-            return self.wait_for_success_message()
+            pass
+        return True
 
     def enable_rule(self, rule_name: str) -> bool:
-        """启用指定规则（无确认弹窗）"""
-        self._click_rule_button(rule_name, "启用")
+        """启用指定规则（无确认弹窗）.
 
+        返回值语义=启用操作是否成功发起(找到并点击"启用"按钮).
+        产品是否真生效由调用方用SSH L1(enabled=yes)权威验证.
+        """
+        clicked = self._click_rule_button(rule_name, "启用")
+        if not clicked:
+            return False
+        # 成功提示为辅(短超时不影响返回值), 真实生效由SSH L1判定
         try:
-            self.page.wait_for_selector("text=启用成功", timeout=5000)
-            return True
+            self.page.wait_for_selector(".ant-message-success", timeout=3000)
         except Exception:
-            return self.wait_for_success_message()
+            pass
+        return True
 
     def edit_rule(self, rule_name: str):
         """点击编辑按钮，进入编辑页面"""
@@ -681,7 +694,14 @@ class IkuaiTablePage(BasePage):
             self.page.wait_for_timeout(1500)
 
             dialog = self.page.locator("dialog, [role='dialog']")
-            if dialog.count() == 0 or not dialog.is_visible():
+            if dialog.count() == 0:
+                return True
+            # 多dialog时(如导入弹窗+结果提示同时存在, 清空导入场景常见)取first判断,
+            # 避免strict mode violation(locator匹配多元素时is_visible报错→误判导入失败)
+            try:
+                if not dialog.first.is_visible(timeout=1000):
+                    return True
+            except Exception:
                 return True
 
             self.close_modal_if_exists()

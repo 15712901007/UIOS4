@@ -246,8 +246,10 @@ class TestIgmpProxyComprehensive:
                        must_pass=True, expected_fields={"enabled": "no"})
             ssh_verify("L2-进程验证", backend_verifier.verify_igmp_proxy_process,
                        must_pass=False, expect_running=False)
-            ssh_verify("L3-配置文件", backend_verifier.verify_igmp_proxy_config_file,
-                       must_pass=False, expect_exists=False)
+            # 产品关闭IGMP后保留conf(只停进程+enabled=no, 不删conf=常见设计);
+            # 功能关闭已由L1(enabled=no)+L2(进程停)确认, conf存在属正常不应期望不存在
+            ssh_verify("L3-配置文件(关闭后保留)", backend_verifier.verify_igmp_proxy_config_file,
+                       must_pass=False, expect_exists=True)
 
         # ========== 步骤7: 不选上联端口直接保存 ==========
         with rec.step("步骤7: 前端校验-不选上联端口", "不选择上联端口直接保存,验证前端校验"):

@@ -75,6 +75,35 @@ class TestPortMapComprehensive:
                     ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
                 return None
 
+        def verify_import_iptables(label):
+            """导入后验证DB所有规则在iptables DSTNAT链生效(捕获产品bug: 导入后iptables可能不生成).
+
+            产品'导入'功能存在iptables同步缺陷: 导入后DB写了规则但iptables DSTNAT链不生成对应DNAT,
+            导致规则不生效。本验证遍历DB实际规则逐条查iptables, 缺失则记⚠产品BUG(软记录, 报告体现)。
+            """
+            if backend_verifier is None:
+                return
+            try:
+                db_rules = backend_verifier.query_port_maps()
+                ipt_ok, ipt_fail = 0, []
+                for r in db_rules:
+                    lan = r.get("lan_addr", "")
+                    if not lan:
+                        continue
+                    res = backend_verifier.verify_port_map_iptables(
+                        tagname=r.get("tagname", ""), lan_addr=lan,
+                        wan_port=r.get("wan_port", ""), expect_rules=True)
+                    if res.passed:
+                        ipt_ok += 1
+                    else:
+                        ipt_fail.append(r.get("tagname", "?"))
+                rec.add_detail(f"  L2-{label}后iptables生效: {ipt_ok}/{len(db_rules)}条")
+                if ipt_fail:
+                    rec.add_detail(f"  ⚠ [产品BUG] {label}后iptables DSTNAT未生效: {ipt_fail}")
+                    print(f"  [WARN] 产品BUG: {label}后{len(ipt_fail)}条iptables未生效(DB有规则但iptables空)")
+            except Exception as e:
+                rec.add_detail(f"  L2-{label}iptables验证异常: {str(e)[:80]}")
+
         # 测试数据 - 覆盖映射类型/协议/端口格式的各种组合
         test_rules = [
             # Rule 1: 外网接口+tcp+单端口(最基础)
@@ -840,6 +869,9 @@ class TestPortMapComprehensive:
                 else:
                     print(f"  [WARN] 追加导入后数量未增加")
                     rec.add_detail(f"  [WARN] 数量未增加")
+
+                # L2验证: 导入的规则是否在iptables DSTNAT链真正生效(补漏: 之前只验count没验iptables)
+                verify_import_iptables("导入追加")
             else:
                 print(f"  [WARN] CSV文件不存在")
                 rec.add_detail(f"  CSV文件不存在")
@@ -874,6 +906,19 @@ class TestPortMapComprehensive:
                 if count_after > 0:
                     print(f"  [OK] 重新导入 {count_after} 条")
                     rec.add_detail(f"  [OK] 重新导入 {count_after} 条")
+
+                # L2验证: 导入的规则是否在iptables DSTNAT链真正生效(补漏: 之前只验count没验iptables)
+                verify_import_iptables("导入清空")
+
+                # 产品"导入清空"删DB可能不同步清理iptables DSTNAT→检测+主动清理额外规则残留
+                if backend_verifier is not None:
+                    stale = backend_verifier.verify_port_map_iptables(
+                        tagname="额外PM规则", lan_addr="192.168.1.200",
+                        wan_port="19999", expect_rules=False)
+                    if not stale.passed:
+                        rec.add_detail(f"  ⚠ [导入清空]未立即同步清理iptables(产品待查): {stale.message}")
+                        n = backend_verifier.cleanup_port_map_iptables(lan_addr="192.168.1.200")
+                        rec.add_detail(f"  ✓ 已清理iptables残留 {n} 条")
             else:
                 print(f"  [WARN] TXT文件不存在")
                 rec.add_detail(f"  TXT文件不存在")
@@ -916,6 +961,9 @@ class TestPortMapComprehensive:
                 rec.add_detail("  无需清理")
 
             if backend_verifier is not None:
+                # 兜底: 清理测试数据(192.168.1.x)可能的iptables残留, 再验证DSTNAT链干净
+                backend_verifier.cleanup_port_map_iptables(lan_addr="192.168.1.")
+                page.page.wait_for_timeout(1500)
                 ssh_verify("L1-最终清理", backend_verifier.verify_port_map_iptables,
                            must_pass=False, expect_rules=False)
 
@@ -992,3 +1040,140 @@ class TestPortMapComprehensive:
             for f in all_failures:
                 print(f"  - {f}")
             assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
+
+
+@pytest.mark.port_map
+@pytest.mark.network
+class TestPortMapFlowVerification:
+    """端口映射功能验证(L5 DNAT打流, 硬断言): 建映射→外网访问wan3口→conntrack DNAT条目=生效.
+
+    端口映射=DNAT(外网访问路由器WAN口:外端口→内网IP:内端口). 用wan3(避开wan1管理网段).
+    L5铁证=conntrack DNAT条目(orig dst=wan_ip:外端口, reply src=内网IP:内端口), SYN即触发不依赖hairpin连通."""
+
+    PREFIX = "pmflow_"
+    WAN_IFACE = "wan3"
+    WAN_IP = "10.66.0.43"      # wan3外网IP(环境变化改此常量)
+    LAN_IP = "192.168.148.2"   # client ens11内网IP(映射目标)
+    LAN_PORT = "5201"
+    WAN_PORT = "15201"         # 外网端口(避开常用端口冲突)
+
+    def test_port_map_flow(self, port_map_page_logged_in, step_recorder: StepRecorder, request):
+        page = port_map_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过端口映射功能验证")
+        rule_name = f"{self.PREFIX}dnat"
+        failures = []
+        print("\n" + "=" * 50)
+        print("端口映射功能验证(L5 DNAT打流)")
+        print("=" * 50)
+
+        def _force_clean():
+            try:
+                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM dst_nat WHERE tagname LIKE '{self.PREFIX}%'\"")
+                bv._router.exec("/usr/ikuai/script/dnat.sh init 2>/dev/null")
+            except Exception:
+                pass
+
+        def _trigger_dnat():
+            """client外网侧(10.66.0.18)发SYN到wan3:WAN_PORT, 触发PREROUTING DNAT建conntrack条目."""
+            bv.connect_client()
+            for _ in range(3):
+                bv._client.exec(
+                    f"curl -s -o /dev/null --connect-timeout 2 -m 3 http://{self.WAN_IP}:{self.WAN_PORT}/ 2>/dev/null",
+                    timeout=8)
+
+        try:
+            # 环境检查: 动态获取wan3 IP + client外网侧可达
+            with rec.step("环境检查", "动态获取wan3 IP + client可达"):
+                bv.connect_router()
+                import re
+                wan_ip_out = bv._router.exec("ip -4 addr show wan3 2>/dev/null")
+                m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', wan_ip_out)
+                wan_ip = m.group(1) if m else ""
+                if not wan_ip:
+                    pytest.skip("未获取到wan3 IP(路由器无wan3接口?), 跳过端口映射功能验证")
+                self.WAN_IP = wan_ip
+                bv.connect_client()
+                ping = bv._client.exec(f"ping -c 1 -W 2 {wan_ip} 2>/dev/null | grep -c '1 received'")
+                if ping.strip() == "0":
+                    pytest.skip(f"client无法访问wan3 {wan_ip}, 跳过端口映射功能验证")
+                rec.add_detail(f"  ✓ wan3={wan_ip} 可达")
+
+            # 建端口映射: wan3:15201 → 192.168.148.2:5201 tcp
+            with rec.step("建端口映射规则", f"{self.WAN_IFACE}:{self.WAN_PORT}→{self.LAN_IP}:{self.LAN_PORT} tcp"):
+                page.navigate_to_port_map()
+                page.page.wait_for_timeout(800)
+                try:
+                    page.delete_rule(rule_name)
+                    page.page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                _force_clean()
+                ok = page.add_rule(rule_name, lan_addr=self.LAN_IP, lan_port=self.LAN_PORT,
+                                   wan_port=self.WAN_PORT, protocol="tcp",
+                                   map_type="外网接口", external_interfaces=[self.WAN_IFACE])
+                if not ok:
+                    failures.append(f"建规则失败: {rule_name}")
+                    rec.add_detail("  ✗ 建规则失败")
+                else:
+                    page.page.wait_for_timeout(2000)
+                    rule = bv.find_port_map(rule_name)
+                    rec.add_detail(f"  ✓ 建规则 id={rule.get('id') if rule else '?'}")
+
+            if not failures:
+                # L1-L4 后端验证(报告体现全链路: 数据库→iptables(DSTNAT链)→运行时→nf_nat内核模块)
+                with rec.step("L1-L4后端验证", "数据库+iptables(DSTNAT链)+运行时+nf_nat内核模块"):
+                    chain = bv.verify_port_map_full_chain(
+                        rule_name,
+                        expected_fields={"protocol": "tcp", "lan_addr": self.LAN_IP,
+                                         "wan_port": self.WAN_PORT, "lan_port": self.LAN_PORT},
+                        lan_addr=self.LAN_IP, wan_port=self.WAN_PORT, protocol="tcp",
+                    )
+                    for r in chain.results:
+                        rec.add_detail(f"  {r.level}: {'[OK]' if r.passed else '[FAIL]'} {r.message}")
+                        if not r.passed:
+                            failures.append(f"{r.level}: {r.message}")
+
+                # L5: 触发DNAT + 查conntrack DNAT条目(铁证)
+                with rec.step("L5 DNAT验证", f"外网访问{self.WAN_IP}:{self.WAN_PORT}→conntrack DNAT到{self.LAN_IP}:{self.LAN_PORT}"):
+                    _trigger_dnat()
+                    res = bv.verify_dnat_conntrack(self.WAN_IP, self.WAN_PORT, self.LAN_IP, self.LAN_PORT)
+                    rec.add_detail(f"  {res.message}")
+                    if res.raw_output:
+                        rec.add_detail(f"  conntrack: {res.raw_output}")
+                    if res.passed:
+                        rec.add_detail("  ✓ 端口映射DNAT生效(数据平面)")
+                    else:
+                        rec.add_detail("  ✗ 端口映射未生效(无DNAT条目)")
+                        failures.append(f"端口映射DNAT未生效: {res.message}")
+
+                # 删规则→验证DNAT消失(恢复)
+                with rec.step("删规则恢复", "删映射→再访问→DNAT应消失"):
+                    page.navigate_to_port_map()
+                    page.page.wait_for_timeout(500)
+                    try:
+                        page.delete_rule(rule_name)
+                    except Exception:
+                        pass
+                    _force_clean()
+                    page.page.wait_for_timeout(1500)
+                    _trigger_dnat()
+                    res2 = bv.verify_dnat_conntrack(self.WAN_IP, self.WAN_PORT, self.LAN_IP, self.LAN_PORT)
+                    if res2.passed:
+                        rec.add_detail("  ✗ 删规则后仍有DNAT(规则残留)")
+                        failures.append("删规则后DNAT仍存在(残留)")
+                    else:
+                        rec.add_detail("  ✓ 删规则后DNAT消失(恢复)")
+        finally:
+            try:
+                page.navigate_to_port_map()
+                page.page.wait_for_timeout(500)
+                page.delete_rule(rule_name)
+            except Exception:
+                pass
+            _force_clean()
+        print(f"\n[端口映射功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"端口映射功能验证失败({len(failures)}项): {'; '.join(failures)}"

@@ -188,11 +188,13 @@ class TestMultiWanLbComprehensive:
             print(f"  [OK] 所有 {len(test_rules)} 条规则添加成功")
             rec.add_detail(f"  [OK] 所有 {len(test_rules)} 条规则添加成功（7种负载模式全覆盖）")
 
-        # ========== 步骤3.5: 后台数据验证 ==========
+        # ========== 步骤3.5-3.8: 分层后台数据验证(SSH) ==========
         if backend_verifier is not None:
-            with rec.step("步骤3.5: 后台数据验证（SSH）", "SSH验证每条规则的数据库状态"):
-                print("\n[步骤3.5] 后台数据验证...")
-                rec.add_detail("[SSH后台验证] 字段映射: mode=整数0-6, isp_name=英文标识")
+            # --- 步骤3.5: L1 数据库验证(逐条) ---
+            with rec.step("步骤3.5: L1数据库验证", "逐条验证7条规则的lb_pcc表字段(mode/isp_name/comment)"):
+                print("\n[步骤3.5] L1数据库验证...")
+                rec.add_detail("[SSH分层] L1=数据库, L2=策略路由(fwmark), L3=转发数据面(conntrack), L4=内核(ik_core+dmesg)")
+                rec.add_detail("字段映射: mode=整数0-6, isp_name=英文标识")
 
                 verify_passed = 0
                 for rule in test_rules:
@@ -225,27 +227,44 @@ class TestMultiWanLbComprehensive:
                                        f"isp_name={db_rule.get('isp_name')}, weight={db_rule.get('weight')}")
                         verify_passed += 1
 
-                print(f"  [OK] 后台验证完成: {verify_passed}/{len(test_rules)} 条通过")
-                rec.add_detail(f"  -- 汇总: {verify_passed}/{len(test_rules)} 条验证通过 --")
+                print(f"  [OK] L1数据库验证完成: {verify_passed}/{len(test_rules)} 条通过")
+                rec.add_detail(f"  -- 汇总: {verify_passed}/{len(test_rules)} 条L1验证通过 --")
 
-            # L2: 策略路由验证
-            ssh_verify(
-                "L2-策略路由",
-                backend_verifier.verify_lb_pcc_policy_routing,
-                must_pass=False,
-                expected_wan_interfaces=["wan1", "wan2", "wan3"],
-            )
+            # --- 步骤3.6: L2 策略路由验证(fwmark) ---
+            with rec.step("步骤3.6: L2策略路由验证", "ip rule fwmark 0x271X lookup wanX + 各WAN路由表(智能软硬:全缺=硬/部分缺=软)"):
+                print("\n[步骤3.6] L2策略路由验证...")
+                # must_pass=True: 让函数内部硬结论(全部WAN缺fwmark=策略路由未生效)真正进ssh_failures;
+                # 部分缺失时函数返回passed=True不阻断(可能线路未连接). 修复原must_pass=False硬结论被吞的残留bug.
+                ssh_verify(
+                    "L2-策略路由",
+                    backend_verifier.verify_lb_pcc_policy_routing,
+                    must_pass=True,
+                    expected_wan_interfaces=["wan1", "wan2", "wan3"],
+                )
 
-            # L3/L4: 内核验证(ik_core + dmesg + conntrack)
-            # ik_core是多线负载的内核基础必须加载, 改硬断言(must_pass=True)避免软断言被吞(原只L1生效)
-            ssh_verify(
-                "L3/L4-内核",
-                backend_verifier.verify_lb_pcc_kernel,
-                must_pass=True,
-                expect_enabled=True,
-            )
+            # --- 步骤3.7: L3 转发数据面验证(conntrack,软断言) ---
+            with rec.step("步骤3.7: L3转发数据面验证", "conntrack remote_if=wanX标记(数据面fwmark落地证据, 软断言中性化)"):
+                print("\n[步骤3.7] L3转发数据面验证...")
+                # 软: 综合测试无受控打流, conntrack采样可能采空, L3中性化不阻断(分布硬验证在L5)
+                ssh_verify(
+                    "L3-数据面",
+                    backend_verifier.verify_lb_pcc_dataplane,
+                    must_pass=False,
+                    expect_marked=True,
+                )
+
+            # --- 步骤3.8: L4 内核控制面验证(ik_core+dmesg,硬断言) ---
+            with rec.step("步骤3.8: L4内核控制面验证", "ik_core模块加载 + dmesg[LB]启用状态(硬断言)"):
+                print("\n[步骤3.8] L4内核控制面验证...")
+                # 硬: ik_core必须加载, LB必须启用, 否则多线负载内核基础不存在
+                ssh_verify(
+                    "L4-内核",
+                    backend_verifier.verify_lb_pcc_kernel,
+                    must_pass=True,
+                    expect_enabled=True,
+                )
         else:
-            print("\n[步骤3.5] 后台数据验证: 跳过（未配置SSH）")
+            print("\n[步骤3.5-3.8] 分层后台数据验证: 跳过（未配置SSH）")
 
         # ========== 步骤4: 编辑第1条规则 ==========
         with rec.step("步骤4: 编辑规则", "编辑第1条规则的名称"):
@@ -791,20 +810,47 @@ class TestMultiWanLbComprehensive:
             page.page.wait_for_load_state("networkidle")
             page.page.wait_for_timeout(1000)
 
+            # SSH计数(权威,优先); 无SSH退回UI计数
+            def _ssh_count():
+                if backend_verifier is not None:
+                    try:
+                        return len(backend_verifier.query_lb_pcc_rules() or [])
+                    except Exception:
+                        return None
+                return None
+
             current_count = page.get_rule_count()
-            if current_count > 0:
-                select_all = page.page.locator("thead input[type='checkbox']").first
-                if select_all.count() > 0 and select_all.is_enabled():
-                    select_all.click()
-                    page.page.wait_for_timeout(500)
+            ssh_cnt = _ssh_count()
+            rec.add_detail(f"  清理前: UI={current_count}条, SSH={ssh_cnt}")
+
+            if current_count > 0 or (ssh_cnt and ssh_cnt > 0):
+                # 重试3次确保删干净(参照步骤12-14, 防批量删除假成功→步骤20提硬的前置保证)
+                cleaned = False
+                for attempt in range(3):
+                    select_all = page.page.locator("thead input[type='checkbox']").first
+                    if select_all.count() > 0 and select_all.is_enabled():
+                        select_all.click()
+                        page.page.wait_for_timeout(500)
                     page.batch_delete()
                     page.page.wait_for_timeout(1500)
+                    page.page.reload()
+                    page.page.wait_for_timeout(500)
+                    ssh_cnt = _ssh_count()
+                    ui_cnt = page.get_rule_count()
+                    rec.add_detail(f"  第{attempt + 1}次删除后: UI={ui_cnt}, SSH={ssh_cnt}")
+                    if (ssh_cnt is not None and ssh_cnt == 0) or (ssh_cnt is None and ui_cnt == 0):
+                        cleaned = True
+                        break
+                    print(f"  第{attempt + 1}次清理后仍有残留(UI={ui_cnt},SSH={ssh_cnt}),重试...")
 
-                page.page.reload()
-                page.page.wait_for_timeout(500)
                 final_count = page.get_rule_count()
-                print(f"  [OK] 清理完成，剩余 {final_count} 条")
-                rec.add_detail(f"[结果] 剩余 {final_count} 条")
+                if cleaned:
+                    print(f"  [OK] 清理完成，规则已清零")
+                    rec.add_detail(f"  [OK] 规则已清零(SSH计数=0)")
+                else:
+                    print(f"  [WARN] 3次清理后仍有残留: UI={final_count}, SSH={_ssh_count()}")
+                    rec.add_detail(f"  [WARN] 3次清理后仍有残留(批量删除假成功?)")
+                    ui_failures.append(f"步骤18清理未清零(UI={final_count}条残留)")
             else:
                 print("  [OK] 无需清理")
                 rec.add_detail("  无需清理")
@@ -835,16 +881,27 @@ class TestMultiWanLbComprehensive:
         print("  - 异常输入: 空名称/重复/超长/特殊字符/纯空格")
         print("  - 自定义运营商: 添加/删除")
         print("  - 批量操作: 批量停用/启用/删除")
-        print("  - SSH后台验证: L1数据库 + L2策略路由 + L3/L4内核(ik_core+dmesg+conntrack)")
+        print("  - SSH分层后台验证: L1数据库 + L2策略路由(fwmark) + L3数据面(conntrack) + L4内核(ik_core+dmesg)")
 
-        # 清理后验证LB已禁用
+        # ========== 步骤20: 清理后分层验证LB已禁用(SSH) ==========
         if backend_verifier is not None:
-            ssh_verify(
-                "L3/L4-清理后",
-                backend_verifier.verify_lb_pcc_kernel,
-                must_pass=False,
-                expect_enabled=False,
-            )
+            with rec.step("步骤20: 清理后验证LB已禁用", "删光规则后L4内核必禁用(硬,LB必然disable lb)/L3数据面软"):
+                print("\n[步骤20] 清理后分层验证...")
+                # L4内核(硬): 实测确认删光规则必然触发dmesg disable lb → LB必禁用.
+                #   步骤18已SSH计数重试确保规则清零,此处提硬: 仍启用=清理未净/LB未停,必FAIL
+                ssh_verify(
+                    "L4-清理后内核",
+                    backend_verifier.verify_lb_pcc_kernel,
+                    must_pass=True,
+                    expect_enabled=False,
+                )
+                # L3数据面: 规则清后conntrack remote_if条目随连接老化消失(残留属正常) → 软
+                ssh_verify(
+                    "L3-清理后数据面",
+                    backend_verifier.verify_lb_pcc_dataplane,
+                    must_pass=False,
+                    expect_marked=False,
+                )
 
         # SSH断言
         all_failures = ssh_failures + ui_failures
@@ -853,3 +910,92 @@ class TestMultiWanLbComprehensive:
             for f in ssh_failures:
                 print(f"  - {f}")
         assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
+
+
+@pytest.mark.multi_wan_lb
+@pytest.mark.network
+class TestMultiWanLbFlowVerification:
+    """多线负载功能验证(分布, 硬断言): 建wan1+wan2负载→多流→conntrack分散到多WAN=负载生效.
+
+    多线负载走ik_core fwmark(无iptables链); 验conntrack多个client流remote_if集合≥2 WAN=分散.
+    未分散到≥2 WAN→FAIL(观测不到分布即功能未生效)."""
+
+    PREFIX = "lbflow_"
+
+    def test_multi_wan_lb_flow(self, multi_wan_lb_page_logged_in, step_recorder, request):
+        page = multi_wan_lb_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过多线负载功能验证")
+        client_ip = "192.168.148.2"
+        rule_name = f"{self.PREFIX}balance"
+        failures = []
+        print("\n" + "=" * 50)
+        print("多线负载功能验证(分布)")
+        print("=" * 50)
+
+        def _force_clean():
+            try:
+                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM lb_pcc WHERE tagname LIKE '{self.PREFIX}%'\"")
+                bv._router.exec("/usr/ikuai/script/lb_pcc.sh init 2>/dev/null")
+            except Exception:
+                pass
+
+        try:
+            with rec.step("清理残留", f"删{self.PREFIX}规则"):
+                page.navigate_to_multi_wan_lb()
+                page.page.wait_for_timeout(1000)
+                try:
+                    page.delete_rule(rule_name)
+                    page.page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                _force_clean()
+            with rec.step("建wan1+wan2负载规则", "load_mode=新建连接数/weights wan1:1,wan2:1"):
+                page.navigate_to_multi_wan_lb()
+                page.page.wait_for_timeout(800)
+                ok = page.add_rule(rule_name, load_mode="新建连接数", carrier="全部",
+                                   weights={"wan1": "1", "wan2": "1"})
+                if not ok:
+                    failures.append(f"建规则失败: {rule_name}")
+                    rec.add_detail("  ✗ 建规则失败")
+                else:
+                    page.page.wait_for_timeout(2000)
+                    rule = bv.find_lb_pcc_rule(tagname=rule_name)
+                    rec.add_detail(f"  ✓ 建规则 id={rule.get('id') if rule else '?'}")
+            # L1-L4 后端验证(报告体现: 数据库→策略路由(LB fwmark)→数据面(conntrack中性)→ik_core内核)
+            if not failures:
+                with rec.step("L1-L4后端验证", "数据库(lb_pcc)+策略路由(LB fwmark)+数据面(conntrack)+ik_core内核"):
+                    for _r in (
+                        bv.verify_lb_pcc_database(rule_name, expected_fields={"enabled": "yes"}),
+                        bv.verify_lb_pcc_policy_routing(expected_wan_interfaces=["wan1", "wan2"]),
+                        bv.verify_lb_pcc_dataplane(expect_marked=True, expected_wan_interfaces=["wan1", "wan2"]),
+                        bv.verify_lb_pcc_kernel(expect_enabled=True),
+                    ):
+                        rec.add_detail(f"  {_r.level}: {'[OK]' if _r.passed else '[FAIL]'} {_r.message}")
+                        if not _r.passed:
+                            failures.append(f"{_r.level}: {_r.message}")
+            with rec.step("分布验证", "8次curl→conntrack client流WAN集合应≥2"):
+                bv.clear_client_conntrack(client_ip)
+                bv.connect_client()
+                for _ in range(8):
+                    bv._client.exec("curl -s -o /dev/null --interface ens11 --connect-timeout 3 -m 6 http://www.baidu.com/", timeout=12)
+                wans = bv.conntrack_client_wans(client_ip, proto="tcp")
+                rec.add_detail(f"  client流 remote_if集合: {wans}")
+                if len(wans) >= 2:
+                    rec.add_detail(f"  ✓ 负载分布生效(流量分散到 {wans})")
+                else:
+                    rec.add_detail(f"  ✗ 负载分布未生效(仅 {wans}, 应≥2 WAN分散)")
+                    failures.append(f"负载分布未生效: client流仅走 {wans}(8流应分散到≥2 WAN)")
+        finally:
+            try:
+                page.navigate_to_multi_wan_lb()
+                page.page.wait_for_timeout(500)
+                page.delete_rule(rule_name)
+            except Exception:
+                pass
+            _force_clean()
+        print(f"\n[多线负载功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"多线负载功能验证失败({len(failures)}项): {'; '.join(failures)}"

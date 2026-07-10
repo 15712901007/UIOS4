@@ -84,30 +84,43 @@ class VlanPage(IkuaiTablePage):
         return self
 
     def select_line(self, line: str):
-        """选择线路(lan1/wan1等物理口, 或已建VLAN名用于QINQ内层)"""
-        self.page.get_by_role("combobox", name="线路").click(force=True)
-        self.page.wait_for_timeout(500)
-        # 优先用Ant Select下拉选项定位(option角色/.ant-select-item-option), 选VLAN名(QINQ)更可靠;
-        # 异常输入场景combobox/dropdown portal未渲染, 默认30s超时×多子项会累积卡死, 用短超时.
-        for loc in (
-            self.page.get_by_role("option", name=line, exact=True),
-            self.page.locator(f".ant-select-item-option[title='{line}']"),
-        ):
-            try:
-                if loc.count() > 0:
-                    loc.first.click(force=True, timeout=5000)
-                    return self
-            except Exception:
-                continue
-        # 降级: get_by_title nth(1)→first→跳过(原逻辑, 兼容)
-        title_items = self.page.get_by_title(line, exact=True)
+        """选择线路(lan1/wan1等物理口, 或已建VLAN名用于QINQ内层).
+
+        QINQ内层选VLAN名时下拉选项动态生成, 需真实click触发React打开下拉
+        (force=True不触发→下拉不开→选不到VLAN名→VLAN55建错成lan1非QINQ).
+        先Escape关残留下拉(子网掩码等), 真实click打开, 等下拉容器visible, 重试3次."""
+        # 关闭可能残留的下拉(子网掩码/前次操作)
         try:
-            title_items.nth(1).click(force=True, timeout=5000)
+            self.page.keyboard.press("Escape")
+            self.page.wait_for_timeout(200)
         except Exception:
+            pass
+        combobox = self.page.get_by_role("combobox", name="线路")
+        for attempt in range(3):
+            # 真实click触发React打开下拉(force=True不触发→下拉不开)
             try:
-                title_items.first.click(force=True, timeout=5000)
+                combobox.click(timeout=3000)
             except Exception:
-                print(f"[DEBUG] select_line: 未能选中线路'{line}'(异常表单状态), 跳过")
+                combobox.click(force=True, timeout=3000)
+            self.page.wait_for_timeout(600)
+            # 等下拉容器渲染
+            try:
+                self.page.locator(".ant-select-dropdown:visible").first.wait_for(state="visible", timeout=3000)
+            except Exception:
+                pass
+            for loc in (
+                self.page.locator(f".ant-select-item-option[title='{line}']:visible"),
+                self.page.get_by_role("option", name=line, exact=True),
+                self.page.get_by_title(line, exact=True),
+            ):
+                try:
+                    cnt = loc.count()
+                    if cnt > 0:
+                        loc.nth(cnt - 1).click(timeout=5000)
+                        return self
+                except Exception:
+                    continue
+        print(f"[DEBUG] select_line: 未能选中线路'{line}', 跳过(已重试3次)")
         return self
 
     # ==================== 添加VLAN ====================

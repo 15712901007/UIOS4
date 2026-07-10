@@ -798,7 +798,33 @@ class AclPage(IkuaiTablePage):
 
     # ==================== 清理 ====================
     def clean_test_rules(self, prefix: str = "acl_t_") -> int:
-        """前端逐条删除prefix开头的规则(兜底清理, 不依赖batch)."""
+        """前端删除prefix开头的规则: 优先批量(选中所有prefix行+batch_delete, 参考VLAN), 残留则逐条兜底.
+        只选中prefix行(不全选), 避免误删用户已有ACL规则."""
+        # 1. 批量: 选中所有prefix行(select_rule多选不互斥) + batch_delete
+        try:
+            names = self.page.evaluate("""(pfx) => {
+                const rows=[...document.querySelectorAll('div.ant-table-row')];
+                const found=[];
+                for(const r of rows){
+                    const txt=(r.innerText||'').trim();
+                    const first=txt.split(/\\s|\\n/)[0]||'';
+                    if(first.startsWith(pfx)) found.push(first);
+                }
+                return found;
+            }""", prefix)
+            if names:
+                for nm in names:
+                    try:
+                        self.select_rule(nm)
+                    except Exception:
+                        pass
+                self.page.wait_for_timeout(600)
+                if self._wait_selection_active(timeout=2000):
+                    self.batch_delete()
+                    self.page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        # 2. 逐条兜底(批量后仍有残留或批量未生效时)
         cnt = 0
         for _ in range(50):
             try:

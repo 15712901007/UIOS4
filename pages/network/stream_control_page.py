@@ -559,11 +559,26 @@ class StreamControlPage(BasePage):
             return False
 
     def enable_line(self, line_name: str) -> bool:
-        """启用单条线路(点该行的'启用'按钮)"""
+        """启用单条线路(已启用则幂等返回True, 否则点'启用'按钮).
+
+        返回值语义=启用操作成功(已启用/点击成功); 真实生效由SSH qos_switch=1权威验证.
+        幂等检查避免"全部启用后再次启用单条"时该行显示"停用"按钮→找不到"启用"→误判失败
+        (见综合测试步骤3: enable_all_lines后enable_line(wan1)报FAIL但SSH qos_switch=1 [OK]).
+        """
+        try:
+            if self.is_line_enabled(line_name):
+                return True
+        except Exception:
+            pass
         return self._click_line_action(line_name, "启用")
 
     def disable_line(self, line_name: str) -> bool:
-        """停用单条线路(点该行的'停用'按钮)"""
+        """停用单条线路(已停用则幂等返回True, 否则点'停用'按钮)."""
+        try:
+            if not self.is_line_enabled(line_name):
+                return True
+        except Exception:
+            pass
         return self._click_line_action(line_name, "停用")
 
     def _click_line_action(self, line_name: str, action: str) -> bool:

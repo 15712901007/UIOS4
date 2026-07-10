@@ -720,3 +720,119 @@ class TestDhcpServerComprehensive:
                 print(f"  - {f}")
         assert not ssh_failures, \
             f"SSH验证失败({len(ssh_failures)}项): {'; '.join(ssh_failures)}"
+
+
+@pytest.mark.dhcp_server
+@pytest.mark.network
+class TestDhcpServerFlowVerification:
+    """DHCP服务端功能验证(L5 dhclient获取, 硬断言): client释放+重新获取→验证拿到IP+网关+DNS+路由器租约.
+
+    DHCP服务端=ik_dhcpd分配IP/网关/DNS. client ens11已是DHCP动态获取(MAC=d4:20:00:b1:45:ec, 免密sudo).
+    L5: sudo dhclient -r释放+重新获取, 验证拿到192.168.148.x+网关192.168.148.1+DNS, 路由器leases.db有租约.
+    ik_dhcpd不工作(磁盘满崩溃等)→client拿不到IP→FAIL. SSH经外网10.66.0.18不受ens11断IP影响."""
+
+    GATEWAY = "192.168.148.1"
+    CLIENT_IFACE = "ens11"
+
+    def test_dhcp_server_flow(self, dhcp_server_page_logged_in, step_recorder: StepRecorder, request):
+        page = dhcp_server_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过DHCP服务端功能验证")
+        failures = []
+        print("\n" + "=" * 50)
+        print("DHCP服务端功能验证(L5 dhclient获取)")
+        print("=" * 50)
+
+        def _release_renew():
+            """client down/up ens11触发systemd-networkd重新DHCP(强制DISCOVER), 轮询等获取, 返回IP.
+            不用dhclient(client ISC 4.4.1不支持-t, 且与systemd-networkd冲突RTNETLINK File exists).
+            down/up后networkd重新DISCOVER; 黑名单时被DROP拿不到IP."""
+            bv.connect_client()
+            bv._client.exec(f"sudo ip link set {self.CLIENT_IFACE} down; sleep 2; sudo ip link set {self.CLIENT_IFACE} up", timeout=15)
+            for _ in range(8):
+                bv._client.exec("sleep 2", timeout=5)
+                out = bv._client.exec(f"ip -4 addr show {self.CLIENT_IFACE} 2>/dev/null | grep -oP 'inet \\K[0-9.]+'")
+                ip = out.strip()
+                if ip:
+                    return ip
+            return ""
+
+        try:
+            # L1-L4 后端验证(报告体现: 数据库→ik_dhcpd进程→ik_dhcpd.conf→UDP67运行时)
+            with rec.step("L1-L4后端验证", "数据库(dhcp_server)+ik_dhcpd进程+ik_dhcpd.conf+UDP67运行时"):
+                serving_name = None
+                try:
+                    all_srv = bv.query_all_dhcp_server() or []
+                    for srv in all_srv:
+                        pool = str(srv.get("addr_pool", "")) + str(srv.get("gateway", ""))
+                        if "192.168.148" in pool and srv.get("enabled") == "yes":
+                            serving_name = srv.get("tagname")
+                            break
+                    rec.add_detail(f"  服务于client子网的DHCP服务端: {serving_name or '未找到'}")
+                except Exception as e:
+                    rec.add_detail(f"  查询DHCP服务端规则异常: {str(e)[:80]}")
+                if serving_name:
+                    chain = bv.verify_dhcp_server_full_chain(
+                        name=serving_name, expect_in_conf=True, expect_process_running=True)
+                    for r in chain.results:
+                        rec.add_detail(f"  {r.level}: {'[OK]' if r.passed else '[FAIL]'} {r.message}")
+                        if not r.passed:
+                            failures.append(f"{r.level}: {r.message}")
+                else:
+                    rec.add_detail("  ⚠️未找到具名DHCP服务端规则, 退化验L2进程+L4运行时")
+                    rp = bv.verify_dhcp_server_process(expect_running=True)
+                    rec.add_detail(f"  {rp.level}: {'[OK]' if rp.passed else '[FAIL]'} {rp.message}")
+                    if not rp.passed:
+                        failures.append(f"{rp.level}: {rp.message}")
+                    rr = bv.verify_dhcp_server_runtime(expect_running=True)
+                    rec.add_detail(f"  {rr.level}: {'[OK]' if rr.passed else '[FAIL]'} {rr.message}")
+                    if not rr.passed:
+                        failures.append(f"{rr.level}: {rr.message}")
+
+            # 2. 获取client信息(MAC)
+            info = bv.get_client_lan_info()
+            client_mac = info.get("mac")
+            rec.add_detail(f"  client: iface={info.get('iface')} ip={info.get('ip')} mac={client_mac}")
+            if not client_mac:
+                pytest.skip("未获取到client MAC, 跳过DHCP服务端功能验证")
+
+            if not failures:
+                # 3. L5: 释放+重新获取, 验证IP+网关+DNS+租约
+                with rec.step("L5 dhclient获取验证", "释放ens11+重新DHCP→验证IP+网关+DNS+路由器租约"):
+                    new_ip = _release_renew()
+                    if new_ip and new_ip.startswith("192.168.1"):
+                        rec.add_detail(f"  ✓ 获取IP={new_ip}")
+                    else:
+                        rec.add_detail(f"  ✗ 未获取到有效IP(={new_ip})")
+                        failures.append(f"DHCP获取失败: 未拿到IP(={new_ip})")
+                    # 网关
+                    gw_out = bv._client.exec("ip route 2>/dev/null | grep default")
+                    rec.add_detail(f"  默认路由: {gw_out.strip()}")
+                    if self.GATEWAY in gw_out:
+                        rec.add_detail(f"  ✓ 网关={self.GATEWAY}")
+                    else:
+                        rec.add_detail(f"  ✗ 网关不符(期望{self.GATEWAY})")
+                        failures.append(f"DHCP网关不符: {gw_out.strip()}")
+                    # DNS
+                    dns_out = bv._client.exec("cat /etc/resolv.conf 2>/dev/null | grep nameserver | head -2")
+                    rec.add_detail(f"  DNS: {dns_out.strip()}")
+                    if not dns_out.strip():
+                        rec.add_detail("  ✗ 无DNS")
+                        failures.append("DHCP未分配DNS")
+                    # 路由器租约
+                    lease = bv.verify_lease_in_db(mac=client_mac)
+                    rec.add_detail(f"  路由器租约: {lease.message}")
+                    if not lease.passed:
+                        failures.append(f"路由器无client租约: {lease.message}")
+        finally:
+            # 确保client恢复IP
+            try:
+                bv.connect_client()
+                bv._client.exec(f"sudo dhclient -1 -t 20 {self.CLIENT_IFACE} 2>/dev/null", timeout=30)
+            except Exception:
+                pass
+        print(f"\n[DHCP服务端功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"DHCP服务端功能验证失败({len(failures)}项): {'; '.join(failures)}"

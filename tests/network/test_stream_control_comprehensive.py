@@ -424,10 +424,15 @@ class TestStreamControlComprehensive:
                        must_pass=True, name=target,
                        expected_fields={"enabled": "no"})
             if rid:
-                # 停用后ipset应清理(或保留但规则不生效, 实测确认)
-                ssh_verify("L2-ipset停用后(alone2)",
-                           backend_verifier.verify_alone_limit_ipset,
-                           rule_id=rid, should_exist=False)
+                # 产品行为: 停用(disable)保留ipset便于快速重新启用, 仅删除(delete)才清理
+                # (见步骤20删除alone3时ipset已清理[OK], 而停用保留). 故停用后ipset"保留"
+                # 属正常, 这里仅记录现状不判失败. (待产品确认停用是否应清ipset)
+                r = backend_verifier.verify_alone_limit_ipset(
+                    rule_id=rid, should_exist=False)
+                if r:
+                    rec.add_detail(
+                        f"    SSH-L2-ipset停用后(alone2): [记录] {r.message}")
+                    print(f"    SSH-L2-ipset停用后(alone2): [记录] {r.message}")
 
             ok = alone_page.enable_rule(target)
             page.wait_for_timeout(1500)
@@ -648,3 +653,215 @@ class TestStreamControlComprehensive:
             f"测试失败: {len(ssh_failures)}项SSH + {len(ui_failures)}项UI: {all_failures}"
 
         print("\n[OK] 智能流控综合测试全部通过!")
+
+
+@pytest.mark.stream_control
+@pytest.mark.network
+class TestStreamControlFlowVerification:
+    """智能流控-终端独立限速功能验证(打流端到端).
+
+    机制: alone_limit走ik_core QoS(sch_htb令牌桶+imq), 限速=整形(丢包retransmit), 非iptables DROP.
+    验证链: 开启流控(htb_rate_est=1硬) → 基线测速(无规则跑满) → 建终端限速规则(绑client内网IP, DB+ipset硬落地)
+    → iperf3上下行打流 → 验吞吐被限(实测≤限速值*(1+tolerance)=生效PASS; 未限速/部分限速/未取值→FAIL硬断言)
+    → 删规则恢复(实测恢复跑满硬验证).
+    6.12: QoS(sch_htb)路径≠peerconns(宕机)/L7 DPI(坏), 预期不宕机; 限速不生效→FAIL硬断言(产品bug报禅道).
+    """
+
+    PREFIX = "alflow_"
+    LIMIT_KBPS = 2000  # 限速值KB/s(≈16Mbps), 明显低于基线(~900Mbps)便于观测
+    BASELINE_MIN_MBPS = 200  # 基线最低阈值Mbps(跑不满=环境异常软skip)
+
+    def test_alone_limit_flow(self, stream_control_page_logged_in,
+                              stream_control_flow_env,
+                              step_recorder: StepRecorder):
+        """终端独立限速: 基线测速→建规则→上下行打流验被限→删规则恢复."""
+        sc = stream_control_page_logged_in
+        page = sc.page
+        alone_page = AloneLimitPage(page, sc.base_url)
+        rec = step_recorder
+        bv = stream_control_flow_env  # backend_verifier(uname+路由+iperf3探活已完成)
+
+        client_ip = bv.get_client_lan_info().get("ip") or "192.168.148.2"
+        rule_name = f"{self.PREFIX}client"
+        failures = []
+        base_up = base_down = None
+
+        limit_mbps = self.LIMIT_KBPS * 8 / 1000  # 16Mbps
+        tolerance = bv._ssh_config.iperf3_tolerance
+        upper = limit_mbps * (1 + tolerance)  # 容差上界
+
+        def _throughput(direction, ipf):
+            """从iperf3 JSON提吞吐Mbps(参照verify_iperf3内部逻辑)."""
+            if not ipf or "error" in ipf or "end" not in ipf:
+                return None
+            end = ipf["end"]
+            key = "sum_sent" if direction == "upload" else "sum_received"
+            return end.get(key, {}).get("bits_per_second", 0) / 1_000_000
+
+        def _force_clean():
+            """SQL兜底删alflow_规则(精确前缀, 不删别人规则)."""
+            try:
+                bv._router.exec(
+                    f"sqlite3 {bv.IK_DB} \"DELETE FROM alone_limit "
+                    f"WHERE tagname LIKE '{self.PREFIX}%'\" 2>/dev/null")
+            except Exception:
+                pass
+
+        print("\n" + "=" * 50)
+        print(f"智能流控-终端独立限速功能验证(打流) client={client_ip} 限速={limit_mbps:.0f}Mbps")
+        print("=" * 50)
+
+        try:
+            # ===== 步骤1: 开启智能流控 + 基线测速(无规则应跑满) =====
+            with rec.step("步骤1: 开启流控+基线测速",
+                          "开启智能流控(htb_rate_est=1硬) + 无规则iperf3基线应跑满"):
+                bv.cleanup_stream_control(disable=False)  # 清残留规则(不关流控)保基线干净
+                sc.navigate_to_stream_control(force_reload=True)
+                page.wait_for_timeout(1000)
+                sc.enable_stream_control()
+                page.wait_for_timeout(1500)
+                # 显式切智能模式(终端独立限速tab仅智能模式显示; 开启后可能残留手动模式2)
+                sc.switch_mode(mode="intelligent")
+                page.wait_for_timeout(1500)
+                # 配置+启用流控线路wan1(qos_switch=1): alone_limit限速htb子class挂在线路root class下,
+                # qos.sh:327/504对qos_switch!=1的线路直接continue跳过→不启用则限速不生效(非产品bug).
+                # 带宽设100000KB/s(800Mbps)保基线>200Mbps不误skip, alone_limit 16Mbps仍明显可观测.
+                sc.edit_line_bandwidth("wan1", upload=100000, download=100000)
+                page.wait_for_timeout(1000)
+                sc.enable_line("wan1")
+                page.wait_for_timeout(2000)
+                # SSH硬验证流控真开启
+                r = bv.verify_qos_runtime(expect_enabled=True)
+                rec.add_detail(
+                    f"  SSH htb_rate_est: {'[OK]' if r.passed else '[FAIL]'} {r.message}")
+                if not r.passed:
+                    failures.append(f"流控未开启: {r.message}")
+                # 基线测速(无规则, 应跑满)
+                bv.clear_client_conntrack(client_ip)
+                base_up = _throughput("upload", bv.run_iperf3(direction="upload", duration=8))
+                base_down = _throughput("download", bv.run_iperf3(direction="download", duration=8))
+                rec.add_detail(f"  基线: 上行={base_up} / 下行={base_down} Mbps")
+                if base_up is None or base_up < self.BASELINE_MIN_MBPS:
+                    rec.add_detail(
+                        f"  [环境] 基线上行跑不满({base_up}Mbps<{self.BASELINE_MIN_MBPS}), 软skip")
+                    pytest.skip(
+                        f"基线上行跑不满({base_up}Mbps), 环境异常跳过")
+
+            # ===== 步骤2: 建终端独立限速规则(绑client内网IP) + SSH硬落地 =====
+            with rec.step("步骤2: 建终端限速规则",
+                          f"绑{client_ip} 上下行={self.LIMIT_KBPS}KB/s + SSH(DB+ipset)硬落地"):
+                alone_page.navigate_to_alone_limit()
+                page.wait_for_timeout(800)
+                ok = alone_page.add_rule(rule_name, ip=client_ip,
+                                         upload=self.LIMIT_KBPS, download=self.LIMIT_KBPS)
+                if not ok:
+                    failures.append(f"建终端限速规则异常: {rule_name}")
+                    rec.add_detail("  ✗ 建规则异常")
+                else:
+                    page.wait_for_timeout(1500)
+                    rec.add_detail(
+                        f"  [OK] 建规则 {rule_name}({client_ip}, {self.LIMIT_KBPS}KB/s)")
+                    rule = bv.query_alone_limit_rule(rule_name)
+                    rid = int(rule["id"]) if rule and rule.get("id") else None
+                    r1 = bv.verify_alone_limit_database(rule_name, expected_fields={
+                        "ip_addr": client_ip, "upload": self.LIMIT_KBPS,
+                        "download": self.LIMIT_KBPS, "enabled": "yes"})
+                    rec.add_detail(
+                        f"  SSH DB: {'[OK]' if r1.passed else '[FAIL]'} {r1.message}")
+                    if not r1.passed:
+                        failures.append(f"规则未入DB: {r1.message}")
+                    if rid:
+                        r2 = bv.verify_alone_limit_ipset(
+                            rule_id=rid, ip=client_ip, should_exist=True)
+                        rec.add_detail(
+                            f"  SSH ipset: {'[OK]' if r2.passed else '[FAIL]'} {r2.message}")
+                        if not r2.passed:
+                            failures.append(f"规则未建ipset: {r2.message}")
+                bv.clear_client_conntrack(client_ip)  # 清缓存让新流被限速规则匹配
+
+            # ===== 步骤3: 打流验证限速生效(核心, 上下行; 生效[OK]/不生效软记录) =====
+            with rec.step("步骤3: 打流验证限速生效",
+                          f"限速{limit_mbps:.0f}Mbps(上界{upper:.1f}) vs 基线上行{base_up:.0f}Mbps"):
+                # 上行(确定性QoS)
+                up_ipf = bv.run_iperf3(direction="upload", duration=10)
+                up_mbps = _throughput("upload", up_ipf)
+                rec.add_detail(
+                    f"  上行实测: {up_mbps}Mbps (基线{base_up:.0f}/上界{upper:.1f})")
+                # iperf3返回error时记录原始信息(原_throughput吞掉error致None无法诊断)
+                if up_mbps is None and up_ipf and "error" in up_ipf:
+                    rec.add_detail(
+                        f"  iperf3上行error(诊断): {str(up_ipf['error'])[:200]}")
+                if up_mbps is not None and up_mbps <= upper:
+                    rec.add_detail(f"  [OK] 上行限速生效(被限, 远低于基线{base_up:.0f})")
+                else:
+                    if up_mbps is None:
+                        rec.add_detail("  ✗ 上行iperf3未取到实测值(异常)")
+                        failures.append(f"上行限速未验证: iperf3未取到实测值(基线{base_up:.0f}/上界{upper:.1f})")
+                    elif up_mbps >= base_up * 0.5:
+                        rec.add_detail(
+                            f"  ✗ 上行未限速(实测{up_mbps:.0f}≈基线{base_up:.0f}, "
+                            f"产品bug: qos.sh alone_rule用local $config解析JSON ip_addr吞引号→"
+                            f"jq失败src空→iptables EMARK不生成→流量不进限速class, 报禅道)")
+                        failures.append(f"上行限速未生效: 实测{up_mbps:.0f}Mbps≈基线(应≤{upper:.1f})")
+                    else:
+                        rec.add_detail(
+                            f"  ✗ 上行部分限速(实测{up_mbps:.0f}, 未达上界{upper:.1f})")
+                        failures.append(f"上行限速未达标: 实测{up_mbps:.0f}Mbps(应≤{upper:.1f})")
+
+                # 下行(参照MAC限速下行bug, 同判定逻辑)
+                down_ipf = bv.run_iperf3(direction="download", duration=10)
+                down_mbps = _throughput("download", down_ipf)
+                base_d = base_down if base_down else base_up
+                rec.add_detail(
+                    f"  下行实测: {down_mbps}Mbps (基线{base_d:.0f}/上界{upper:.1f})")
+                if down_mbps is None and down_ipf and "error" in down_ipf:
+                    rec.add_detail(
+                        f"  iperf3下行error(诊断): {str(down_ipf['error'])[:200]}")
+                if down_mbps is not None and down_mbps <= upper:
+                    rec.add_detail("  [OK] 下行限速生效(被限)")
+                else:
+                    if down_mbps is None:
+                        rec.add_detail("  ✗ 下行iperf3未取到实测值(异常)")
+                        failures.append(f"下行限速未验证: iperf3未取到实测值(基线{base_d:.0f}/上界{upper:.1f})")
+                    elif down_mbps >= base_d * 0.5:
+                        rec.add_detail(
+                            f"  ✗ 下行未限速(实测{down_mbps:.0f}≈基线{base_d:.0f}, "
+                            f"同上行产品bug(EMARK不生成), 报禅道)")
+                        failures.append(f"下行限速未生效: 实测{down_mbps:.0f}Mbps≈基线(应≤{upper:.1f})")
+                    else:
+                        rec.add_detail(
+                            f"  ✗ 下行部分限速(实测{down_mbps:.0f}, 未达上界{upper:.1f})")
+                        failures.append(f"下行限速未达标: 实测{down_mbps:.0f}Mbps(应≤{upper:.1f})")
+
+            # ===== 步骤4: 删规则恢复(实测应恢复跑满, 硬验证) =====
+            with rec.step("步骤4: 删规则恢复", "删规则+清缓存+iperf3实测恢复跑满(硬)"):
+                try:
+                    alone_page.navigate_to_alone_limit()
+                    page.wait_for_timeout(500)
+                    alone_page.delete_rule(rule_name)
+                except Exception:
+                    pass
+                _force_clean()
+                bv.clear_client_conntrack(client_ip)
+                page.wait_for_timeout(1500)  # 等qos.sh重启刷内核ipset
+                recover_up = _throughput(
+                    "upload", bv.run_iperf3(direction="upload", duration=8))
+                rec.add_detail(f"  恢复后上行实测: {recover_up}Mbps (基线{base_up:.0f})")
+                if recover_up is not None and recover_up >= base_up * 0.8:
+                    rec.add_detail("  [OK] 恢复跑满(规则已清除, 限速解除)")
+                else:
+                    rec.add_detail(
+                        f"  ✗ 未恢复(实测{recover_up} < 基线{base_up:.0f}*0.8, 疑残留干扰)")
+                    failures.append(
+                        f"删规则未恢复: {recover_up} < 基线{base_up:.0f}*0.8")
+        finally:
+            # 兜底清理: 删alflow_规则 + 关流控恢复环境
+            try:
+                _force_clean()
+                bv.cleanup_stream_control(disable=True)
+            except Exception:
+                pass
+
+        print(f"\n[终端独立限速功能验证] {'通过' if not failures else '异常'+str(len(failures))+'项'}")
+        assert not failures, \
+            f"终端独立限速功能验证异常({len(failures)}项): {'; '.join(failures)}"

@@ -84,14 +84,14 @@ class TestStaticRouteComprehensive:
             {"name": "sr_test_001", "line": "自动", "dest": "10.10.0.0", "mask": "255.255.255.0 (24)", "gateway": "192.168.148.1", "priority": 1, "remark": "基础路由-自动线路", "desc": "基础-自动线路"},
             # 路由2: wan1线路 + /16掩码
             {"name": "sr_test_002", "line": "wan1", "dest": "172.16.0.0", "mask": "255.255.0.0 (16)", "gateway": "10.66.0.1", "priority": 2, "remark": "wan1线路-大网段", "desc": "wan1+/16掩码"},
-            # 路由3: wan2线路 + 主机路由/32
-            {"name": "sr_test_003", "line": "wan2", "dest": "8.8.8.8", "mask": "255.255.255.255 (32)", "gateway": "172.20.10.100", "priority": 1, "remark": "wan2-主机路由", "desc": "wan2+主机路由"},
+            # 路由3: wan2线路 + 主机路由/32 (网关须在wan2直连网段内, 否则内核RTNETLINK unreachable拒装)
+            {"name": "sr_test_003", "line": "wan2", "dest": "8.8.8.8", "mask": "255.255.255.255 (32)", "gateway": "192.168.112.1", "priority": 1, "remark": "wan2-主机路由", "desc": "wan2+主机路由"},
             # 路由4: lan1线路 + /28掩码
             {"name": "sr_test_004", "line": "lan1", "dest": "192.168.200.0", "mask": "255.255.255.240 (28)", "gateway": "192.168.148.2", "priority": 3, "remark": "lan1-小子网", "desc": "lan1+/28掩码"},
             # 路由5: 无网关 + 高优先级
             {"name": "sr_test_005", "line": "自动", "dest": "10.20.0.0", "mask": "255.255.255.0 (24)", "gateway": "", "priority": 1, "remark": "无网关路由", "desc": "无网关"},
-            # 路由6: wan3线路 + 低优先级
-            {"name": "sr_test_006", "line": "wan3", "dest": "192.168.50.0", "mask": "255.255.255.0 (24)", "gateway": "192.168.148.1", "priority": 10, "remark": "wan3线路-低优先级", "desc": "wan3+低优先级"},
+            # 路由6: wan3线路 + 低优先级 (网关须在wan3直连网段内)
+            {"name": "sr_test_006", "line": "wan3", "dest": "192.168.50.0", "mask": "255.255.255.0 (24)", "gateway": "10.66.0.1", "priority": 10, "remark": "wan3线路-低优先级", "desc": "wan3+低优先级"},
             # 路由7: 无备注
             {"name": "sr_test_007", "line": "自动", "dest": "10.30.0.0", "mask": "255.255.254.0 (23)", "gateway": "192.168.148.1", "priority": 5, "remark": "", "desc": "无备注+/23掩码"},
             # 路由8: 完整信息
@@ -676,3 +676,176 @@ class TestStaticRouteComprehensive:
         print(f"\n{'='*60}")
         print(f"静态路由综合测试全部完成！共 19 个步骤")
         print(f"{'='*60}")
+
+
+@pytest.mark.static_route
+@pytest.mark.network
+class TestStaticRouteFlowVerification:
+    """静态路由功能验证(L5 路由器ping环回, 硬断言): 建静态路由→路由器ping client环回→通=生效→删恢复.
+
+    静态路由=路由表指定目标网段→下一跳. client lo有环回10.99.99.1/32(ip_forward=1),
+    路由器建10.99.99.0/24→下一跳10.66.0.18(client enp2s0).
+    L5: 基线路由器ping 10.99.99.1不通(无路由)→建静态路由→ping通+traceroute下一跳→删恢复ping不通.
+    不用再搭设备(client环回作目标). client ping 10.99.99.1走本地lo, 故用路由器ping验路由器路由表."""
+
+    PREFIX = "srflow_"
+    DEST_NET = "10.99.99.0"
+    DEST_MASK = "255.255.255.0 (24)"
+    GATEWAY = "10.66.0.18"      # client enp2s0(下一跳, 10.99.99.1在client lo)
+    PING_TARGET = "10.99.99.1"  # client lo环回
+
+    def test_static_route_flow(self, static_route_page_logged_in, step_recorder: StepRecorder, request):
+        import re
+        page = static_route_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过静态路由功能验证")
+        rule_name = f"{self.PREFIX}route"
+        failures = []
+        print("\n" + "=" * 50)
+        print("静态路由功能验证(L5 路由器ping环回)")
+        print("=" * 50)
+
+        def _router_ping_target():
+            """路由器ping 10.99.99.1, 返回(transmitted, received)."""
+            bv.connect_router()
+            out = bv._router.exec(f"ping -c 3 -W 2 {self.PING_TARGET} 2>/dev/null", timeout=20)
+            m = re.search(r'(\d+)\s+packets transmitted.*?(\d+)\s+received', out)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+            return 0, 0
+
+        try:
+            # 1. 基线: 路由器ping 10.99.99.1不通(无静态路由)
+            with rec.step("基线: 路由器ping 10.99.99.1", "无静态路由时应不通(10.99.99.1不可达)"):
+                t, r = _router_ping_target()
+                rec.add_detail(f"  ping {self.PING_TARGET}: {r}/{t} received")
+                if r > 0:
+                    rec.add_detail(f"  ⚠️基线即通({r}/{t}), 10.99.99.1可能已有路由")
+                else:
+                    rec.add_detail(f"  ✓ 基线不通(无路由, 符合预期)")
+
+            # 2. 建静态路由: 10.99.99.0/24 → 下一跳 10.66.0.18
+            with rec.step("建静态路由", f"{self.DEST_NET}/24 → 下一跳{self.GATEWAY}"):
+                page.navigate_to_static_route()
+                page.page.wait_for_timeout(800)
+                try:
+                    page.delete_rule(rule_name)
+                    page.page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                try:
+                    bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM static_route WHERE tagname LIKE '{self.PREFIX}%'\" 2>/dev/null")
+                except Exception:
+                    pass
+                ok = page.add_route(rule_name, dest_address=self.DEST_NET,
+                                    subnet_mask=self.DEST_MASK, gateway=self.GATEWAY, line="自动")
+                if not ok:
+                    failures.append(f"建静态路由失败: {rule_name}")
+                    rec.add_detail("  ✗ 建规则失败")
+                else:
+                    page.page.wait_for_timeout(2000)
+                    rule = bv.find_static_route(rule_name)
+                    rec.add_detail(f"  ✓ 建规则 id={rule.get('id') if rule else '?'} dest={rule.get('dest') if rule else '?'} gw={rule.get('gateway') if rule else '?'}")
+
+            # L1-L3 后端验证(报告体现: 数据库→内核路由表→static_rt_table; 静态路由无独立内核模块故无L4)
+            if not failures:
+                with rec.step("L1-L3后端验证", "数据库(static_rt)+内核路由表(ip route)+static_rt_table路由表"):
+                    r1 = bv.verify_static_route_database(rule_name, expected_fields={
+                        "dst_addr": self.DEST_NET, "gateway": self.GATEWAY, "enabled": "yes"})
+                    rec.add_detail(f"  {r1.level}: {'[OK]' if r1.passed else '[FAIL]'} {r1.message}")
+                    if not r1.passed:
+                        failures.append(f"{r1.level}: {r1.message}")
+                    r2 = bv.verify_static_route_kernel(self.DEST_NET, "255.255.255.0", gateway=self.GATEWAY)
+                    rec.add_detail(f"  {r2.level}: {'[OK]' if r2.passed else '[FAIL]'} {r2.message}")
+                    if not r2.passed:
+                        failures.append(f"{r2.level}: {r2.message}")
+                    r3 = bv.verify_static_route_table(self.DEST_NET, gateway=self.GATEWAY)
+                    rec.add_detail(f"  {r3.level}: {'[OK]' if r3.passed else '[FAIL]'} {r3.message}")
+                    if not r3.passed:
+                        failures.append(f"{r3.level}: {r3.message}")
+
+            # 3. L5: 路由器ping 10.99.99.1 → 通(静态路由生效) + traceroute下一跳
+            if not failures:
+                with rec.step("L5 ping验证", f"建路由后ping {self.PING_TARGET} 应通 + traceroute下一跳{self.GATEWAY}"):
+                    t, r = _router_ping_target()
+                    rec.add_detail(f"  ping {self.PING_TARGET}: {r}/{t} received")
+                    if r > 0:
+                        rec.add_detail(f"  ✓ 静态路由生效(ping通)")
+                    else:
+                        rec.add_detail(f"  ✗ 静态路由未生效(ping不通)")
+                        failures.append(f"静态路由未生效: ping {self.PING_TARGET} {r}/{t}")
+                    tr_out = bv._router.exec(f"traceroute -n -w 2 -q 1 -m 5 {self.PING_TARGET} 2>/dev/null", timeout=25)
+                    tr_last = tr_out.strip().splitlines()[-1] if tr_out.strip() else "空"
+                    rec.add_detail(f"  traceroute末行: {tr_last}")
+                    if self.GATEWAY in tr_out:
+                        rec.add_detail(f"  ✓ traceroute经下一跳{self.GATEWAY}")
+                    else:
+                        rec.add_detail(f"  ⚠️traceroute未显{self.GATEWAY}(可能直连同网段)")
+
+            # 4. 停用静态路由 → ping不通(规则在但停用, 路由表不生效)
+            if not failures:
+                with rec.step("停用规则验证", "停用静态路由→ping应不通(规则在但不生效)"):
+                    page.navigate_to_static_route()
+                    page.page.wait_for_timeout(500)
+                    dis_ok = page.disable_rule(rule_name)
+                    page.page.wait_for_timeout(1500)
+                    is_dis = page.is_rule_disabled(rule_name)
+                    rec.add_detail(f"  停用={dis_ok}, is_disabled={is_dis}")
+                    t, r = _router_ping_target()
+                    rec.add_detail(f"  停用后ping {self.PING_TARGET}: {r}/{t} received")
+                    if r > 0:
+                        rec.add_detail(f"  ✗ 停用后仍通(停用未生效)")
+                        failures.append(f"停用未生效: ping仍通{r}/{t}")
+                    else:
+                        rec.add_detail(f"  ✓ 停用后不通(停用生效)")
+
+                # 5. 启用静态路由 → ping通(恢复)
+                with rec.step("启用规则验证", "启用静态路由→ping应通(恢复)"):
+                    page.navigate_to_static_route()
+                    page.page.wait_for_timeout(500)
+                    page.enable_rule(rule_name)
+                    page.page.wait_for_timeout(1500)
+                    t, r = _router_ping_target()
+                    rec.add_detail(f"  启用后ping {self.PING_TARGET}: {r}/{t} received")
+                    if r > 0:
+                        rec.add_detail(f"  ✓ 启用后通(启用生效)")
+                    else:
+                        rec.add_detail(f"  ✗ 启用后不通(启用未生效)")
+                        failures.append(f"启用未生效: ping不通{r}/{t}")
+
+            # 6. 删静态路由 → ping不通(恢复)
+            with rec.step("删规则恢复", "删静态路由→ping 10.99.99.1应不通"):
+                page.navigate_to_static_route()
+                page.page.wait_for_timeout(500)
+                try:
+                    page.delete_rule(rule_name)
+                except Exception:
+                    pass
+                try:
+                    bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM static_route WHERE tagname LIKE '{self.PREFIX}%'\" 2>/dev/null")
+                except Exception:
+                    pass
+                page.page.wait_for_timeout(1500)
+                t2, r2 = _router_ping_target()
+                rec.add_detail(f"  删后ping {self.PING_TARGET}: {r2}/{t2} received")
+                if r2 > 0:
+                    rec.add_detail(f"  ✗ 删规则后仍通(规则残留或已有路由)")
+                    failures.append("删规则后仍ping通(残留)")
+                else:
+                    rec.add_detail(f"  ✓ 删规则后不通(恢复)")
+        finally:
+            try:
+                page.navigate_to_static_route()
+                page.page.wait_for_timeout(500)
+                page.delete_rule(rule_name)
+            except Exception:
+                pass
+            try:
+                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM static_route WHERE tagname LIKE '{self.PREFIX}%'\" 2>/dev/null")
+            except Exception:
+                pass
+        print(f"\n[静态路由功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"静态路由功能验证失败({len(failures)}项): {'; '.join(failures)}"

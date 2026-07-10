@@ -1,3 +1,3 @@
-id=2 tagname=mac_t_b2 enabled=yes mac=aa:bb:cc:dd:ee:02 comment= time={"custom":[{"start_time":"00:00","end_time":"23:59","type":"weekly","comment":"","weekdays":"1234567"}],"object":{}} termname=
-id=3 tagname=mac_t_b3 enabled=yes mac=aa:bb:cc:dd:ee:03 comment= time={"custom":[{"start_time":"00:00","end_time":"23:59","type":"weekly","comment":"","weekdays":"1234567"}],"object":{}} termname=
-id=4 tagname=mac_t_b4 enabled=yes mac=aa:bb:cc:dd:ee:04 comment=黑名单备注 time={"object":{},"custom":[{"start_time":"00:00","end_time":"23:59","type":"weekly","comment":"","weekdays":"1234567"}]} termname=测试终端
+id=2 tagname=mac_t_b2 enabled=yes mac=aa:bb:cc:dd:ee:02 comment= time={"custom":[{"comment":"","weekdays":"1234567","start_time":"00:00","type":"weekly","end_time":"23:59"}],"object":{}} termname=
+id=3 tagname=mac_t_b3 enabled=yes mac=aa:bb:cc:dd:ee:03 comment= time={"custom":[{"comment":"","weekdays":"1234567","start_time":"00:00","type":"weekly","end_time":"23:59"}],"object":{}} termname=
+id=4 tagname=mac_t_b4 enabled=yes mac=aa:bb:cc:dd:ee:04 comment=黑名单备注 time={"custom":[{"comment":"","weekdays":"1234567","start_time":"00:00","type":"weekly","end_time":"23:59"}],"object":{}} termname=测试终端

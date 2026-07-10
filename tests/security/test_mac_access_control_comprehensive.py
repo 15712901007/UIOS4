@@ -331,6 +331,56 @@ class TestMacAccessControlComprehensive:
                 left = page.get_rule_count()
                 rec.add_detail(f"[批量删除后] 剩余 {left} 条")
 
+            # ==================== 步骤16: 功能连通性验证(黑名单阻断) ====================
+            with rec.step("步骤16: 功能连通性验证(黑名单阻断)", "基线curl→加client MAC黑名单→不通(硬)→移除恢复(硬)"):
+                if backend_verifier is None:
+                    rec.add_detail("[功能] 跳过(无SSH验证器)")
+                else:
+                    client_mac = "d4:20:00:b1:45:ec"  # client ens11 MAC(线上报文src MAC)
+                    flow_name = f"{PREFIX}flow_blk"
+                    try:
+                        backend_verifier.connect_client()
+                        # 基线: curl baidu经ens11应通
+                        base = backend_verifier.verify_connectivity(dst_domain="www.baidu.com")
+                        rec.add_detail(f"[基线] {base['detail']}")
+                        if not base["connected"]:
+                            rec.add_detail("[功能] baidu经ens11不可达, 跳过(环境)")
+                        else:
+                            # 黑名单加client MAC(ACL_MAC链-j DROP, 阻断该MAC经路由器所有流量;
+                            # SSH走enp2s0管理网不经路由器, 不受影响)
+                            res = page.add_rule(flow_name, client_mac)
+                            rec.add_detail(f"[加黑名单] mac={client_mac}: {res.get('success')} {res.get('error', '')}")
+                            page.page.wait_for_timeout(2000)
+                            # curl baidu应不通(client MAC被阻)
+                            blk = backend_verifier.verify_connectivity(dst_domain="www.baidu.com")
+                            rec.add_detail(f"[加MAC后] {blk['detail']}")
+                            if blk["connected"]:
+                                # 硬断言: 黑名单未阻断即FAIL. xt_set坏(6.12)致ACL_MAC规则未建→同样FAIL(如实反映, 报禅道)
+                                if backend_verifier.is_xt_set_broken():
+                                    rec.add_detail("  ✗ 黑名单未阻断(xt_set内核bug 6.12致ACL_MAC规则未建, 报禅道)")
+                                else:
+                                    rec.add_detail("  ✗ 黑名单未阻断(curl baidu仍可达)")
+                                ui_failures.append(f"步骤16: MAC黑名单未阻断: {blk['detail']}")
+                            else:
+                                rec.add_detail("  ✓ 黑名单阻断生效(curl baidu不通)")
+                            # 移除MAC→恢复
+                            page.navigate_to_mac_ctrl()
+                            page.page.wait_for_timeout(800)
+                            try:
+                                page.delete_rule(flow_name)
+                            except Exception:
+                                pass
+                            page.page.wait_for_timeout(2000)
+                            restore = backend_verifier.verify_connectivity(dst_domain="www.baidu.com")
+                            rec.add_detail(f"[移除MAC后] {restore['detail']}")
+                            if not restore["connected"]:
+                                rec.add_detail("  ✗ 移除MAC后baidu仍不通(规则残留/环境)")
+                                ui_failures.append(f"步骤16: 移除MAC未恢复: {restore['detail']}")
+                            else:
+                                rec.add_detail("  ✓ 恢复连通")
+                    except Exception as e:
+                        rec.add_detail(f"[功能] 异常: {str(e)[:80]}")
+
         finally:
             try:
                 page.navigate_to_mac_ctrl()

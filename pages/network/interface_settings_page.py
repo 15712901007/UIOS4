@@ -343,40 +343,54 @@ class InterfaceSettingsPage(IkuaiTablePage):
         return len(parts) == 4 and all(p.isdigit() for p in parts if p)
 
     def set_check_link_mode(self, mode_keyword: str) -> bool:
-        """设置线路检测模式. mode_keyword: 'HTTP'/'PING'/'关闭'/'网关'等关键词
-        用Playwright真实点击选项(虚拟列表)"""
+        """设置线路检测模式. mode_keyword须精确等于option文本(如'PING'/'HTTP'/'HTTP + PING + 网关').
+        单选下拉(虚拟滚动option). 必须**精确匹配**: 旧includes逻辑(`mode_keyword in val`)当wan2原始值
+        为'HTTP + PING + 网关'组合时, 'PING' in val=True→误判已选return True, 实际未操作, DB留原值3
+        (步骤5假成功根因). 同理点option/回读也必须===, 不能has_text(会误中'HTTP+PING+网关'等组合).
+        mode值=option序号(诊断实测DB=3对应第3项'HTTP + PING + 网关', 选'PING'第5项→DB=5)."""
         try:
             sels = self.page.locator(".ant-select")
             for i in range(sels.count()):
                 item = sels.nth(i).locator(".ant-select-selection-item")
                 if item.count() > 0:
-                    val = item.first.text_content() or ""
+                    val = (item.first.text_content() or "").strip()
                     if any(k in val for k in ["HTTP", "PING", "网关", "关闭", "检测"]):
-                        if mode_keyword in val:
+                        # 已是目标模式: 精确相等(非includes), 避免组合值含关键词误判
+                        if val == mode_keyword:
                             return True
+                        # 点开下拉(Playwright真实click触发React mousedown, JS click打不开Ant Select)
                         sels.nth(i).locator(".ant-select-selector").click()
                         self.page.wait_for_timeout(1000)
-                        # 用option-content精确匹配(避开数字标签)
-                        real_opt = self.page.locator(".ant-select-dropdown:visible").last.locator(
-                            ".ant-select-item-option-content"
-                        ).filter(has_text=mode_keyword)
-                        if real_opt.count() > 0:
-                            real_opt.first.click()
-                            self.page.wait_for_timeout(1000)
-                            return True
-                        # JS降级: 用title匹配
+                        # 滚动虚拟列表找精确文本===匹配的option并点击(避开'HTTP+PING+网关'等含关键词的组合)
                         clicked = self.page.evaluate("""(kw) => {
-                            let dds=[...document.querySelectorAll('.ant-select-dropdown')];
-                            for(let dd of dds){
-                                let opts=dd.querySelectorAll('.ant-select-item');
-                                for(let o of opts){
-                                    let title=o.getAttribute('title')||'';
-                                    if(title.includes(kw)){o.click();return true;}
-                                }}
-                            return false;
+                            return new Promise(resolve => {
+                                let dds=[...document.querySelectorAll('.ant-select-dropdown')].filter(d=>d.offsetParent!==null);
+                                let dd=dds[dds.length-1];
+                                if(!dd){resolve(false);return;}
+                                let holder=dd.querySelector('.rc-virtual-list-holder')||dd;
+                                let tries=0;
+                                function step(){
+                                    let opt=[...dd.querySelectorAll('.ant-select-item-option')].find(o=>{
+                                        const c=o.querySelector('.ant-select-item-option-content');
+                                        return c && c.textContent.trim()===kw;
+                                    });
+                                    if(opt){opt.click();resolve(true);return;}
+                                    holder.scrollTop += 90;
+                                    tries++;
+                                    if(tries>15){resolve(false);return;}
+                                    setTimeout(step,150);
+                                }
+                                step();
+                            });
                         }""", mode_keyword)
                         self.page.wait_for_timeout(800)
-                        return bool(clicked)
+                        # 回读精确校验: select显示值应===mode_keyword
+                        if clicked and (item.first.text_content() or "").strip() == mode_keyword:
+                            return True
+                        try:
+                            self.page.keyboard.press("Escape"); self.page.wait_for_timeout(300)
+                        except Exception:
+                            pass
         except Exception as e:
             print(f"[DEBUG] set_check_link_mode error: {e}")
         return False
@@ -818,9 +832,30 @@ class InterfaceSettingsPage(IkuaiTablePage):
                     return True
                 return False
             ok_name = f("请输入名称", name)
-            f("请输入VLAN_ID", vlan_id)  # VLAN混合必填(物理混合drawer无此input→f()返回False跳过)
+            # VLAN_ID: VLAN混合(internet=4)drawer必填. placeholder存在变体(请输入VLAN_ID/请输入VLAN ID等),
+            # 多候选+label(VLAN_ID/VLAN ID)fallback定位, 避免placeholder不匹配致必填空→红框"输入格式错误"
+            # (步骤27 VLAN混合子接入添加失败根因). 物理混合(internet=3)drawer无此字段, 候选均count==0自动跳过.
+            if vlan_id:
+                if not any(f(ph, vlan_id) for ph in ["请输入VLAN_ID", "请输入VLAN ID", "请输入VLANID"]):
+                    try:
+                        vloc = dc.locator(
+                            ".ant-form-item:has-text('VLAN_ID') input[type='text'], "
+                            ".ant-form-item:has-text('VLAN ID') input[type='text']").first
+                        if vloc.count() > 0:
+                            vloc.fill(""); vloc.type(vlan_id, delay=40)
+                    except Exception:
+                        pass
             f("请输入IP地址", ip)
-            f("请输入MAC地址", mac)
+            # MAC: placeholder存在变体(请输入MAC地址/请输入MAC/请输入客户端MAC等), 多候选+label(MAC)fallback,
+            # 避免物理混合drawer定位失败致MAC空→非法MAC用例(vwaniv1+ZZ:ZZ:ZZ)误判"未拦截"(步骤26根因,实为MAC未填).
+            if mac:
+                if not any(f(ph, mac) for ph in ["请输入MAC地址", "请输入正确的MAC", "请输入MAC", "请输入Mac地址", "请输入客户端MAC"]):
+                    try:
+                        mloc = dc.locator(".ant-form-item:has-text('MAC') input[type='text']").first
+                        if mloc.count() > 0:
+                            mloc.fill(""); mloc.type(mac, delay=40)
+                    except Exception:
+                        pass
             f("请输入网关", gateway)
             if account:
                 loc = dc.locator("input[placeholder='请输入账号']")

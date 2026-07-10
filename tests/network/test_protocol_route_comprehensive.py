@@ -992,3 +992,159 @@ class TestProtocolRouteComprehensive:
             for f in ssh_failures:
                 print(f"  - {f}")
         assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
+
+
+@pytest.mark.protocol_route
+@pytest.mark.network
+class TestProtocolRouteFlowVerification:
+    """协议分流功能验证(命中+选路, 硬断言): 两场景(指定IP/不指定)×多域名→mangle Δpkts>0 + client连接mark==规则mark.
+
+    命中=mangle STREAM_LAYER7_NEW counter Δpkts>0(规则匹配流量) + cflow L7增量辅助.
+    选路=规则--set-mark值出现在client连接mark里(被规则匹配+打标+--set-ifname wan选路).
+    ⚠️conntrack remote_if对协议分流(L7)不可靠: curl的http未必在appset里→未匹配mark=0走默认WAN(remote_if=wan1);
+    匹配的流量(如DNS)被打rule mark+--set-ifname选路, 故用client连接mark==规则mark作选路铁证(非remote_if).
+    DPI正常(识别baidu appid/domain); 协议分流功能正常(匹配流量打mark选路). 历史"6.12 user_dpi坏"误判, 实为read_mangle_counter comment格式bug+选路信号错.
+    两场景: ①ip_mac_group=临时IP分组(含client_ip, 仅该IP生效; 协议分流UI无直接src_addr字段, 用IP分组限定)
+    ②不指定(全IP生效). 多域名(baidu/qq)逐个curl验."""
+
+    PREFIX = "prflow_"
+    TARGET_WAN = "wan2"
+    TEST_DOMAINS = ["www.baidu.com", "www.qq.com"]
+    IP_GROUP_NAME = "prflow_ipsrc"
+
+    def test_protocol_route_flow(self, protocol_route_page_logged_in, step_recorder, request):
+        page = protocol_route_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过协议分流功能验证")
+        client_ip = "192.168.148.2"
+        target_wan = self.TARGET_WAN
+        failures = []
+        print("\n" + "=" * 50)
+        print(f"协议分流功能验证(两场景×{len(self.TEST_DOMAINS)}域名, L7 DPI)")
+        print("=" * 50)
+
+        def _force_clean():
+            try:
+                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM stream_layer7 WHERE tagname LIKE '{self.PREFIX}%'\"")
+                bv._router.exec("/usr/ikuai/script/stream_layer7.sh init 2>/dev/null")
+            except Exception:
+                pass
+
+        def _verify_domain(rid, domain):
+            """单域名命中+选路: 清conntrack+reset cflow→curl×3→mangle Δpkts(命中) + client连接mark==规则mark(选路).
+
+            命中=mangle STREAM_LAYER7_NEW counter Δpkts>0(规则匹配流量); cflow L7增量辅助.
+            选路=规则--set-mark值出现在client连接mark里(被规则匹配+打标+--set-ifname wan选路).
+            ⚠️conntrack remote_if对协议分流(L7)不可靠: curl的http未必在"网络协议"appset里→未匹配mark=0走默认WAN;
+            匹配的流量(如DNS)被打rule mark+--set-ifname选路, 故用client连接mark==规则mark作选路铁证(非remote_if).
+            DPI正常(识别baidu appid/domain); 协议分流功能正常(匹配流量打mark选路)."""
+            bv.clear_client_conntrack(client_ip)
+            bv.reset_cflow_stats()
+            cf_b = bv.read_cflow_stats()["l7"]
+            cb = bv.read_mangle_counter("STREAM_LAYER7_NEW", int(rid))
+            rule_mark = bv.read_mangle_rule_mark("STREAM_LAYER7_NEW", int(rid)) if rid else 0
+            bv.connect_client()
+            for _ in range(3):
+                bv._client.exec(
+                    f"curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 http://{domain}/",
+                    timeout=15)
+            client_marks = bv.conntrack_client_marks(client_ip) if rule_mark else set()  # curl后及时取(短流mark易过期)
+            cf_a = bv.read_cflow_stats()["l7"]
+            ca = bv.read_mangle_counter("STREAM_LAYER7_NEW", int(rid))
+            delta = ca - cb
+            cf_delta = cf_a - cf_b
+            wans = bv.conntrack_client_wans(client_ip, proto="tcp")
+            mark_selected = bool(rule_mark) and rule_mark in client_marks
+            hit = delta > 0 or cf_delta > 0
+            selected = (target_wan in wans) or mark_selected
+            ok = hit and selected
+            rec.add_detail(f"    {'✓' if ok else '✗'} {domain}: Δpkts={delta} cflowL7Δ={cf_delta} "
+                           f"wans={wans} mark_sel={mark_selected}(rule_mark={rule_mark},client_marks={sorted(client_marks)})")
+            if not hit:
+                failures.append(f"{domain} 未命中(Δpkts={delta} cflowL7Δ={cf_delta})")
+            if not selected:
+                failures.append(f"{domain} 未选路{target_wan}(wans={wans} mark_sel={mark_selected})")
+
+        def _run_scenario(scenario_label, rule_name, ip_mac_group):
+            grp_desc = ip_mac_group or "无(全IP生效)"
+            with rec.step(scenario_label, f"proto=网络协议 line={target_wan} ip_mac_group={grp_desc}"):
+                page.navigate_to_protocol_route()
+                page.page.wait_for_timeout(800)
+                try:
+                    page.delete_rule(rule_name)
+                    page.page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                _force_clean()
+                ok = page.add_rule(rule_name, line=target_wan, proto="网络协议",
+                                   priority=1, ip_mac_group=ip_mac_group)
+                if not ok:
+                    failures.append(f"{scenario_label}建规则失败: {rule_name}")
+                    rec.add_detail("  ✗ 建规则失败")
+                    return
+                page.page.wait_for_timeout(2000)
+                rule = bv.find_stream_layer7_rule(tagname=rule_name)
+                rid = rule.get("id") if rule else None
+                rec.add_detail(f"  ✓ 建规则 id={rid} ip_mac_group={grp_desc}")
+                # L1-L4 后端验证(报告体现: 数据库→iptables(STREAM_LAYER7_NEW)→策略路由→ik_core模块)
+                if rid:
+                    for _r in (
+                        bv.verify_stream_layer7_database(rule_name, expected_fields={"enabled": "yes"}),
+                        bv.verify_stream_layer7_iptables(rid),
+                        bv.verify_stream_layer7_policy_routing(),
+                        bv.verify_stream_layer7_kernel(),
+                    ):
+                        rec.add_detail(f"  {_r.level}: {'[OK]' if _r.passed else '[FAIL]'} {_r.message}")
+                        if not _r.passed:
+                            failures.append(f"{_r.level}-{rule_name}: {_r.message}")
+                    for d in self.TEST_DOMAINS:
+                        _verify_domain(rid, d)
+                try:
+                    page.navigate_to_protocol_route()
+                    page.page.wait_for_timeout(300)
+                    page.delete_rule(rule_name)
+                except Exception:
+                    pass
+                _force_clean()
+
+        from pages.network.route_object_page import IpGroupPage
+        ip_page = IpGroupPage(page.page, page.base_url)
+        try:
+            with rec.step("基线探活+建临时IP分组", f"curl baidu应通 + 建IP分组{self.IP_GROUP_NAME}含{client_ip}"):
+                bv.connect_client()
+                base = bv.verify_connectivity(dst_domain="www.baidu.com")
+                rec.add_detail(f"  基线: {base['detail']}")
+                if not base["connected"]:
+                    pytest.skip(f"基线baidu经ens11不可达, 跳过协议分流功能验证: {base['detail']}")
+                try:
+                    ip_page.delete_rule(self.IP_GROUP_NAME)
+                except Exception:
+                    pass
+                ip_ok = ip_page.add_rule(self.IP_GROUP_NAME, ips=[client_ip])
+                rec.add_detail(f"  IP分组{self.IP_GROUP_NAME}(含{client_ip}): {'✓' if ip_ok else '✗'}")
+            try:
+                _run_scenario("场景1: 指定内网IP(IP分组限定)", f"{self.PREFIX}srcip", self.IP_GROUP_NAME)
+                _run_scenario("场景2: 不指定内网IP(全IP生效)", f"{self.PREFIX}allip", None)
+            finally:
+                try:
+                    ip_page.navigate_back_to_list()
+                    ip_page.delete_rule(self.IP_GROUP_NAME)
+                except Exception:
+                    pass
+        finally:
+            try:
+                page.navigate_to_protocol_route()
+                page.page.wait_for_timeout(500)
+                for rn in (f"{self.PREFIX}srcip", f"{self.PREFIX}allip"):
+                    try:
+                        page.delete_rule(rn)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            _force_clean()
+        print(f"\n[协议分流功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"协议分流功能验证失败({len(failures)}项): {'; '.join(failures)}"

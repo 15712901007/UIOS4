@@ -695,6 +695,7 @@ class MainWindow(QMainWindow):
                         "testcases": [
                             # 静态路由综合测试（19步：添加8条+编辑+复制+停用+启用+删除+搜索+排序+导出+异常+路由表+批量操作+导入+帮助）
                             "test_static_route_comprehensive.py::TestStaticRouteComprehensive::test_static_route_comprehensive",
+                            "test_static_route_comprehensive.py::TestStaticRouteFlowVerification::test_static_route_flow",
                         ],
                         "groups": {
                             "综合测试（推荐）": [
@@ -742,6 +743,7 @@ class MainWindow(QMainWindow):
                             "多线负载": {
                                 "testcases": [
                                     "test_multi_wan_lb_comprehensive.py::TestMultiWanLbComprehensive::test_multi_wan_lb_comprehensive",
+                                    "test_multi_wan_lb_comprehensive.py::TestMultiWanLbFlowVerification::test_multi_wan_lb_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -752,6 +754,7 @@ class MainWindow(QMainWindow):
                             "协议分流": {
                                 "testcases": [
                                     "test_protocol_route_comprehensive.py::TestProtocolRouteComprehensive::test_protocol_route_comprehensive",
+                                    "test_protocol_route_comprehensive.py::TestProtocolRouteFlowVerification::test_protocol_route_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -762,6 +765,7 @@ class MainWindow(QMainWindow):
                             "端口分流": {
                                 "testcases": [
                                     "test_port_route_comprehensive.py::TestPortRouteComprehensive::test_port_route_comprehensive",
+                                    "test_port_route_comprehensive.py::TestPortRouteFlowVerification::test_port_route_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -772,6 +776,7 @@ class MainWindow(QMainWindow):
                             "域名分流": {
                                 "testcases": [
                                     "test_domain_route_comprehensive.py::TestDomainRouteComprehensive::test_domain_route_comprehensive",
+                                    "test_domain_route_comprehensive.py::TestDomainRouteFlowVerification::test_domain_route_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -782,6 +787,7 @@ class MainWindow(QMainWindow):
                             "上下行分离": {
                                 "testcases": [
                                     "test_updown_route_comprehensive.py::TestUpdownRouteComprehensive::test_updown_route_comprehensive",
+                                    "test_updown_route_comprehensive.py::TestUpdownRouteFlowVerification::test_updown_route_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -806,6 +812,7 @@ class MainWindow(QMainWindow):
                             "NAT规则": {
                                 "testcases": [
                                     "test_nat_rule_comprehensive.py::TestNatRuleComprehensive::test_nat_rule_comprehensive",
+                                    "test_nat_rule_comprehensive.py::TestNatRuleFlowVerification::test_snat_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -816,6 +823,7 @@ class MainWindow(QMainWindow):
                             "端口映射": {
                                 "testcases": [
                                     "test_port_map_comprehensive.py::TestPortMapComprehensive::test_port_map_comprehensive",
+                                    "test_port_map_comprehensive.py::TestPortMapFlowVerification::test_port_map_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -826,6 +834,7 @@ class MainWindow(QMainWindow):
                             "DMZ主机": {
                                 "testcases": [
                                     "test_dmz_host_comprehensive.py::TestDmzHostComprehensive::test_dmz_host_comprehensive",
+                                    "test_dmz_host_comprehensive.py::TestDmzHostFlowVerification::test_dmz_host_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -898,6 +907,7 @@ class MainWindow(QMainWindow):
                             "DHCP服务端": {
                                 "testcases": [
                                     "test_dhcp_server_comprehensive.py::TestDhcpServerComprehensive::test_dhcp_server_comprehensive",
+                                    "test_dhcp_server_comprehensive.py::TestDhcpServerFlowVerification::test_dhcp_server_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -928,6 +938,7 @@ class MainWindow(QMainWindow):
                             "DHCP黑白名单": {
                                 "testcases": [
                                     "test_dhcp_acl_mac_comprehensive.py::TestDhcpAclMacComprehensive::test_dhcp_acl_mac_comprehensive",
+                                    "test_dhcp_acl_mac_comprehensive.py::TestDhcpAclMacFlowVerification::test_dhcp_acl_mac_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
@@ -950,6 +961,7 @@ class MainWindow(QMainWindow):
                     "智能流控": {
                         "testcases": [
                             "test_stream_control_comprehensive.py::TestStreamControlComprehensive::test_stream_control_comprehensive",
+                            "test_stream_control_comprehensive.py::TestStreamControlFlowVerification::test_alone_limit_flow",
                         ],
                         "groups": {
                             "综合测试（推荐）": [
@@ -1069,6 +1081,7 @@ class MainWindow(QMainWindow):
                     "ACL规则": {
                         "testcases": [
                             "security/test_acl_comprehensive.py::TestAclComprehensive::test_acl_comprehensive",
+                            "security/test_acl_comprehensive.py::TestAclFlowVerification::test_acl_flow_verification",
                         ],
                         "groups": {
                             "综合测试（推荐）": [
@@ -1079,6 +1092,7 @@ class MainWindow(QMainWindow):
                     "连接数限制": {
                         "testcases": [
                             "security/test_conn_limit_comprehensive.py::TestConnLimitComprehensive::test_conn_limit_comprehensive",
+                            "security/test_conn_limit_comprehensive.py::TestConnLimitFlowVerification::test_conn_limit_concurrent_drop",
                         ],
                         "groups": {
                             "综合测试（推荐）": [

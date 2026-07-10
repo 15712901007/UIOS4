@@ -210,10 +210,16 @@ class ConnLimitPage(AclPage):
             return 0
 
     def clean_test_rules(self, prefix: str = "cl_t_") -> int:
-        """前端逐条删除prefix开头的规则(兜底清理)"""
+        """批量删除prefix开头的规则(搜索prefix→全选当前页→批量删循环, 比逐条快).
+
+        search_rule(prefix)限定只显示prefix规则, select_all全选的都是prefix规则(不误删正式规则);
+        循环每轮删当前页(≤分页数)直到搜索无prefix规则. 批量假成功/异常由后端cleanup_conn_limit_test
+        (SQL DELETE)兜底, 保证最终清理干净."""
         cnt = 0
-        for _ in range(50):
-            try:
+        try:
+            self.search_rule(prefix)  # 搜索限定: 当前页只显示prefix规则, 全选不误删正式规则
+            self.page.wait_for_timeout(1500)
+            for _ in range(20):
                 names = self.page.evaluate("""(pfx) => {
                     const rows=[...document.querySelectorAll('div.ant-table-row')];
                     const found=[];
@@ -226,11 +232,18 @@ class ConnLimitPage(AclPage):
                 }""", prefix)
                 if not names:
                     break
-                if self.delete_rule(names[0]):
-                    cnt += 1
-                else:
-                    break
-                self.page.wait_for_timeout(500)
+                if not self.select_all_rules():
+                    break  # 全选失败(可能无批量操作栏), 回退后端SQL清理
+                self.batch_delete()
+                self.page.wait_for_timeout(1200)
+                cnt += len(names)
+            self.clear_search()
+            self.page.wait_for_timeout(600)
+            self.close_modal_if_exists()  # 兜底关弹窗(防批量删除确认弹窗残留影响后续导入等操作)
+        except Exception as e:
+            print(f"[DEBUG] clean_test_rules批量异常(后端SQL兜底): {e}")
+            try:
+                self.close_modal_if_exists()
             except Exception:
-                break
+                pass
         return cnt

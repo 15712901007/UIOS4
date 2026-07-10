@@ -118,6 +118,17 @@ class ReportGenerator:
                 'suggestion': '查看失败截图确认页面实际状态；检查定位器是否仍匹配当前前端版本；增加 wait_for 等待或加入重试。',
             }
 
+        # 4.5 产品bug: 6.12内核xt_set模块坏(带地址规则iptables下发失败errno=22不生效, 连接数限制/NAT等)
+        if any(k in text for k in ['xt_set', 'errno=22', 'match-set', 'set模块', 'xt_set模块坏']):
+            return {
+                'category': '产品bug: 6.12内核xt_set模块坏(带地址规则不生效)',
+                'reason': f"【{name}】6.12内核iptables set模块(xt_set)损坏, `-m set --match-set` 报errno=22失败, "
+                          f"导致带源地址/地址分组的规则(连接数限制/NAT等)iptables下发失败→规则不生效。"
+                          f"这是路由器内核产品bug(已报禅道), 非测试问题——带源IP规则不生效如实FAIL体现, 不应掩盖为通过。",
+                'suggestion': '① 确认内核为6.12(xt_set已知bug, uname -r); ② 功能机制本身正常(全局规则/仅接口规则的验证通过); '
+                              '③ 该bug修复(固件升级修xt_set)后, 带地址规则验证会自动恢复通过; ④ 跟进禅道该bug修复进度。',
+            }
+
         # 5. 后端 SSH 验证失败
         if any(k in text for k in ['iptables', 'ipset', 'must_pass', 'SSH-[FAIL]', '后端', 'sqlite', '数据库']):
             return {

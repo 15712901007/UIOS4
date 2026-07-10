@@ -1201,3 +1201,123 @@ class TestDomainRouteComprehensive:
             for f in ssh_failures:
                 print(f"  - {f}")
         assert not all_failures, f"验证失败({len(all_failures)}项): {'; '.join(all_failures)}"
+
+
+@pytest.mark.domain_route
+@pytest.mark.network
+class TestDomainRouteFlowVerification:
+    """域名分流功能验证(选路, 硬断言): 两场景(指定内网IP/不指定IP)×多域名→conntrack含目标WAN=生效PASS.
+
+    域名走ik_core url_route(DNS解析后选路); 需DNS+url_route生效. 选路未生效→FAIL(6.12 url_route匹配不打mark报禅道).
+    两场景: ①src_addr=client_ip(仅该IP生效) ②src_addr空(全IP生效). 多域名(baidu/qq/taobao/jd)逐个curl验选路(conntrack remote_if铁证)."""
+
+    PREFIX = "dmflow_"
+    TARGET_WAN = "wan2"
+    TEST_DOMAINS = ["www.baidu.com", "www.qq.com", "www.taobao.com", "www.jd.com"]
+
+    def test_domain_route_flow(self, domain_route_page_logged_in, step_recorder, request):
+        page = domain_route_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过域名分流功能验证")
+        client_ip = "192.168.148.2"
+        target_wan = self.TARGET_WAN
+        failures = []
+        print("\n" + "=" * 50)
+        print(f"域名分流功能验证(选路, 两场景×{len(self.TEST_DOMAINS)}域名)")
+        print("=" * 50)
+
+        def _force_clean():
+            try:
+                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM stream_domain WHERE tagname LIKE '{self.PREFIX}%'\"")
+                bv._router.exec("/usr/ikuai/script/stream_domain.sh init 2>/dev/null")
+            except Exception:
+                pass
+
+        def _verify_domain(domain):
+            """单域名选路验证: 清conntrack→curl×3→conntrack含target_wan=生效(选路铁证, cflow辅助)."""
+            bv.clear_client_conntrack(client_ip)
+            bv.reset_cflow_stats()
+            cf_b = bv.read_cflow_stats()["domain"]
+            bv.connect_client()
+            for _ in range(3):
+                bv._client.exec(
+                    f"curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 http://{domain}/",
+                    timeout=15)
+            cf_a = bv.read_cflow_stats()["domain"]
+            wans = bv.conntrack_client_wans(client_ip, proto="tcp")
+            cf_delta = cf_a - cf_b
+            selected = target_wan in wans
+            rec.add_detail(f"    {'✓' if selected else '✗'} {domain}: wans={wans} cflow {cf_b}→{cf_a}(Δ{cf_delta})")
+            if not selected:
+                failures.append(f"{domain} 未选路{target_wan}(wans={wans})")
+
+        def _run_scenario(scenario_label, rule_name, src_addr):
+            """单场景: 建规则(多域名+src_addr)→逐域名验选路→删规则."""
+            src_desc = src_addr or "空(全IP生效)"
+            with rec.step(scenario_label, f"domains={len(self.TEST_DOMAINS)}个 line={target_wan} src_addr={src_desc}"):
+                page.navigate_to_domain_route()
+                page.page.wait_for_timeout(800)
+                try:
+                    page.delete_rule(rule_name)
+                    page.page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                _force_clean()
+                ok = page.add_rule(rule_name, line=target_wan,
+                                   domains=self.TEST_DOMAINS, src_addr=src_addr)
+                if not ok:
+                    failures.append(f"{scenario_label}建规则失败: {rule_name}")
+                    rec.add_detail("  ✗ 建规则失败")
+                    return
+                page.page.wait_for_timeout(2000)
+                rule = bv.find_stream_domain_rule(tagname=rule_name)
+                rec.add_detail(f"  ✓ 建规则 id={rule.get('id') if rule else '?'} src_addr={src_desc}")
+                # L1-L4 后端验证(报告体现: 数据库→url_route内核group/ipset→内核状态→ik_core模块)
+                rid = rule.get("id") if rule else None
+                if rid:
+                    for _r in (
+                        bv.verify_stream_domain_database(rule_name, expected_fields={"enabled": "yes"}),
+                        bv.verify_stream_domain_ipset(rid),
+                        bv.verify_stream_domain_kernel_status(),
+                        bv.verify_stream_domain_kernel(),
+                    ):
+                        rec.add_detail(f"  {_r.level}: {'[OK]' if _r.passed else '[FAIL]'} {_r.message}")
+                        if not _r.passed:
+                            failures.append(f"{_r.level}-{rule_name}: {_r.message}")
+                for d in self.TEST_DOMAINS:
+                    _verify_domain(d)
+                try:
+                    page.navigate_to_domain_route()
+                    page.page.wait_for_timeout(300)
+                    page.delete_rule(rule_name)
+                except Exception:
+                    pass
+                _force_clean()
+
+        try:
+            # 基线探活: curl baidu经ens11应通(无规则时走默认wan1), 不通=环境问题skip
+            with rec.step("基线探活", "curl baidu --interface ens11 应通(确认环境经路由器)"):
+                bv.connect_client()
+                base = bv.verify_connectivity(dst_domain="www.baidu.com")
+                rec.add_detail(f"  基线: {base['detail']}")
+                if not base["connected"]:
+                    pytest.skip(f"基线baidu经ens11不可达, 跳过域名分流功能验证: {base['detail']}")
+            _run_scenario("场景1: 指定内网IP(仅该IP生效)", f"{self.PREFIX}srcip", client_ip)
+            _run_scenario("场景2: 不指定内网IP(全IP生效)", f"{self.PREFIX}allip", None)
+        finally:
+            try:
+                page.navigate_to_domain_route()
+                page.page.wait_for_timeout(500)
+                for rn in (f"{self.PREFIX}srcip", f"{self.PREFIX}allip"):
+                    try:
+                        page.delete_rule(rn)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            _force_clean()
+        print(f"\n[域名分流功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"域名分流功能验证失败({len(failures)}项): {'; '.join(failures)}"

@@ -569,6 +569,7 @@ class TestMacRateLimitComprehensive:
                             mac_addr_detail = db_mac_addr
                         else:
                             mac_addr_detail = str(db_mac_addr)
+                        # MAC限速实测生效(L5✓)+L3已修(_mac_qos_* hash:mac含MAC), 恢复硬验证(带MAC且非time_plan)
                         l2_must_pass = db_has_mac and "time_plan" not in rule
                         set_prefix = "mac_qos" if qos_type_found == "mac_qos" else "dt_mac_qos"
                         if not db_has_mac:
@@ -1494,9 +1495,10 @@ class TestMacRateLimitComprehensive:
                                     tag = "✓" if r.passed else "✗"
                                     rec.add_detail(f"  {tag} {r.level}: {r.message}")
                                     print(f"  [{tag}] {r.level}: {r.message}")
-                                    # MAC限速iperf3实测软记录(不硬失败): MAC限速规则删除后iptables/ipset可能残留
-                                    # (产品行为), 实测可能命中残留规则致结果失真; 且上下行匹配机制复杂(dir:in/dst
-                                    # 与dir:out/src两条规则), 下行(iperf3 -R)实测可能不限速. 实测数据如实入报告供分析.
+                                    # 硬断言: 任何链路失败(L1-L5)进ssh_failures. MAC限速6.12产品bug"完全不生效"→
+                                    # L5 iperf3不限速→FAIL(如实反映, 报禅道). 残留/下行不限速均如实FAIL.
+                                    if not r.passed:
+                                        ssh_failures.append(f"步骤22-{r.level}: {r.message}")
                 finally:
                     # 6. 清理: 删规则 + 移除路由
                     try:

@@ -746,3 +746,104 @@ class TestUpdownRouteComprehensive:
         print("  - 批量操作: 批量停用/启用/删除")
         print("  - 帮助功能")
         print("  - SSH后台验证: L1数据库+L2 ipset+L3内核状态+L4 ik_core")
+
+
+@pytest.mark.updown_route
+@pytest.mark.network
+class TestUpdownRouteFlowVerification:
+    """上下行分流功能验证(双向, 硬断言): 建upload=wan2/download=wan1→conntrack remote_if=wan2(上)+rev_remote_if=wan1(下).
+
+    上下行走ik_cntl wans-snat; 验conntrack双向remote_if=上行口/下行口. 未观测到双向分离→FAIL."""
+
+    PREFIX = "udflow_"
+
+    def test_updown_route_flow(self, updown_route_page_logged_in, step_recorder, request):
+        page = updown_route_page_logged_in
+        rec = step_recorder
+        try:
+            bv = request.getfixturevalue('backend_verifier')
+        except Exception:
+            pytest.skip("无SSH验证器, 跳过上下行分流功能验证")
+        client_ip = "192.168.148.2"
+        up_wan, down_wan = "wan2", "wan1"  # 上行用非默认wan2(可观测), 下行wan1
+        rule_name = f"{self.PREFIX}sep"
+        failures = []
+        print("\n" + "=" * 50)
+        print("上下行分流功能验证(双向)")
+        print("=" * 50)
+
+        def _force_clean():
+            try:
+                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM stream_updown WHERE tagname LIKE '{self.PREFIX}%'\"")
+                bv._router.exec("/usr/ikuai/script/stream_updown.sh init 2>/dev/null")
+            except Exception:
+                pass
+
+        try:
+            with rec.step("清理残留", f"删{self.PREFIX}规则"):
+                page.navigate_to_updown_route()
+                page.page.wait_for_timeout(1000)
+                try:
+                    page.delete_rule(rule_name)
+                    page.page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                _force_clean()
+            with rec.step("建上下行分离规则", f"upload={up_wan}/download={down_wan}/tcp/src={client_ip}"):
+                page.navigate_to_updown_route()
+                page.page.wait_for_timeout(800)
+                ok = page.add_rule(rule_name, upload_line=up_wan, download_line=down_wan,
+                                   protocol="tcp", src_addr=client_ip)
+                if not ok:
+                    failures.append(f"建规则失败: {rule_name}")
+                    rec.add_detail("  ✗ 建规则失败")
+                else:
+                    page.page.wait_for_timeout(2000)
+                    rule = bv.find_stream_updown_rule(rule_name)
+                    rec.add_detail(f"  ✓ 建规则 id={rule.get('id') if rule else '?'}")
+            # L1-L4 SSH验证(建规则后, 报告体现全链路落库+内核)
+            if not failures:
+                with rec.step("L1-L4后端验证", "数据库+ipset+内核wans-snat落地+ik_core模块"):
+                    rid = rule.get("id") if rule else None
+                    r1 = bv.verify_stream_updown_database(rule_name, expected_fields={"enabled": "yes"})
+                    rec.add_detail(f"  L1-数据库: {'[OK]' if r1.passed else '[FAIL]'} {r1.message}")
+                    if not r1.passed:
+                        failures.append(f"L1数据库: {r1.message}")
+                    r2 = bv.verify_stream_updown_ipset(rid, src_addr=client_ip) if rid else None
+                    if r2:
+                        rec.add_detail(f"  L2-ipset: {'[OK]' if r2.passed else '[FAIL]'} {r2.message}")
+                        if r2.raw_output:
+                            rec.add_detail(f"    {r2.raw_output}")
+                        if not r2.passed:
+                            failures.append(f"L2 ipset: {r2.message}")
+                    r3 = bv.verify_stream_updown_kernel_status()
+                    rec.add_detail(f"  L3-内核状态: {'[OK]' if r3.passed else '[FAIL]'} {r3.message}")
+                    if not r3.passed:
+                        failures.append(f"L3内核状态: {r3.message}")
+                    r4 = bv.verify_stream_updown_kernel()
+                    rec.add_detail(f"  L4-内核模块: {'[OK]' if r4.passed else '[FAIL]'} {r4.message}")
+                    if not r4.passed:
+                        failures.append(f"L4内核模块: {r4.message}")
+            with rec.step("L5双向验证", f"curl→conntrack remote_if={up_wan}(上)+rev_remote_if={down_wan}(下)"):
+                bv.clear_client_conntrack(client_ip)
+                bv.connect_client()
+                for _ in range(3):
+                    bv._client.exec("curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 http://www.baidu.com/", timeout=15)
+                eg = bv.conntrack_egress(client_ip, proto="tcp")
+                rec.add_detail(f"  conntrack: found={eg['found']} remote_if={eg['remote_if']} rev_remote_if={eg['rev_remote_if']}")
+                # 上下行走ik_cntl wans-snat; 硬断言: conntrack双向remote_if须=上行口/下行口, 未观测到即FAIL
+                if eg["found"] and eg["remote_if"] == up_wan and eg["rev_remote_if"] == down_wan:
+                    rec.add_detail(f"  ✓ 上下行分离观测到(remote_if={up_wan}/rev={down_wan})")
+                else:
+                    rec.add_detail(f"  ✗ 上下行分离未观测到 remote_if={eg['remote_if']}/rev={eg['rev_remote_if']}(期望 {up_wan}/{down_wan})")
+                    failures.append(f"上下行分离未生效: remote_if={eg['remote_if']}/rev={eg['rev_remote_if']}(期望 {up_wan}/{down_wan})")
+        finally:
+            try:
+                page.navigate_to_updown_route()
+                page.page.wait_for_timeout(500)
+                page.delete_rule(rule_name)
+            except Exception:
+                pass
+            _force_clean()
+        print(f"\n[上下行分流功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+        assert not failures, f"上下行分流功能验证失败({len(failures)}项): {'; '.join(failures)}"

@@ -704,131 +704,125 @@ class TestVlanComprehensive:
             page.page.wait_for_load_state("networkidle")
             page.page.wait_for_timeout(500)
 
-        # ========== 步骤11: 批量停用所有VLAN ==========
+        # ========== 步骤11: 批量停用所有VLAN(3次重试, 参照限速模块) ==========
         with rec.step("步骤11: 批量停用VLAN", f"批量停用剩余的 {len(test_vlans)} 条VLAN"):
             print("\n[步骤11] 批量停用所有VLAN...")
-            rec.add_detail(f"【批量停用操作】")
-            rec.add_detail(f"  目标数量: {len(test_vlans)} 条VLAN")
-            # 使用全选功能
-            select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
-            if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
-                rec.add_detail(f"  1. 点击全选复选框")
-                select_all_checkbox.click()
-                page.page.wait_for_timeout(500)
-            rec.add_detail(f"  2. 点击批量停用按钮")
-            page.batch_disable()
-            rec.add_detail(f"  3. 确认停用对话框")
-            # 等待操作完成（成功消息可能很快消失，通过状态验证替代）
-            page.page.wait_for_timeout(1500)
-
-            # 验证全部变为停用状态
-            rec.add_detail(f"【验证结果】")
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            disabled_count = 0
-            for vlan in test_vlans:
-                assert page.is_vlan_disabled(vlan["name"]), f"VLAN {vlan['name']} 批量停用后仍为启用状态"
-                disabled_count += 1
-            print(f"  [OK] 批量停用 {len(test_vlans)} 条VLAN成功")
-            rec.add_detail(f"  ✓ 所有 {disabled_count} 条VLAN已停用")
-
-            # SSH验证批量停用后数据库中所有规则enabled=no
+            rec.add_detail(f"【批量停用操作(3次重试)】")
+            disable_success = False
+            for attempt in range(3):
+                page.page.reload(); page.page.wait_for_timeout(500)
+                # 用基类select_all_rules(等待渲染+is_checked判断+等"已选X条"确认选中生效),
+                # 替代裸点thead checkbox: 重试时若checkbox保持上次勾选态, 裸click会反向取消全选
+                # →底部"已选X条"操作栏不显示→batch_disable找不到footer按钮静默空操作→假成功0/7
+                if not page.select_all_rules():
+                    print(f"  第{attempt+1}次全选未生效(select_all_rules), 重试...")
+                    rec.add_detail(f"  第{attempt+1}次: 全选未生效, 重试")
+                    page.page.wait_for_timeout(500)
+                    continue
+                page.batch_disable(); page.page.wait_for_timeout(1500)
+                page.page.reload(); page.page.wait_for_timeout(500)
+                if all(page.is_vlan_disabled(v["name"]) for v in test_vlans):
+                    disable_success = True; break
+                print(f"  第{attempt+1}次批量停用后仍有启用, 重试...")
+                rec.add_detail(f"  第{attempt+1}次: 仍有启用, 重试")
+            if disable_success:
+                print(f"  [OK] 批量停用成功(重试{attempt+1}次)")
+                rec.add_detail(f"  ✓ 所有VLAN已停用(重试{attempt+1}次)")
+            else:
+                still_enabled = [v["name"] for v in test_vlans if not page.is_vlan_disabled(v["name"])]
+                ssh_failures.append(f"步骤11-批量停用: {still_enabled} 仍启用")
+                print(f"  [WARN] 3次重试后仍启用: {still_enabled}")
+                rec.add_detail(f"  ✗ 3次重试后仍启用: {still_enabled}")
             if backend_verifier is not None:
                 try:
                     vlan_rules = backend_verifier.query_vlan_rules()
                     test_names = {v["name"] for v in test_vlans}
                     disabled_in_db = sum(1 for r in vlan_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
-                    print(f"    SSH: 数据库中{disabled_in_db}/{len(test_vlans)}条VLAN已停用")
+                    print(f"    SSH: {disabled_in_db}/{len(test_vlans)}条停用")
                     rec.add_detail(f"    SSH: {disabled_in_db}/{len(test_vlans)}条停用")
                     if disabled_in_db < len(test_vlans):
                         ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_in_db}/{len(test_vlans)}条VLAN停用")
                 except Exception as e:
-                    print(f"    SSH-L1-批量停用验证: 跳过 - {str(e)[:80]}")
-                    rec.add_detail(f"    SSH-L1-批量停用验证: 跳过 - {str(e)[:80]}")
+                    rec.add_detail(f"    SSH-L1-批量停用: 跳过 - {str(e)[:80]}")
 
-        # ========== 步骤12: 批量启用所有VLAN ==========
+        # ========== 步骤12: 批量启用所有VLAN(3次重试) ==========
         with rec.step("步骤12: 批量启用VLAN", f"批量启用剩余的 {len(test_vlans)} 条VLAN"):
             print("\n[步骤12] 批量启用所有VLAN...")
-            rec.add_detail(f"【批量启用操作】")
-            rec.add_detail(f"  目标数量: {len(test_vlans)} 条VLAN")
-            # 使用全选功能
-            select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
-            if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
-                rec.add_detail(f"  1. 点击全选复选框")
-                select_all_checkbox.click()
-                page.page.wait_for_timeout(500)
-            rec.add_detail(f"  2. 点击批量启用按钮")
-            page.batch_enable()
-            rec.add_detail(f"  3. 确认启用对话框")
-            # 等待操作完成
-            page.page.wait_for_timeout(1500)
-
-            # 验证全部变为启用状态
-            rec.add_detail(f"【验证结果】")
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            enabled_count = 0
-            for vlan in test_vlans:
-                assert page.is_vlan_enabled(vlan["name"]), f"VLAN {vlan['name']} 批量启用后仍为停用状态"
-                enabled_count += 1
-            print(f"  [OK] 批量启用 {len(test_vlans)} 条VLAN成功")
-            rec.add_detail(f"  ✓ 所有 {enabled_count} 条VLAN已启用")
-
-            # SSH验证批量启用后数据库中所有规则enabled=yes(参照跨三层, 补断言)
+            rec.add_detail(f"【批量启用操作(3次重试)】")
+            enable_success = False
+            for attempt in range(3):
+                page.page.reload(); page.page.wait_for_timeout(500)
+                # 用基类select_all_rules替代裸点thead checkbox(同步骤11, 避免反向取消全选致假成功)
+                if not page.select_all_rules():
+                    print(f"  第{attempt+1}次全选未生效(select_all_rules), 重试...")
+                    rec.add_detail(f"  第{attempt+1}次: 全选未生效, 重试")
+                    page.page.wait_for_timeout(500)
+                    continue
+                page.batch_enable(); page.page.wait_for_timeout(1500)
+                page.page.reload(); page.page.wait_for_timeout(500)
+                if all(page.is_vlan_enabled(v["name"]) for v in test_vlans):
+                    enable_success = True; break
+                print(f"  第{attempt+1}次批量启用后仍有停用, 重试...")
+                rec.add_detail(f"  第{attempt+1}次: 仍有停用, 重试")
+            if enable_success:
+                print(f"  [OK] 批量启用成功(重试{attempt+1}次)")
+                rec.add_detail(f"  ✓ 所有VLAN已启用(重试{attempt+1}次)")
+            else:
+                still_disabled = [v["name"] for v in test_vlans if not page.is_vlan_enabled(v["name"])]
+                ssh_failures.append(f"步骤12-批量启用: {still_disabled} 仍停用")
+                print(f"  [WARN] 3次重试后仍停用: {still_disabled}")
+                rec.add_detail(f"  ✗ 3次重试后仍停用: {still_disabled}")
             if backend_verifier is not None:
                 try:
                     vlan_rules = backend_verifier.query_vlan_rules()
                     test_names = {v["name"] for v in test_vlans}
                     enabled_in_db = sum(1 for r in vlan_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
-                    print(f"    SSH: 数据库中{enabled_in_db}/{len(test_vlans)}条VLAN已启用")
+                    print(f"    SSH: {enabled_in_db}/{len(test_vlans)}条启用")
                     rec.add_detail(f"    SSH: {enabled_in_db}/{len(test_vlans)}条enabled=yes")
                     if enabled_in_db < len(test_vlans):
                         ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_in_db}/{len(test_vlans)}条VLAN启用")
                 except Exception as e:
-                    print(f"    SSH-L1-批量启用验证: 跳过 - {str(e)[:80]}")
-                    rec.add_detail(f"    SSH-L1-批量启用验证: 跳过 - {str(e)[:80]}")
+                    rec.add_detail(f"    SSH-L1-批量启用: 跳过 - {str(e)[:80]}")
 
-        # ========== 步骤13: 批量删除所有VLAN ==========
+        # ========== 步骤13: 批量删除所有VLAN(3次重试) ==========
         with rec.step("步骤13: 批量删除VLAN", f"批量删除剩余的 {len(test_vlans)} 条VLAN"):
             print("\n[步骤13] 批量删除所有VLAN...")
-            rec.add_detail(f"【批量删除操作】")
-            rec.add_detail(f"  目标数量: {len(test_vlans)} 条VLAN")
-            # 使用全选功能
-            select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
-            if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
-                rec.add_detail(f"  1. 点击全选复选框")
-                select_all_checkbox.click()
-                page.page.wait_for_timeout(500)
-            rec.add_detail(f"  2. 点击批量删除按钮")
-            page.batch_delete()
-            rec.add_detail(f"  3. 确认删除对话框")
-            # 等待操作完成
-            page.page.wait_for_timeout(1500)
-
-            # 验证所有VLAN已删除
-            rec.add_detail(f"【验证结果】")
-            page.page.reload()
-            page.page.wait_for_timeout(500)
-            for vlan in test_vlans:
-                assert not page.vlan_exists(vlan["name"]), f"VLAN {vlan['name']} 仍然存在"
-            print(f"  [OK] 批量删除 {len(test_vlans)} 条VLAN成功")
-            rec.add_detail(f"  ✓ 所有 {len(test_vlans)} 条VLAN已删除")
-
-            # SSH验证批量删除后数据库中测试规则不存在
+            rec.add_detail(f"【批量删除操作(3次重试)】")
+            delete_success = False
+            for attempt in range(3):
+                page.page.reload(); page.page.wait_for_timeout(500)
+                # 用基类select_all_rules替代裸点thead checkbox(同步骤11/12, 避免反向取消全选致假成功)
+                if not page.select_all_rules():
+                    print(f"  第{attempt+1}次全选未生效(select_all_rules), 重试...")
+                    rec.add_detail(f"  第{attempt+1}次: 全选未生效, 重试")
+                    page.page.wait_for_timeout(500)
+                    continue
+                page.batch_delete(); page.page.wait_for_timeout(1500)
+                page.page.reload(); page.page.wait_for_timeout(500)
+                if all(not page.vlan_exists(v["name"]) for v in test_vlans):
+                    delete_success = True; break
+                print(f"  第{attempt+1}次批量删除后仍有残留, 重试...")
+                rec.add_detail(f"  第{attempt+1}次: 仍有残留, 重试")
+            if delete_success:
+                print(f"  [OK] 批量删除成功(重试{attempt+1}次)")
+                rec.add_detail(f"  ✓ 所有VLAN已删除(重试{attempt+1}次)")
+            else:
+                still_exist = [v["name"] for v in test_vlans if page.vlan_exists(v["name"])]
+                ssh_failures.append(f"步骤13-批量删除: {still_exist} 仍存在")
+                print(f"  [WARN] 3次重试后仍存在: {still_exist}")
+                rec.add_detail(f"  ✗ 3次重试后仍存在: {still_exist}")
             if backend_verifier is not None:
                 try:
                     vlan_rules = backend_verifier.query_vlan_rules()
                     test_names = {v["name"] for v in test_vlans}
                     remaining = [r for r in vlan_rules if r.get("tagname") in test_names]
                     if remaining:
-                        print(f"    SSH: 数据库中仍有{len(remaining)}条测试VLAN")
                         ssh_failures.append(f"SSH-L1-批量删除: 数据库中仍有{len(remaining)}条测试VLAN")
                     else:
-                        print(f"    SSH: 数据库中测试VLAN已全部删除（总规则数: {len(vlan_rules)}）")
+                        print(f"    SSH: 测试VLAN已全部删除（总: {len(vlan_rules)}）")
                         rec.add_detail(f"    SSH: 测试VLAN已全部删除")
                 except Exception as e:
-                    print(f"    SSH-L1-批量删除验证: 跳过 - {str(e)[:80]}")
-                    rec.add_detail(f"    SSH-L1-批量删除验证: 跳过 - {str(e)[:80]}")
+                    rec.add_detail(f"    SSH-L1-批量删除: 跳过 - {str(e)[:80]}")
 
         # ========== 步骤14: 导入VLAN配置测试 ==========
         with rec.step("步骤14: 导入VLAN配置", "使用导出的CSV和TXT文件进行导入测试"):

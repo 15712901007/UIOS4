@@ -352,13 +352,34 @@
 
 ---
 
+## Phase 24: 智能流控测试修复 + QoS限速机制探明 [100%] (2026-07-09)
+
+### 智能流控报告4失败修复 + QoS机制(4文件5处, py_compile通过)
+- [x] 报告`test_report_20260709_171235` 4失败归因: ①步骤3/19/25启用停用FAIL=UI返回值硬等"X成功"文案误判(SSH L1全OK操作实际生效) ②步骤19 ipset停用未清理=产品停用保留ipset删除才清(断言过严) ③独立Test打流None=iperf3偶发error被`_throughput`吞掉致无法诊断
+- [x] 修复: `disable_rule/enable_rule`(ikuai_table_page.py:128)+`enable_line/disable_line`幂等(stream_control_page.py:561)="找到按钮+点击=返回True, 真实生效交SSH L1权威验证"; `run_iperf3`加`retries=2`重试(backend_verifier.py:871)+步骤3记录iperf3 error原文; 步骤19 ipset改中性`[记录]`
+- [x] 核心思路: UI操作返回值=操作是否成功发起(不硬等成功提示文案), 真实生效交SSH L1. 原步骤3/19/25三个FAIL全是SSH通过、UI返回值被文案/时序拖累.
+- [x] **SSH读qos.sh探明QoS机制[stream-control-qos-mechanism]**: 流量FORWARD→LAYER7→IMQ→htb整形; **root class(线路) rate=ceil=qos_upload×85/10≈配置×1.06 对所有流量整形→线路速率能限终端**(用户实测确认, ik_core自实现非标准HTB default); alone子class ceil=配置值=单终端硬上限; 测速"超线路速率"=限速点配置×1.06+burst突发(正常非bug); 限速=整形丢包非DROP. 修正alone-limit-bug: EMARK不生成只致alone子class不生效(跑到线路速率)线路root仍限.
+- [x] 验证: 4文件py_compile通过. 详见docs/CHANGELOG.md 2026-07-09段 + topic stream-control-qos-mechanism.
+
+## Phase 25: ACL功能验证合并 + check_link_mode假成功修复 + iperf3探活优化 [100%] (2026-07-10)
+
+### ACL合并(3→2) + tagname15字符坑 + check_link_mode假成功 + iperf3探活(多轮诊断定位)
+- [x] **ACL功能验证合并(对齐"每模块1综合+1功能验证"双测试模式)**: `test_acl_flow_drop` + `test_acl_protocol_matrix`(6协议parametrize,报告显英文nodeid) → 合并为 `TestAclFlowVerification::test_acl_flow_verification` 单测试(10步: 清理+基线curl+iperf3软探活+6协议矩阵L1/L2/L5+TCP端到端drop闭环). 单协议失败软收集不连坐+末尾聚合硬断言. 删`test_acl_protocol_matrix.py`. GUI ACL节点3→2(对齐连接数限制). `TEST_NAME_MAPPING`加中文映射(英文nodeid根因=映射表未收录method名). 实测PASSED(243s).
+- [x] **tagname 15字符静默截断坑[acl-flow-verification-merge]**: 合并首用`acl_flow_`(9字符)前缀, `acl_flow_tcp_udp`=16字符超iKuai tagname限制→后端**静默截断**15→`find_acl_rule`按完整名查不到→误判"建规则失败"(规则其实建成,极易误判产品bug). 改`acl_pm_`(6字符≤14). 诊断铁证=DB全表看tagname被截. (iKuai通用约束, 混合子接入vwan前缀同源)
+- [x] **check_link_mode假成功修复(自动化bug非产品, CHANGELOG:279曾误标"既有环境问题")**: 步骤5期望check_link_mode=5(PING)实际3(原值). 根因 `set_check_link_mode`(interface_settings_page.py:345) `if mode_keyword in val` **includes判断**→wan2原始"HTTP+PING+网关"组合含"PING"字符串→误判"已选"return True不操作→DB留3(`[OK]`假成功). 修复: 全程精确===匹配option文本+滚动`rc-virtual-list-holder`点击(虚拟列表option)+回读`val===kw`. 步骤5`must_pass=False→True`(硬断言, 修复后PASS; 将来退化/产品bug→硬FAIL测出真问题). mode值=option序号(DB=3↔第3项"HTTP+PING+网关", "PING"第5项→DB=5; page原mode映射注释过时已更正). 内外网综合测试35步全绿(步骤5硬PASS).
+- [x] **iperf3探活卡顿优化(60s→0.2s)**: 步骤3探活用`run_iperf3`首次连接卡60s(paramiko `channel.settimeout` Windows下偶发不生效→`stdout.read`阻塞→exec看门狗51s+重连; `--connect-timeout`/`timeout`包裹都管不到iperf3的D状态卡顿). 改 bash`/dev/tcp`轻量探端口(3s,不走iperf3进程). `run_iperf3`命令加`--connect-timeout 3000`. 总耗时基本不变(首次iperf3卡顿从探活转移至L5各协议打流,环境硬约束无法完全消除).
+- [x] **2个通用坑记memory**: iKuai tagname/名称15字符静默截断 / Ant Select单选组合option必须精确===匹配非includes(组合值含关键词致includes误判已选).
+- [x] 验证: ACL合并PASSED(10步中文名"安全中心-ACL功能验证(多协议打流+端到端drop)") + 内外网综合测试35步全绿(步骤5硬断言PASS). 详见docs/CHANGELOG.md 2026-07-10段.
+
+---
+
 **总体进度: 约99%**
 
 **已覆盖模块: 24个** (VLAN/IP限速/MAC限速/静态路由/跨三层服务/多线负载/协议分流/端口分流/域名分流/上下行分离/UPnP设置/NAT规则/端口映射/DMZ主机/IGMP代理/IPTV透传/UDPXY设置/内外网设置/**安全中心-ACL规则**/安全中心-连接数限制/安全中心-MAC访问控制/**安全中心-应用协议控制**)
 
 **已知产品Bug: 1个** (DMZ重启后不生效, netmap.sh init的select*错误)
 
-**最后更新: 2026-07-07**
+**最后更新: 2026-07-10**
 
 ### 重要经验教训
 1. **DMZ的NETMAP是全流量劫持**: interface=all或wan1会导致设备失联, 必须用wan2/wan3或外网IP模式
