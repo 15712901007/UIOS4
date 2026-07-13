@@ -27,6 +27,7 @@ from datetime import datetime
 
 from pages.network.ip_rate_limit_page import IpRateLimitPage
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 from utils.step_recorder import StepRecorder
 
 
@@ -55,28 +56,7 @@ class TestIpRateLimitComprehensive:
         ssh_failures = []
         ui_failures = []  # 收集must_pass=True但验证失败的项，测试末尾统一断言
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            """执行SSH后台验证并记录结果。must_pass=True时失败会记录到ssh_failures"""
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'✓' if result.passed else '✗'} {result.message}")
-                # 显示SSH后台查询的原始内容
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         def ssh_find_rule(tagname):
             """通过SSH查找数据库中的规则"""
@@ -101,6 +81,8 @@ class TestIpRateLimitComprehensive:
                 rec.add_detail(f"  [截图] 错误现场: {screenshot_name}")
             except Exception as e2:
                 print(f"  [截图] 保存失败: {str(e2)[:50]}")
+
+        kernel_check = make_kernel_check(backend_verifier, rec, ssh_failures, default_module="simple_qos")
 
         # 测试数据 - 9条规则，覆盖各种数据组合场景
         # 包含：不同线路、不同协议、不同内网地址、有意义的备注
@@ -690,6 +672,8 @@ class TestIpRateLimitComprehensive:
 
                 print(f"  [OK] 后台验证完成: {verify_passed}/{verify_total} 条规则L1验证通过")
                 rec.add_detail(f"  ── 验证汇总: {verify_passed}/{verify_total} 条规则数据库验证通过 ──")
+                # 底层一致性实时校验: 添加后基线(底层应与DB一致, 记录用)
+                kernel_check("步骤6.5-添加后基线", fail_on_residual=False)
         else:
             print("\n[步骤6.5] 后台数据验证: 跳过（未配置SSH或paramiko未安装）")
 
@@ -841,6 +825,8 @@ class TestIpRateLimitComprehensive:
             else:
                 print(f"  [WARN] 删除验证失败")
                 rec.add_detail(f"  - 删除未确认")
+            # 底层一致性实时校验: 删除后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤10-删除后", fail_on_residual=True)
 
         # ========== 步骤11: 搜索IP限速规则 ==========
         with rec.step("步骤11: 搜索IP限速规则", "测试搜索存在/不存在的规则"):
@@ -1228,6 +1214,8 @@ class TestIpRateLimitComprehensive:
                     print(f"    SSH: 数据库中仍有 {len(remaining_test_rules)} 条测试规则")
                     rec.add_detail(f"    SSH-L1-批量删除验证: ✗ 仍有{len(remaining_test_rules)}条测试规则")
                     ssh_failures.append(f"SSH-L1-批量删除: 数据库中仍有{len(remaining_test_rules)}条测试规则")
+            # 底层一致性实时校验: 批量删除后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤17-批量删除后", fail_on_residual=True)
 
         # ========== 步骤18: 导入IP限速规则 ==========
         with rec.step("步骤18: 导入IP限速规则", "使用导出的CSV和TXT文件进行导入测试"):
@@ -1267,6 +1255,8 @@ class TestIpRateLimitComprehensive:
             else:
                 print(f"  [WARN] TXT文件不存在")
                 rec.add_detail(f"    ✗ TXT文件不存在")
+            # 底层一致性实时校验: 导入后底层应与DB一致(记录用, 不硬FAIL)
+            kernel_check("步骤18-导入后", fail_on_residual=False)
 
         # ========== 步骤19: 清理导入的IP限速规则 ==========
         with rec.step("步骤19: 清理导入的IP限速规则", "清理导入测试产生的规则数据"):
@@ -1291,6 +1281,8 @@ class TestIpRateLimitComprehensive:
             else:
                 print("  [OK] 没有需要清理的规则")
                 rec.add_detail(f"  ✓ 环境已干净，无需清理")
+            # 底层一致性实时校验: 清理后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤19-清理后", fail_on_residual=True)
 
         # ========== 步骤20: 帮助功能测试 ==========
         with rec.step("步骤20: 帮助功能测试", "测试帮助图标的显示和功能"):

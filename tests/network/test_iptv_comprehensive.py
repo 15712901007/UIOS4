@@ -23,6 +23,7 @@ SSH后台验证: L1数据库 + L2桥接接口(iptv bridge) + L3 VLAN子接口
 import pytest
 from pages.network.iptv_page import IptvPage
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 
 @pytest.mark.iptv
@@ -47,26 +48,7 @@ class TestIptvComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '[OK]' if result.passed else '[FAIL]'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output[:200]}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output[:200]}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         print("\n" + "=" * 60)
         print("IPTV透传综合测试开始")

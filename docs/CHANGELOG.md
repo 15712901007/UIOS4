@@ -1,5 +1,22 @@
 # 开发日志
 
+## 2026-07-13 验证命令进报告(方案A) + iptables链累加检测(方案B) + IPv6报告详情优化
+
+### 改动
+1. **方案A: SSH验证命令显示进HTML报告**(工程师看报告即可复制命令自己复验, 不用翻代码):
+   - `utils/backend_verifier.py`: `SSHClient.exec`(:381)咽喉点录每条命令到`_cmd_log`(选exec入口非_exec_with_retry, 避免重连重试重复录); `BackendVerifier`加`mark_cmd_start`/`collect_cmds_since_mark`(差量捕获, `[router]`/`[client]`标注, is not判断重连重建)/`get_last_cmds`
+   - 新建`utils/verify_helper.py`: `make_ssh_verify`/`make_kernel_check`工厂(命令在finally发, 含异常路径) + `attach_cmd_recording_to_closure`包装器(给特化闭包加录制, 逻辑零改动)
+   - 36测试文件迁移: ~29标准用工厂; security(conn_limit/acl/app/mac_access/acl_priority)+ipv6_lan/wan+custom/route用包装器/adapter(security的`[SSH-{label}]PASS/FAIL`格式+无must_pass条件特化, 包装器保留)
+   - 报告每SSH步骤多一行`验证命令(N): [router]...; [client]...`
+2. **方案B: iptables链规则数累加检测(通用carrier, 测导入清空累加BUG)**:
+   - `verify_module_kernel_consistency`加carrier类型`iptables_rule_count`: `_read_iptables_rule_count`用`iptables -t X -L chain -n -v`数规则行(**用-L非-S**, iKuai `-S {chain}`对部分链返回空, 实测`-t raw -S CONNLIMIT`空但`-L -n -v`有24条); `count_overflow`(规则数>DB count=累加dup条); 闭包判定加`count_overflow`
+   - 8模块signatures加carrier: conn_limit(raw/CONNLIMIT)/mac_qos(filter/MAC_QOS)/simple_qos(filter/IP_QOS)/acl(filter/FIREWALL+INPUT_ACL)/mac_access(filter/ACL_MAC)/stream_layer7(mangle/STREAM_LAYER7_NEW)/stream_ipport(mangle/STREAM_IPPORT_NEW)
+   - conn_limit步骤19改`fail_on_residual=True`+移进`with rec.step`(原在with外detail丢失)
+3. **IPv6报告详情优化**: ipv6_wan/lan kernel_check从只列ipset名→显示每个ipv6_prefix的`entry/refs/前缀`详情, 主行+每个bullet换行(定位残留类型=前缀残留 vs iptables引用未释放)
+
+### 结果
+方案A验证: conn_limit(包装器)+mac_rate(工厂)报告验证命令完整可复制`[router]`/`[client]`标注. 方案B验证: **conn_limit测出CONNLIMIT 16>8累加8条**(之前测不出), **mac_rate测出MAC_QOS 12>7累加5条**(8模块通用覆盖, raw+filter+mangle表/工厂+包装器路径全通过). IPv6报告详情具体(`ipv6_prefix_wan1(entry=1,refs=0,前缀=fd00:abcd:ef00:14::/62)`). **新发现产品BUG报禅道**: conn_limit/mac_qos导入清空iptables链累加 + IPv6 ipset ipv6_prefix删不干净(前缀残留/iptables引用未释放). topic: verify-cmd-in-report/iptables-rule-count-carrier.
+
 ## 2026-07-10 ACL功能验证合并(3→2) + check_link_mode假成功修复 + iperf3探活优化
 
 ### 背景

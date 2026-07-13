@@ -49,6 +49,7 @@ import pytest
 import os
 from pages.network.interface_settings_page import InterfaceSettingsPage
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 
 def _hybrid_invalid_cases(subtab):
@@ -351,25 +352,7 @@ class TestInterfaceSettingsComprehensive:
         # 新建的接口(测试末尾必删)
         created_interfaces = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '[OK]' if result.passed else '[FAIL]'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-                if result.raw_output:
-                    rec.add_detail(f"      SSH数据: {result.raw_output[:200]}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         print("\n" + "=" * 60)
         print("内外网设置综合测试开始")

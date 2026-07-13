@@ -27,6 +27,7 @@ from pages.network.alone_limit_page import AloneLimitPage
 from pages.network.high_prio_host_page import HighPrioHostPage
 from pages.network.layer7_qos_page import Layer7QosPage
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 from utils.step_recorder import StepRecorder
 
 
@@ -59,25 +60,9 @@ class TestStreamControlComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'[OK]' if result.passed else '[FAIL]'} {result.message}")
-                if result.raw_output:
-                    rec.add_detail(f"      SSH数据: {result.raw_output[:160]}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
+
+        kernel_check = make_kernel_check(backend_verifier, rec, ssh_failures, default_module="alone_limit")
 
         # 导出文件路径(提前定义)
         export_high_csv = config.test_data.get_export_path(
@@ -464,6 +449,8 @@ class TestStreamControlComprehensive:
                 ssh_verify("L2-ipset删除后(alone3)",
                            backend_verifier.verify_alone_limit_ipset,
                            rule_id=rid, should_exist=False)
+            # 底层一致性实时校验: alone删除后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤20-alone删除后", fail_on_residual=True, module="alone_limit")
 
         # ========== 步骤21: 终端独立限速-搜索+异常输入 ==========
         with rec.step("步骤21: 终端独立限速-搜索+异常", "搜索 + 空名称/重复名称异常"):
@@ -542,6 +529,8 @@ class TestStreamControlComprehensive:
             ssh_verify("L1-stream_ctl_mode=2(手动)",
                        backend_verifier.verify_stream_ctl_mode, must_pass=True,
                        expected_mode=2)
+            # 底层一致性实时校验: 切手动前清alone后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤23-清alone后", fail_on_residual=True, module="alone_limit")
 
         # ========== 步骤24: 流控策略-添加2条 ==========
         l7_rules = [
@@ -572,6 +561,8 @@ class TestStreamControlComprehensive:
                                backend_verifier.verify_layer7_qos_ipset,
                                must_pass=True,
                                rule_id=int(rule_row["id"]), should_exist=True)
+            # 底层一致性实时校验: l7添加后基线(底层应与DB一致, 记录用)
+            kernel_check("步骤24-l7添加后基线", fail_on_residual=False, module="layer7_qos")
 
         # ========== 步骤25: 流控策略-编辑/停用启用/删除/搜索/导入导出 ==========
         with rec.step("步骤25: 流控策略-编辑/停启用/搜索/导出", "编辑+停用启用+搜索+导出"):
@@ -627,6 +618,9 @@ class TestStreamControlComprehensive:
             ssh_verify("L1-stream_ctl_mode=0(关闭)",
                        backend_verifier.verify_stream_ctl_mode, must_pass=True,
                        expected_mode=0)
+            # 底层一致性实时校验: 关闭流控清理后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤26-清理后-alone_limit", fail_on_residual=True, module="alone_limit")
+            kernel_check("步骤26-清理后-layer7_qos", fail_on_residual=True, module="layer7_qos")
 
         # ========== 最终断言 ==========
         print("\n" + "=" * 60)

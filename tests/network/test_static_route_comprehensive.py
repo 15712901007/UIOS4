@@ -29,6 +29,7 @@ import io
 from pages.network.static_route_page import StaticRoutePage
 from config.config import get_config
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 
 @pytest.mark.static_route
@@ -55,28 +56,7 @@ class TestStaticRouteComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            """执行SSH后台验证并记录结果"""
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'✓' if result.passed else '✗'} {result.message}")
-                # 显示SSH后台查询的原始内容
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         # 测试数据 - 8条路由，覆盖各种数据组合场景
         test_routes = [

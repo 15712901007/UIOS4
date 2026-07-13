@@ -31,6 +31,7 @@ from datetime import datetime
 from pages.network.cross_layer_service_page import CrossLayerServicePage
 from config.config import get_config
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 
 @pytest.mark.cross_layer_service
@@ -57,26 +58,7 @@ class TestCrossLayerServiceComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'OK' if result.passed else 'FAIL'} {result.message}")
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         # 测试数据 - 8条规则，覆盖各种数据组合场景
         # 注意: 每条规则的SNMP服务器IP必须唯一（iKuai不允许重复）

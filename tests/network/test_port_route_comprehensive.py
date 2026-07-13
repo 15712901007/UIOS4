@@ -23,6 +23,7 @@ import pytest
 import os
 from pages.network.port_route_page import PortRoutePage
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 from utils.step_recorder import StepRecorder
 
 
@@ -49,26 +50,9 @@ class TestPortRouteComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'[OK]' if result.passed else '[FAIL]'} {result.message}")
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
+
+        kernel_check = make_kernel_check(backend_verifier, rec, ssh_failures, default_module="stream_ipport")
 
         # 测试数据 - 10条规则，覆盖6种负载模式+2种分流方式+多协议+端口+线路绑定+生效时间+反向匹配
         # 注意：名称最多15字符
@@ -569,6 +553,8 @@ class TestPortRouteComprehensive:
                         should_exist=False,
                         must_pass=False,
                     )
+            # 底层一致性实时校验: 删除后底层应无残留
+            kernel_check("步骤8-删除后", fail_on_residual=True)
 
         # ========== 步骤9: 搜索测试 ==========
         with rec.step("步骤9: 搜索功能测试", "精确搜索/模糊搜索/不存在的规则"):
@@ -1114,6 +1100,8 @@ class TestPortRouteComprehensive:
                         rec.add_detail(f"    SSH: 测试规则已全部删除")
                 except Exception:
                     pass
+            # 底层一致性实时校验: 批量删除后底层应无残留
+            kernel_check("步骤15-批量删除后", fail_on_residual=True)
 
         # ========== 步骤16: 导入测试(追加) ==========
         with rec.step("步骤16: 导入配置(追加)", "使用导出的CSV追加导入"):
@@ -1142,6 +1130,8 @@ class TestPortRouteComprehensive:
             else:
                 print(f"  [WARN] CSV文件不存在")
                 rec.add_detail(f"  CSV文件不存在")
+            # 底层一致性实时校验: 追加导入后底层应与DB一致
+            kernel_check("步骤16-导入追加后", fail_on_residual=False)
 
         # ========== 步骤17: 导入测试(TXT清空现有) ==========
         with rec.step("步骤17: 导入配置(清空现有)", "使用导出的TXT清空现有后导入"):
@@ -1177,6 +1167,8 @@ class TestPortRouteComprehensive:
             else:
                 print(f"  [WARN] TXT文件不存在")
                 rec.add_detail(f"  TXT文件不存在")
+            # 底层一致性实时校验: 清空导入后底层应与DB一致
+            kernel_check("步骤17-导入清空后", fail_on_residual=False)
 
         # ========== 步骤18: 清理环境 ==========
         with rec.step("步骤18: 清理环境", "清理所有残留数据"):
@@ -1214,6 +1206,8 @@ class TestPortRouteComprehensive:
             else:
                 print("  [OK] 无需清理")
                 rec.add_detail("  无需清理")
+            # 底层一致性实时校验: 清理后底层应彻底无残留(硬FAIL)
+            kernel_check("步骤18-清理后", fail_on_residual=True)
 
         # ========== 步骤19: 帮助功能测试 ==========
         with rec.step("步骤19: 帮助功能测试", "测试帮助图标"):
@@ -1381,7 +1375,7 @@ class TestPortRouteFlowVerification:
         try:
             with rec.step("基线探活", "curl baidu --interface ens11 应通(确认环境经路由器)"):
                 bv.connect_client()
-                base = bv.verify_connectivity(dst_domain="www.baidu.com")
+                base = bv.verify_connectivity(dst_domain="www.baidu.com", retries=2)
                 rec.add_detail(f"  基线: {base['detail']}")
                 if not base["connected"]:
                     pytest.skip(f"基线baidu经ens11不可达, 跳过端口分流功能验证: {base['detail']}")

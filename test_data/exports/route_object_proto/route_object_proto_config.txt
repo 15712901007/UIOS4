@@ -1,1 +1,2 @@
-id=8 group_name=AUTOPROTO1E group_value=[{"proto":"网络协议","comment":""}]
+id=11 group_name=协议分组测试 group_value=[{"proto":"基础协议","comment":""},{"proto":"通用协议","comment":""},{"proto":"休闲娱乐","comment":""}]
+id=13 group_name=AUTOPROTO1E group_value=[{"proto":"网络协议","comment":""}]

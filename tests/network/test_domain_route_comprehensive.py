@@ -23,6 +23,7 @@ import pytest
 import os
 from pages.network.domain_route_page import DomainRoutePage
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, attach_cmd_recording_to_closure
 from utils.step_recorder import StepRecorder
 
 
@@ -49,26 +50,47 @@ class TestDomainRouteComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
+
+        def kernel_check(label, fail_on_residual=True, module="stream_domain"):
+            """域名分流底层一致性实时校验(ipset sdomain_src_{id} + ik_core url_route状态). 定位删除残留.
+            域名分流走ik_core url_route内核表(非iptables, ik_summary url_route:on/off + DomainStr域名正则),
+            ipset sdomain_src_{id}仅带src_addr规则建(ignore_missing=True, 无src_addr规则不建ipset正常).
+            残留检测: ①ipset sdomain_src_{id}残留(带src_addr规则删后) ②DB空但url_route仍on(全局残留).
+            不清理底层(保留现场追溯). 残留→failures(硬FAIL+报禅道)."""
             if backend_verifier is None:
                 return None
             try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'[OK]' if result.passed else '[FAIL]'} {result.message}")
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
+                backend_verifier.connect_router()
+                res = backend_verifier.verify_module_kernel_consistency(module, label)
+                rec.add_detail(f"  [底层一致性-{label}] {res['detail']}")
+                for rd in res['residual_detail']:
+                    rec.add_detail(f"    ✗残留 {rd}")
+                # 额外: url_route全局状态(DB空+url_route仍on=残留)
+                row = backend_verifier._sqlite_query_line(
+                    "SELECT count(*) as cnt FROM stream_domain WHERE enabled='yes'")
+                db_count = int(row.get("cnt", 0)) if row else 0
+                cmd = ("sleep 1; cat /proc/ikuai/stats/ik_summary 2>/dev/null"
+                       if db_count == 0 else "cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+                ik = backend_verifier._router.exec(cmd)
+                url_route_on = ("url_route: on" in ik) or ("url_route:on" in ik)
+                ur_residual = (db_count == 0) and url_route_on  # DB空但url_route仍on=残留
+                rec.add_detail(f"    ipset残留={res.get('residual', [])}; DB enabled={db_count}; url_route={'on' if url_route_on else 'off'}")
+                has_residual = bool(res.get('residual')) or ur_residual
+                if has_residual:
+                    if res.get('residual'):
+                        rec.add_detail(f"    ✗ stream_domain ipset残留(删不干净,报禅道): id={res['residual']}")
+                    if ur_residual:
+                        rec.add_detail(f"    ✗ stream_domain url_route残留(DB空但url_route仍on,报禅道)")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: stream_domain ipset={res.get('residual')} url_route残留={ur_residual}(报禅道)")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(无残留, url_route={'on' if url_route_on else 'off'}符合DB={db_count})")
+                return res
             except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
                 return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         # 测试数据 - 10条规则，覆盖多线路+多域名+分组+源地址+生效时间+优先级
         test_rules = [
@@ -510,6 +532,8 @@ class TestDomainRouteComprehensive:
                         should_exist=False,
                         must_pass=False,
                     )
+            # 底层一致性实时校验: 删除后底层ipset+url_route应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤8-删除后", fail_on_residual=True)
 
         # ========== 步骤9: 搜索测试 ==========
         with rec.step("步骤9: 搜索功能测试", "精确搜索/模糊搜索/不存在的规则"):
@@ -1047,6 +1071,8 @@ class TestDomainRouteComprehensive:
                         rec.add_detail(f"    SSH: 测试规则已全部删除")
                 except Exception:
                     pass
+            # 底层一致性实时校验: 批量删除后底层ipset+url_route应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤15-批量删除后", fail_on_residual=True)
 
         # ========== 步骤16: 导入测试(追加CSV) ==========
         with rec.step("步骤16: 导入配置(追加)", "使用导出的CSV追加导入"):
@@ -1147,6 +1173,8 @@ class TestDomainRouteComprehensive:
             else:
                 print("  [OK] 无需清理")
                 rec.add_detail("  无需清理")
+            # 底层一致性实时校验: 清理后底层ipset+url_route应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤18-清理后", fail_on_residual=True)
 
         # ========== 步骤19: 帮助功能测试 ==========
         with rec.step("步骤19: 帮助功能测试", "测试帮助图标"):
@@ -1301,7 +1329,7 @@ class TestDomainRouteFlowVerification:
             # 基线探活: curl baidu经ens11应通(无规则时走默认wan1), 不通=环境问题skip
             with rec.step("基线探活", "curl baidu --interface ens11 应通(确认环境经路由器)"):
                 bv.connect_client()
-                base = bv.verify_connectivity(dst_domain="www.baidu.com")
+                base = bv.verify_connectivity(dst_domain="www.baidu.com", retries=2)
                 rec.add_detail(f"  基线: {base['detail']}")
                 if not base["connected"]:
                     pytest.skip(f"基线baidu经ens11不可达, 跳过域名分流功能验证: {base['detail']}")

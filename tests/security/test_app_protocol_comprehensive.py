@@ -26,6 +26,7 @@ URL: 列表 /login#/securityCenter/applicationProtocolControl
 import os
 import pytest
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import attach_cmd_recording_to_closure
 
 pytestmark = [pytest.mark.security, pytest.mark.app_protocol]
 
@@ -78,6 +79,7 @@ class TestAppProtocolComprehensive:
                 rec.add_detail(f"[SSH-{label}] 异常: {str(e)[:80]}")
                 ssh_failures.append(f"SSH-{label}异常: {str(e)[:80]}")
                 return None
+        ssh_verify = attach_cmd_recording_to_closure(backend_verifier, rec, ssh_verify)
 
         def ui_check(label, cond, detail=""):
             if cond:
@@ -94,6 +96,31 @@ class TestAppProtocolComprehensive:
             print(f"\n{'='*50}\n[STEP] {title} — {desc}", flush=True)
             return _orig_step(title, desc)
         rec.step = _step
+
+        def kernel_check(label, fail_on_residual=True, module="acl_l7"):
+            """应用协议底层一致性实时校验(snapshot ik_app_rule App Rules vs DB). 定位导入→删除残留.
+            不清理底层(保留现场追溯BUG触发步骤). 残留→failures(硬FAIL+报禅道)."""
+            if backend_verifier is None:
+                return None
+            try:
+                backend_verifier.connect_router()
+                res = backend_verifier.verify_module_kernel_consistency(module, label)
+                rec.add_detail(f"  [底层一致性-{label}] {res['detail']}")
+                for rd in res['residual_detail']:
+                    rec.add_detail(f"    ✗残留 {rd}")
+                if res['residual']:
+                    rec.add_detail(f"    ✗ {module}底层残留(删不干净,报禅道): id={res['residual']}")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: {module} id {res['residual']} 底层有DB无(报禅道)")
+                elif res['missing']:
+                    rec.add_detail(f"    ⚠ 漏下发(DB有底层无): {res['missing']}")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(无残留)")
+                return res
+            except Exception as e:
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
+                return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         try:
             # ==================== 步骤1: 环境清理 ====================
@@ -135,6 +162,8 @@ class TestAppProtocolComprehensive:
                                "prio": str(prio)} if prio != 31 else {"enabled": "yes", "action": action})
                     ssh_verify(f"L2-{suffix}", backend_verifier.verify_app_protocol_kernel_rule,
                                name, expect_present=True, expect_action=action)
+                # 底层一致性实时校验: 添加后基线(底层应与DB一致, 记录用)
+                kernel_check("步骤2.5-添加后基线", fail_on_residual=False)
 
             # ==================== 步骤3: 计数验证 ====================
             with rec.step("步骤3: 计数验证(≥8条appt_)", "SSH prefix计数"):
@@ -248,6 +277,8 @@ class TestAppProtocolComprehensive:
                 ssh_verify("步骤9-DB不存在", backend_verifier.verify_app_protocol_not_exists, f"{PREFIX}s04")
                 ssh_verify("步骤9-内核无", backend_verifier.verify_app_protocol_kernel_rule,
                            f"{PREFIX}s04", expect_present=False)
+                # 底层一致性实时校验: 删除后底层应无残留(残留=删不干净BUG,硬FAIL报禅道)
+                kernel_check("步骤9-删除后", fail_on_residual=True)
 
             # ==================== 步骤10: 异常输入分类测试 ====================
             with rec.step("步骤10: 异常输入拦截", "空名/名称格式/未选协议/非法源IP/超长备注"):
@@ -360,6 +391,8 @@ class TestAppProtocolComprehensive:
                     rec.add_detail(f"[导入] 不清空={imp_ok1} 清空={imp_ok2} 文件={os.path.basename(imp_file)}")
                 else:
                     rec.add_detail("[导入] 跳过(无导出文件)")
+                # 底层一致性实时校验: 导入后底层应与DB一致(记录用, 不硬FAIL)
+                kernel_check("步骤12-导入后", fail_on_residual=False)
 
             # ==================== 步骤13: 批量停用/启用/删除 ====================
             with rec.step("步骤13: 批量操作", "批量停用/启用/删除"):
@@ -393,6 +426,8 @@ class TestAppProtocolComprehensive:
                 page.batch_delete()
                 page.page.wait_for_timeout(2500)
                 rec.add_detail("[批量] 停用/启用/删除完成")
+                # 底层一致性实时校验: 批量删除后底层应无残留(残留=删不干净BUG,硬FAIL报禅道)
+                kernel_check("步骤13-批量删除后", fail_on_residual=True)
 
             # ==================== 步骤14: 帮助功能测试 ====================
             with rec.step("步骤14: 帮助功能测试", "图标点击/面板显示/内容/链接/关闭"):
@@ -465,7 +500,7 @@ class TestAppProtocolComprehensive:
                         backend_verifier.connect_router()
                         backend_verifier.connect_client()
                         # 基线: curl baidu经ens11应通(此时无drop规则; --interface ens11强制经路由器)
-                        base = backend_verifier.verify_connectivity(dst_domain="www.baidu.com")
+                        base = backend_verifier.verify_connectivity(dst_domain="www.baidu.com", retries=2)
                         rec.add_detail(f"[基线] {base['detail']}")
                         if not base["connected"]:
                             rec.add_detail("[打流] baidu经ens11不可达, 跳过打流(环境问题)")
@@ -504,7 +539,7 @@ class TestAppProtocolComprehensive:
                             # 删除规则→恢复通(确认规则导致; 删除清appset故恢复)
                             backend_verifier.cleanup_app_protocol_test(flow_name)
                             page.page.wait_for_timeout(1500)
-                            restore = backend_verifier.verify_connectivity(dst_domain="www.baidu.com")
+                            restore = backend_verifier.verify_connectivity(dst_domain="www.baidu.com", retries=2)
                             rec.add_detail(f"[删规则后恢复] {restore['detail']}")
                     except Exception as e:
                         rec.add_detail(f"[打流] 异常: {str(e)[:80]}")
@@ -524,6 +559,8 @@ class TestAppProtocolComprehensive:
                     rec.add_detail(f"[finally SQL清理+ik_cntl del残留] {res}")
                 except Exception as e:
                     rec.add_detail(f"[finally清理异常] {str(e)[:60]}")
+            # 底层一致性实时校验: 清理后底层应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("finally-清理后", fail_on_residual=True)
 
         all_failures = ssh_failures + ui_failures
         if all_failures:
@@ -575,6 +612,7 @@ class TestAppProtocolFlowVerification:
             except Exception as e:
                 rec.add_detail(f"[SSH-{label}] 异常: {str(e)[:80]}")
                 failures.append(f"{label}异常: {str(e)[:80]}")
+        ssh_verify = attach_cmd_recording_to_closure(bv, rec, ssh_verify)
 
         print("\n" + "=" * 50)
         print("应用协议控制功能验证(端到端drop闭环 + 停用BUG三重信号)")
@@ -587,11 +625,12 @@ class TestAppProtocolFlowVerification:
 
         try:
             # ==================== 步骤1: 环境清理 ====================
-            with rec.step("步骤1: 环境清理", "清apptflow_残留+内核残留, 确保new_tc干净"):
+            with rec.step("步骤1: 环境清理", "彻底清acl_l7全表+内核所有app_rule残留(产品BUG删不干净累积干扰判定)"):
                 try:
-                    bv.cleanup_app_protocol_test(self.PREFIX)
-                except Exception:
-                    pass
+                    pur = bv.cleanup_all_app_protocol()
+                    rec.add_detail(f"[SSH清理] {pur}")
+                except Exception as e:
+                    rec.add_detail(f"[清理异常] {str(e)[:60]}")
                 page.navigate_to_app_proto()
                 page.page.wait_for_timeout(1500)
                 try:
@@ -599,7 +638,6 @@ class TestAppProtocolFlowVerification:
                 except Exception:
                     pass
                 page.page.wait_for_timeout(1000)
-                rec.add_detail("[清理] acl_l7表apptflow_ + 内核app_rule/appset清空")
 
             # ==================== 步骤2: DPI引擎探活 ====================
             with rec.step("步骤2: DPI引擎探活", "读ik_features_status的dpi(基础DPI识别引擎)"):
@@ -672,6 +710,10 @@ class TestAppProtocolFlowVerification:
             with rec.step("步骤5: 建drop规则 + 验证阻断生效", f"UI建drop {target['category']}→L1/L2→curl阻断判定"):
                 # UI建规则走API完整下发(含new_tc引擎启用); SSH直接建SQL不触发引擎→drop不执行.
                 # 停用/启用/删除用UI触发down()/del()(正是停用BUG的触发动作).
+                try:
+                    rec.add_detail(f"[建前清理] {bv.cleanup_all_app_protocol()}")  # 清步骤3 probe残留, 确保flow规则id干净
+                except Exception:
+                    pass
                 page.navigate_to_app_proto(); page.page.wait_for_timeout(1500)
                 r = page.add_rule(flow_name, protocol_category=target["category"], action="drop", prio=32)
                 page.page.wait_for_timeout(2000)
@@ -749,7 +791,7 @@ class TestAppProtocolFlowVerification:
                     deleted = page.delete_rule(flow_name)
                     page.page.wait_for_timeout(2000)
                     rec.add_detail(f"  [UI] 删除 {flow_name}: {'成功' if deleted else '失败'}")
-                    restore = bv.verify_connectivity(dst_domain=target["domain"])
+                    restore = bv.verify_connectivity(dst_domain=target["domain"], retries=2)
                     rec.add_detail(f"  [恢复连通] {restore['detail']}")
                     ssh_verify("步骤8-内核无规则", bv.verify_app_protocol_kernel_rule, flow_name, expect_present=False)
                     if bv.app_protocol_appset_has_appid(flow_name):
@@ -765,7 +807,7 @@ class TestAppProtocolFlowVerification:
             except Exception:
                 pass
             try:
-                bv.cleanup_app_protocol_test(self.PREFIX)
+                bv.cleanup_all_app_protocol()
             except Exception:
                 pass
 

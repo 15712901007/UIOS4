@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from utils.step_recorder import StepRecorder
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 PREFIX = "ud"
 
@@ -94,25 +95,8 @@ class TestUpdownRouteComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'[OK]' if result.passed else '[FAIL]'} {result.message}")
-                if result.raw_output:
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
+        kernel_check = make_kernel_check(backend_verifier, rec, ssh_failures, default_module="stream_updown")
 
         print("\n" + "=" * 60)
         print("上下行分离综合测试开始")
@@ -216,6 +200,8 @@ class TestUpdownRouteComprehensive:
             # L3+L4 内核验证
             ssh_verify("L3-内核状态", backend_verifier.verify_stream_updown_kernel_status)
             ssh_verify("L4-内核模块", backend_verifier.verify_stream_updown_kernel)
+            # 底层一致性基线(添加后): 记录snapshot, 作为后续删除/导入残留对比基准
+            kernel_check("步骤12-添加后基线", fail_on_residual=False)
 
         # ========== 步骤13: 编辑规则 ==========
         with rec.step("步骤13: 编辑规则", "编辑ud10_remark的备注"):
@@ -592,6 +578,8 @@ class TestUpdownRouteComprehensive:
             rec.add_detail(f"[结果] 删除{before_delete}条规则成功, 剩余{after_delete}条")
 
             ssh_verify("L3-删除后验证", backend_verifier.verify_stream_updown_kernel_status)
+            # 底层一致性实时校验: 批量删除后底层应无残留
+            kernel_check("步骤22-批量删除后", fail_on_residual=True)
 
         # ========== 步骤23: 导入测试(追加) ==========
         with rec.step("步骤23: 导入配置(追加)", "使用导出的CSV追加导入"):
@@ -620,6 +608,8 @@ class TestUpdownRouteComprehensive:
             else:
                 print(f"  [WARN] CSV文件不存在")
                 rec.add_detail(f"  CSV文件不存在")
+            # 底层一致性实时校验: 追加导入后底层应与DB一致
+            kernel_check("步骤23-导入追加后", fail_on_residual=False)
 
         # ========== 步骤24: 导入测试(TXT清空现有) ==========
         with rec.step("步骤24: 导入配置(清空现有)", "使用导出的TXT清空现有后导入"):
@@ -654,6 +644,8 @@ class TestUpdownRouteComprehensive:
             else:
                 print(f"  [WARN] TXT文件不存在")
                 rec.add_detail(f"  TXT文件不存在")
+            # 底层一致性实时校验: 清空导入后底层应与DB一致
+            kernel_check("步骤24-导入清空后", fail_on_residual=False)
 
         # ========== 步骤25: 清理环境 ==========
         with rec.step("步骤25: 清理环境", "清理所有残留数据"):
@@ -695,6 +687,8 @@ class TestUpdownRouteComprehensive:
 
             ssh_verify("L3-最终验证", backend_verifier.verify_stream_updown_kernel_status)
             ssh_verify("L4-最终验证", backend_verifier.verify_stream_updown_kernel)
+            # 底层一致性实时校验: 清理后底层应彻底无残留(硬FAIL)
+            kernel_check("步骤25-清理后", fail_on_residual=True)
 
         # ========== 步骤26: 帮助功能测试 ==========
         with rec.step("步骤26: 帮助功能测试", "测试帮助图标"):

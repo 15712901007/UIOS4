@@ -19,6 +19,7 @@ import pytest
 import os
 from pages.network.multi_wan_lb_page import MultiWanLbPage
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, attach_cmd_recording_to_closure
 from utils.step_recorder import StepRecorder
 
 
@@ -45,26 +46,42 @@ class TestMultiWanLbComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
+
+        def kernel_check(label, fail_on_residual=True, module="lb_pcc"):
+            """多线负载底层一致性实时校验(lb_pcc DB enabled数 vs ik_core LB状态). 定位删除残留.
+            多线负载无per-rule ipset/mark_rule(fwmark固定0x271X系统级), 用DB数vs ik_core LB enable/disable对比:
+            DB有规则+LB enable=正常; DB空+LB disable=正常; DB空+LB仍enable=残留(删不干净); DB有+LB disable=漏落地.
+            DB空时LB disable可能有延迟(lb_pcc.sh reload), sleep 1s再查避误报.
+            不清理底层(保留现场追溯). 残留→failures(硬FAIL+报禅道)."""
             if backend_verifier is None:
                 return None
             try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'[OK]' if result.passed else '[FAIL]'} {result.message}")
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
+                backend_verifier.connect_router()
+                row = backend_verifier._sqlite_query_line(
+                    "SELECT count(*) as cnt FROM lb_pcc WHERE enabled='yes'")
+                db_count = int(row.get("cnt", 0)) if row else 0
+                cmd = ("sleep 1; cat /proc/ikuai/stats/ik_summary 2>/dev/null"
+                       if db_count == 0 else "cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+                ik = backend_verifier._router.exec(cmd)
+                lb_enabled = ("LB: enable" in ik) or ("LB:enable" in ik)
+                residual = (db_count == 0) and lb_enabled  # DB空但LB仍enable=删不干净残留
+                miss = (db_count > 0) and (not lb_enabled)  # DB有规则但LB disable=漏落地
+                rec.add_detail(f"  [底层一致性-{label}] lb_pcc: DB enabled={db_count}条; "
+                               f"ik_core LB={'enable' if lb_enabled else 'disable'}")
+                if residual:
+                    rec.add_detail(f"    ✗ lb_pcc底层残留(删不干净,报禅道): DB空但ik_core LB仍enable")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: lb_pcc DB空但ik_core LB仍enable(报禅道)")
+                elif miss:
+                    rec.add_detail(f"    ⚠ 漏落地(DB有规则但ik_core LB disable, 可能线路未启用或时延)")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(LB={'enable' if lb_enabled else 'disable'}符合DB={db_count})")
+                return {"db_count": db_count, "lb_enabled": lb_enabled}
             except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
                 return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         # 测试数据 - 7条规则，覆盖全部7种负载模式
         # 注意：后端tagname字段最多15字符，超长会被截断
@@ -361,6 +378,8 @@ class TestMultiWanLbComprehensive:
                         ssh_failures.append(f"SSH-L1-删除验证: {delete_rule_data['name']} 仍在数据库中")
                 except Exception as e:
                     print(f"    SSH-L1: 跳过 - {str(e)[:80]}")
+            # 底层一致性实时校验: 删除1条后LB应仍enable(DB还有规则); 不跟随=异常
+            kernel_check("步骤7-删除后", fail_on_residual=True)
 
         # ========== 步骤8: 搜索测试(扩展) ==========
         with rec.step("步骤8: 搜索功能测试", "精确搜索/模糊搜索/不存在的规则"):
@@ -697,6 +716,8 @@ class TestMultiWanLbComprehensive:
                         rec.add_detail(f"    SSH: 测试规则已全部删除")
                 except Exception:
                     pass
+            # 底层一致性实时校验: 批量删除后DB空+LB应disable(LB仍enable=删不干净残留,硬FAIL报禅道)
+            kernel_check("步骤14-批量删除后", fail_on_residual=True)
 
         # ========== 步骤15: 导入测试(追加) ==========
         with rec.step("步骤15: 导入配置(追加)", "使用导出的CSV追加导入"):

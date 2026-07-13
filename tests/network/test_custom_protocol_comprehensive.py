@@ -15,6 +15,7 @@ from pages.network.custom_protocol_page import (
     CustomProtocolPage, AdvancedCustomProtocolPage, CLASS_NAMES,
 )
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify
 
 
 # ==================== L4 测试数据 ====================
@@ -38,27 +39,8 @@ L7_NAMES = [r["name"] for r in L7_RULES]
 
 
 def _make_ssh_verify(rec, backend_verifier, failures):
-    """构造 ssh_verify helper (软断言收集 + 末尾硬断言)"""
-    def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-        if backend_verifier is None:
-            return None
-        try:
-            result = verify_func(*args, **kwargs)
-            status = '[OK]' if result.passed else '[FAIL]'
-            print(f"    SSH-{label}: {status} - {result.message}")
-            rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-            if result.raw_output:
-                rec.add_detail(f"      SSH数据: {result.raw_output[:200]}")
-            if must_pass and not result.passed:
-                failures.append(f"SSH-{label}: {result.message}")
-            return result
-        except Exception as e:
-            print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-            rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-            if must_pass:
-                failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-            return None
-    return ssh_verify
+    """构造 ssh_verify helper (委托共享工厂 make_ssh_verify, 含验证命令录制显示进报告)"""
+    return make_ssh_verify(backend_verifier, rec, failures)
 
 
 # ============================================================================

@@ -22,6 +22,7 @@ URL: 列表 /login#/securityCenter/macAccessControl, 配置 /login#/securityCent
 import os
 import pytest
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import attach_cmd_recording_to_closure
 
 pytestmark = [pytest.mark.security, pytest.mark.mac_access_control]
 
@@ -63,6 +64,7 @@ class TestMacAccessControlComprehensive:
                 rec.add_detail(f"[SSH-{label}] 异常: {str(e)[:80]}")
                 ssh_failures.append(f"SSH-{label}异常: {str(e)[:80]}")
                 return None
+        ssh_verify = attach_cmd_recording_to_closure(backend_verifier, rec, ssh_verify)
 
         def ui_check(label, cond, detail=""):
             if cond:
@@ -70,6 +72,36 @@ class TestMacAccessControlComprehensive:
             else:
                 rec.add_detail(f"[UI] {label}: 失败 - {detail}")
                 ui_failures.append(f"{label}: {detail}")
+
+        def kernel_check(label, fail_on_residual=True):
+            """MAC访问控制底层一致性实时校验(ipset acl_mac_{id} vs 当前模式表). 定位删除残留.
+            双表acl_mac_black/white, ipset acl_mac_{id}共用(跟随global_config.acl_mac模式0黑/1白).
+            根据当前模式选表对比. 不清理底层(保留现场追溯). 残留→failures(硬FAIL+报禅道)."""
+            if backend_verifier is None:
+                return None
+            try:
+                backend_verifier.connect_router()
+                gc = backend_verifier._sqlite_query_line("SELECT acl_mac FROM global_config") or {}
+                mode = str(gc.get("acl_mac", "0"))
+                module = "mac_access_black" if mode == "0" else "mac_access_white"
+                res = backend_verifier.verify_module_kernel_consistency(module, label)
+                rec.add_detail(f"  [底层一致性-{label}] {res['detail']} (模式={'黑名单' if mode=='0' else '白名单'})")
+                for rd in res['residual_detail']:
+                    rec.add_detail(f"    ✗残留 {rd}")
+                if res['residual'] or res.get('count_overflow'):
+                    ovf = '/'.join(f"{c['chain']}累加{c['dup']}条" for c in res.get('count_overflow', []))
+                    rec.add_detail(f"    ✗ {module}底层残留(删不干净,报禅道): id={res['residual']}{'; ' + ovf if ovf else ''}")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: {module} id {res['residual']} {ovf} 底层有DB无(报禅道)")
+                elif res['missing']:
+                    rec.add_detail(f"    ⚠ 漏下发(DB有底层无): {res['missing']}")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(无残留)")
+                return res
+            except Exception as e:
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
+                return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         try:
             # ==================== 步骤1: 环境快照+清理 ====================
@@ -186,6 +218,8 @@ class TestMacAccessControlComprehensive:
                            f"{PREFIX}b1", "black")
                 ssh_verify("步骤10-iptables无", backend_verifier.verify_mac_ctrl_iptables,
                            f"{PREFIX}b1", "black", expect_present=False)
+                # 底层一致性实时校验: 删除后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+                kernel_check("步骤10-删除后", fail_on_residual=True)
 
             # ==================== 步骤11: 模式切换(黑→白) + 白名单场景 ====================
             with rec.step("步骤11: 模式切换黑→白+白名单MAC", "radio UI切换(不调API已知)+后端切换+白名单规则"):
@@ -330,6 +364,8 @@ class TestMacAccessControlComprehensive:
                 page.page.wait_for_timeout(1500)
                 left = page.get_rule_count()
                 rec.add_detail(f"[批量删除后] 剩余 {left} 条")
+                # 底层一致性实时校验: 批量删除后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+                kernel_check("步骤15-批量删除后", fail_on_residual=True)
 
             # ==================== 步骤16: 功能连通性验证(黑名单阻断) ====================
             with rec.step("步骤16: 功能连通性验证(黑名单阻断)", "基线curl→加client MAC黑名单→不通(硬)→移除恢复(硬)"):
@@ -341,7 +377,7 @@ class TestMacAccessControlComprehensive:
                     try:
                         backend_verifier.connect_client()
                         # 基线: curl baidu经ens11应通
-                        base = backend_verifier.verify_connectivity(dst_domain="www.baidu.com")
+                        base = backend_verifier.verify_connectivity(dst_domain="www.baidu.com", retries=2)
                         rec.add_detail(f"[基线] {base['detail']}")
                         if not base["connected"]:
                             rec.add_detail("[功能] baidu经ens11不可达, 跳过(环境)")
@@ -371,7 +407,7 @@ class TestMacAccessControlComprehensive:
                             except Exception:
                                 pass
                             page.page.wait_for_timeout(2000)
-                            restore = backend_verifier.verify_connectivity(dst_domain="www.baidu.com")
+                            restore = backend_verifier.verify_connectivity(dst_domain="www.baidu.com", retries=2)
                             rec.add_detail(f"[移除MAC后] {restore['detail']}")
                             if not restore["connected"]:
                                 rec.add_detail("  ✗ 移除MAC后baidu仍不通(规则残留/环境)")
@@ -395,6 +431,8 @@ class TestMacAccessControlComprehensive:
                     rec.add_detail(f"[finally SQL清理+恢复黑名单] {res}")
                 except Exception as e:
                     rec.add_detail(f"[finally清理异常] {str(e)[:60]}")
+            # 底层一致性实时校验: 清理后底层ipset应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("finally-清理后", fail_on_residual=True)
 
         all_failures = ssh_failures + ui_failures
         if all_failures:

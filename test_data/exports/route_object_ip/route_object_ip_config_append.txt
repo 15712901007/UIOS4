@@ -1,1 +1,1 @@
-group_name=AUTOIMP1 group_value=[{"comment":"","ip":"10.66.0.1"},{"comment":"","ip":"10.66.0.5"},{"comment":"","ip":"10.66.0.10"}]
+group_name=AUTOIMP1 group_value=[{"ip":"10.66.0.1","comment":""},{"ip":"10.66.0.5","comment":""},{"ip":"10.66.0.10","comment":""},{"ip":"10.66.0.11","comment":""},{"ip":"10.66.0.22","comment":""}]

@@ -74,6 +74,7 @@ class SSHClient:
         self._client: Optional[paramiko.SSHClient] = None
         self._console_logged_in = False  # 控制台登录状态
         self._used_console_login = False  # 是否使用了控制台登录流程
+        self._cmd_log: List[str] = []  # 执行过的命令录制(供验证报告显示验证命令, mark/collect差量)
 
     def connect(self):
         if self._client is not None:
@@ -385,6 +386,7 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
         会导致stdout.read()无限阻塞(实测测试过程中偶发卡死5分钟+)。
         这里用看门狗线程, 超时后强制close client让阻塞的recv抛异常退出, 再重连重试一次。
         """
+        self._cmd_log.append(command)  # 录制命令(入口录制, 重连重试不再经此故不重复; 供报告显示验证命令)
         import threading
         hard_limit = timeout + 20  # settimeout应在timeout触发, 留20s余量后强制中断
         holder = {}
@@ -541,6 +543,42 @@ class BackendVerifier:
         if self._client:
             self._client.close()
             self._client = None
+
+    # ==================== 验证命令录制(供测试报告显示, 方便工程师看报告自己复验) ====================
+    def mark_cmd_start(self) -> Dict[str, tuple]:
+        """标记当前命令录制位置(供 collect_cmds_since_mark 差量捕获)。
+
+        捕获 router+client 两个 SSHClient 的 (实例引用, 当前log长度)。永不抛异常。
+        ssh_verify/kernel_check 在调用 verify 前标记、后差量, 把本次验证执行的SSH命令显示进报告。
+        """
+        def _snap(role):
+            inst = getattr(self, f"_{role}", None)
+            return (inst, len(inst._cmd_log)) if inst is not None else (None, 0)
+        return {"router": _snap("router"), "client": _snap("client")}
+
+    def collect_cmds_since_mark(self, mark) -> List[str]:
+        """取 mark 之后的命令差量, 逐条加 [router]/[client] 前缀。
+
+        用 `is not` 判断 SSHClient 实例是否变更(mark后重连重建了实例),
+        变更则从0切片(捕获重建后新实例的全部命令, 含重连本身触发的命令)。
+        """
+        out = []
+        for role in ("router", "client"):
+            inst_mark, start = mark.get(role, (None, 0))
+            inst_now = getattr(self, f"_{role}", None)
+            if inst_now is None:
+                continue
+            s = 0 if (inst_mark is None or inst_mark is not inst_now) else start
+            for c in inst_now._cmd_log[s:]:
+                out.append(f"[{role}] {c}")
+        return out
+
+    def get_last_cmds(self, n: int = 50) -> List[str]:
+        """最近 n 条命令(router+client 合并)。手动调试/复验用, 非报告路径。"""
+        router = self._router._cmd_log if self._router else []
+        client = self._client._cmd_log if self._client else []
+        all_cmds = [f"[router] {c}" for c in router] + [f"[client] {c}" for c in client]
+        return all_cmds[-n:] if n else all_cmds
 
     def is_xt_set_broken(self) -> bool:
         """探测iptables xt_set模块是否可用。
@@ -1443,43 +1481,218 @@ class BackendVerifier:
         return {"connected": received > 0, "received": received, "detail": detail, "raw": out}
 
     def verify_connectivity(self, src_iface="ens11", dst_domain=None, dst_ip=None,
-                            count=3, timeout=8) -> Dict:
+                            count=3, timeout=8, retries=0, fallback_domains=None) -> Dict:
         """通用连通性验证: client从指定源接口curl域名或ping IP, 判定通/不通.
         不依赖match/user_dpi/new_tc, 纯连通性端到端判定(用户验证逻辑).
         dst_domain优先用curl(HTTP), dst_ip用ping(ICMP).
-        Returns: {"connected": bool, "detail": str}
+        retries: 连通失败时的重试次数(默认0, 向后兼容). 基线/恢复探测传retries=2可抗外网瞬时抖动;
+                 ⚠️建drop规则后期望"不通"的验证(blk/dis_conn)勿传, 否则重试会掩盖规则效果.
+        fallback_domains: 主dst_domain经retries重试仍不通时依次尝试的备用域名列表
+                 (如["www.qq.com","cn.bing.com","www.taobao.com"]), 任一通即判connected=True.
+                 抗单域名/外网瞬时抖动(实测baidu凌晨间歇http_code=000但qq/bing正常).
+                 ⚠️仅用于"期望通"的基线/恢复探测; 建drop/停用规则后"期望不通"的验证
+                 (blk/dis_conn)勿传(会fallback到备用域名误判规则未生效). 默认None=原行为(单域名).
+        Returns: {"connected": bool, "detail": str, "attempts": int, "tried": list(各域名结果)}
         """
         self.connect_client()
-        if dst_domain:
-            out = self._client.exec(
-                f"curl -s -o /dev/null -w '%{{http_code}}' --interface {src_iface} --connect-timeout 3 -m {timeout} http://{dst_domain}/",
-                timeout=timeout + 5)
-            code = out.strip().rstrip("'").lstrip("'")
-            connected = any(c in code for c in ["200", "301", "302", "304"])
-            return {"connected": connected, "detail": f"curl {dst_domain} http_code={code}"}
-        elif dst_ip:
-            out = self._client.exec(f"ping -I {src_iface} -c {count} -W 2 {dst_ip}", timeout=count * 3 + 5)
-            m = re.search(r"(\d+)\s*received", out)
-            received = int(m.group(1)) if m else 0
-            return {"connected": received > 0, "detail": f"ping {dst_ip} {received}/{count} received"}
-        return {"connected": False, "detail": "no dst_domain or dst_ip specified"}
+
+        def _probe_http(dom):
+            """单域名retries轮curl, 返回(connected, code, attempts)."""
+            code = "000"
+            for attempt in range(retries + 1):
+                out = self._client.exec(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' --interface {src_iface} "
+                    f"--connect-timeout 3 -m {timeout} http://{dom}/",
+                    timeout=timeout + 5)
+                code = (out or "").strip().strip("'").lstrip("'")
+                if any(c in code for c in ["200", "301", "302", "304"]):
+                    return True, code, attempt + 1
+                if attempt < retries:
+                    time.sleep(1)
+            return False, code, retries + 1
+
+        # dst_ip分支: ping(不涉及fallback)
+        if dst_ip and not dst_domain:
+            for attempt in range(retries + 1):
+                out = self._client.exec(f"ping -I {src_iface} -c {count} -W 2 {dst_ip}", timeout=count * 3 + 5)
+                m = re.search(r"(\d+)\s*received", out or "")
+                received = int(m.group(1)) if m else 0
+                if received > 0:
+                    detail = f"ping {dst_ip} {received}/{count} received"
+                    if attempt > 0:
+                        detail += f" (第{attempt + 1}次尝试成功)"
+                    return {"connected": True, "detail": detail, "attempts": attempt + 1, "tried": []}
+                if attempt < retries:
+                    time.sleep(1)
+            return {"connected": False, "detail": f"ping {dst_ip} 0/{count} received (重试{retries}次仍失败)",
+                    "attempts": retries + 1, "tried": []}
+
+        if not dst_domain:
+            return {"connected": False, "detail": "no dst_domain or dst_ip specified", "attempts": 0, "tried": []}
+
+        # http探测: 主域名 + fallback域名(任一通即返回)
+        targets = [dst_domain]
+        if fallback_domains:
+            targets += [d for d in fallback_domains if d and d != dst_domain]
+        tried = []
+        for idx, dom in enumerate(targets):
+            ok, code, att = _probe_http(dom)
+            tried.append({"domain": dom, "connected": ok, "code": code, "attempts": att})
+            if ok:
+                tag = "" if idx == 0 else f" (主{dst_domain}抖动不通, fallback {dom}成功)"
+                if att > 1 and idx == 0:
+                    tag += f" (第{att}次成功)"
+                return {"connected": True, "detail": f"curl {dom} http_code={code}{tag}",
+                        "attempts": att, "tried": tried}
+        # 全失败: 汇总各域名code(供诊断)
+        codes_str = ", ".join(f"{t['domain'].replace('www.', '')}={t['code']}" for t in tried)
+        if len(tried) > 1:
+            # 基线/恢复探测(多域名冗余仍全失败): 提示环境问题, 建议查诊断
+            detail = (f"{len(tried)}域名全失败({codes_str}); 疑似环境/外网抖动, "
+                      f"建议调diagnose_baseline_block定位(残留挡流→FAIL / WAN断→skip)")
+        else:
+            # 单域名(可能是建drop/停用规则后期望不通的验证): 只报code, 不臆断环境
+            detail = f"curl {tried[0]['domain']} http_code={tried[0]['code']}"
+        return {"connected": False, "detail": detail,
+                "attempts": tried[-1]["attempts"] if tried else 0, "tried": tried}
 
     def concurrent_curl(self, n: int = 8, dst: str = "www.baidu.com",
-                        src_iface: str = "ens11", timeout: int = 6) -> Dict:
+                        src_iface: str = "ens11", timeout: int = 6, retries: int = 0,
+                        fallback_dsts=None) -> Dict:
         """并发n个curl经src_iface到dst(连接数限制功能验证用: limit=N时超限并发连接被丢弃).
 
         单条exec内shell & + wait起n个并发curl, 统计HTTP成功数.
         limit=1时: 基线应≈n成功, 建规则后应明显下降(peerconns-above 1丢弃第2+并发).
-        Returns: {"success": 成功数, "total": 实际完成数, "codes": 各curl的http_code(前20)}
+        retries: 未达全成功(n)时的重试轮数(默认0, 向后兼容). 基线/恢复探测传retries=2抗外网瞬时抖动,
+                 多轮取success最高者; ⚠️建limit规则后期望success下降的验证(lim1/lim2)勿传, 否则取max会掩盖限速.
+        fallback_dsts: 主dst经retries仍success偏低时, 依次尝试的备用域名(如["www.qq.com","cn.bing.com"]),
+                 跨域名取success最高者. 抗单域名抖动(实测baidu凌晨间歇0/8但qq/bing正常).
+                 ⚠️仅基线/恢复探测传; limit验证(lim1/lim2)勿传(会跨域名掩盖限速效果). 默认None=原行为.
+        Returns: {"success": 成功数, "total": 实际完成数, "codes": 各curl的http_code(前20), "attempts": 轮数}
         """
         self.connect_client()
-        cmd = (f"for i in $(seq 1 {n}); do "
-               f"curl -s -o /dev/null -w '%{{http_code}}\\n' --interface {src_iface} "
-               f"--connect-timeout 3 -m {timeout} http://{dst}/ & done; wait")
-        out = self._client.exec(cmd, timeout=n * timeout + 25)
-        codes = [c.strip().strip("'") for c in out.splitlines() if c.strip()]
-        success = sum(1 for c in codes if any(x in c for x in ["200", "301", "302", "304"]))
-        return {"success": success, "total": len(codes), "codes": codes[:20]}
+
+        def _one_dst(d):
+            """单域名retries轮并发curl, 返回best dict."""
+            cmd = (f"for i in $(seq 1 {n}); do "
+                   f"curl -s -o /dev/null -w '%{{http_code}}\\n' --interface {src_iface} "
+                   f"--connect-timeout 3 -m {timeout} http://{d}/ & done; wait")
+            best = None
+            rounds = 0
+            for attempt in range(retries + 1):
+                out = self._client.exec(cmd, timeout=n * timeout + 25)
+                codes = [c.strip().strip("'") for c in (out or "").splitlines() if c.strip()]
+                success = sum(1 for c in codes if any(x in c for x in ["200", "301", "302", "304"]))
+                cur = {"success": success, "total": len(codes), "codes": codes[:20]}
+                rounds += 1
+                if best is None or success > best["success"]:
+                    best = cur
+                if success >= n:  # 全成功则无需再重试
+                    break
+                if attempt < retries:
+                    time.sleep(1)
+            best["attempts"] = rounds
+            if rounds > 1:
+                best["detail"] = f"多轮取最高(共{rounds}轮)"
+            return best
+
+        targets = [dst] + ([d for d in fallback_dsts if d and d != dst] if fallback_dsts else [])
+        best_overall = None
+        tried = []
+        for d in targets:
+            r = _one_dst(d)
+            tried.append({"domain": d, "success": r["success"], "total": r["total"]})
+            if best_overall is None or r["success"] > best_overall["success"]:
+                best_overall = dict(r)
+            if best_overall["success"] >= n:
+                break
+        best_overall["tried"] = tried
+        if len(targets) > 1:
+            best_overall["detail"] = f"{len(targets)}域名取最高: " + ", ".join(
+                f"{t['domain'].replace('www.', '')}={t['success']}/{t['total']}" for t in tried)
+        return best_overall
+
+    def diagnose_baseline_block(self, src_iface="ens11", dst_domain="www.baidu.com") -> Dict:
+        """基线连通性全域名失败时的根因诊断.
+
+        区分两种"基线不通":
+          A. 残留规则挡流(功能/配置问题) → 调用方应判FAIL并在报告写清规则+命令(不应skip)
+          B. 路由器WAN自身中断/纯外网抖动(环境问题) → 调用方可skip, 但报告须含本诊断全部信息+命令
+
+        诊断维度: 路由器自身curl外网(区分WAN断vs仅client侧断) + client DNS解析 +
+                  路由器iptables FORWARD链残留DROP/connlimit规则 + conn_limit enabled规则数.
+        Returns: {
+            "router_wan_ok": bool,        # 路由器直接出WAN能否curl外网
+            "router_code": str,           # 路由器curl http_code
+            "dns_ok": bool,               # client DNS解析
+            "dns_detail": str,
+            "residual_block": str/None,   # 残留挡流规则(已滤系统默认WAN入站DROP); None=无残留
+            "conn_limit_enabled": str,    # conn_limit enabled规则数
+            "commands": [str],            # 可复现验证命令(写入报告)
+            "summary": str,               # 人读结论+处置建议
+        }
+        """
+        self.connect_router()
+        self.connect_client()
+        cmds = []
+
+        # 1. 路由器自身curl外网(不经ens11, 走WAN直出): 区分WAN断 vs 仅client侧断
+        out = self._router.exec(
+            f"curl -s -o /dev/null -w '%{{http_code}}' --connect-timeout 4 -m 8 http://{dst_domain}/ 2>&1",
+            timeout=15)
+        router_code = (out or "").strip().strip("'").lstrip("'").splitlines()[-1] if (out or "").strip() else "000"
+        router_wan_ok = any(c in router_code for c in ["200", "301", "302", "304"])
+        cmds.append(f"# 路由器自身出WAN: curl -s -o /dev/null -w '%{{http_code}}' -m 8 http://{dst_domain}/")
+
+        # 2. client DNS解析
+        dns = self._client.exec(f"getent hosts {dst_domain} 2>&1", timeout=8)
+        dns_detail = (dns or "").strip().splitlines()[0] if (dns or "").strip() else "无解析结果"
+        dns_ok = bool((dns or "").strip()) and "not found" not in dns_detail.lower()
+        cmds.append(f"# client DNS: getent hosts {dst_domain}")
+
+        # 3. 路由器iptables残留挡流规则: 只匹配真正的 -j DROP/REJECT 动作(空链跳转
+        #    -A FORWARD -j CONNLIMIT 是系统基础设施, 空链不挡流, 不匹配不误判),
+        #    排除系统默认WAN入站DROP(DROP_U/T_PORTS等).
+        ipt = self._router.exec(
+            "iptables -S 2>/dev/null | grep -E -- '-j (DROP|REJECT)' | "
+            "grep -vE 'WAN_IN|DROP_U_PORTS|DROP_T_PORTS|AUTH_EXPIRES|WEBTO|PPPOE-to-PPPOE|DHCP_ACL' | head -20",
+            timeout=10)
+        cmds.append("# 路由器残留挡流(只看-j DROP/REJECT, 排除系统默认WAN入站DROP): "
+                    "iptables -S | grep -E '-j (DROP|REJECT)' | grep -vE 'WAN_IN|DROP_U_PORTS|...'")
+        residual = None
+        ipt = ipt or ""
+        if ipt.strip():
+            lines = [l.strip() for l in ipt.splitlines()
+                     if l.strip() and not l.strip().startswith("-N ")]
+            if lines:
+                residual = "; ".join(l[:100] for l in lines[:5])
+
+        # 4. conn_limit enabled规则数(连接数限制残留会挡client并发)
+        cl = self._router.exec(
+            'sqlite3 /etc/mnt/ikuai/config.db "select count(*) from conn_limit where enabled=1" 2>/dev/null',
+            timeout=8)
+        cl_cnt = (cl or "0").strip() or "0"
+        cmds.append('# conn_limit残留: sqlite3 /etc/mnt/ikuai/config.db "select count(*) from conn_limit where enabled=1"')
+        cmds.append("# client经ens11复测: curl -s -o /dev/null -w '%{http_code}' --interface ens11 -m 8 http://{dom}/".replace("{dom}", dst_domain))
+
+        # 结论
+        if residual:
+            summary = (f"[功能/配置问题] 路由器有残留挡流规则: {residual} → 应判FAIL(非环境), "
+                       f"清理残留规则后重测. conn_limit enabled={cl_cnt}")
+        elif not router_wan_ok:
+            summary = (f"[环境问题] 路由器自身出WAN也不通(http_code={router_code}), 整体外网中断, "
+                       f"与被测功能无关, 可skip(详报已附命令).")
+        elif not dns_ok:
+            summary = (f"[环境问题] client DNS解析失败({dns_detail}), {dst_domain}无IP, DNS问题, 可skip.")
+        else:
+            summary = (f"[环境抖动] 路由器WAN通({router_code})+DNS正常, 但client经{src_iface}不通, "
+                       f"无残留规则, 判client侧路由/接口瞬时抖动, 可skip(建议稍后重测).")
+        return {
+            "router_wan_ok": router_wan_ok, "router_code": router_code,
+            "dns_ok": dns_ok, "dns_detail": dns_detail,
+            "residual_block": residual, "conn_limit_enabled": cl_cnt,
+            "commands": cmds, "summary": summary,
+        }
 
     def conntrack_egress(self, client_ip: str, dst_port: int = None,
                          proto: str = None) -> Dict:
@@ -2657,6 +2870,275 @@ class BackendVerifier:
                 passed=False,
                 message=f"内核检查失败: {str(e)[:100]}",
             )
+
+    def snapshot_stream_layer7_kernel(self) -> Dict:
+        """snapshot协议分流底层4类载体(各为stream_layer7 id集合):
+        1. iptables mangle STREAM_LAYER7_NEW链(comment id = stream_layer7 id)
+        2. ik_summary Mark Rules的mark_rule(id=4000000+stream_layer7 id, IPT_CONNMARK_STREAM_LAYER7=4000000)
+        3. appset slayer7_app_{id}(从iptables appset字段)
+        4. ipset slayer7_src_{id}(带源址规则)"""
+        self.connect_router()
+        ipt_rules = self.query_stream_layer7_iptables()
+        ipt_ids, appset_ids = set(), set()
+        for r in ipt_rules:
+            rid = r.get("rule_id")
+            if rid is not None:
+                ipt_ids.add(int(rid))
+            m = re.search(r'slayer7_app_(\d+)', r.get("appset", ""))
+            if m:
+                appset_ids.add(int(m.group(1)))
+        # ik_summary Mark Rules: 协议分流mark_rule id∈[4000001,6000000)(下个base端口分流6000000)
+        mark_ids = set()
+        ik = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+        in_mark = False
+        for line in ik.splitlines():
+            if "Mark Rules" in line:
+                in_mark = True
+                continue
+            if line.startswith("----") and in_mark:
+                in_mark = False
+                continue
+            if in_mark:
+                m = re.search(r'ID:(\d+)', line)
+                if m:
+                    mid = int(m.group(1))
+                    if 4000001 <= mid < 6000000:
+                        mark_ids.add(mid - 4000000)
+        ipset_out = self._router.exec("ipset list -n 2>/dev/null | grep -E 'slayer7_src_'")
+        src_ids = set(int(x) for x in re.findall(r'slayer7_src_(\d+)', ipset_out))
+        return {"iptables_ids": ipt_ids, "mark_rule_ids": mark_ids,
+                "appset_ids": appset_ids, "src_ipset_ids": src_ids}
+
+    def verify_stream_layer7_kernel_consistency(self, label: str = "") -> Dict:
+        """协议分流底层一致性校验(实时snapshot对比DB, 定位残留, 不清理).
+
+        每步操作(添加/导入/删除)后调用, 对比DB stream_layer7 id vs 底层4类载体. 不清理底层
+        (保留现场追溯BUG触发步骤). residual=底层有id但DB无(删不干净); missing=DB有id但底层无(漏下发).
+        用户场景: cat /proc/ikuai/stats/ik_summary|grep ID 看到mark_rule残留即此函数mark_rule_ids.
+        Returns: {db_ids, kernel_*ids, residual, missing, residual_detail, clean, detail}"""
+        snap = self.snapshot_stream_layer7_kernel()
+        db_rules = self.query_stream_layer7_rules()
+        db_ids, name_map = set(), {}
+        for r in db_rules:
+            rid = r.get("id")
+            if rid is not None:
+                db_ids.add(int(rid))
+                name_map[int(rid)] = r.get("tagname", "")
+        all_kernel = snap["iptables_ids"] | snap["mark_rule_ids"] | snap["appset_ids"] | snap["src_ipset_ids"]
+        residual = all_kernel - db_ids
+        missing = db_ids - all_kernel
+        residual_detail = []
+        for i in sorted(residual):
+            carriers = []
+            if i in snap["iptables_ids"]:
+                carriers.append("iptables")
+            if i in snap["mark_rule_ids"]:
+                carriers.append(f"mark_rule(ID:{4000000 + i})")
+            if i in snap["appset_ids"]:
+                carriers.append("appset")
+            if i in snap["src_ipset_ids"]:
+                carriers.append("src_ipset")
+            residual_detail.append(f"id={i}[{name_map.get(i, 'DB已删')}] 残留载体: {'+'.join(carriers)}")
+        detail = (f"[{label}] DB={sorted(db_ids)}; 内核 iptables={sorted(snap['iptables_ids'])} "
+                  f"mark_rule={sorted(snap['mark_rule_ids'])} appset={sorted(snap['appset_ids'])} "
+                  f"src_ipset={sorted(snap['src_ipset_ids'])}"
+                  f" → 残留={sorted(residual)} 漏下发={sorted(missing)}")
+        return {"db_ids": sorted(db_ids), "iptables_ids": sorted(snap["iptables_ids"]),
+                "mark_rule_ids": sorted(snap["mark_rule_ids"]), "appset_ids": sorted(snap["appset_ids"]),
+                "src_ipset_ids": sorted(snap["src_ipset_ids"]),
+                "residual": sorted(residual), "missing": sorted(missing),
+                "residual_detail": residual_detail, "clean": not residual and not missing,
+                "detail": detail}
+
+    # ==================== 通用底层一致性校验(各模块残留检测, 推广自协议分流) ====================
+    # 模块→内核载体签名表: table=DB表(SELECT id), carriers=底层载体列表.
+    # carrier类型: ("iptables_comment", table, chain)=iptables链规则comment id /* N_ */;
+    #   ("mark_rule", base, upper)=ik_summary Mark Rules的id∈(base,upper)→id-base;
+    #   ("appset_from_iptables", prefix)=从iptables appset字段提取(须排在iptables_comment后);
+    #   ("ipset", prefix)=ipset list名匹配prefix提取id; ("ik_app_rule", prefix)=ik_summary App Rules id.
+    MODULE_KERNEL_SIGNATURES = {
+        "stream_layer7": {"table": "stream_layer7", "carriers": [
+            ("iptables_comment", "mangle", "STREAM_LAYER7_NEW"),
+            ("mark_rule", 4000000, 6000000),
+            ("appset_from_iptables", "slayer7_app_"),
+            ("ipset", "slayer7_src_"),
+            ("iptables_rule_count", "mangle", "STREAM_LAYER7_NEW")]},
+        "stream_ipport": {"table": "stream_ipport", "carriers": [
+            ("iptables_comment", "mangle", "STREAM_IPPORT_NEW"),
+            ("mark_rule", 6000000, 7000000),
+            ("ipset", "sipport_src_"),
+            ("ipset", "sipport_sport_"),
+            ("iptables_rule_count", "mangle", "STREAM_IPPORT_NEW")]},
+        "stream_updown": {"table": "stream_updown", "ignore_missing": True, "carriers": [
+            ("ipset", "updown_src_"), ("ipset", "updown_dst_"),
+            ("ipset", "updown_sport_"), ("ipset", "updown_dport_")]},  # 仅带地址/端口规则建ipset, missing无意义
+        "conn_limit": {"table": "conn_limit", "carriers": [("ipset", "conn_limit_src_"), ("iptables_rule_count", "raw", "CONNLIMIT")]},
+        "mac_qos": {"table": "mac_qos", "carriers": [("ipset", "mac_qos_"), ("iptables_rule_count", "filter", "MAC_QOS")]},
+        "simple_qos": {"table": "simple_qos", "carriers": [("ipset", "simple_qos_"), ("iptables_rule_count", "filter", "IP_QOS")]},
+        "acl": {"table": "acl", "carriers": [("ipset", "acl_src_"), ("ipset", "acl_dst_"),
+            ("iptables_rule_count", "filter", "FIREWALL"), ("iptables_rule_count", "filter", "INPUT_ACL")]},
+        "dst_nat": {"table": "dst_nat", "carriers": [("iptables_comment", "nat", "DSTNAT")]},
+        "acl_l7": {"table": "acl_l7", "carriers": [("ik_app_rule", "acl7_app_")]},
+        "alone_limit": {"table": "alone_limit", "carriers": [("ipset", "alone_limit_")]},
+        "layer7_qos": {"table": "layer7_qos", "carriers": [("ipset", "layer7qos_")]},
+        "stream_domain": {"table": "stream_domain", "ignore_missing": True, "carriers": [("ipset", "sdomain_src_")]},
+        "object_group": {"table": "object_group", "ignore_missing": True, "carriers": [
+            ("ipset", "group_IPGP"), ("ipset", "group_IPV6GP"),
+            ("ipset", "group_MACGP"), ("ipset", "group_PORTGP")]},
+        "mac_access_black": {"table": "acl_mac_black", "carriers": [("ipset", "acl_mac_"), ("iptables_rule_count", "filter", "ACL_MAC")]},
+        "mac_access_white": {"table": "acl_mac_white", "carriers": [("ipset", "acl_mac_"), ("iptables_rule_count", "filter", "ACL_MAC")]},
+    }
+
+    def _read_module_db_ids(self, table: str) -> set:
+        self.connect_router()
+        rows = self._sqlite_query_list(f"SELECT id FROM {table}")
+        ids = set()
+        for r in rows:
+            try:
+                ids.add(int(r.get("id")))
+            except (TypeError, ValueError):
+                pass
+        return ids
+
+    def _read_mark_rule_ids(self, base: int, upper: int) -> set:
+        self.connect_router()
+        ik = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+        ids, in_mark = set(), False
+        for line in ik.splitlines():
+            if "Mark Rules" in line:
+                in_mark = True
+                continue
+            if line.startswith("----") and in_mark:
+                in_mark = False
+                continue
+            if in_mark:
+                m = re.search(r'ID:(\d+)', line)
+                if m and base < int(m.group(1)) < upper:
+                    ids.add(int(m.group(1)) - base)
+        return ids
+
+    def _read_ipset_ids(self, prefix: str) -> set:
+        self.connect_router()
+        out = self._router.exec("ipset list -n 2>/dev/null")
+        return set(int(x) for x in re.findall(re.escape(prefix) + r'(\d+)', out))
+
+    def _read_iptables_rule_count(self, table: str, chain: str) -> int:
+        """数iptables链规则数(-L -n -v输出, 排除Chain行/表头/空行, 规则行首字段=pkts数字).
+        用于检测导入清空累加(规则数>DB count). 用-L非-S: iKuai iptables -S {chain}对部分链返回空
+        (实测-t raw -S CONNLIMIT输出空, 但-L -n -v有规则). -v保证规则行首字段是pkts计数值."""
+        self.connect_router()
+        out = self._router.exec(f"iptables -t {table} -L {chain} -n -v 2>/dev/null")
+        count = 0
+        for line in out.splitlines():
+            s = line.strip()
+            if not s or s.startswith("Chain ") or s.startswith("pkts"):
+                continue
+            parts = s.split()
+            if parts and parts[0].replace(",", "").isdigit():
+                count += 1
+        return count
+
+    def _query_iptables_chain_comment_ids(self, table: str, chain: str):
+        """返回 (comment id集合, 原始文本) 后续appset_from_iptables解析用."""
+        self.connect_router()
+        out = self._router.exec(f"iptables -t {table} -L {chain} -n -v 2>/dev/null")
+        ids = set()
+        for line in out.split("\n"):
+            for m in re.finditer(r'/\*\s*(\d+)(?:_|\s*\*/)', line):
+                ids.add(int(m.group(1)))
+        return ids, out
+
+    def _read_ik_app_rule_ids(self, prefix: str) -> set:
+        """ik_summary App Rules段规则id(应用协议acl_l7的app_rule id=acl_l7 id)."""
+        self.connect_router()
+        ik = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+        ids, in_app = set(), False
+        for line in ik.splitlines():
+            if "App Rules" in line:
+                in_app = True
+                continue
+            if line.startswith("----") and in_app:
+                break
+            if in_app:
+                m = re.search(r'ID:(\d+)\b', line)
+                if m:
+                    ids.add(int(m.group(1)))
+        return ids
+
+    def snapshot_module_kernel(self, module: str) -> Dict:
+        """snapshot指定模块底层载体(各id集合). 用MODULE_KERNEL_SIGNATURES carriers遍历."""
+        sig = self.MODULE_KERNEL_SIGNATURES.get(module)
+        if not sig:
+            return {"_error": f"未知模块签名: {module}"}
+        snap = {"iptables": set(), "mark_rule": set(), "appset": set(),
+                "ipset": set(), "ik_app_rule": set(), "rule_counts": {}}
+        ipt_raw = ""
+        for carrier in sig["carriers"]:
+            ctype = carrier[0]
+            if ctype == "iptables_comment":
+                ids, raw = self._query_iptables_chain_comment_ids(carrier[1], carrier[2])
+                snap["iptables"] |= ids
+                ipt_raw += " " + raw
+            elif ctype == "mark_rule":
+                snap["mark_rule"] |= self._read_mark_rule_ids(carrier[1], carrier[2])
+            elif ctype == "appset_from_iptables":
+                snap["appset"] |= set(int(x) for x in
+                                      re.findall(re.escape(carrier[1]) + r'(\d+)', ipt_raw))
+            elif ctype == "ipset":
+                snap["ipset"] |= self._read_ipset_ids(carrier[1])
+            elif ctype == "ik_app_rule":
+                snap["ik_app_rule"] |= self._read_ik_app_rule_ids(carrier[1])
+            elif ctype == "iptables_rule_count":
+                snap["rule_counts"][f"{carrier[1]}/{carrier[2]}"] = self._read_iptables_rule_count(carrier[1], carrier[2])
+        return snap
+
+    def verify_module_kernel_consistency(self, module: str, label: str = "") -> Dict:
+        """通用底层一致性校验(各模块残留检测). 实时snapshot对比DB, 定位残留触发步骤, 不清理.
+        residual=底层有id但DB无(删不干净); missing=DB有id但底层无(漏下发).
+        模块载体见MODULE_KERNEL_SIGNATURES. 协议分流首发验证定位mark_rule残留(报禅道)."""
+        sig = self.MODULE_KERNEL_SIGNATURES.get(module)
+        if not sig:
+            return {"error": f"未知模块: {module}", "detail": f"[{label}] 未知模块: {module}", "clean": False}
+        snap = self.snapshot_module_kernel(module)
+        if "_error" in snap:
+            return {"error": snap["_error"], "detail": f"[{label}] {snap['_error']}", "clean": False}
+        db_ids = self._read_module_db_ids(sig["table"])
+        kernel_ids = set()
+        for v in snap.values():
+            if isinstance(v, set):
+                kernel_ids |= v
+        residual = kernel_ids - db_ids
+        if sig.get("ignore_missing") or not kernel_ids:
+            missing = set()  # ignore_missing(如上下行仅部分规则建ipset)或kernel空时, missing无意义避免误报
+        else:
+            missing = db_ids - kernel_ids
+        residual_detail = []
+        for i in sorted(residual):
+            carriers = [k for k, v in snap.items() if isinstance(v, set) and i in v]
+            residual_detail.append(f"id={i} 残留载体: {'+'.join(carriers)}")
+        # iptables链规则数 vs DB count(检测导入清空累加: 规则数>DB count = 旧规则未删堆积)
+        db_count = len(db_ids)
+        count_overflow = []
+        for desc, ipt_cnt in snap.get("rule_counts", {}).items():
+            if ipt_cnt > db_count:
+                count_overflow.append({"chain": desc, "iptables": ipt_cnt, "db": db_count, "dup": ipt_cnt - db_count})
+        for co in count_overflow:
+            residual_detail.append(f"{co['chain']}规则累加: iptables={co['iptables']}条 > DB={co['db']}条 (累加{co['dup']}条, 导入未清空iptables链)")
+        ksum = " ".join(f"{k}={sorted(v)}" for k, v in snap.items() if isinstance(v, set) and v)
+        cnt_sum = " ".join(f"{k}={v}" for k, v in snap.get("rule_counts", {}).items())
+        ovf_sum = ",".join(f"{c['chain']}:{c['iptables']}>{c['db']}" for c in count_overflow)
+        detail = (f"[{label}] {module}: DB={sorted(db_ids)}; 内核 {ksum}"
+                  + (f" 规则数 {cnt_sum}" if cnt_sum else "")
+                  + f" → 残留={sorted(residual)} 漏下发={sorted(missing)}"
+                  + (f" 规则累加={ovf_sum}" if count_overflow else ""))
+        return {"module": module, "db_ids": sorted(db_ids),
+                "kernel": {k: sorted(v) for k, v in snap.items() if isinstance(v, set)},
+                "rule_counts": dict(snap.get("rule_counts", {})),
+                "residual": sorted(residual), "missing": sorted(missing),
+                "count_overflow": count_overflow,
+                "residual_detail": residual_detail,
+                "clean": not residual and not missing and not count_overflow,
+                "detail": detail}
 
     # ==================== 端口分流(stream_ipport)验证 ====================
 
@@ -10903,22 +11385,29 @@ class BackendVerifier:
                 # 避免目标服务器反爬403被误判为阻断(403是服务器响应=连通, 非路由器drop).
                 if code and code != "000":
                     connected += 1
+            # ping辅助(ICMP更底层, 双确认阻断; 用户建议提高准确性. 注: L7规则可能只drop应用不drop ICMP)
+            ping_out = self._client.exec(f"ping -I ens11 -c 3 -W 2 {dst_domain} 2>/dev/null", timeout=15)
+            pm = re.search(r'(\d+)\s*received', ping_out)
+            ping_recv = int(pm.group(1)) if pm else 0
             match_after = self._read_app_match(rid)
         finally:
             if turned_on:
                 self._router.exec("ik_cntl user_dpi off 2>/dev/null")
         match_delta = match_after - match_before
-        blocked = connected == 0
+        ping_blocked = ping_recv == 0
+        # blocked判定: ping(ICMP,主, 更准不被CDN/403掩盖)或curl(HTTP)任一不通=阻断. 用户建议ping.
+        blocked = ping_blocked or (connected == 0)
         dpi_hit = match_delta > 0
-        if dpi_hit and blocked:
-            verdict = "阻断生效(match+>0且不通)"
-        elif dpi_hit and not blocked:
-            verdict = "规则匹配但new_tc未drop(match+>0但连通)"
+        if blocked:
+            verdict = f"阻断生效(curl={connected}/{count} ping={ping_recv}/3)"
+        elif dpi_hit:
+            verdict = f"规则匹配但未阻断(curl={connected}/{count} ping={ping_recv}/3)"
         else:
-            verdict = "DPI未识别curl流量(match=0, 软降级)"
+            verdict = f"未阻断(curl={connected}/{count} ping={ping_recv}/3)"
         return {"match_delta": match_delta, "connected": connected, "blocked": blocked,
+                "ping_recv": ping_recv, "ping_blocked": ping_blocked,
                 "dpi_hit": dpi_hit, "user_dpi_was_on": user_dpi_was_on, "rid": rid,
-                "detail": f"id={rid} match+{match_delta} conn={connected}/{count} → {verdict}"}
+                "detail": f"id={rid} match+{match_delta} curl={connected}/{count} ping={ping_recv}/3 → {verdict}"}
 
     def verify_app_protocol_disable_effect(self, tagname: str, dst_domain: str,
                                            baseline_blocked: bool, count: int = 5) -> Dict:
@@ -10955,31 +11444,34 @@ class BackendVerifier:
                     f"curl -s -o /dev/null -w '%{{http_code}}' --interface ens11 --connect-timeout 3 -m 8 http://{dst_domain}/",
                     timeout=15)
                 code = out.strip().strip("'").strip()
-                # 任何HTTP响应(2xx/3xx/4xx/5xx, 非超时拒绝000)=连通; 仅000(无响应=路由器drop)=阻断.
-                # 避免目标服务器反爬403被误判为阻断(403是服务器响应=连通, 非路由器drop).
                 if code and code != "000":
                     connected += 1
+            # ping辅助(ICMP, 主判定, 不被CDN/403掩盖; 用户建议)
+            ping_out = self._client.exec(f"ping -I ens11 -c 3 -W 2 {dst_domain} 2>/dev/null", timeout=15)
+            pm = re.search(r'(\d+)\s*received', ping_out)
+            ping_recv = int(pm.group(1)) if pm else 0
             match_after = self._read_app_match(rid)
         finally:
             if turned_on:
                 self._router.exec("ik_cntl user_dpi off 2>/dev/null")
         match_delta = match_after - match_before
-        still_blocked = baseline_blocked and connected == 0
+        ping_blocked = ping_recv == 0
+        still_blocked = baseline_blocked and (ping_blocked or connected == 0)
         match_still_inc = match_delta > 0
         still_active = self._app_rule_is_active(rid)
         signals = []
         if still_blocked:
-            signals.append(f"连通仍不通(conn={connected}/{count})")
+            signals.append(f"连通仍阻断(curl={connected}/{count} ping={ping_recv}/3)")
         if match_still_inc:
             signals.append(f"规则仍匹配(match+{match_delta})")
         if still_active:
             signals.append("内核规则仍active(应消失)")
         bug_detected = bool(signals)
-        detail = (f"id={rid} 停用后: conn={connected}/{count} match+{match_delta} active={still_active}"
+        detail = (f"id={rid} 停用后: curl={connected}/{count} ping={ping_recv}/3 match+{match_delta} active={still_active}"
                   f" → {'停用BUG(' + '; '.join(signals) + ')' if bug_detected else '停用正常(阻断消失)'}")
         return {"still_blocked": still_blocked, "match_still_inc": match_still_inc,
                 "still_active": still_active, "bug_detected": bug_detected, "signals": signals,
-                "connected": connected, "match_delta": match_delta, "rid": rid, "detail": detail}
+                "connected": connected, "ping_recv": ping_recv, "match_delta": match_delta, "rid": rid, "detail": detail}
 
     def cleanup_app_protocol_test(self, prefix: str = "appt_") -> str:
         """清理prefix开头的应用协议控制规则(acl_l7表)+清内核残留+脚本init重建.
@@ -11001,5 +11493,36 @@ class BackendVerifier:
                     pass
             self._router.exec("/usr/ikuai/script/acl_l7.sh init 2>/dev/null")
             return f"deleted {total} rules"
+        except Exception as e:
+            return f"error: {e}"
+
+    def cleanup_all_app_protocol(self) -> str:
+        """彻底清理所有应用协议控制规则(acl_l7全表+内核所有app_rule/appset残留).
+        产品BUG: app_rule删不干净累积(id复用+残留active干扰停用BUG判定), 测试前/后必须彻底清.
+        与cleanup_app_protocol_test(prefix)区别: 本方法清全表+遍历ik_summary清内核所有App Rules残留."""
+        self.connect_router()
+        try:
+            rows = self._sqlite_query_list("SELECT id,prio FROM acl_l7")
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM acl_l7\"")
+            for r in rows:
+                rid = r.get("id", "")
+                rprio = r.get("prio", "31")
+                self._router.exec(f"ik_cntl new_tc app_rule del id {rid} prio {rprio} 2>/dev/null")
+                self._router.exec(f"ik_cntl appset clear acl7_app_{rid} 2>/dev/null")
+            # 清内核残留(DB已空但app_rule累积, 遍历ik_summary App Rules, 排除Mac App Rules id≥1000000)
+            out = self._router.exec("cat /proc/ikuai/stats/ik_summary 2>/dev/null")
+            seen = set()
+            for line in out.splitlines():
+                m = re.search(r'ID:(\d+)\s+prio:(\d+)', line)
+                if not m:
+                    continue
+                rid, rprio = m.group(1), m.group(2)
+                if (rid, rprio) in seen or not (rid.isdigit() and int(rid) < 1000000):
+                    continue
+                seen.add((rid, rprio))
+                self._router.exec(f"ik_cntl new_tc app_rule del id {rid} prio {rprio} 2>/dev/null")
+                self._router.exec(f"ik_cntl appset clear acl7_app_{rid} 2>/dev/null")
+            self._router.exec("/usr/ikuai/script/acl_l7.sh init 2>/dev/null")
+            return f"purged {len(rows)} db rules + {len(seen)} kernel app_rule"
         except Exception as e:
             return f"error: {e}"

@@ -24,6 +24,7 @@ import os
 from pages.network.upnp_setting_page import UpnpSettingPage
 from config.config import get_config
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 
 @pytest.mark.upnp_setting
@@ -49,26 +50,7 @@ class TestUpnpSettingComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'[OK]' if result.passed else '[FAIL]'} {result.message}")
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         # 测试数据 - 7条规则，覆盖单IP/多IP/IP段/多线路/所有线路/备注
         # 名称只允许中文英文数字(不允许下划线等特殊字符)

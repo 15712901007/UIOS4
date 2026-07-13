@@ -27,6 +27,7 @@ SSH后台验证: L1数据库(ipv6_dhcp_static_config) + L4模拟重启(init)
 import pytest
 from pages.network.ipv6_static_page import Ipv6StaticPage
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 
 TEST_RULE = "IPV6TEST_1"
@@ -51,23 +52,7 @@ class TestIpv6StaticComprehensive:
 
         ssh_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '[OK]' if result.passed else '[FAIL]'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         print("\n" + "=" * 60)
         print("IPv6前缀静态分配综合测试开始")

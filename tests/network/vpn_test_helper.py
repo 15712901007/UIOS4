@@ -12,6 +12,8 @@ VPN客户端特性: 启用=自动拨号; 无segmented筛选; 无复制按钮; �
 """
 import os
 
+from utils.verify_helper import make_ssh_verify
+
 
 def run_vpn_comprehensive_test(*, page, rec, request,
                                 module_key, test_rules, invalid_base_fields,
@@ -44,27 +46,7 @@ def run_vpn_comprehensive_test(*, page, rec, request,
     verify_full = getattr(backend_verifier, f'verify_{module_key}_full_chain', None) if backend_verifier else None
     query_rules = getattr(backend_verifier, f'query_{module_key}_rules', None) if backend_verifier else None
 
-    def ssh_verify(label, func, *args, must_pass=False, **kwargs):
-        if func is None or backend_verifier is None:
-            return None
-        try:
-            result = func(*args, **kwargs)
-            # 软断言(must_pass=False)的FAIL显示[软断言]而非[FAIL], 避免报告误标步骤失败
-            # (L2连接等软记录: 拨号依赖VPN服务端, 环境无服务器时未连接属预期, 不应让步骤标红)
-            status = '[OK]' if result.passed else ('[软断言]' if not must_pass else '[FAIL]')
-            print(f"    SSH-{label}: {status} - {result.message}")
-            rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-            if getattr(result, 'raw_output', ''):
-                rec.add_detail(f"      SSH数据: {result.raw_output}")
-            if must_pass and not result.passed:
-                ssh_failures.append(f"SSH-{label}: {result.message}")
-            return result
-        except Exception as e:
-            print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-            rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-            if must_pass:
-                ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-            return None
+    ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures, soft_assert=True)
 
     name_prefix = page.NAME_PREFIX
     module_name = page.MODULE_NAME

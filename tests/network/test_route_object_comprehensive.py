@@ -22,30 +22,12 @@ SSH全链路验证: L1数据库 + L2 ipset(IP/MAC/端口/IPv6) + L3 cache + L4�
 """
 import pytest
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, attach_cmd_recording_to_closure
 
 
 def _make_ssh_verify(rec, backend_verifier, failures):
-    """构造 ssh_verify helper (软断言收集 + 末尾硬断言)"""
-    def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-        if backend_verifier is None:
-            return None
-        try:
-            result = verify_func(*args, **kwargs)
-            status = '[OK]' if result.passed else '[FAIL]'
-            print(f"    SSH-{label}: {status} - {result.message}")
-            rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-            if result.raw_output:
-                rec.add_detail(f"      SSH数据: {result.raw_output[:200]}")
-            if must_pass and not result.passed:
-                failures.append(f"SSH-{label}: {result.message}")
-            return result
-        except Exception as e:
-            print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-            rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-            if must_pass:
-                failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-            return None
-    return ssh_verify
+    """构造 ssh_verify helper (委托共享工厂 make_ssh_verify, 含验证命令录制显示进报告)"""
+    return make_ssh_verify(backend_verifier, rec, failures)
 
 
 def _test_help(page, rec, failures):
@@ -132,6 +114,32 @@ def _run_group_comprehensive(page, rec, backend_verifier, failures,
         extra_value: AUTOEXTRA标志用的value
     """
     ssh_verify = _make_ssh_verify(rec, backend_verifier, failures)
+
+    def kernel_check(label, fail_on_residual=True, module="object_group"):
+        """路由对象底层一致性实时校验(snapshot ipset group_IPGP/MACGP/PORTGP/IPV6GP vs DB object_group).
+        被引用的路由对象在DB+ipset(不算残留), 仅删了但ipset没清的算残留(硬FAIL报禅道).
+        时间/协议/域名分组不建ipset(逻辑对象), ignore_missing避开."""
+        if backend_verifier is None:
+            return None
+        try:
+            backend_verifier.connect_router()
+            res = backend_verifier.verify_module_kernel_consistency(module, label)
+            rec.add_detail(f"  [底层一致性-{label}] {res['detail']}")
+            for rd in res['residual_detail']:
+                rec.add_detail(f"    ✗残留 {rd}")
+            if res['residual']:
+                rec.add_detail(f"    ✗ object_group底层残留(删不干净,报禅道): id={res['residual']}")
+                if fail_on_residual:
+                    failures.append(f"底层残留-{label}: object_group id {res['residual']} 底层有DB无(报禅道)")
+            elif res['missing']:
+                rec.add_detail(f"    ⚠ 漏下发(非IP/MAC/端口分组不建ipset,正常): {res['missing']}")
+            else:
+                rec.add_detail(f"    ✓ 底层与DB一致(无残留)")
+            return res
+        except Exception as e:
+            rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
+            return None
+    kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
     def wait(ms=2000):
         page.page.wait_for_timeout(ms)
@@ -235,6 +243,8 @@ def _run_group_comprehensive(page, rec, backend_verifier, failures,
             ssh_verify(f"L2-{last['name']}ipset消失",
                        backend_verifier.verify_object_group_ipset,
                        must_pass=False, name=last['name'], type_key=tk, expect_exists=False)
+            # 底层一致性实时校验: 删除后ipset应无残留(被引用的在DB不算,删了没清的=残留硬FAIL报禅道)
+            kernel_check(f"步骤5-{type_key}-删除后", fail_on_residual=True)
 
     # 步骤6: 被引用保护
     with rec.step("步骤6: 被引用保护", "ref_count机制 + 被引用无法删除"):
@@ -398,6 +408,9 @@ def _run_group_comprehensive(page, rec, backend_verifier, failures,
             ssh_verify(f"L1-清理后无{nm}",
                        backend_verifier.verify_object_group_database,
                        must_pass=False, name=nm, type_key=type_key, expect_absent=True)
+        if has_ipset:
+            # 底层一致性实时校验: 清理后ipset应无残留(被引用的在DB不算,删了没清的=残留硬FAIL报禅道)
+            kernel_check(f"步骤12-{type_key}-清理后", fail_on_residual=True)
 
     print("\n" + "=" * 60)
     print(f"路由对象-{type_key}分组综合测试完成")

@@ -15,6 +15,7 @@ prio排序是ACL规则冲突时的核心功能, 旧用例只验DB prio字段, �
 import pytest
 
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import attach_cmd_recording_to_closure
 
 pytestmark = [pytest.mark.security, pytest.mark.acl, pytest.mark.p1]
 PREFIX = "acl_po_"  # priority order
@@ -45,6 +46,7 @@ def test_acl_priority_order(acl_page_logged_in, backend_verifier,
             rec.add_detail(f"[SSH-{label}] 异常: {str(e)[:80]}")
             failures.append(f"{label}异常: {str(e)[:80]}")
             return None
+    ssh_verify = attach_cmd_recording_to_closure(bv, rec, ssh_verify)
 
     id_to_prio = {}
     try:

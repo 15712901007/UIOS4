@@ -41,6 +41,7 @@ SSH后台验证: L1数据库(v4 dhcp_acl_mac + v6 dhcp6_acl_mac) + L2 ipset + L4
 import pytest
 from pages.network.dhcp_acl_mac_page import DhcpAclMacPage
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 
 # IPv4 测试规则(6条虚拟MAC, 不碰iktest的d4:20:00:b1:45:ec)
@@ -87,25 +88,7 @@ class TestDhcpAclMacComprehensive:
 
         ssh_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '[OK]' if result.passed else '[FAIL]'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-                if result.raw_output:
-                    rec.add_detail(f"      SSH数据: {result.raw_output[:200]}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         def count_black(ip_version='v4', enabled_only=False):
             if backend_verifier is None:

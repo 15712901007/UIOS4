@@ -33,6 +33,7 @@ import os
 from pages.network.dmz_host_page import DmzHostPage
 from config.config import get_config
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 
 
 @pytest.mark.dmz_host
@@ -58,25 +59,7 @@ class TestDmzHostComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '[OK]' if result.passed else '[FAIL]'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-                if result.raw_output:
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         # 测试数据 - 覆盖映射类型(外网接口选wan2/wan3 + 外网IP)和排除协议的组合
         # ⚠️ 安全: 禁止 interface=all(任意) 和 wan1, 会NETMAP管理流量导致设备失联

@@ -22,6 +22,7 @@ import pytest
 import os
 from pages.network.protocol_route_page import ProtocolRoutePage
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, make_kernel_check
 from utils.step_recorder import StepRecorder
 
 
@@ -48,26 +49,9 @@ class TestProtocolRouteComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '通过' if result.passed else '失败'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {'[OK]' if result.passed else '[FAIL]'} {result.message}")
-                if result.raw_output:
-                    print(f"      SSH数据: {result.raw_output}")
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
+
+        kernel_check = make_kernel_check(backend_verifier, rec, ssh_failures, default_module="stream_layer7")
 
         # 测试数据 - 8条规则，覆盖3种负载模式+线路绑定+生效时间+IP/MAC分组
         # 注意：名称最多15字符
@@ -324,6 +308,9 @@ class TestProtocolRouteComprehensive:
         else:
             print("\n[步骤4] 后台数据验证: 跳过（未配置SSH）")
 
+        # 底层一致性基线(步骤3添加后): 记录添加后的底层snapshot, 作为后续删除/导入残留对比基准
+        kernel_check("步骤3-添加后基线", fail_on_residual=False)
+
         # ========== 步骤5: 编辑第1条规则 ==========
         with rec.step("步骤5: 编辑规则", "编辑第1条规则的名称"):
             print("\n[步骤5] 编辑第1条规则...")
@@ -521,6 +508,8 @@ class TestProtocolRouteComprehensive:
                         should_exist=False,
                         must_pass=False,
                     )
+                # 底层一致性实时校验: 删除后底层(ik_summary mark_rule/iptables/appset)应无残留
+                kernel_check("步骤8-删除后", fail_on_residual=True)
 
         # ========== 步骤9: 搜索测试(扩展) ==========
         with rec.step("步骤9: 搜索功能测试", "精确搜索/模糊搜索/不存在的规则"):
@@ -860,6 +849,8 @@ class TestProtocolRouteComprehensive:
                         rec.add_detail(f"    SSH: 测试规则已全部删除")
                 except Exception:
                     pass
+            # 底层一致性实时校验: 批量删除后底层应无残留(定位删除触发残留)
+            kernel_check("步骤15-批量删除后", fail_on_residual=True)
 
         # ========== 步骤16: 导入测试(追加) ==========
         with rec.step("步骤16: 导入配置(追加)", "使用导出的CSV追加导入"):
@@ -888,6 +879,8 @@ class TestProtocolRouteComprehensive:
             else:
                 print(f"  [WARN] CSV文件不存在")
                 rec.add_detail(f"  CSV文件不存在")
+            # 底层一致性实时校验: 追加导入后底层应与DB一致(定位导入是否引入残留)
+            kernel_check("步骤16-导入追加后", fail_on_residual=False)
 
         # ========== 步骤17: 导入测试(清空现有数据) ==========
         with rec.step("步骤17: 导入配置(清空现有)", "勾选清空现有数据后导入"):
@@ -924,6 +917,8 @@ class TestProtocolRouteComprehensive:
             else:
                 print(f"  [WARN] CSV文件不存在")
                 rec.add_detail(f"  CSV文件不存在")
+            # 底层一致性实时校验: 清空导入后底层应与DB一致(定位清空导入是否残留)
+            kernel_check("步骤17-导入清空后", fail_on_residual=False)
 
         # ========== 步骤18: 清理环境 ==========
         with rec.step("步骤18: 清理环境", "清理所有残留数据"):
@@ -955,6 +950,8 @@ class TestProtocolRouteComprehensive:
             else:
                 print("  [OK] 无需清理")
                 rec.add_detail("  无需清理")
+            # 底层一致性实时校验: 清理后底层应彻底无残留(最终校验, 硬FAIL)
+            kernel_check("步骤18-清理后", fail_on_residual=True)
 
         # ========== 步骤19: 帮助功能测试 ==========
         with rec.step("步骤19: 帮助功能测试", "测试帮助图标"):
@@ -1115,7 +1112,7 @@ class TestProtocolRouteFlowVerification:
         try:
             with rec.step("基线探活+建临时IP分组", f"curl baidu应通 + 建IP分组{self.IP_GROUP_NAME}含{client_ip}"):
                 bv.connect_client()
-                base = bv.verify_connectivity(dst_domain="www.baidu.com")
+                base = bv.verify_connectivity(dst_domain="www.baidu.com", retries=2)
                 rec.add_detail(f"  基线: {base['detail']}")
                 if not base["connected"]:
                     pytest.skip(f"基线baidu经ens11不可达, 跳过协议分流功能验证: {base['detail']}")

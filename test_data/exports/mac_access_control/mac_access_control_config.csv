@@ -1,4 +1,4 @@
 id,tagname,enabled,mac,comment,time,termname
-2,"mac_t_b2","yes","aa:bb:cc:dd:ee:02","","{""object"":{},""custom"":[{""start_time"":""00:00"",""comment"":"""",""end_time"":""23:59"",""type"":""weekly"",""weekdays"":""1234567""}]}",""
-3,"mac_t_b3","yes","aa:bb:cc:dd:ee:03","","{""object"":{},""custom"":[{""start_time"":""00:00"",""comment"":"""",""end_time"":""23:59"",""type"":""weekly"",""weekdays"":""1234567""}]}",""
-4,"mac_t_b4","yes","aa:bb:cc:dd:ee:04","ºÚÃûµ¥±¸×¢","{""object"":{},""custom"":[{""start_time"":""00:00"",""comment"":"""",""end_time"":""23:59"",""type"":""weekly"",""weekdays"":""1234567""}]}","²âÊÔÖÕ¶Ë"
+2,"mac_t_b2","yes","aa:bb:cc:dd:ee:02","","{""custom"":[{""start_time"":""00:00"",""type"":""weekly"",""weekdays"":""1234567"",""comment"":"""",""end_time"":""23:59""}],""object"":{}}",""
+3,"mac_t_b3","yes","aa:bb:cc:dd:ee:03","","{""object"":{},""custom"":[{""start_time"":""00:00"",""type"":""weekly"",""weekdays"":""1234567"",""comment"":"""",""end_time"":""23:59""}]}",""
+4,"mac_t_b4","yes","aa:bb:cc:dd:ee:04","ºÚÃûµ¥±¸×¢","{""custom"":[{""start_time"":""00:00"",""comment"":"""",""weekdays"":""1234567"",""type"":""weekly"",""end_time"":""23:59""}],""object"":{}}","²âÊÔÖÕ¶Ë"

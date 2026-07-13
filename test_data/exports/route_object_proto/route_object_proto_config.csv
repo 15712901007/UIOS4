@@ -1,2 +1,3 @@
 id,group_name,group_value
-8,"AUTOPROTO1E","[{""proto"":""网络协议"",""comment"":""""}]"
+11,"协议分组测试","[{""proto"":""基础协议"",""comment"":""""},{""proto"":""通用协议"",""comment"":""""},{""proto"":""休闲娱乐"",""comment"":""""}]"
+13,"AUTOPROTO1E","[{""proto"":""网络协议"",""comment"":""""}]"

@@ -20,6 +20,7 @@ URL: 列表 /login#/securityCenter/connectionLimit, 配置 /login#/securityCente
 import os
 import pytest
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import attach_cmd_recording_to_closure
 
 pytestmark = [pytest.mark.security, pytest.mark.conn_limit]
 
@@ -59,6 +60,7 @@ class TestConnLimitComprehensive:
                 rec.add_detail(f"[SSH-{label}] 异常: {str(e)[:80]}")
                 ssh_failures.append(f"SSH-{label}异常: {str(e)[:80]}")
                 return None
+        ssh_verify = attach_cmd_recording_to_closure(backend_verifier, rec, ssh_verify)
 
         def ui_check(label, cond, detail=""):
             if cond:
@@ -66,6 +68,32 @@ class TestConnLimitComprehensive:
             else:
                 rec.add_detail(f"[UI] {label}: 失败 - {detail}")
                 ui_failures.append(f"{label}: {detail}")
+
+        def kernel_check(label, fail_on_residual=True, module="conn_limit"):
+            """连接数底层一致性实时校验(snapshot ipset vs DB). 定位导入→删除残留.
+            不清理底层(保留现场追溯BUG触发步骤). 残留→failures(硬FAIL+报禅道)."""
+            if backend_verifier is None:
+                return None
+            try:
+                backend_verifier.connect_router()
+                res = backend_verifier.verify_module_kernel_consistency(module, label)
+                rec.add_detail(f"  [底层一致性-{label}] {res['detail']}")
+                for rd in res['residual_detail']:
+                    rec.add_detail(f"    ✗残留 {rd}")
+                if res['residual'] or res.get('count_overflow'):
+                    ovf = '/'.join(f"{c['chain']}累加{c['dup']}条" for c in res.get('count_overflow', []))
+                    rec.add_detail(f"    ✗ {module}底层残留(删不干净,报禅道): id={res['residual']}{'; ' + ovf if ovf else ''}")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: {module} id {res['residual']} {ovf} 底层有DB无(报禅道)")
+                elif res['missing']:
+                    rec.add_detail(f"    ⚠ 漏下发(DB有底层无): {res['missing']}")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(无残留)")
+                return res
+            except Exception as e:
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
+                return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         # 注: conn_limit的peerconns模块在6.12内核曾触发NULL指针宕机(重启死循环),
         # 固件FIRMWAREID 10002已修复(实测建规则+转发流量uptime连续未重启). 不再skip整模块.
@@ -238,6 +266,8 @@ class TestConnLimitComprehensive:
                            f"{PREFIX}src1")
                 ssh_verify("步骤15-iptables无", backend_verifier.verify_conn_limit_iptables,
                            f"{PREFIX}src1", expect_present=False)
+                # 底层一致性实时校验: 删除后底层ipset应无残留
+                kernel_check("步骤15-删除后", fail_on_residual=True)
 
             # ==================== 步骤16: 异常输入拦截 ====================
             with rec.step("步骤16: 异常输入拦截(空名称/非法IP)", "前端校验应阻止保存"):
@@ -347,6 +377,8 @@ class TestConnLimitComprehensive:
                     rec.add_detail(f"[导入] 不清空={imp_ok1} 清空={imp_ok2} 文件={os.path.basename(imp_file)}")
                 else:
                     rec.add_detail("[导入] 跳过(无导出文件)")
+                # 底层一致性实时校验: 导入后底层应与DB一致(必须在with rec.step步骤19内, 否则detail丢失)
+                kernel_check("步骤19-导入后", fail_on_residual=True)
 
             # ==================== 步骤20: 批量停用/启用/删除 ====================
             with rec.step("步骤20: 批量操作", "批量停用/启用/删除"):
@@ -383,6 +415,8 @@ class TestConnLimitComprehensive:
                 page.page.wait_for_timeout(1500)
                 left = page.get_rule_count()
                 rec.add_detail(f"[批量删除后] 剩余 {left} 条")
+                # 底层一致性实时校验: 批量删除后底层应无残留
+                kernel_check("步骤20-批量删除后", fail_on_residual=True)
 
             # ==================== 步骤21: 功能连通性验证(全局规则, 硬断言) ====================
             with rec.step("步骤21: 功能连通性验证(全局规则限速)", "基线并发curl→建全局limit=1→并发骤降(硬)→删恢复(硬)"):
@@ -397,7 +431,7 @@ class TestConnLimitComprehensive:
                             rec.add_detail("[功能] 软记录: iptables set模块损坏(6.12), 带src规则iptables生成失败, "
                                            "故用全局规则(src_addr空不需match-set)验证peerconns限制机制(报禅道)")
                         # 基线: 8并发curl baidu经ens11(无规则应多数成功)
-                        base = backend_verifier.concurrent_curl(n=8, dst="www.baidu.com")
+                        base = backend_verifier.concurrent_curl(n=8, dst="www.baidu.com", retries=2)
                         rec.add_detail(f"[基线] 并发8: 成功{base['success']}/{base['total']}")
                         if base["success"] < 6:
                             rec.add_detail(f"[功能] 基线并发成功率偏低({base['success']}/8), 跳过限速验证(环境)")
@@ -423,7 +457,7 @@ class TestConnLimitComprehensive:
                             except Exception:
                                 pass
                             page.page.wait_for_timeout(1500)
-                            restore = backend_verifier.concurrent_curl(n=8, dst="www.baidu.com")
+                            restore = backend_verifier.concurrent_curl(n=8, dst="www.baidu.com", retries=2)
                             rec.add_detail(f"[删规则后] 并发8: 成功{restore['success']}/{restore['total']}")
                             if restore["success"] < base["success"]:
                                 ui_failures.append(f"步骤21: 删规则未恢复(成功数 {restore['success']} < 基线{base['success']})")
@@ -495,13 +529,29 @@ class TestConnLimitFlowVerification:
                 page.clean_test_rules(self.PREFIX)
                 _force_clean()
 
-            # 基线: 8并发curl经ens11(无规则应≥6成功)
-            with rec.step("基线并发探测", "8并发curl baidu --interface ens11 应≥6成功"):
+            # 基线: 8并发curl经ens11(无规则应≥6成功, baidu+qq+bing多域名取最高抗单点抖动)
+            with rec.step("基线并发探测", "8并发curl经ens11应≥6成功(baidu+qq+bing多域名取最高抗抖动)"):
                 bv.connect_client()
-                base = bv.concurrent_curl(n=8, dst="www.baidu.com")
-                rec.add_detail(f"  基线并发8: 成功{base['success']}/{base['total']}")
+                base = bv.concurrent_curl(
+                    n=8, dst="www.baidu.com", retries=2,
+                    fallback_dsts=["www.qq.com", "cn.bing.com", "www.taobao.com"])
+                rec.add_detail(f"  基线并发8: 成功{base['success']}/{base['total']}"
+                               + (f" [{base.get('detail', '')}]" if base.get('detail') else ""))
                 if base["success"] < 6:
-                    pytest.skip(f"基线并发成功率偏低({base['success']}/8), 跳过连接数限制功能验证(环境)")
+                    # 多域名取最高仍偏低: 诊断区分"残留挡流(→FAIL)" vs "环境(→skip+详报)"
+                    diag = bv.diagnose_baseline_block(dst_domain="www.baidu.com")
+                    rec.add_detail(f"  [根因诊断] {diag['summary']}")
+                    rec.add_detail(f"  [诊断数据] 路由器WAN curl={diag['router_code']} | "
+                                   f"client DNS={'OK' if diag['dns_ok'] else 'FAIL(' + diag['dns_detail'] + ')'} | "
+                                   f"conn_limit_enabled={diag['conn_limit_enabled']} | "
+                                   f"残留挡流={diag['residual_block'] or '无'}")
+                    rec.add_detail("  [验证命令]")
+                    for c in diag["commands"]:
+                        rec.add_detail(f"    {c}")
+                    if diag["residual_block"]:
+                        pytest.fail(f"基线并发偏低({base['success']}/8)且路由器有残留挡流规则({diag['residual_block']}), "
+                                    f"判功能/配置问题(非环境抖动). 清理残留规则后重测. 验证命令见上.")
+                    pytest.skip(f"基线并发多域名取最高仍偏低({base['success']}/8); 诊断: {diag['summary']}")
 
             # 建全局limit=1规则 + set bug软说明 + SSH硬落地
             with rec.step("建全局limit=1规则", "src_addr空tcp limit=1(绕过xt_set) + SSH(DB+iptables)硬落地"):
@@ -553,7 +603,9 @@ class TestConnLimitFlowVerification:
                     pass
                 page.page.wait_for_timeout(1500)
                 _force_clean()
-                restore = bv.concurrent_curl(n=8, dst="www.baidu.com")
+                restore = bv.concurrent_curl(
+                    n=8, dst="www.baidu.com", retries=2,
+                    fallback_dsts=["www.qq.com", "cn.bing.com"])
                 rec.add_detail(f"  删规则后并发8: 成功{restore['success']}/{restore['total']}")
                 if restore["success"] < base["success"]:
                     failures.append(f"删规则未恢复: 成功数 {restore['success']} < 基线{base['success']}")

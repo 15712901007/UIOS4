@@ -29,6 +29,7 @@ import pytest
 import os
 from pages.network.port_map_page import PortMapPage
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, attach_cmd_recording_to_closure
 from utils.step_recorder import StepRecorder
 
 
@@ -55,25 +56,7 @@ class TestPortMapComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
-            if backend_verifier is None:
-                return None
-            try:
-                result = verify_func(*args, **kwargs)
-                status = '[OK]' if result.passed else '[FAIL]'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-                if result.raw_output:
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
-            except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
-                return None
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
         def verify_import_iptables(label):
             """导入后验证DB所有规则在iptables DSTNAT链生效(捕获产品bug: 导入后iptables可能不生成).
@@ -103,6 +86,39 @@ class TestPortMapComprehensive:
                     print(f"  [WARN] 产品BUG: {label}后{len(ipt_fail)}条iptables未生效(DB有规则但iptables空)")
             except Exception as e:
                 rec.add_detail(f"  L2-{label}iptables验证异常: {str(e)[:80]}")
+
+        def kernel_check(label, fail_on_residual=True, module="dst_nat"):
+            """端口映射底层一致性实时校验(DSTNAT规则数 vs DB enabled数). 定位导入→删除残留.
+            dst_nat DSTNAT规则无/*id*/comment(只有[fastid:N], 且N≠DB id从0偏移), 故用规则数对比
+            (非id集合): DB enabled数 vs DSTNAT -A规则数, 差值>0=删不干净残留.
+            不清理底层(保留现场追溯BUG触发步骤). 残留→failures(硬FAIL+报禅道)."""
+            if backend_verifier is None:
+                return None
+            try:
+                backend_verifier.connect_router()
+                row = backend_verifier._sqlite_query_line(
+                    "SELECT count(*) as cnt FROM dst_nat WHERE enabled='yes'")
+                db_enabled = int(row.get("cnt", 0)) if row else 0
+                ipt = backend_verifier._router.exec("iptables -t nat -S DSTNAT 2>/dev/null")
+                ipt_rules = [l for l in ipt.split('\n')
+                             if l.strip().startswith('[fastid') and '-A DSTNAT' in l]
+                ipt_cnt = len(ipt_rules)
+                residual = ipt_cnt - db_enabled  # DSTNAT比DB多=删不干净残留
+                rec.add_detail(f"  [底层一致性-{label}] dst_nat: DB enabled={db_enabled}条; "
+                               f"DSTNAT规则={ipt_cnt}条 → 残留差值={max(residual, 0)}")
+                if residual > 0:
+                    rec.add_detail(f"    ✗ dst_nat底层残留(删不干净,报禅道): DSTNAT比DB多{residual}条")
+                    for l in ipt_rules[:8]:
+                        rec.add_detail(f"    ✗残留 {l.strip()[:110]}")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: dst_nat DSTNAT比DB多{residual}条规则(报禅道)")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(DSTNAT规则数={db_enabled})")
+                return {"residual": residual, "db_enabled": db_enabled, "ipt_cnt": ipt_cnt}
+            except Exception as e:
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
+                return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         # 测试数据 - 覆盖映射类型/协议/端口格式的各种组合
         test_rules = [
@@ -268,6 +284,8 @@ class TestPortMapComprehensive:
                     if full:
                         for r in full.results:
                             rec.add_detail(f"    {r.level}: {'[OK]' if r.passed else '[FAIL]'} {r.message}")
+                # 底层一致性实时校验: 添加后基线(底层应与DB一致, 记录用)
+                kernel_check("步骤11-添加后基线", fail_on_residual=False)
 
         # ========== 步骤12: 编辑规则 ==========
         with rec.step("步骤12: 编辑规则", "编辑pm基础->改名+改备注"):
@@ -369,6 +387,8 @@ class TestPortMapComprehensive:
                            backend_verifier.verify_port_map_database,
                            target, must_pass=True,
                            expect_absent=True)
+            # 底层一致性实时校验: 删除后底层DSTNAT应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤15-删除后", fail_on_residual=True)
 
         # ========== 步骤16: segmented筛选器测试 ==========
         with rec.step("步骤16: segmented筛选器", "全部/已停用/已启用 计数验证"):
@@ -844,6 +864,8 @@ class TestPortMapComprehensive:
                         rec.add_detail(f"    SSH: 测试规则已全部删除")
                 except Exception as e:
                     ssh_failures.append(f"SSH-L1-批量删除验证异常: {str(e)[:80]}")
+            # 底层一致性实时校验: 批量删除后底层DSTNAT应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤23-批量删除后", fail_on_residual=True)
 
         # ========== 步骤24: 导入追加(CSV) ==========
         with rec.step("步骤24: 导入配置(追加)", "使用导出的CSV追加导入"):
@@ -875,6 +897,8 @@ class TestPortMapComprehensive:
             else:
                 print(f"  [WARN] CSV文件不存在")
                 rec.add_detail(f"  CSV文件不存在")
+            # 底层一致性实时校验: 导入追加后底层应与DB一致(记录用, 不硬FAIL)
+            kernel_check("步骤24-导入后", fail_on_residual=False)
 
         # ========== 步骤25: 导入清空(TXT) ==========
         with rec.step("步骤25: 导入配置(清空现有)", "使用导出的TXT清空现有后导入"):
@@ -966,6 +990,8 @@ class TestPortMapComprehensive:
                 page.page.wait_for_timeout(1500)
                 ssh_verify("L1-最终清理", backend_verifier.verify_port_map_iptables,
                            must_pass=False, expect_rules=False)
+            # 底层一致性实时校验: 清理后底层DSTNAT应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤26-清理后", fail_on_residual=True)
 
         # ========== 步骤27: 帮助功能测试 ==========
         with rec.step("步骤27: 帮助功能测试", "测试帮助图标"):

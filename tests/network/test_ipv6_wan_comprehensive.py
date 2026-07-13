@@ -35,6 +35,7 @@ import pytest
 import os
 from pages.network.ipv6_wan_page import Ipv6WanPage
 from utils.step_recorder import StepRecorder
+from utils.verify_helper import make_ssh_verify, attach_cmd_recording_to_closure
 
 
 @pytest.mark.ipv6_wan
@@ -57,25 +58,48 @@ class TestIpv6WanComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
+
+        def kernel_check(label, fail_on_residual=True):
+            """IPv6外网底层一致性实时校验(apply侧ipset ipv6_prefix vs DB ipv6_wan_config).
+            IPv6全局enabled=no时apply侧(ipset)不落地=正常漏落地(软);
+            残留=DB空但apply侧ipset ipv6_prefix仍有=删不干净(硬FAIL报禅道).
+            注: ipset ipv6_prefix_{iface}是per-iface非per-id, 用数量对比(非id集合)."""
             if backend_verifier is None:
                 return None
             try:
-                result = verify_func(*args, **kwargs)
-                status = '[OK]' if result.passed else '[FAIL]'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-                if result.raw_output:
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
+                backend_verifier.connect_router()
+                row = backend_verifier._sqlite_query_line(
+                    "SELECT count(*) as cnt FROM ipv6_wan_config WHERE enabled='yes'")
+                db_count = int(row.get("cnt", 0)) if row else 0
+                ipset_out = backend_verifier._router.exec("ipset list -n 2>/dev/null") or ""
+                ipset_v6 = [l.strip() for l in ipset_out.split('\n') if 'ipv6_prefix' in l]
+                apply_count = len(ipset_v6)
+                # 每个ipv6_prefix详情(entry数/refs引用/前缀成员): 定位残留类型=前缀残留 vs iptables引用未释放
+                import re as _re
+                detail_parts = []
+                for ips in ipset_v6[:5]:
+                    info = backend_verifier._router.exec(f"ipset list {ips} 2>/dev/null") or ""
+                    _n = _re.search(r'Number of entries:\s*(\d+)', info)
+                    _r = _re.search(r'References:\s*(\d+)', info)
+                    _m = _re.findall(r'^\s*([0-9a-fA-F:]+/\d+)\s*$', info, _re.M)
+                    detail_parts.append(f"{ips}(entry={_n.group(1) if _n else '?'},refs={_r.group(1) if _r else '?'}{',前缀='+','.join(_m[:2]) if _m else ''})")
+                rec.add_detail(f"  [底层一致性-{label}] ipv6_wan: DB enabled={db_count}条; apply侧(ipset ipv6_prefix={apply_count}个)")
+                for dp in detail_parts:
+                    rec.add_detail(f"    - {dp}")
+                if db_count == 0 and apply_count > 0:
+                    rec.add_detail(f"    ✗ ipv6底层残留(DB空但apply侧ipset ipv6_prefix仍在,报禅道): {ipset_v6}")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: ipv6 DB空但ipset ipv6_prefix残留{apply_count}个(报禅道)")
+                elif db_count > 0 and apply_count == 0:
+                    rec.add_detail(f"    ⚠ 漏落地(DB有{db_count}条但ipset空, IPv6全局enabled=no正常)")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(ipset ipv6_prefix={apply_count}符合DB={db_count})")
+                return {"db_count": db_count, "apply_count": apply_count}
             except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
                 return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         # 测试规则(受multi-limit=3约束, 已有CFWAN_1, 加2条达上限)
         T1 = "IPV6WAN_T1"          # wan2 / dhcp
@@ -426,6 +450,8 @@ class TestIpv6WanComprehensive:
             for n in batch_names:
                 ssh_verify(f"L1-删除验证({n})", backend_verifier.verify_ipv6_wan_database,
                            n, must_pass=True, expect_absent=True)
+            # 底层一致性实时校验: 批量删除后apply侧ipset应无残留(残留=删不干净,硬FAIL报禅道)
+            kernel_check("步骤12-批量删除后", fail_on_residual=True)
 
         # ========== 步骤13: 导入测试(追加) ==========
         with rec.step(f"步骤13: 导入配置(追加)", f"导入{IMP} + L1验证"):
@@ -536,6 +562,8 @@ class TestIpv6WanComprehensive:
                 if cfwan:
                     print(f"  [OK] 默认CFWAN_1保留/已恢复")
                     rec.add_detail("[OK] 默认CFWAN_1保留/已恢复")
+            # 底层一致性实时校验: 清理后apply侧ipset应无残留(残留=删不干净,硬FAIL报禅道)
+            kernel_check("步骤16-清理后", fail_on_residual=True)
 
         print("\n" + "=" * 60)
         print("IPv6外网设置综合测试完成")

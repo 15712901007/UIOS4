@@ -24,6 +24,7 @@ import pytest
 import os
 from pages.network.nat_rule_page import NatRulePage
 from config.config import get_config
+from utils.verify_helper import make_ssh_verify, attach_cmd_recording_to_closure
 from utils.step_recorder import StepRecorder
 
 
@@ -50,25 +51,47 @@ class TestNatRuleComprehensive:
         ssh_failures = []
         ui_failures = []
 
-        def ssh_verify(label, verify_func, *args, must_pass=False, **kwargs):
+        ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
+
+        def kernel_check(label, fail_on_residual=True, module="nat_rule"):
+            """NAT规则底层一致性实时校验(NATRULE_SNAT+DNAT规则数 vs DB enabled数). 定位删除残留.
+            nat_rule规则无/*id*/comment(只[fastid:N]≠DB id, 同dst_nat), 故用规则数对比.
+            ⚠filter动作规则也进NATRULE链(-j ACCEPT/DTROP, 实测SNAT链含filter+snat),
+            故db_count含所有enabled(含filter), 不能只计snat+dnat(否则filter误报残留).
+            ⚠6.12 xt_set间歇坏: 带地址规则可能生成失败(漏落地, db>ipt正常); 只ipt>db=删不干净残留.
+            不清理底层(保留现场追溯). 残留→failures(硬FAIL+报禅道)."""
             if backend_verifier is None:
                 return None
             try:
-                result = verify_func(*args, **kwargs)
-                status = '[OK]' if result.passed else '[FAIL]'
-                print(f"    SSH-{label}: {status} - {result.message}")
-                rec.add_detail(f"    SSH-{label}: {status} {result.message}")
-                if result.raw_output:
-                    rec.add_detail(f"      SSH数据: {result.raw_output}")
-                if must_pass and not result.passed:
-                    ssh_failures.append(f"SSH-{label}: {result.message}")
-                return result
+                backend_verifier.connect_router()
+                row = backend_verifier._sqlite_query_line(
+                    "SELECT count(*) as cnt FROM nat_rule WHERE enabled='yes'")
+                db_count = int(row.get("cnt", 0)) if row else 0
+                snat = backend_verifier._router.exec("iptables -t nat -S NATRULE_SNAT 2>/dev/null")
+                dnat = backend_verifier._router.exec("iptables -t nat -S NATRULE_DNAT 2>/dev/null")
+                snat_rules = [l for l in snat.split('\n') if l.strip().startswith('[fastid') and '-A NATRULE_SNAT' in l]
+                dnat_rules = [l for l in dnat.split('\n') if l.strip().startswith('[fastid') and '-A NATRULE_DNAT' in l]
+                ipt_cnt = len(snat_rules) + len(dnat_rules)
+                residual = ipt_cnt - db_count  # >0=删不干净残留
+                miss = db_count - ipt_cnt  # >0=xt_set漏落地(带地址规则)
+                rec.add_detail(f"  [底层一致性-{label}] nat_rule: DB enabled={db_count}条; "
+                               f"NATRULE链(SNAT={len(snat_rules)}+DNAT={len(dnat_rules)}={ipt_cnt}) → "
+                               f"残留差值={max(residual, 0)} xt_set漏落地={max(miss, 0)}")
+                if residual > 0:
+                    rec.add_detail(f"    ✗ nat_rule底层残留(删不干净,报禅道): NATRULE链比DB多{residual}条")
+                    for l in (snat_rules + dnat_rules)[:8]:
+                        rec.add_detail(f"    ✗残留 {l.strip()[:110]}")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: nat_rule NATRULE链比DB多{residual}条(报禅道)")
+                elif miss > 0:
+                    rec.add_detail(f"    ⚠ {miss}条snat/dnat未落地iptables(6.12 xt_set坏,带地址规则errno=22,产品bug报禅道)")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(NATRULE链规则数={db_count})")
+                return {"residual": residual, "db_count": db_count, "ipt_cnt": ipt_cnt}
             except Exception as e:
-                print(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                rec.add_detail(f"    SSH-{label}: 跳过 - {str(e)[:80]}")
-                if must_pass:
-                    ssh_failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
                 return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         # 测试数据 - 9条规则, 覆盖3种动作类型
         test_rules = [
@@ -260,6 +283,8 @@ class TestNatRuleComprehensive:
                     if full:
                         for r in full.results:
                             rec.add_detail(f"    {r.level}: {'[OK]' if r.passed else '[FAIL]'} {r.message}")
+                # 底层一致性实时校验: 添加后基线(底层应与DB一致, 记录用)
+                kernel_check("步骤11-添加后基线", fail_on_residual=False)
 
         # ========== 步骤12: 编辑规则 ==========
         with rec.step("步骤12: 编辑规则", "编辑nat过滤基础->改名"):
@@ -362,6 +387,8 @@ class TestNatRuleComprehensive:
                            target, must_pass=True,
                            expected_fields=None,
                            expect_absent=True)
+            # 底层一致性实时校验: 删除后NATRULE链应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤15-删除后", fail_on_residual=True)
 
         # ========== 步骤16: 搜索测试 ==========
         with rec.step("步骤16: 搜索测试", "精确/部分/不存在/清空"):
@@ -713,6 +740,8 @@ class TestNatRuleComprehensive:
                         rec.add_detail(f"    SSH: 测试规则已全部删除")
                 except Exception:
                     pass
+            # 底层一致性实时校验: 批量删除后NATRULE链应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤22-批量删除后", fail_on_residual=True)
 
         # ========== 步骤23: 导入追加(CSV) ==========
         with rec.step("步骤23: 导入配置(追加)", "使用导出的CSV追加导入"):
@@ -774,6 +803,8 @@ class TestNatRuleComprehensive:
             else:
                 print(f"  [WARN] TXT文件不存在")
                 rec.add_detail(f"  TXT文件不存在")
+            # 底层一致性实时校验: 导入后NATRULE链应与DB一致(记录用, 不硬FAIL)
+            kernel_check("步骤24-导入后", fail_on_residual=False)
 
         # ========== 步骤25: 齿轮设置 - 开启本地转发自动NAT ==========
         with rec.step("步骤25: 设置-开启本地转发自动NAT", "通过齿轮设置抽屉开启本地转发自动NAT"):
@@ -876,6 +907,8 @@ class TestNatRuleComprehensive:
             if backend_verifier is not None:
                 ssh_verify("L1-最终清理", backend_verifier.verify_nat_rule_iptables,
                            must_pass=False, expect_rules=False)
+            # 底层一致性实时校验: 清理后NATRULE链应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("步骤27-清理后", fail_on_residual=True)
 
         # ========== 步骤28: 帮助功能测试 ==========
         with rec.step("步骤28: 帮助功能测试", "测试帮助图标"):

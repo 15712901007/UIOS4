@@ -21,6 +21,7 @@ import os
 import pytest
 from utils.step_recorder import StepRecorder
 from tests.security.acl_test_data import load_acl_cases
+from utils.verify_helper import attach_cmd_recording_to_closure
 
 pytestmark = [pytest.mark.security, pytest.mark.acl]
 
@@ -62,6 +63,7 @@ class TestAclComprehensive:
                 rec.add_detail(f"[SSH-{label}] 异常: {str(e)[:80]}")
                 ssh_failures.append(f"SSH-{label}异常: {str(e)[:80]}")
                 return None
+        ssh_verify = attach_cmd_recording_to_closure(backend_verifier, rec, ssh_verify)
 
         def ui_check(label, cond, detail=""):
             if cond:
@@ -69,6 +71,32 @@ class TestAclComprehensive:
             else:
                 rec.add_detail(f"[UI] {label}: 失败 - {detail}")
                 ui_failures.append(f"{label}: {detail}")
+
+        def kernel_check(label, fail_on_residual=True, module="acl"):
+            """ACL底层一致性实时校验(snapshot ipset vs DB). 定位导入→删除残留.
+            不清理底层(保留现场追溯BUG触发步骤). 残留→failures(硬FAIL+报禅道)."""
+            if backend_verifier is None:
+                return None
+            try:
+                backend_verifier.connect_router()
+                res = backend_verifier.verify_module_kernel_consistency(module, label)
+                rec.add_detail(f"  [底层一致性-{label}] {res['detail']}")
+                for rd in res['residual_detail']:
+                    rec.add_detail(f"    ✗残留 {rd}")
+                if res['residual'] or res.get('count_overflow'):
+                    ovf = '/'.join(f"{c['chain']}累加{c['dup']}条" for c in res.get('count_overflow', []))
+                    rec.add_detail(f"    ✗ {module}底层残留(删不干净,报禅道): id={res['residual']}{'; ' + ovf if ovf else ''}")
+                    if fail_on_residual:
+                        ssh_failures.append(f"底层残留-{label}: {module} id {res['residual']} {ovf} 底层有DB无(报禅道)")
+                elif res['missing']:
+                    rec.add_detail(f"    ⚠ 漏下发(DB有底层无): {res['missing']}")
+                else:
+                    rec.add_detail(f"    ✓ 底层与DB一致(无残留)")
+                return res
+            except Exception as e:
+                rec.add_detail(f"  [底层一致性-{label}] 异常: {str(e)[:80]}")
+                return None
+        kernel_check = attach_cmd_recording_to_closure(backend_verifier, rec, kernel_check)
 
         try:
             # ==================== 步骤1: 环境快照+清理 ====================
@@ -198,6 +226,8 @@ class TestAclComprehensive:
                     # 至少10条测试规则
                     if ui_cnt < 10:
                         ui_failures.append(f"步骤12: UI规则数{ui_cnt}<10(期望≥10)")
+                # 底层一致性实时校验: 添加后基线(底层应与DB一致, 记录用)
+                kernel_check("步骤12-添加后基线", fail_on_residual=False)
 
             # ==================== 步骤13: 搜索 ====================
             with rec.step("步骤13: 搜索(存在/不存在/清空)", "search_rule验证"):
@@ -257,6 +287,8 @@ class TestAclComprehensive:
                            f"{PREFIX}src1")
                 ssh_verify("步骤17-iptables无", backend_verifier.verify_acl_iptables,
                            f"{PREFIX}src1", expect_present=False)
+                # 底层一致性实时校验: 删除后底层应无残留(残留=删不干净BUG,硬FAIL报禅道)
+                kernel_check("步骤17-删除后", fail_on_residual=True)
 
             # ==================== 步骤18: 异常输入拦截 ====================
             with rec.step("步骤18: 异常输入拦截(空名称/非法IP)", "前端校验应阻止保存"):
@@ -336,6 +368,8 @@ class TestAclComprehensive:
                     rec.add_detail(f"[导入] 不清空={imp_ok1} 清空={imp_ok2} 文件={os.path.basename(imp_file)}")
                 else:
                     rec.add_detail("[导入] 跳过(无导出文件)")
+                # 底层一致性实时校验: 导入后底层应与DB一致(记录用, 不硬FAIL)
+                kernel_check("步骤20-导入后", fail_on_residual=False)
 
             # ==================== 步骤21: 批量停用/启用/删除 ====================
             with rec.step("步骤21: 批量操作", "批量停用/启用/删除"):
@@ -377,6 +411,8 @@ class TestAclComprehensive:
                 page.page.wait_for_timeout(1500)
                 left = page.get_rule_count()
                 rec.add_detail(f"[批量删除后] 剩余 {left} 条")
+                # 底层一致性实时校验: 批量删除后底层应无残留(残留=删不干净BUG,硬FAIL报禅道)
+                kernel_check("步骤21-批量删除后", fail_on_residual=True)
 
             # ==================== 步骤22: 复制功能(ACL特有, 行操作含复制) ====================
             with rec.step("步骤22: 复制规则", "复制acl_t_src2→copy_test+SSH验证字段一致"):
@@ -436,6 +472,8 @@ class TestAclComprehensive:
                     rec.add_detail(f"[finally SQL清理] {res}")
                 except Exception as e:
                     rec.add_detail(f"[finally SQL清理异常] {str(e)[:60]}")
+            # 底层一致性实时校验: 清理后底层应无残留(残留=删不干净BUG,硬FAIL报禅道)
+            kernel_check("finally-清理后", fail_on_residual=True)
 
         # ==================== 汇总断言 ====================
         all_failures = ssh_failures + ui_failures
@@ -481,6 +519,7 @@ class TestAclFlowVerification:
             except Exception as e:
                 rec.add_detail(f"[SSH-{label}] 异常: {str(e)[:80]}")
                 failures.append(f"{label}异常: {str(e)[:80]}")
+        ssh_verify = attach_cmd_recording_to_closure(bv, rec, ssh_verify)
 
         print("\n" + "=" * 50)
         print("ACL功能验证(多协议打流矩阵 + 端到端drop闭环)")
@@ -497,13 +536,28 @@ class TestAclFlowVerification:
                 except Exception:
                     pass
 
-            # 步骤2: 基线连通性探测(curl baidu经ens11应通, 不通则环境问题skip)
-            with rec.step("步骤2: 基线连通性探测", "curl baidu --interface ens11 应通(经路由器FIREWALL)"):
+            # 步骤2: 基线连通性探测(curl经ens11应通, baidu+qq+bing多域名冗余抗单点抖动)
+            with rec.step("步骤2: 基线连通性探测", "curl经ens11应通(baidu+qq+bing多域名冗余抗抖动)"):
                 bv.connect_client()
-                base = bv.verify_connectivity(dst_domain="www.baidu.com")
+                base = bv.verify_connectivity(
+                    dst_domain="www.baidu.com", retries=2,
+                    fallback_domains=["www.qq.com", "cn.bing.com", "www.taobao.com"])
                 rec.add_detail(f"  基线: {base['detail']}")
                 if not base["connected"]:
-                    pytest.skip(f"基线baidu经ens11不可达, 跳过ACL功能验证: {base['detail']}")
+                    # 全域名失败: 诊断区分"残留挡流(功能/配置问题→FAIL, 不skip)" vs "环境(WAN断/抖动→skip+详报)"
+                    diag = bv.diagnose_baseline_block(dst_domain="www.baidu.com")
+                    rec.add_detail(f"  [根因诊断] {diag['summary']}")
+                    rec.add_detail(f"  [诊断数据] 路由器WAN curl={diag['router_code']} | "
+                                   f"client DNS={'OK' if diag['dns_ok'] else 'FAIL(' + diag['dns_detail'] + ')'} | "
+                                   f"conn_limit_enabled={diag['conn_limit_enabled']} | "
+                                   f"残留挡流={diag['residual_block'] or '无'}")
+                    rec.add_detail("  [验证命令]")
+                    for c in diag["commands"]:
+                        rec.add_detail(f"    {c}")
+                    if diag["residual_block"]:
+                        pytest.fail(f"基线不通且路由器有残留挡流规则({diag['residual_block']}), "
+                                    f"判功能/配置问题(非环境抖动). 清理残留规则后重测. 验证命令见上.")
+                    pytest.skip(f"基线多域名全不可达({base['detail']}); 诊断: {diag['summary']}")
 
             # 步骤3: iperf3打流环境软探活
             # 用bash /dev/tcp轻量探端口(3s), 不走iperf3进程: iperf3首次连接会卡致paramiko read阻塞
@@ -623,7 +677,9 @@ class TestAclFlowVerification:
                         except Exception:
                             pass
                     page.page.wait_for_timeout(1000)
-                    restore = bv.verify_connectivity(dst_domain="www.baidu.com")
+                    restore = bv.verify_connectivity(
+                        dst_domain="www.baidu.com", retries=2,
+                        fallback_domains=["www.qq.com", "cn.bing.com"])
                     rec.add_detail(f"  删规则后: {restore['detail']}")
                     if not restore["connected"]:
                         rec.add_detail("  ✗ 删规则后baidu仍不通(规则残留或环境)")
