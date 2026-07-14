@@ -745,9 +745,10 @@ class TestUpdownRouteComprehensive:
 @pytest.mark.updown_route
 @pytest.mark.network
 class TestUpdownRouteFlowVerification:
-    """上下行分流功能验证(双向, 硬断言): 建upload=wan2/download=wan1→conntrack remote_if=wan2(上)+rev_remote_if=wan1(下).
+    """上下行分流功能验证(双向, 硬断言): 建upload=wan1/download=wan3→conntrack remote_if=wan1(上)+rev_remote_if=wan3(下).
 
-    上下行走ik_cntl wans-snat; 验conntrack双向remote_if=上行口/下行口. 未观测到双向分离→FAIL."""
+    上下行走ik_cntl wans-snat(不走iptables); 选路铁证=conntrack扩展行 remote_if=上行口/rev_remote_if=下行口.
+    用wan1上/wan3下(同手机实测可行; wan2=192.168.112.x孤立网段作上行不可靠). 轮询打流解短连接条目时机. 未观测到→FAIL."""
 
     PREFIX = "udflow_"
 
@@ -759,7 +760,7 @@ class TestUpdownRouteFlowVerification:
         except Exception:
             pytest.skip("无SSH验证器, 跳过上下行分流功能验证")
         client_ip = "192.168.148.2"
-        up_wan, down_wan = "wan2", "wan1"  # 上行用非默认wan2(可观测), 下行wan1
+        up_wan, down_wan = "wan1", "wan3"  # 上行wan1/下行wan3(同手机实测可行; wan2孤立网段作上行不可靠)
         rule_name = f"{self.PREFIX}sep"
         failures = []
         print("\n" + "=" * 50)
@@ -818,19 +819,33 @@ class TestUpdownRouteFlowVerification:
                     rec.add_detail(f"  L4-内核模块: {'[OK]' if r4.passed else '[FAIL]'} {r4.message}")
                     if not r4.passed:
                         failures.append(f"L4内核模块: {r4.message}")
-            with rec.step("L5双向验证", f"curl→conntrack remote_if={up_wan}(上)+rev_remote_if={down_wan}(下)"):
+            with rec.step("L5双向验证", f"轮询打流+conntrack remote_if={up_wan}(上)+rev_remote_if={down_wan}(下)"):
                 bv.clear_client_conntrack(client_ip)
                 bv.connect_client()
-                for _ in range(3):
-                    bv._client.exec("curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 http://www.baidu.com/", timeout=15)
-                eg = bv.conntrack_egress(client_ip, proto="tcp")
-                rec.add_detail(f"  conntrack: found={eg['found']} remote_if={eg['remote_if']} rev_remote_if={eg['rev_remote_if']}")
+                # 上下行走ik_cntl wans-snat(不走iptables); 选路铁证=conntrack扩展行remote_if/rev_remote_if.
+                # HTTP短连接打完即TIME_WAIT→条目易消失; 用轮询"打流2次+抓conntrack"多次重试解时机问题.
+                observed = False
+                last_eg = {"found": False, "remote_if": "", "rev_remote_if": "", "mark": "", "raw": ""}
+                for attempt in range(8):
+                    for _ in range(2):
+                        try:
+                            bv._client.exec("curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 http://www.baidu.com/", timeout=15)
+                        except Exception:
+                            pass
+                    eg = bv.conntrack_egress(client_ip, proto="tcp")
+                    last_eg = eg
+                    if eg["found"] and eg["remote_if"] == up_wan and eg["rev_remote_if"] == down_wan:
+                        observed = True
+                        rec.add_detail(f"  第{attempt + 1}轮观测到分离: remote_if={eg['remote_if']}/rev={eg['rev_remote_if']}")
+                        break
+                    time.sleep(0.5)
+                rec.add_detail(f"  conntrack(末次): found={last_eg['found']} remote_if={last_eg['remote_if']} rev_remote_if={last_eg['rev_remote_if']}")
                 # 上下行走ik_cntl wans-snat; 硬断言: conntrack双向remote_if须=上行口/下行口, 未观测到即FAIL
-                if eg["found"] and eg["remote_if"] == up_wan and eg["rev_remote_if"] == down_wan:
+                if observed:
                     rec.add_detail(f"  ✓ 上下行分离观测到(remote_if={up_wan}/rev={down_wan})")
                 else:
-                    rec.add_detail(f"  ✗ 上下行分离未观测到 remote_if={eg['remote_if']}/rev={eg['rev_remote_if']}(期望 {up_wan}/{down_wan})")
-                    failures.append(f"上下行分离未生效: remote_if={eg['remote_if']}/rev={eg['rev_remote_if']}(期望 {up_wan}/{down_wan})")
+                    rec.add_detail(f"  ✗ 上下行分离未观测到 remote_if={last_eg['remote_if']}/rev={last_eg['rev_remote_if']}(期望 {up_wan}/{down_wan})")
+                    failures.append(f"上下行分离未生效: remote_if={last_eg['remote_if']}/rev={last_eg['rev_remote_if']}(期望 {up_wan}/{down_wan})")
         finally:
             try:
                 page.navigate_to_updown_route()

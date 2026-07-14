@@ -137,7 +137,10 @@ from pages.network.wireguard_page import WireguardPage
 from pages.security.acl_page import AclPage
 from pages.security.conn_limit_page import ConnLimitPage
 from pages.security.mac_access_control_page import MacAccessControlPage
+from pages.security.arp_setting_page import ArpSettingPage
 from pages.security.app_protocol_page import AppProtocolPage
+from pages.security.advanced_page import AdvancedPage
+from pages.security.other_control_page import OtherControlPage
 from utils.report_generator import ReportGenerator
 from utils.step_recorder import StepRecorder, get_step_recorder
 
@@ -231,8 +234,11 @@ TEST_NAME_MAPPING = {
     'test_conn_limit_comprehensive': '安全中心-连接数限制综合测试',
     'test_conn_limit_concurrent_drop': '安全中心-连接数限制功能验证(并发drop阻断)',
     'test_mac_access_control_comprehensive': '安全中心-MAC访问控制综合测试',
+    'test_arp_setting_comprehensive': '安全中心-ARP设置综合测试',
     'test_app_protocol_comprehensive': '安全中心-应用协议控制综合测试',
     'test_app_protocol_flow_verification': '安全中心-应用协议控制功能验证(端到端drop+停用BUG三重信号)',
+    'test_advanced_comprehensive': '安全中心-高级设置综合测试',
+    'test_other_control_comprehensive': '安全中心-其他控制综合测试',
     'test_ipv6_static_comprehensive': 'IPv6前缀静态分配综合测试',
     'test_ipv6_wan_comprehensive': 'IPv6外网设置综合测试',
     'test_ipv6_lan_comprehensive': 'IPv6内网设置综合测试',
@@ -899,6 +905,28 @@ def conn_limit_page_logged_in(logged_in_page: Page, config: Config) -> ConnLimit
 
 
 @pytest.fixture(scope="function")
+def advanced_page(page: Page, config: Config) -> AdvancedPage:
+    """创建高级设置页面实例(安全中心>高级设置)"""
+    return AdvancedPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def advanced_page_logged_in(logged_in_page: Page, config: Config) -> AdvancedPage:
+    """已登录并导航到高级设置页的实例(安全中心>高级设置, 纯配置类页面)"""
+    pg = AdvancedPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_advanced()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def other_control_page_logged_in(logged_in_page: Page, config: Config) -> OtherControlPage:
+    """已登录并导航到其他控制页的实例(安全中心>其他控制>网络分享控制, 配置类页面)"""
+    pg = OtherControlPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_other_control()
+    return pg
+
+
+@pytest.fixture(scope="function")
 def mac_access_control_page(page: Page, config: Config) -> MacAccessControlPage:
     """创建MAC访问控制页面实例(安全中心>MAC访问控制)"""
     return MacAccessControlPage(page, config.get_base_url())
@@ -909,6 +937,20 @@ def mac_access_control_page_logged_in(logged_in_page: Page, config: Config) -> M
     """已登录并导航到MAC访问控制列表页的实例(安全中心>MAC访问控制)"""
     pg = MacAccessControlPage(logged_in_page, config.get_base_url())
     pg.navigate_to_mac_ctrl()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def arp_setting_page(page: Page, config: Config) -> ArpSettingPage:
+    """创建ARP设置页面实例(安全中心>ARP设置)"""
+    return ArpSettingPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def arp_setting_page_logged_in(logged_in_page: Page, config: Config) -> ArpSettingPage:
+    """已登录并导航到ARP设置列表页的实例(安全中心>ARP设置)"""
+    pg = ArpSettingPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_arp()
     return pg
 
 

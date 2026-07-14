@@ -1122,6 +1122,26 @@ class MainWindow(QMainWindow):
                             ]
                         }
                     },
+                    "高级设置": {
+                        "testcases": [
+                            "security/test_advanced_comprehensive.py::TestAdvancedComprehensive::test_advanced_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "security/test_advanced_comprehensive.py::TestAdvancedComprehensive::test_advanced_comprehensive",
+                            ]
+                        }
+                    },
+                    "其他控制": {
+                        "testcases": [
+                            "security/test_other_control_comprehensive.py::TestOtherControlComprehensive::test_other_control_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "security/test_other_control_comprehensive.py::TestOtherControlComprehensive::test_other_control_comprehensive",
+                            ]
+                        }
+                    },
                 }
             },
         }

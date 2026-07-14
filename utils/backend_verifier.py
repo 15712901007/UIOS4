@@ -10,6 +10,7 @@ SSH后台验证工具
 
 基于MCP-SSH全链路探索经验编写（2026-03-04）
 """
+import base64
 import ipaddress
 import json
 import re
@@ -11236,6 +11237,331 @@ class BackendVerifier:
             return VerifyResult(level="L5-tcp_mss抓包", passed=False,
                                 message=f"tcpdump抓包异常: {str(e)[:80]}")
 
+    # ==================== 其他控制 (安全中心 > 其他控制 > 网络分享控制) ====================
+    # acl_l2route.sh: 单表acl_l2route(id=1), nol2rt(int)/ttl_num(int)/nol2rt_ip(base64 JSON)/time(base64 JSON)
+    # 规则(nol2rt=1): iptables -t mangle -I FORWARD -m timeset --timeset acl_l2rt_time_1 -m ttl --ttl-gt 1
+    #   <WAN in>(wan,vwan,adsl,pptp,l2tp,ovpn,iked) <LAN out>(lan,vlan,ppp,tap0,sovpn,sdwan,ikec,doc_)
+    #   [-m set ! --match-set Linux_acl_l2rt dst] -j TTL --ttl-set <ttl_num>
+    # 时间: __format_timeset 建 acl_l2rt_time_1(引用_acl_l2rt_time_1周期表weekly + 时间计划group_{gid})
+    # 例外: ipset Linux_acl_l2rt(dst方向, !match=不在例外集才夹TTL)
+    # 实测(2026-07-14, 6.12.87): nol2rt=1/ttl=5 → client ping 10.66.0.40 回包ttl=5; 排除今天→ttl=63+计数器不动
+    def query_other_control_config(self) -> Optional[Dict]:
+        """查acl_l2route单记录(id=1)原始字段. time/nol2rt_ip为base64 JSON字符串."""
+        return self._sqlite_query_line("SELECT * FROM acl_l2route WHERE id=1")
+
+    @staticmethod
+    def _decode_b64_json(raw: str) -> Optional[Dict]:
+        """解析acl_l2route的time/nol2rt_ip字段(实测DB存明文JSON, 非base64).
+
+        save()把API的base64解码后以明文JSON写DB. 兼容: 先json.loads明文, 失败再尝试base64."""
+        if not raw:
+            return None
+        s = raw.strip().strip('"')
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+        try:
+            return json.loads(base64.b64decode(s).decode("utf-8", "replace"))
+        except Exception:
+            return None
+
+    def verify_other_control_database(self, expected: Dict = None) -> VerifyResult:
+        """L1: 验证acl_l2route字段.
+
+        expected标量: {'nol2rt':'1', 'ttl_num':'10'}(值转str比对)
+        expected.time: {'type':'weekly','weekdays':'1234567','start_time':'00:00','end_time':'23:59'}
+            (比对time JSON的custom[0]字段, weekdays用包含子串匹配)
+        expected.time_object_gid: time.object引用的gid(时间计划模式)
+        expected.nol2rt_ip_custom: 例外custom IP列表(nol2rt_ip.custom含这些)
+        expected.nol2rt_ip_object_gid: 例外IP分组gid
+        """
+        cfg = self.query_other_control_config()
+        if cfg is None:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message="acl_l2route配置不存在(DB无id=1记录)")
+        if not expected:
+            return VerifyResult(level="L1-数据库", passed=True,
+                                message=(f"acl_l2route存在 (nol2rt={cfg.get('nol2rt')}, "
+                                         f"ttl_num={cfg.get('ttl_num')})"),
+                                details=cfg, raw_output=json.dumps(cfg, ensure_ascii=False)[:300])
+        mismatches = {}
+        # 标量字段
+        for k in ("nol2rt", "ttl_num"):
+            if k in expected and str(cfg.get(k)) != str(expected[k]):
+                mismatches[k] = {"expected": expected[k], "actual": cfg.get(k)}
+        # time JSON
+        if "time" in expected or "time_object_gid" in expected:
+            tj = self._decode_b64_json(cfg.get("time", ""))
+            if tj is None:
+                mismatches["time"] = {"expected": expected.get("time"), "actual": "decode_fail"}
+            else:
+                want = expected.get("time")
+                if want:
+                    custom = tj.get("custom") or tj.get("custom", [])
+                    c0 = custom[0] if custom else {}
+                    for fk, fv in want.items():
+                        if fk == "weekdays":
+                            if str(fv) not in str(c0.get("weekdays", "")):
+                                mismatches[f"time.{fk}"] = {"expected": fv, "actual": c0.get("weekdays")}
+                        elif str(c0.get(fk)) != str(fv):
+                            mismatches[f"time.{fk}"] = {"expected": fv, "actual": c0.get(fk)}
+                if "time_object_gid" in expected:
+                    gids = [str(o.get("gid")) for o in (tj.get("object") or [])]
+                    if str(expected["time_object_gid"]) not in gids:
+                        mismatches["time.object_gid"] = {"expected": expected["time_object_gid"], "actual": gids}
+        # nol2rt_ip JSON
+        if "nol2rt_ip_custom" in expected or "nol2rt_ip_object_gid" in expected:
+            ipj = self._decode_b64_json(cfg.get("nol2rt_ip", ""))
+            if ipj is None:
+                mismatches["nol2rt_ip"] = {"expected": expected, "actual": "decode_fail"}
+            else:
+                if "nol2rt_ip_custom" in expected:
+                    customs_raw = ipj.get("custom")
+                    customs_str = json.dumps(customs_raw, ensure_ascii=False) if customs_raw else ""
+                    for ip in expected["nol2rt_ip_custom"]:
+                        if str(ip) not in customs_str:
+                            mismatches[f"nol2rt_ip.custom.{ip}"] = {"expected": "present", "actual": customs_raw}
+                if "nol2rt_ip_object_gid" in expected:
+                    gids = [str(o.get("gid")) for o in (ipj.get("object") or [])]
+                    if str(expected["nol2rt_ip_object_gid"]) not in gids:
+                        mismatches["nol2rt_ip.object_gid"] = {"expected": expected["nol2rt_ip_object_gid"], "actual": gids}
+        if mismatches:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"字段不匹配: {mismatches}", details={"mismatches": mismatches},
+                                raw_output=json.dumps(cfg, ensure_ascii=False)[:300])
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"acl_l2route字段正确 ({', '.join(f'{k}={v}' for k, v in expected.items())})",
+                            details=cfg, raw_output=json.dumps(cfg, ensure_ascii=False)[:300])
+
+    def verify_other_control_iptables(self, expect_present: bool = True,
+                                      expect_ttl: int = None,
+                                      expect_exception: Optional[bool] = None) -> VerifyResult:
+        """L2: 验证mangle FORWARD链的TTL夹制规则存在性 + ttl值 + 例外dst匹配.
+
+        expect_present: 规则应存在(nol2rt=1)/不存在(nol2rt=0)
+        expect_ttl: 比对 --ttl-set N
+        expect_exception: True=应有 -m set ! --match-set Linux_acl_l2rt dst(配了例外);
+                          False=应无; None=不验证"""
+        self.connect_router()
+        out = self._router.exec("iptables -t mangle -S FORWARD 2>/dev/null")
+        rules = [l for l in out.splitlines()
+                 if "timeset" in l and "acl_l2rt_time_1" in l and "--ttl-set" in l]
+        present = len(rules) > 0
+        if present != expect_present:
+            return VerifyResult(level="L2-iptables", passed=False,
+                                message=f"TTL夹制规则 present={present} 期望={expect_present}",
+                                raw_output=out[:400])
+        detail_bits = []
+        if expect_present:
+            rule = rules[0]
+            if expect_ttl is not None and f"--ttl-set {expect_ttl}" not in rule:
+                m = re.search(r"--ttl-set (\d+)", rule)
+                actual = m.group(1) if m else "?"
+                return VerifyResult(level="L2-iptables", passed=False,
+                                    message=f"TTL值不匹配: 期望{expect_ttl} 实际{actual}",
+                                    raw_output=rule[:200])
+            detail_bits.append(f"ttl-set匹配({expect_ttl})" if expect_ttl else "规则存在")
+            if expect_exception is True and "Linux_acl_l2rt" not in rule:
+                return VerifyResult(level="L2-iptables", passed=False,
+                                    message="规则缺少例外dst匹配(-m set ! --match-set Linux_acl_l2rt dst)",
+                                    raw_output=rule[:200])
+            if expect_exception is False and "Linux_acl_l2rt" in rule:
+                return VerifyResult(level="L2-iptables", passed=False,
+                                    message="规则不应有例外匹配但存在Linux_acl_l2rt",
+                                    raw_output=rule[:200])
+            if expect_exception is True:
+                detail_bits.append("含例外dst匹配")
+            return VerifyResult(level="L2-iptables", passed=True,
+                                message=f"TTL夹制规则存在({', '.join(detail_bits)})",
+                                raw_output=rule[:200])
+        return VerifyResult(level="L2-iptables", passed=True,
+                            message="TTL夹制规则不存在(符合期望)", raw_output=out[:200])
+
+    def verify_other_control_timeset(self, expect_present: bool = True) -> VerifyResult:
+        """L3: 验证禁止时间timeset已绑定到规则(-m timeset --timeset acl_l2rt_time_1).
+
+        ik_cntl timeset无show命令, 靠iptables规则引用判定绑定; 配了时间才会在规则里出现timeset匹配."""
+        self.connect_router()
+        out = self._router.exec("iptables -t mangle -S FORWARD 2>/dev/null")
+        present = any("timeset" in l and "acl_l2rt_time_1" in l for l in out.splitlines())
+        if present != expect_present:
+            return VerifyResult(level="L3-timeset", passed=False,
+                                message=f"timeset acl_l2rt_time_1 绑定={present} 期望={expect_present}",
+                                raw_output=out[:300])
+        return VerifyResult(level="L3-timeset", passed=True,
+                            message=f"禁止时间timeset{'已绑定规则' if present else '未绑定(无时间配置)'}",
+                            raw_output=out[:200])
+
+    def verify_other_control_exception(self, expect_present: bool = True,
+                                       ip: str = None) -> VerifyResult:
+        """L3: 验证例外ipset存在 + (可选)含指定IP成员.
+
+        ipset_rule_add把Linux_acl_l2rt建为list:set, 实际IP成员在下划线子集_Linux_acl_l2rt(hash:net).
+        故: present查Linux_acl_l2rt setlist存在; ip成员查_Linux_acl_l2rt."""
+        if self.is_xt_set_broken():
+            return self.xt_set_degrade_result("L3-ipset", "", " Linux_acl_l2rt(例外地址)")
+        self.connect_router()
+        out = self._router.exec("ipset list Linux_acl_l2rt 2>/dev/null")
+        present = "Name: Linux_acl_l2rt" in out
+        if present != expect_present:
+            return VerifyResult(level="L3-ipset", passed=False,
+                                message=f"ipset Linux_acl_l2rt present={present} 期望={expect_present}",
+                                raw_output=out[:300])
+        if expect_present and ip:
+            sub = self._router.exec("ipset list _Linux_acl_l2rt 2>/dev/null")
+            if str(ip) not in sub:
+                return VerifyResult(level="L3-ipset", passed=False,
+                                    message=f"_Linux_acl_l2rt 不含例外IP {ip}",
+                                    raw_output=sub[:300])
+        return VerifyResult(level="L3-ipset", passed=True,
+                            message=f"ipset Linux_acl_l2rt{'存在' if present else '不存在'}" +
+                                    (f" 含{ip}(子集_Linux_acl_l2rt)" if (expect_present and ip) else ""),
+                            raw_output=out[:200])
+
+    def client_ping_ttl(self, src_iface: str = "ens11", dst_ip: str = "10.66.0.40",
+                        count: int = 4) -> Dict:
+        """L5原语: client经src_iface ping dst, 抓回包ttl众数(被夹=ttl_num, 正常=63).
+
+        返回 {ttl:众数ttl或None, ttls:每次ttl, raw}"""
+        self.connect_client()
+        try:
+            out = self._client.exec(
+                f"ping -I {src_iface} -c {count} -W 2 {dst_ip} 2>&1",
+                timeout=20)
+            ttls = re.findall(r"ttl=(\d+)", out or "")
+            ttls_int = [int(t) for t in ttls]
+            ttl = None
+            if ttls_int:
+                # 众数
+                from collections import Counter
+                ttl = Counter(ttls_int).most_common(1)[0][0]
+            return {"ttl": ttl, "ttls": ttls_int, "raw": out}
+        except Exception as e:
+            return {"ttl": None, "ttls": [], "raw": str(e), "error": str(e)[:80]}
+
+    def verify_ttl_clamp_real(self, src_iface: str = "ens11", dst_ip: str = "10.66.0.40",
+                              expect_clamped: bool = True, ttl_num: int = None) -> VerifyResult:
+        """L5硬验证: ping回包TTL证明TTL夹制+禁止时间门控(6.12端到端铁证).
+
+        expect_clamped=True: 当前禁止时间active, 回包应ttl==ttl_num(被夹)
+        expect_clamped=False: 当前禁止时间inactive或例外豁免, 回包应正常ttl(>ttl_num, 实测63)
+        ttl_num: 被夹时的期望TTL值(必填, 当expect_clamped=True)
+        多目标fallback: 主目标无回包时按WAN侧备选列表重试(避单点抖动, 见baseline-probe-robustness)"""
+        targets = [dst_ip] + [t for t in ("8.8.8.8", "10.66.0.1", "10.66.0.40") if t != dst_ip]
+        res = {"ttl": None, "raw": ""}
+        used = dst_ip
+        for t in targets:
+            res = self.client_ping_ttl(src_iface=src_iface, dst_ip=t)
+            if res.get("ttl") is not None:
+                used = t
+                break
+        ttl = res.get("ttl")
+        if ttl is None:
+            return VerifyResult(level="L5-TTL实测", passed=False,
+                                message=f"ping {targets} 全部无回包(环境不通?), 无法判定TTL",
+                                raw_output=res.get("raw", "")[:200])
+        if expect_clamped:
+            if ttl_num is not None and ttl != ttl_num:
+                return VerifyResult(level="L5-TTL实测", passed=False,
+                                    message=f"期望被夹TTL={ttl_num} 实际={ttl}(夹制/门控未生效?) [目标{used}]",
+                                    details=res, raw_output=res.get("raw", "")[:200])
+            return VerifyResult(level="L5-TTL实测", passed=True,
+                                message=f"TTL被夹到{ttl}(禁止时间active, 夹制生效) [目标{used}]",
+                                details=res, raw_output=res.get("raw", "")[:200])
+        else:
+            # 正常回包ttl应明显>ttl_num(实测63, 一跳)
+            if ttl_num is not None and ttl <= ttl_num:
+                return VerifyResult(level="L5-TTL实测", passed=False,
+                                    message=f"期望正常TTL(>{ttl_num}, 时间门控inactive/例外豁免) 实际={ttl}(仍被夹) [目标{used}]",
+                                    details=res, raw_output=res.get("raw", "")[:200])
+            return VerifyResult(level="L5-TTL实测", passed=True,
+                                message=f"TTL正常={ttl}(禁止时间inactive/例外豁免, 未被夹) [目标{used}]",
+                                details=res, raw_output=res.get("raw", "")[:200])
+
+    def get_ttl_rule_counter(self) -> int:
+        """读mangle FORWARD的TTL夹制规则匹配包数(佐证active/inactive). 无规则返回-1."""
+        self.connect_router()
+        out = self._router.exec("iptables -t mangle -L FORWARD -n -v 2>/dev/null")
+        for line in out.splitlines():
+            if "timeset acl_l2rt" in line and "TTL set to" in line:
+                m = re.match(r"\s*(\d+)\s+", line)
+                if m:
+                    return int(m.group(1))
+        return -1
+
+    def rebuild_timeset_exclude_today(self, today_weekday: int) -> str:
+        """内核级辅助: 重建_acl_l2rt_time_1只保留非今天的星期(门控inactive佐证).
+
+        today_weekday: 1-7(1=周一). 仅当UI时间模式难自动化时用, 用后须restore_include_all回24/7.
+        ⚠️不掩盖: 这是辅助验证手段, 非掩盖bug; 正常优先用UI切换星期."""
+        others = ",".join(str(d) for d in range(1, 8) if d != today_weekday)
+        self.connect_router()
+        self._router.exec("ik_cntl timeset clear _acl_l2rt_time_1 2>/dev/null")
+        self._router.exec(f"ik_cntl timeset add _acl_l2rt_time_1 weekly {others} 0 86399 2>/dev/null")
+        return f"rebuilt exclude weekday {today_weekday} (keep {others})"
+
+    def rebuild_timeset_include_all(self) -> str:
+        """内核级辅助: 恢复_acl_l2rt_time_1为24/7全周(门控active)."""
+        self.connect_router()
+        self._router.exec("ik_cntl timeset clear _acl_l2rt_time_1 2>/dev/null")
+        self._router.exec("ik_cntl timeset add _acl_l2rt_time_1 weekly 1,2,3,4,5,6,7 0 86399 2>/dev/null")
+        return "rebuilt include all week 24/7"
+
+    def verify_other_control_residual(self, expect_clean: bool = True) -> VerifyResult:
+        """残留检测: UI关闭(web还原)后底层应全部清理(正确哲学: web还原→检测残留→有残留=删不干净BUG).
+
+        expect_clean=True(nol2rt已UI关闭): 期望无残留; 检测到残留=产品BUG(报禅道), 不后台强清掩盖.
+        检查项: mangle FORWARD无acl_l2rt TTL规则 + 无Linux_acl_l2rt ipset(setlist)."""
+        self.connect_router()
+        ipt = self._router.exec("iptables -t mangle -S FORWARD 2>/dev/null")
+        rules = [l for l in ipt.splitlines() if "acl_l2rt_time_1" in l and "--ttl-set" in l]
+        ipset_out = self._router.exec("ipset list Linux_acl_l2rt 2>/dev/null")
+        ipset_present = "Name: Linux_acl_l2rt" in ipset_out
+        residual = {"ttl_rules": len(rules), "ipset_present": ipset_present}
+        has_residual = len(rules) > 0 or ipset_present
+        if expect_clean and has_residual:
+            return VerifyResult(level="残留检测", passed=False,
+                                message=f"删不干净BUG: UI关闭后底层仍有残留 {residual}(报禅道, 不强清掩盖)",
+                                details=residual,
+                                raw_output=("规则: " + "; ".join(r[:60] for r in rules))[:300])
+        if expect_clean:
+            return VerifyResult(level="残留检测", passed=True,
+                                message=f"UI关闭后底层无残留(模块清理正常) {residual}",
+                                details=residual, raw_output=ipt[:200])
+        return VerifyResult(level="残留检测", passed=not has_residual,
+                            message=f"残留状态 {residual}", details=residual)
+
+    def cleanup_other_control_test(self) -> str:
+        """SSH兜底: 关闭禁止二级路由 + 删残留TTL规则 + 清ipset/timeset.
+
+        防UI清理失败 + 残留mangle TTL规则影响后续打流测试."""
+        self.connect_router()
+        try:
+            # nol2rt_ip存明文JSON, JSON双引号与shell/sqlite引号冲突→整条SQL base64编码经stdin管道喂sqlite3
+            sql = ("UPDATE acl_l2route SET nol2rt=0, "
+                   "nol2rt_ip='{\"custom\":[],\"object\":[]}' WHERE id=1;\n")
+            sql_b64 = base64.b64encode(sql.encode("utf-8")).decode()
+            self._router.exec(f"echo {sql_b64} | base64 -d | sqlite3 {self.DNS_DB}")
+            cleaned = []
+            # 删残留TTL夹制规则(iptables-save/restore法, 绕过-D对fastid/!匹配的失败)
+            out = self._router.exec("iptables -t mangle -S FORWARD 2>/dev/null")
+            n_residual = sum(1 for l in out.splitlines() if "acl_l2rt_time_1" in l and "--ttl-set" in l)
+            if n_residual > 0:
+                # 过滤mangle表中的acl_l2rt规则行后restore回(保留其他合法规则)
+                self._router.exec(
+                    "iptables-save -t mangle 2>/dev/null | grep -v 'acl_l2rt_time_1' "
+                    "| iptables-restore -T mangle 2>/dev/null")
+                cleaned.append(f"{n_residual} ttl rules via save/restore")
+            # 清例外ipset(setlist + 下划线子集) + timeset
+            self._router.exec("ipset destroy Linux_acl_l2rt 2>/dev/null")
+            self._router.exec("ipset destroy _Linux_acl_l2rt 2>/dev/null")
+            self._router.exec("ik_cntl timeset clear acl_l2rt_time_1 2>/dev/null")
+            self._router.exec("ik_cntl timeset clear _acl_l2rt_time_1 2>/dev/null")
+            return f"reset nol2rt=0 + cleaned {len(cleaned)} residual TTL rule(s)"
+        except Exception as e:
+            return f"error: {e}"
+
     # ==================== MAC访问控制 (安全中心 > MAC访问控制) ====================
     # 两模式: 黑名单(global_config.acl_mac=0, 默认)/白名单(acl_mac=1).
     # 表: acl_mac_black/acl_mac_white (enabled默认no/tagname unique/comment/time JSON/expires/mac小写unique).
@@ -11400,6 +11726,195 @@ class BackendVerifier:
             self._router.exec("/usr/ikuai/script/acl_mac.sh init 2>/dev/null")
             self._router.exec("iptables -F ACL_MAC 2>/dev/null")
             return f"deleted {total} rules"
+        except Exception as e:
+            return f"error: {e}"
+
+    # ==================== ARP设置 (安全中心 > ARP设置) ====================
+    # 表 arp: id/tagname(unique)/ip_addr(unique)/mac/interface/comment/bind_type(0普通/1唯一)
+    # global_config: arp_filter(0/1 非绑定MAC不允许上网)/arp_filter_iface(any或接口)/dhcpd_arp(0/1 兼容DHCP静态分配)
+    # 4个ipset: Linux_arp_default(hash:mac)+Linux_arpip_default(hash:ip)←所有bind_type都进(arp -s在if块外,建静态ARP)
+    #           Linux_arponly_default(hash:mac)+Linux_iponly_default(hash:ip)←bind_type=1额外进(DHCP兼容标记)
+    # 注: arp.sh __exec_rule_add的arp -s在bind_type判断if块外, 故bind_type=0/1都建静态ARP+进arp_default/arpip_default;
+    #     bind_type=1(唯一)额外进arponly/iponly. 区别仅在DHCP静态分配兼容标记(同mac双写arp_default+arponly)
+    # arp_filter=1时FORWARD→ARP链: -m set ! --match-set Linux_arpip_default src -j REJECT
+    #                              -m set ! --match-set Linux_arp_default src -j REJECT (白名单,只放行bind_type=0的MAC+IP)
+    # arp_filter用-m set依赖xt_set(6.12间歇bug, is_xt_set_broken降级)
+    # L5: "非绑定MAC不允许上网"=白名单机制, client绑定(bind_type=0)后才能经LAN→WAN上网
+    def find_arp_rule(self, key: str) -> Optional[Dict]:
+        """按名称或IP查找ARP绑定规则(arp表). key=tagname或ip_addr."""
+        return self._sqlite_query_line(f"SELECT * FROM arp WHERE tagname='{key}' OR ip_addr='{key}'")
+
+    def verify_arp_database(self, tagname: str, ip: str = None, mac: str = None,
+                            interface: str = None, bind_type: str = None) -> VerifyResult:
+        """L1: 验证ARP绑定在arp表存在且字段正确. mac自动转小写比对."""
+        rule = self.find_arp_rule(tagname)
+        if rule is None and ip:
+            rule = self.find_arp_rule(ip)
+        if rule is None:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"ARP规则未找到: {tagname}")
+        mismatches = {}
+        for k, exp in {"ip_addr": ip, "interface": interface, "bind_type": bind_type}.items():
+            if exp is not None and str(rule.get(k, "")) != str(exp):
+                mismatches[k] = {"expected": exp, "actual": rule.get(k)}
+        if mac is not None and str(rule.get("mac", "")).lower() != str(mac).lower():
+            mismatches["mac"] = {"expected": str(mac).lower(), "actual": rule.get("mac")}
+        if mismatches:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"字段不匹配: {mismatches}", details={"mismatches": mismatches},
+                                raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"ARP规则存在且字段正确 (id={rule.get('id')}, ip={rule.get('ip_addr')}, mac={rule.get('mac')}, iface={rule.get('interface')}, bind_type={rule.get('bind_type')})",
+                            details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+
+    def verify_arp_not_exists(self, key: str) -> VerifyResult:
+        """L1: 验证ARP规则已删除(DB无)."""
+        rule = self.find_arp_rule(key)
+        if rule is None:
+            return VerifyResult(level="L1-删除验证", passed=True, message=f"ARP规则已删除: {key}")
+        return VerifyResult(level="L1-删除验证", passed=False,
+                            message=f"ARP规则仍存在: {key}(id={rule.get('id')})", details={"rule": rule})
+
+    def verify_arp_count(self, prefix: str = None) -> VerifyResult:
+        """L1: 统计ARP绑定数(prefix开头数, 或总数). 仅返回计数(不判定期望)."""
+        if prefix:
+            rows = self._sqlite_query_list(f"SELECT tagname FROM arp WHERE tagname LIKE '{prefix}%'")
+            actual = len(rows)
+        else:
+            row = self._sqlite_query_line("SELECT count(*) as cnt FROM arp")
+            actual = int(row.get("cnt", 0)) if row else 0
+        return VerifyResult(level="L1-计数", passed=True,
+                            message=f"ARP规则数量: {actual}" + (f"(prefix={prefix})" if prefix else ""),
+                            details={"count": actual})
+
+    def verify_arp_ipset(self, ip: str = None, mac: str = None, bind_type: str = "0",
+                         expect_present: bool = True) -> VerifyResult:
+        """L3: 验证ARP绑定下发到对应ipset. bind_type=0查Linux_arp_default(mac)+Linux_arpip_default(ip);
+        =1查Linux_arponly_default(mac)+Linux_iponly_default(ip). mac查hash:mac集合(小写比对), ip查hash:ip集合.
+        expect_present=False时验证删除后底层无残留(残留=删不干净BUG报禅道)."""
+        self.connect_router()
+        if str(bind_type) == "1":
+            mac_set, ip_set = "Linux_arponly_default", "Linux_iponly_default"
+        else:
+            mac_set, ip_set = "Linux_arp_default", "Linux_arpip_default"
+        detail, ok = [], True
+        if mac:
+            out = self._router.exec(f"ipset list {mac_set} 2>/dev/null")
+            has_mac = str(mac).lower() in out.lower()
+            detail.append(f"{mac_set}含{mac}={has_mac}")
+            if has_mac != expect_present:
+                ok = False
+        if ip:
+            out = self._router.exec(f"ipset list {ip_set} 2>/dev/null")
+            has_ip = str(ip) in out
+            detail.append(f"{ip_set}含{ip}={has_ip}")
+            if has_ip != expect_present:
+                ok = False
+        if ok:
+            return VerifyResult(level="L3-ipset", passed=True,
+                                message=f"ipset验证符合预期: {', '.join(detail)}", raw_output="; ".join(detail))
+        return VerifyResult(level="L3-ipset", passed=False,
+                            message=f"ipset验证不符: {', '.join(detail)}", raw_output="; ".join(detail))
+
+    def verify_arp_static(self, ip: str, expect_present: bool = True) -> VerifyResult:
+        """L2: 验证静态ARP(arp -s). /proc/net/arp Flags=0x6(CM static)/0x7(CRM), 动态=0x2.
+        bind_type=0才arp -s建静态ARP; bind_type=1不建(查到动态0x2正常)."""
+        self.connect_router()
+        out = self._router.exec("cat /proc/net/arp 2>/dev/null")
+        found = None
+        for line in out.splitlines():
+            parts = line.split()
+            # /proc/net/arp: [0]IP [1]HWtype(0x1) [2]Flags(0x2动/0x6静CM/0x7CRM) [3]MAC [4]Mask [5]Device
+            # flags=MAC前一个0x字段(避开HWtype=0x1在Flags前), mac=17字符冒号格式
+            if parts and parts[0] == ip:
+                mac = ""
+                flags = ""
+                for i, p in enumerate(parts):
+                    if re.match(r'^[0-9a-fA-F:]{17}$', p):
+                        mac = p
+                        if i > 0 and parts[i - 1].startswith("0x"):
+                            flags = parts[i - 1]
+                        break
+                iface = parts[-1] if parts else ""
+                found = {"flags": flags, "mac": mac, "iface": iface}
+                break
+        is_static = found is not None and found.get("flags", "") in ("0x6", "0x7")
+        if is_static != expect_present:
+            return VerifyResult(level="L2-静态ARP", passed=False,
+                                message=f"静态ARP ip={ip} static={is_static} 期望={expect_present}; arp条目={found}",
+                                raw_output=out[:300])
+        return VerifyResult(level="L2-静态ARP", passed=True,
+                            message=f"静态ARP ip={ip} static={is_static} 符合预期 ({found})",
+                            raw_output=out[:300])
+
+    def verify_arp_global_config(self, arp_filter: str = None, dhcpd_arp: str = None) -> VerifyResult:
+        """L1: 验证ARP全局设置(global_config). arp_filter=0/1; dhcpd_arp=0/1."""
+        self.connect_router()
+        row = self._sqlite_query_line("SELECT arp_filter,dhcpd_arp FROM global_config") or {}
+        mismatches = {}
+        if arp_filter is not None and str(row.get("arp_filter", "")) != str(arp_filter):
+            mismatches["arp_filter"] = {"expected": arp_filter, "actual": row.get("arp_filter")}
+        if dhcpd_arp is not None and str(row.get("dhcpd_arp", "")) != str(dhcpd_arp):
+            mismatches["dhcpd_arp"] = {"expected": dhcpd_arp, "actual": row.get("dhcpd_arp")}
+        if mismatches:
+            return VerifyResult(level="L1-全局设置", passed=False,
+                                message=f"全局设置不匹配: {mismatches}", details=mismatches,
+                                raw_output=json.dumps(row, ensure_ascii=False))
+        return VerifyResult(level="L1-全局设置", passed=True,
+                            message=f"全局设置正确: arp_filter={row.get('arp_filter')}, dhcpd_arp={row.get('dhcpd_arp')}",
+                            raw_output=json.dumps(row, ensure_ascii=False))
+
+    def verify_arp_chain(self, expect_on: bool = None) -> VerifyResult:
+        """L2: 验证ARP链规则(arp_filter开关). arp_filter=1时ARP链有REJECT非绑定规则.
+        依赖xt_set(6.12间歇bug). expect_on=True期望生效; False期望无REJECT; None仅查询."""
+        self.connect_router()
+        if self.is_xt_set_broken() and expect_on:
+            return self.xt_set_degrade_result("L2-ARP链", "ARP", " arp_filter REJECT规则")
+        out = self._router.exec("iptables -L ARP -n -v 2>/dev/null")
+        has_reject = "REJECT" in out and "Linux_arp" in out
+        if expect_on is None:
+            return VerifyResult(level="L2-ARP链", passed=True,
+                                message=f"ARP链状态: REJECT规则={has_reject}", raw_output=out[:500])
+        if has_reject != expect_on:
+            return VerifyResult(level="L2-ARP链", passed=False,
+                                message=f"ARP链 REJECT={has_reject} 期望={expect_on}",
+                                raw_output=out[:400])
+        return VerifyResult(level="L2-ARP链", passed=True,
+                            message=f"ARP链 REJECT={has_reject} 符合预期(arp_filter={'开' if has_reject else '关'})",
+                            raw_output=out[:400])
+
+    def set_arp_filter(self, val) -> str:
+        """SSH切换非绑定MAC不允许上网开关. val=0/1. UPDATE global_config + arp.sh init重新下发ARP链."""
+        self.connect_router()
+        try:
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"UPDATE global_config SET arp_filter='{int(val)}'\"")
+            self._router.exec("/usr/ikuai/script/arp.sh init 2>/dev/null")
+            return f"arp_filter set to {val}"
+        except Exception as e:
+            return f"error: {e}"
+
+    def set_dhcpd_arp(self, val) -> str:
+        """SSH切换兼容DHCP静态分配开关. val=0/1."""
+        self.connect_router()
+        try:
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"UPDATE global_config SET dhcpd_arp='{int(val)}'\"")
+            return f"dhcpd_arp set to {val}"
+        except Exception as e:
+            return f"error: {e}"
+
+    def cleanup_arp_test(self, prefix: str = "arp_t_") -> str:
+        """清理ARP测试: DELETE arp prefix + 恢复arp_filter=0/dhcpd_arp=0 + arp.sh init重建ipset/ARP链.
+        init内部会清静态ARP+flush 4 ipset+按剩余DB重建, 无需手动flush."""
+        self.connect_router()
+        try:
+            rows = self._sqlite_query_list(f"SELECT tagname FROM arp WHERE tagname LIKE '{prefix}%'")
+            total = len(rows)
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM arp WHERE tagname LIKE '{prefix}%'\"")
+            self._router.exec("sqlite3 " + self.DNS_DB + " \"UPDATE global_config SET arp_filter='0',dhcpd_arp='0'\"")
+            self._router.exec("/usr/ikuai/script/arp.sh init 2>/dev/null")
+            # 清理测试终端名称残留(/tmp/mac_comment: add_rule用name作termname写入, termname含arp_t_)
+            self._router.exec("grep -v ' arp_t_' /tmp/mac_comment >/tmp/mac_comment.tmp 2>/dev/null; mv /tmp/mac_comment.tmp /tmp/mac_comment 2>/dev/null")
+            return f"deleted {total} arp rules"
         except Exception as e:
             return f"error: {e}"
 

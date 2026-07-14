@@ -65,6 +65,9 @@ _MODULE_NAMES = {
     "igmp_proxy": "IGMP代理", "iptv": "IPTV透传", "udp_proxy": "UDPXY设置",
     "ip_group": "IP分组", "mac_group": "MAC分组", "port_group": "端口分组",
     "domain_group": "域名分组", "time_plan": "时间计划", "protocol_group": "协议分组",
+    "advanced": "安全中心-高级设置", "acl": "安全中心-ACL规则",
+    "conn_limit": "安全中心-连接数限制", "mac_access_control": "安全中心-MAC访问控制",
+    "app_protocol": "安全中心-应用协议控制",
 }
 
 _STATUS_CN = {"passed": "通过", "failed": "失败", "skipped": "跳过", "error": "错误"}

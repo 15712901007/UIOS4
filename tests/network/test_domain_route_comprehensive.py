@@ -1265,11 +1265,16 @@ class TestDomainRouteFlowVerification:
                 pass
 
         def _verify_domain(domain):
-            """单域名选路验证: 清conntrack→curl×3→conntrack含target_wan=生效(选路铁证, cflow辅助)."""
+            """单域名选路验证: 清conntrack→flush DNS缓存→curl×3→conntrack含target_wan=生效.
+
+            flush client DNS缓存强制重新解析→路由器ikdnsx处理DNS→url_route重新学习"域名→IP"映射→
+            选路。不flush则systemd-resolved缓存命中→不查询路由器→reset后映射空→选路失败
+            (baidu等CNAME域名尤甚: IP缓存复用, 不触发重新解析)。"""
             bv.clear_client_conntrack(client_ip)
             bv.reset_cflow_stats()
             cf_b = bv.read_cflow_stats()["domain"]
             bv.connect_client()
+            bv._client.exec("sudo -n resolvectl flush-caches 2>/dev/null", timeout=10)
             for _ in range(3):
                 bv._client.exec(
                     f"curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 http://{domain}/",
@@ -1325,7 +1330,26 @@ class TestDomainRouteFlowVerification:
                     pass
                 _force_clean()
 
+        dns_snap = None
+        dns_was_enabled = None
         try:
+            # 前置: DNS加速开启 + client DNS指向路由器(域名分流选路依赖DNS学习建映射)。
+            # client(多网卡Ubuntu)默认DNS走enp2s0公网绕过路由器→ikdnsx看不到DNS→url_route无
+            # "域名→IP"映射→cflow domain=0/选路不生效(实测SNI/HTTP Host的DPI识别也不触发选路,
+            # 因连接首包已按默认路由转发, 事后识别无法改路)。故必须DNS经路由器学习。
+            with rec.step("前置: DNS加速+client DNS经路由器", "域名分流选路依赖DNS经路由器学习建映射"):
+                dr = bv.ensure_dns_accel_enabled()
+                rec.add_detail(f"  {dr.level}: {'[OK]' if dr.passed else '[FAIL]'} {dr.message}")
+                if not dr.passed:
+                    pytest.skip(f"DNS加速前置不满足, 域名分流无法选路: {dr.message}")
+                dns_was_enabled = dr.details.get("was_enabled")
+                dns_snap = bv.setup_client_dns_via_router()
+                ok = dns_snap.get("configured")
+                rec.add_detail(
+                    f"  client DNS→路由器: {'[OK] 测试期间临时指向路由器, 测后恢复' if ok else '[FAIL]'}"
+                    + ("" if ok else f" {dns_snap.get('error')}"))
+                if not ok:
+                    pytest.skip(f"client DNS配置失败, 域名分流无法选路: {dns_snap.get('error')}")
             # 基线探活: curl baidu经ens11应通(无规则时走默认wan1), 不通=环境问题skip
             with rec.step("基线探活", "curl baidu --interface ens11 应通(确认环境经路由器)"):
                 bv.connect_client()
@@ -1336,6 +1360,12 @@ class TestDomainRouteFlowVerification:
             _run_scenario("场景1: 指定内网IP(仅该IP生效)", f"{self.PREFIX}srcip", client_ip)
             _run_scenario("场景2: 不指定内网IP(全IP生效)", f"{self.PREFIX}allip", None)
         finally:
+            # 关回DNS加速(若测试前是关的, 避免影响其他功能测试)
+            if dns_was_enabled is not None:
+                bv.restore_dns_accel(dns_was_enabled)
+            # 恢复client DNS(避免污染client环境, 即便后续清理异常也先恢复)
+            if dns_snap:
+                bv.restore_client_dns(dns_snap)
             try:
                 page.navigate_to_domain_route()
                 page.page.wait_for_timeout(500)
