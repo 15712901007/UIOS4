@@ -574,6 +574,7 @@ class TestStreamControlComprehensive:
                        backend_verifier.verify_layer7_qos_database,
                        must_pass=True, name="l7q1",
                        expected_fields={"min_up": 3000, "min_down": 3000})
+            kernel_check("步骤25-编辑l7q1后", fail_on_residual=False, module="layer7_qos")
 
             # 停用/启用
             ok = l7_page.disable_rule("l7q2")
@@ -583,9 +584,11 @@ class TestStreamControlComprehensive:
                        backend_verifier.verify_layer7_qos_database,
                        must_pass=True, name="l7q2",
                        expected_fields={"enabled": "no"})
+            kernel_check("步骤25-停用l7q2后", fail_on_residual=False, module="layer7_qos")
             ok = l7_page.enable_rule("l7q2")
             page.wait_for_timeout(1500)
             rec.add_detail(f"  启用l7q2: {'[OK]' if ok else '[FAIL]'}")
+            kernel_check("步骤25-启用l7q2后", fail_on_residual=False, module="layer7_qos")
 
             # 智能流控tab无搜索框, 跳过搜索; 验证排序
             l7_page.navigate_to_layer7_qos()
@@ -605,15 +608,18 @@ class TestStreamControlComprehensive:
         # ========== 步骤26: 关闭流控 + 恢复环境 ==========
         with rec.step("步骤26: 关闭流控+恢复环境", "关闭流控+清理规则 + SSH验证stream_ctl_mode=0"):
             print("\n[步骤26] 关闭流控 + 恢复环境...")
+            # 删规则+关流控, clean_ipset=False: 不后台destroy ipset(铁律: 不手动后台清数据隐藏问题).
+            # 让后续UI关闭流控触发系统qos重载自己清iptables+ipset, kernel_check检测系统清得干不干净,
+            # 残留=真bug该FAIL暴露报禅道(此前用后台destroy强清是错误掩盖).
             if backend_verifier is not None:
-                backend_verifier.cleanup_stream_control(disable=True)
-                rec.add_detail("[清理] 关闭流控+清空规则表+清理ipset")
-            # UI也关闭(确保页面状态同步)
+                backend_verifier.cleanup_stream_control(disable=True, clean_ipset=False)
+                rec.add_detail("[关闭流控+删规则] clean_ipset=False不后台清, 测系统是否同步清ipset")
+            # UI关闭流控: 触发系统qos重载清iptables对layer7qos_的引用+ipset(真实用户操作路径)
             sc.navigate_to_stream_control(force_reload=True)
             page.wait_for_timeout(1000)
             if sc.is_stream_control_enabled():
                 sc.disable_stream_control()
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)  # 等系统重载清理
 
             ssh_verify("L1-stream_ctl_mode=0(关闭)",
                        backend_verifier.verify_stream_ctl_mode, must_pass=True,

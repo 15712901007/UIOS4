@@ -379,7 +379,8 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
         """执行命令并返回stdout（exec方法的别名，保持兼容性）"""
         return self.exec(command, timeout)
 
-    def exec(self, command: str, timeout: int = 30) -> str:
+    def exec(self, command: str, timeout: int = 30,
+             probe_console: bool = True) -> str:
         """执行命令并返回stdout（exec方法的别名，保持兼容性）
 
         外层线程硬超时防护: paramiko的channel.settimeout在Windows下偶发不生效,
@@ -393,7 +394,7 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
 
         def _worker():
             try:
-                holder["result"] = self._exec_with_retry(command, timeout)
+                holder["result"] = self._exec_with_retry(command, timeout, probe_console=probe_console)
             except BaseException as e:  # noqa: BLE001 看门狗需捕获所有异常
                 holder["error"] = e
 
@@ -413,26 +414,37 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
             t.join(5)  # 等待阻塞的recv因连接关闭而退出
             try:
                 self.connect()
-                return self._exec_with_retry(command, timeout)
+                return self._exec_with_retry(command, timeout, probe_console=probe_console)
             except Exception as e:
                 raise RuntimeError(f"SSH exec 硬超时后重连重试仍失败: {e}") from e
         if "error" in holder:
             raise holder["error"]
         return holder.get("result", "")
 
-    def _exec_with_retry(self, command: str, timeout: int = 30) -> str:
+    def _exec_with_retry(self, command: str, timeout: int = 30,
+                         probe_console: bool = True) -> str:
         """执行命令并返回stdout，连接断开时自动重连一次
 
         增加控制台模式检测: 如果shell被重置回/etc/setup/rc(测试过程中可能发生),
         exec_command不会报错但返回的是控制台菜单内容而非命令结果。
         检测到这种情况时自动重新走控制台登录修复shell。
+
+        probe_console: True(默认)首次用10秒短超时快速探测控制台模式(适短命令);
+            长命令(如iperf3 -t 10实际跑~12秒)必须传False——否则首次10秒超时会在
+            iperf3未结束时中断它→远程进程变孤儿占用服务端单会话→重连重发撞自己造的
+            孤儿→"the server is busy running a test"(duration=8基线侥幸<10s成功、
+            duration=10限速必败、手动测无此超时故成功的真根因)。
         """
         for attempt in range(2):
             try:
                 if self._client is None:
                     self.connect()
-                # 第一次尝试用短超时(10秒), 快速检测控制台模式; 第二次用正常超时
-                exec_timeout = 10 if attempt == 0 else timeout
+                # probe_console=True: 首次10秒短超时快速检测控制台模式; 第二次用正常超时
+                # probe_console=False: 两次都用完整timeout(长命令专用, 避免超时制造孤儿)
+                if probe_console:
+                    exec_timeout = 10 if attempt == 0 else timeout
+                else:
+                    exec_timeout = timeout
                 _, stdout, stderr = self._client.exec_command(command, timeout=exec_timeout)
                 stdout.channel.settimeout(exec_timeout)  # 确保read也遵守超时
                 output = stdout.read().decode("utf-8", errors="replace")
@@ -948,10 +960,24 @@ class BackendVerifier:
 
         # 偶发iperf3连接失败(网络抖动/server短暂无响应/限速class挂载时序)返回error或非法JSON,
         # 单次失败直接判FAIL过于脆弱(见test_stream_control打流None盲区), 故加重试.
+        #
+        # 真根因(非命令错, 非历史孤儿): "the server is busy running a test" 是 _exec_with_retry
+        # 默认首次10秒短超时(探测控制台模式) < iperf3 -t 10实际耗时(~12秒), 首次超时中断iperf3
+        # →远程进程变孤儿占用服务端单会话→重连重发撞自己刚造的孤儿→busy。故duration=8基线
+        # (8+1<10s侥幸成功)、duration=10限速(>10s必败)、手动测(无此超时)成功。
+        # 修复: probe_console=False让iperf3用完整timeout跑完, 不制造孤儿(见_exec_with_retry)。
+        import time as _time
         last_output = ""
         for attempt in range(retries + 1):
+            # 重试退避(首次attempt=0不等待): 应对偶发服务端busy(如被其他测试占用单会话)
+            if attempt > 0:
+                backoff = 2 * attempt  # 2s, 4s...
+                logger.info(f"iperf3 {direction} 重试前退避{backoff}s(等服务端释放会话)")
+                _time.sleep(backoff)
+
             logger.info(f"iperf3 {direction} attempt{attempt + 1}/{retries + 1}: {cmd}")
-            output = self._client.exec(cmd, timeout=duration + 30)
+            # probe_console=False关键: iperf3长命令必须用完整timeout, 避免首次10秒超时制造孤儿
+            output = self._client.exec(cmd, timeout=duration + 30, probe_console=False)
             last_output = output or ""
             try:
                 result = json.loads(output)
@@ -963,10 +989,15 @@ class BackendVerifier:
                 logger.error(f"iperf3 output parse failed: {output[:300]}")
                 return {"error": output[:500] if output else "no output"}
 
-            # iperf3自身报error(如控制连接被重置/超时), 重试
+            # iperf3自身报error(如控制连接被重置/超时/server busy), 重试
             if "error" in result and attempt < retries:
-                logger.warning(
-                    f"iperf3 attempt{attempt + 1} 返回error, 重试: {str(result['error'])[:120]}")
+                err_msg = str(result['error'])
+                if "busy" in err_msg.lower():
+                    logger.warning(
+                        f"iperf3 attempt{attempt + 1} 服务端busy, 退避后重试: {err_msg[:120]}")
+                else:
+                    logger.warning(
+                        f"iperf3 attempt{attempt + 1} 返回error, 重试: {err_msg[:120]}")
                 continue
             return result
 
@@ -2956,6 +2987,9 @@ class BackendVerifier:
     #   ("mark_rule", base, upper)=ik_summary Mark Rules的id∈(base,upper)→id-base;
     #   ("appset_from_iptables", prefix)=从iptables appset字段提取(须排在iptables_comment后);
     #   ("ipset", prefix)=ipset list名匹配prefix提取id; ("ik_app_rule", prefix)=ik_summary App Rules id.
+    #   ("iptables_rule_count", table, chain)=数链规则总数(count_overflow累加检测, ⚠️对上下行1:2模块必误报, 已弃用);
+    #   ("iptables_regex_ids", table, chain, regex)=按regex从链规则文本提取id去重(按实际下发判断残留,
+    #     上下行同id算1个, 替代count避免1:2误报. regex须含1个id捕获组, 如 simple_qos(?:_time)?_(\d+)).
     MODULE_KERNEL_SIGNATURES = {
         "stream_layer7": {"table": "stream_layer7", "carriers": [
             ("iptables_comment", "mangle", "STREAM_LAYER7_NEW"),
@@ -2973,8 +3007,12 @@ class BackendVerifier:
             ("ipset", "updown_src_"), ("ipset", "updown_dst_"),
             ("ipset", "updown_sport_"), ("ipset", "updown_dport_")]},  # 仅带地址/端口规则建ipset, missing无意义
         "conn_limit": {"table": "conn_limit", "carriers": [("ipset", "conn_limit_src_"), ("iptables_rule_count", "raw", "CONNLIMIT")]},
-        "mac_qos": {"table": "mac_qos", "carriers": [("ipset", "mac_qos_"), ("iptables_rule_count", "filter", "MAC_QOS")]},
-        "simple_qos": {"table": "simple_qos", "carriers": [("ipset", "simple_qos_"), ("iptables_rule_count", "filter", "IP_QOS")]},
+        "mac_qos": {"table": "mac_qos", "ignore_missing": True, "carriers": [
+            ("ipset", "mac_qos_"),
+            ("iptables_regex_ids", "filter", "MAC_QOS", r"mac_qos(?:_time)?_(\d+)")]},  # 去count避上下行1:2误报; ignore_missing因IPv6规则走ip6tables不在v4 MAC_QOS链(missing=[2]是噪音); MAC真bug(iptables/ipset删不干净)由residual抓
+        "simple_qos": {"table": "simple_qos", "carriers": [
+            ("ipset", "simple_qos_"),
+            ("iptables_regex_ids", "filter", "IP_QOS", r"simple_qos(?:_time)?_(\d+)")]},  # 按实际下发id去重(上下行同id算1), 去count避免1:2误报; 不限速0不下发故链无其id
         "acl": {"table": "acl", "carriers": [("ipset", "acl_src_"), ("ipset", "acl_dst_"),
             ("iptables_rule_count", "filter", "FIREWALL"), ("iptables_rule_count", "filter", "INPUT_ACL")]},
         "dst_nat": {"table": "dst_nat", "carriers": [("iptables_comment", "nat", "DSTNAT")]},
@@ -3038,6 +3076,21 @@ class BackendVerifier:
                 count += 1
         return count
 
+    def _read_iptables_chain_regex_ids(self, table: str, chain: str, regex: str) -> set:
+        r"""从iptables链规则文本里用正则提取所有规则id(去重). 替代数总数的count_overflow做精确残留判断:
+        一条DB规则在链里可能下发多条(上行srcip+下行dstip各1; 某方向不限速0则只下发1条; 全0不下发),
+        但规则id相同→set去重算1个. residual=链id-DBid 才是真残留, 不受上下行条数(1/2/0)影响.
+        regex须含1个捕获组提取id, 如 r'simple_qos(?:_time)?_(\d+)' (兼容simple_qos_time_{id}/simple_qos_{id})."""
+        self.connect_router()
+        out = self._router.exec(f"iptables -t {table} -L {chain} -n -v 2>/dev/null")
+        ids = set()
+        for m in re.finditer(regex, out):
+            try:
+                ids.add(int(m.group(1)))
+            except (ValueError, IndexError):
+                continue
+        return ids
+
     def _query_iptables_chain_comment_ids(self, table: str, chain: str):
         """返回 (comment id集合, 原始文本) 后续appset_from_iptables解析用."""
         self.connect_router()
@@ -3090,6 +3143,9 @@ class BackendVerifier:
                 snap["ik_app_rule"] |= self._read_ik_app_rule_ids(carrier[1])
             elif ctype == "iptables_rule_count":
                 snap["rule_counts"][f"{carrier[1]}/{carrier[2]}"] = self._read_iptables_rule_count(carrier[1], carrier[2])
+            elif ctype == "iptables_regex_ids":
+                # carrier: ("iptables_regex_ids", table, chain, regex) 按实际下发规则id判断(替代count避免1:2误报)
+                snap["iptables"] |= self._read_iptables_chain_regex_ids(carrier[1], carrier[2], carrier[3])
         return snap
 
     def verify_module_kernel_consistency(self, module: str, label: str = "") -> Dict:
@@ -3700,6 +3756,100 @@ class BackendVerifier:
                 passed=False,
                 message=f"内核检查失败: {str(e)[:100]}",
             )
+
+    # ==================== 域名分流前置条件: DNS加速 + client DNS经路由器 ====================
+    # 域名分流(url_route)选路依赖DNS学习: client DNS查询经路由器lan1口→ikdnsx处理→通知
+    # ik_core建"域名→IP→源IP"映射→连接首包查映射打mark选路。前置不满足→cflow domain=0,
+    # conntrack remote_if=默认WAN(选路不生效)。实测: SNI/HTTP Host的DPI识别(不开DNS加速)
+    # 能填conntrack domain= 但不触发选路(连接首包已按默认路由转发, 事后识别无法改路)。
+    # 故: 测试setup开DNS加速+client DNS指向路由器; finally关回DNS加速+恢复client DNS
+    # (DNS加速只在本测试期间开, 测完关回原状避免影响其他功能测试; client DNS同理临时配/恢复)。
+
+    def ensure_dns_accel_enabled(self) -> VerifyResult:
+        """确保路由器DNS加速开启(域名分流选路前置). 查dns_config.enabled, 关则开(UPDATE+dns.sh init).
+
+        DNS加速关→ikdnsx不绑:53+无iptables DNSPROXY REDIRECT→client DNS查询被原样转发公网→
+        ik_core收不到DNS→无域名映射→选路永不命中。开DNS加速后ikdnsx绑:53+REDIRECT lan入站:53。
+        返回details.was_enabled=测试前原始状态, 调用方finally传给restore_dns_accel关回(避免影响其他测试)。"""
+        self.connect_router()
+        try:
+            cfg = self.query_dns_config()
+            was_enabled = (cfg or {}).get("enabled") == "yes"
+            if was_enabled:
+                return VerifyResult(
+                    level="前置-DNS加速", passed=True,
+                    message="DNS加速已开启(域名分流前置满足, 保持)",
+                    details={"enabled": "yes", "was_enabled": True})
+            # 原本关闭: 开启(测试后由restore_dns_accel关回, 避免影响其他功能测试)
+            self._router.exec(
+                f'sqlite3 {self.DNS_DB} "UPDATE dns_config SET enabled=\'yes\' WHERE id=1"')
+            self._router.exec("/usr/ikuai/script/dns.sh init 2>/dev/null")
+            udp = self._router.exec("cat /proc/net/udp 2>/dev/null")
+            ok = ":0035 " in udp
+            return VerifyResult(
+                level="前置-DNS加速", passed=ok,
+                message=("DNS加速已开启(ikdnsx监听:53, 测试后关回)" if ok
+                         else "DNS加速开启失败(:53未监听, 检查dns.sh)"),
+                details={"enabled": "yes" if ok else "unknown", "was_enabled": False})
+        except Exception as e:
+            return VerifyResult(
+                level="前置-DNS加速", passed=False,
+                message=f"DNS加速检查/开启异常: {str(e)[:100]}")
+
+    def setup_client_dns_via_router(self, client_iface: str = "ens11",
+                                     router_lan_ip: str = "192.168.148.1") -> Dict:
+        """配置client DNS指向路由器(域名分流选路前置). 返回快照供restore_client_dns恢复.
+
+        client(多网卡Ubuntu)默认DNS走enp2s0(公网114), 绕过被测路由器→ikdnsx看不到DNS→
+        url_route无映射。本方法临时把ens11 DNS设为路由器lan IP(192.168.148.1)并接管全域解析
+        (~.), 让DNS查询从ens11进路由器lan1口被ikdnsx处理+建映射。resolvectl需sudo(iktest免密)。
+        测试finally调restore_client_dns恢复, client平时保持原状不被污染。"""
+        self.connect_client()
+        snap = {"iface": client_iface, "router_ip": router_lan_ip, "configured": False}
+        try:
+            self._client.exec(f"sudo -n resolvectl dns {client_iface} {router_lan_ip}", timeout=10)
+            self._client.exec(f"sudo -n resolvectl default-route {client_iface} true", timeout=10)
+            self._client.exec(f"sudo -n resolvectl domain {client_iface} '~.'", timeout=10)
+            self._client.exec("sudo -n resolvectl flush-caches 2>/dev/null", timeout=10)
+            snap["configured"] = True
+        except Exception as e:
+            snap["error"] = str(e)[:100]
+        return snap
+
+    def restore_client_dns(self, snap: Dict) -> bool:
+        """恢复client DNS配置(域名分流测试后). resolvectl revert <iface> 回到DHCP/默认原状.
+
+        client环境平时保持原状(DNS走enp2s0), 仅域名分流测试期间临时指向路由器, 测完恢复。"""
+        if not snap or not snap.get("configured"):
+            return False
+        self.connect_client()
+        iface = snap.get("iface", "ens11")
+        try:
+            self._client.exec(f"sudo -n resolvectl revert {iface}", timeout=10)
+            self._client.exec("sudo -n resolvectl flush-caches 2>/dev/null", timeout=10)
+            return True
+        except Exception as e:
+            logger.error(f"restore_client_dns失败: {e}")
+            return False
+
+    def restore_dns_accel(self, was_enabled: bool) -> bool:
+        """恢复DNS加速到测试前状态. was_enabled=False(原本关)→关回(UPDATE no+dns.sh init移除:53 REDIRECT);
+        was_enabled=True(原本开)→保持开。
+
+        用户要求: 域名分流测试完自动关DNS加速(避免影响其他功能测试)。与ensure_dns_accel_enabled配对:
+        ensure记录was_enabled并按需开启, finally调本方法按was_enabled关回。关回后ikdnsx:53监听可能
+        残留(进程常驻), 但iptables DNSPROXY无REDIRECT规则→client DNS不被本地劫持→功能等同关闭。"""
+        if was_enabled:
+            return True  # 原本就开, 保持
+        self.connect_router()
+        try:
+            self._router.exec(
+                f'sqlite3 {self.DNS_DB} "UPDATE dns_config SET enabled=\'no\' WHERE id=1"')
+            self._router.exec("/usr/ikuai/script/dns.sh init 2>/dev/null")
+            return True
+        except Exception as e:
+            logger.error(f"restore_dns_accel失败: {e}")
+            return False
 
     # ==================== 上下行分离(stream_updown)验证 ====================
 
@@ -7646,7 +7796,7 @@ class BackendVerifier:
             )
 
     # ---------- 清理 ----------
-    def cleanup_stream_control(self, disable: bool = True) -> str:
+    def cleanup_stream_control(self, disable: bool = True, clean_ipset: bool = True) -> str:
         """清理智能流控环境(关闭流控 + 清空规则表 + 清理ipset)
 
         测试异常退出后的兜底清理。正常流程通过UI操作。
@@ -7667,13 +7817,20 @@ class BackendVerifier:
                     f"'UPDATE global_config SET stream_ctl_mode=0 WHERE id=1;' 2>&1"
                 )
                 out_parts.append(f"stream_ctl_mode=0: {o.strip()[:40]}")
-            # 重启qos使配置生效 + 清理残留ipset
-            self._router.exec("killall -q qos.sh 2>/dev/null; killall -q qos 2>/dev/null")
-            self._router.exec(
-                "for s in $(ipset list -n 2>/dev/null | grep -E 'alone_limit|layer7qos'); "
-                "do ipset destroy $s 2>/dev/null; done"
-            )
             self._router.exec("ik_cntl http_app high_prio_host off 2>/dev/null")
+            # 强清ipset: 仅clean_ipset=True(finally/兜底, 检测已结束)时执行. 步骤26传clean_ipset=False,
+            # 不后台destroy ipset — 让"关流控+删规则"后系统自己清, kernel_check检测系统是否清干净,
+            # 残留=真bug该FAIL暴露. 后台destroy会掩盖真实残留问题(铁律: 不手动后台清数据隐藏问题).
+            if clean_ipset:
+                self._router.exec("killall -q qos.sh 2>/dev/null; killall -q qos 2>/dev/null")
+                # 先destroy父集(无_前缀)再子集(_前缀): layer7qos_1父list:set→_layer7qos_1子, 子集被父集引用
+                # 须先清父解除引用; 单次按字典序子集(_<l)先尝试会失败致残留. (finally兜底清环境用, 不影响步骤26检测)
+                self._router.exec(
+                    "for s in $(ipset list -n 2>/dev/null | grep -E '^(layer7qos_|alone_limit_)'); "
+                    "do ipset destroy $s 2>/dev/null; done; "
+                    "for s in $(ipset list -n 2>/dev/null | grep -E '^_(layer7qos_|alone_limit_)'); "
+                    "do ipset destroy $s 2>/dev/null; done"
+                )
             logger.info(f"[清理] 智能流控环境: {'; '.join(out_parts)}")
         except Exception as e:
             logger.warning(f"[清理] 智能流控清理失败: {e}")
@@ -10892,6 +11049,192 @@ class BackendVerifier:
                     except ValueError:
                         continue
         return 0
+
+    # ==================== 高级设置 (安全中心 > 高级设置, advanced.sh) ====================
+    # 单表单记录配置(无CRUD, 7勾选字段+tcp_mss_num). advanced表id=1单记录.
+    # 每勾选对应iptables规则; tcp_mss额外 mangle TCPMSS + ik_cntl syn_proxy set_mss.
+    # reset默认: noping_lan/wan/notracert/hijack_ping/invalid/dos_lan=0, dos_lan_num=300, tcp_mss=1, tcp_mss_num=1400.
+    # 字段→iptables查询规格(实测iKuai 4.0规则文本): lan/wan接口用 --ifaces lan,vlan.. / wan,vwan,adsl 区分.
+    _ADV_IPTABLES_SPECS = {
+        "noping_lan":  ("iptables -S INPUT",             ["--icmp-type 8", "ifaces lan"]),
+        "noping_wan":  ("iptables -S INPUT",             ["--icmp-type 8", "ifaces wan"]),
+        "notracert":   ("iptables -S CONNLIMIT",         ["--icmp-type 11", "DROP"]),
+        "hijack_ping": ("iptables -t nat -S PREROUTING", ["--icmp-type 8", "REDIRECT"]),
+        "invalid":     ("iptables -S INPUT",             ["ctstate INVALID", "REJECT"]),
+        "dos_lan":     ("iptables -t raw -S CONNLIMIT",  ["peerconns-above", "DROP"]),
+        "tcp_mss":     ("iptables -t mangle -S",         ["TCPMSS", "--set-mss"]),
+    }
+
+    def query_advanced_config(self) -> Optional[Dict]:
+        """查advanced表单记录(id=1). 返回全字段(含limit_tcp2p/udp2p残留字段)."""
+        return self._sqlite_query_line("SELECT * FROM advanced WHERE id=1")
+
+    def verify_advanced_database(self, expected: Dict = None) -> VerifyResult:
+        """L1: 验证advanced表字段值. expected如{'noping_lan':'1','tcp_mss_num':'1400'}(值转str比对)."""
+        cfg = self.query_advanced_config()
+        if cfg is None:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message="advanced配置不存在(DB无id=1记录)")
+        if not expected:
+            return VerifyResult(level="L1-数据库", passed=True,
+                                message=(f"advanced配置存在 (tcp_mss={cfg.get('tcp_mss')}/num={cfg.get('tcp_mss_num')}, "
+                                         f"noping_lan={cfg.get('noping_lan')} wan={cfg.get('noping_wan')} "
+                                         f"notracert={cfg.get('notracert')} invalid={cfg.get('invalid')} "
+                                         f"dos_lan={cfg.get('dos_lan')} hijack={cfg.get('hijack_ping')})"),
+                                details=cfg, raw_output=json.dumps(cfg, ensure_ascii=False)[:300])
+        mismatches = {k: {"expected": str(v), "actual": cfg.get(k)}
+                      for k, v in expected.items() if str(cfg.get(k)) != str(v)}
+        if mismatches:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"字段不匹配: {mismatches}", details={"mismatches": mismatches},
+                                raw_output=json.dumps(cfg, ensure_ascii=False)[:300])
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"advanced字段正确 ({', '.join(f'{k}={v}' for k, v in expected.items())})",
+                            details=cfg, raw_output=json.dumps(cfg, ensure_ascii=False)[:300])
+
+    def verify_advanced_iptables(self, field: str, expect_present: bool = True) -> VerifyResult:
+        """L2: 验证advanced某勾选字段对应iptables规则存在/不存在.
+
+        按field查对应表/链的规则文本, 判断是否含全部特征子串. 实测规则文本:
+        noping_lan/wan→filter INPUT(--icmp-type 8 + --ifaces lan/wan + DROP, 接口区分);
+        notracert→filter CONNLIMIT(--icmp-type 11 DROP); hijack_ping→nat PREROUTING(--icmp-type 8 REDIRECT);
+        invalid→filter INPUT(ctstate invalid REJECT); dos_lan→raw CONNLIMIT(peerconns-above DROP);
+        tcp_mss→mangle(TCPMSS --set-mss)."""
+        spec = self._ADV_IPTABLES_SPECS.get(field)
+        if spec is None:
+            return VerifyResult(level="L2-iptables", passed=False,
+                                message=f"未知advanced字段: {field}")
+        cmd, must_contain = spec
+        self.connect_router()
+        out = self._router.exec(f"{cmd} 2>/dev/null")
+        present = any(all(s in line for s in must_contain) for line in out.splitlines())
+        if present != expect_present:
+            return VerifyResult(level="L2-iptables", passed=False,
+                                message=f"{field} iptables规则 present={present} 期望={expect_present}",
+                                raw_output=out[:400])
+        return VerifyResult(level="L2-iptables", passed=True,
+                            message=f"{field} iptables规则{'存在' if present else '不存在'}(符合期望)",
+                            raw_output=out[:300])
+
+    def verify_advanced_tcp_mss(self, num: int = None) -> VerifyResult:
+        """L3: 验证tcp_mss钳制生效(mangle TCPMSS规则的--set-mss值).
+
+        tcp_mss开启时mangle有2条TCPMSS规则(FORWARD + POSTROUTING -o vwan+), --set-mss {num}.
+        num=None只验规则存在性; num指定则额外验mss值匹配(实测默认1400)."""
+        self.connect_router()
+        out = self._router.exec("iptables -t mangle -S 2>/dev/null")
+        rules = [l for l in out.splitlines() if "TCPMSS" in l and "--set-mss" in l]
+        if not rules:
+            return VerifyResult(level="L3-内核", passed=False,
+                                message="tcp_mss未生效(mangle无TCPMSS规则)", raw_output=out[:300])
+        if num is not None:
+            target = f"--set-mss {num}"
+            if not any(target in r for r in rules):
+                actual = [r.split("--set-mss ")[1].split()[0] for r in rules if "--set-mss" in r]
+                return VerifyResult(level="L3-内核", passed=False,
+                                    message=f"tcp_mss值不匹配: 期望{num} 实际{actual}",
+                                    raw_output=rules[0][:200])
+        return VerifyResult(level="L3-内核", passed=True,
+                            message=f"tcp_mss生效(mangle TCPMSS规则{len(rules)}条, set-mss={num})",
+                            raw_output=rules[0][:200])
+
+    def cleanup_advanced_test(self) -> str:
+        """SSH兜底恢复advanced默认配置+清所有iptables残留(防UI清理失败+产品BUG累积影响后续测试).
+
+        reset默认值: noping_lan/wan/notracert/hijack_ping/invalid/dos_lan=0, dos_lan_num=300,
+        tcp_mss=1, tcp_mss_num=1400. UPDATE + advanced.sh init(重建) + 手动清所有advanced相关
+        iptables残留规则.
+
+        ⚠️产品BUG(报禅道): advanced.sh init()只在字段=1时add规则, 字段=0时不del旧规则→多次操作
+        累积重复规则(tcp_mss的mangle TCPMSS最严重, 实测init多次后FORWARD/POSTROUTING各累积4条).
+        故cleanup必须手动按规则文本逐条-D清理, 否则残留的noping/invalid/TCPMSS等规则会:
+        ①挡掉后续所有测试的ping/curl流量 ②tcp_mss关闭后L2验证误FAIL(规则关闭不掉)."""
+        self.connect_router()
+        try:
+            self._router.exec(
+                f'sqlite3 {self.DNS_DB} "UPDATE advanced SET '
+                f"noping_lan=0, noping_wan=0, notracert=0, hijack_ping=0, invalid=0, "
+                f"dos_lan=0, dos_lan_num=300, tcp_mss=1, tcp_mss_num=1400 "
+                f'WHERE id=1"')
+            # 先清所有advanced相关iptables残留(产品BUG: init不del旧规则, 多次操作累积)
+            cleaned = []
+            specs = [
+                # (表参数, 查询命令, 特征匹配lambda)
+                ("-t mangle", "iptables -t mangle -S", lambda r: "TCPMSS" in r and "--set-mss" in r),
+                ("",          "iptables -S INPUT",     lambda r: (("--icmp-type 8" in r and "DROP" in r and "ifaces" in r) or ("ctstate INVALID" in r and "REJECT" in r))),
+                ("",          "iptables -S CONNLIMIT", lambda r: "--icmp-type 11" in r and "DROP" in r),
+                ("-t raw",    "iptables -t raw -S CONNLIMIT", lambda r: "peerconns-above" in r and "DROP" in r),
+                ("-t nat",    "iptables -t nat -S PREROUTING", lambda r: "--icmp-type 8" in r and "REDIRECT" in r),
+            ]
+            for tbl_opt, query, match in specs:
+                out = self._router.exec(f"{query} 2>/dev/null")
+                for line in out.splitlines():
+                    r = re.sub(r'^\[[^\]]*\]\s*', '', line.strip())  # 去掉 [fastid: N] 前缀
+                    if match(r) and r.startswith("-A "):
+                        self._router.exec(f"iptables {tbl_opt} {r.replace('-A ', '-D ', 1)} 2>/dev/null")
+                        cleaned.append(r[:40])
+            # 再init重建: tcp_mss=1(默认)→add TCPMSS 2条; 其他字段=0不add. 保证默认状态有效且不累积
+            self._router.exec("/usr/ikuai/script/advanced.sh init 2>/dev/null")
+            return f"reset+cleaned {len(cleaned)} residual rules"
+        except Exception as e:
+            return f"error: {e}"
+
+    def client_traceroute(self, dst: str = "8.8.8.8", src_iface: str = "ens11",
+                          max_hops: int = 8) -> Dict:
+        """client经src_iface traceroute到dst, 返回跳数+原始输出(notracert的L5验证).
+
+        backend_verifier无traceroute原语, 自实现. notracert勾选后: iptables CONNLIMIT
+        --icmp-type 11 DROP 截断traceroute(跳数骤降/全*); 正常时显示多跳途经路由器192.168.148.1.
+        hops=有IP回应的跳数(含x.x.x.x的行数); reached=是否到达dst."""
+        self.connect_client()
+        try:
+            out = self._client.exec(
+                f"traceroute -i {src_iface} -m {max_hops} -w 1 -q 1 {dst} 2>&1",
+                timeout=30)
+            lines = [l for l in (out or "").splitlines() if l.strip()]
+            hops_with_ip = sum(1 for l in lines if re.search(r"\d+\.\d+\.\d+\.\d+", l))
+            return {"raw": out, "hops": hops_with_ip, "lines": len(lines),
+                    "reached": (dst in (out or "")[-200:])}
+        except Exception as e:
+            return {"raw": str(e), "hops": 0, "lines": 0, "reached": False, "error": str(e)[:80]}
+
+    def verify_tcp_mss_clamp_real(self, src_iface: str = "ens11",
+                                   dst_domain: str = "www.baidu.com",
+                                   expected_mss: int = 1400) -> VerifyResult:
+        """L5: tcpdump抓包验证tcp_mss实际钳制效果(SYN-ACK的MSS被钳到expected_mss).
+
+        tcp_mss的L3只验内核mangle规则set-mss值, 本方法验实际TCP连接MSS被钳(L5端到端铁证).
+        原理: client经src_iface curl外网建TCP, 路由器FORWARD TCPMSS钳制server→client的SYN-ACK,
+        client ens11抓到的SYN-ACK MSS应=expected_mss. 实测tcp_mss=1400时: client原始SYN mss 1460
+        (MTU1500-40, 未钳, POSTROUTING只钳wan出向), 服务器SYN-ACK经FORWARD钳到mss 1400.
+        建议用特殊expected_mss(如1000)便于识别."""
+        self.connect_client()
+        try:
+            cmd = (
+                f"sudo bash -c 'rm -f /tmp/tcpd_mss.log; "
+                f"timeout 9 tcpdump -i {src_iface} -nn -vv \"tcp[tcpflags] & tcp-syn != 0\" "
+                f"2>/dev/null > /tmp/tcpd_mss.log & TPID=$!; sleep 2; "
+                f"for i in 1 2 3; do curl -s -o /dev/null --interface {src_iface} "
+                f"--connect-timeout 4 -m 6 http://{dst_domain}/ 2>/dev/null; done; "
+                f"sleep 4; wait $TPID 2>/dev/null; "
+                f"echo MSS_VALUES:; grep -oiE \"mss [0-9]+\" /tmp/tcpd_mss.log | sort | uniq -c'")
+            out = self._client.exec(cmd, timeout=25)
+            mss_counts = {}
+            for line in (out or "").splitlines():
+                m = re.search(r'(\d+)\s+mss\s+(\d+)', line.strip())
+                if m:
+                    mss_counts[m.group(2)] = int(m.group(1))
+            clamped = str(expected_mss) in mss_counts
+            if clamped:
+                return VerifyResult(level="L5-tcp_mss抓包", passed=True,
+                                    message=f"tcp_mss实际钳制生效: 抓到SYN-ACK MSS={expected_mss}(钳制值)",
+                                    details={"mss_dist": mss_counts}, raw_output=out[:300])
+            return VerifyResult(level="L5-tcp_mss抓包", passed=False,
+                                message=f"tcp_mss钳制未生效: 抓包未见MSS={expected_mss}, MSS分布={mss_counts}",
+                                details={"mss_dist": mss_counts}, raw_output=out[:400])
+        except Exception as e:
+            return VerifyResult(level="L5-tcp_mss抓包", passed=False,
+                                message=f"tcpdump抓包异常: {str(e)[:80]}")
 
     # ==================== MAC访问控制 (安全中心 > MAC访问控制) ====================
     # 两模式: 黑名单(global_config.acl_mac=0, 默认)/白名单(acl_mac=1).
