@@ -41,6 +41,9 @@ reports/output/
 reports/screenshots/
 reports/allure-results/
 
+# Test export artifacts (regenerated per run; JSON key order is non-deterministic)
+test_data/exports/
+
 # OS files
 .DS_Store
 Thumbs.db

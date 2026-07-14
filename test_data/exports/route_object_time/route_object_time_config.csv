@@ -1,3 +1,0 @@
-id,group_name,group_value
-13,"AUTOTIME1E","[{""weekdays"":""1234567"",""start_time"":""00:00"",""end_time"":""23:59"",""type"":""weekly""}]"
-14,"AUTO_BAD_X","[{""weekdays"":""1234567"",""start_time"":""00:00"",""end_time"":""23:59"",""type"":""weekly""}]"

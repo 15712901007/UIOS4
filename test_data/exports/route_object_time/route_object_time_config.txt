@@ -1,2 +1,0 @@
-id=13 group_name=AUTOTIME1E group_value=[{"weekdays":"1234567","start_time":"00:00","end_time":"23:59","type":"weekly"}]
-id=14 group_name=AUTO_BAD_X group_value=[{"weekdays":"1234567","start_time":"00:00","end_time":"23:59","type":"weekly"}]

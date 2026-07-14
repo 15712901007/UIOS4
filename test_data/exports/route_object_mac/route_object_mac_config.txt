@@ -1,2 +1,0 @@
-id=12 group_name=test_mac_group_ group_value=[{"comment":"","mac":"AA:BB:CC:11:00:01"},{"comment":"","mac":"AA:BB:CC:11:00:02"},{"comment":"","mac":"AA:BB:CC:11:00:03"}]
-id=13 group_name=AUTOMAC1E group_value=[{"mac":"AA:BB:CC:00:00:01","comment":""},{"mac":"AA:BB:CC:00:00:02","comment":""}]

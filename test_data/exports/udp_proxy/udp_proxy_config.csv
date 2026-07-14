@@ -1,3 +1,0 @@
-id,enabled,tagname,interface,renew_time,listen_port,access
-1,"yes","udpxy≤‚ ‘1","wan2",0,39811,1
-2,"yes","udpxy≤‚ ‘2","wan1",60,39802,0

@@ -1,3 +1,0 @@
-id=6 group_name=snmp_ipgroup_te group_value=[{"ip":"10.66.0.1","comment":""},{"ip":"10.66.0.5","comment":""},{"ip":"10.66.0.10","comment":""},{"ip":"10.66.0.11","comment":""},{"ip":"10.66.0.22","comment":""}]
-id=13 group_name=AUTOIP1E group_value=[{"comment":"","ip":"10.66.0.100"},{"comment":"","ip":"10.66.0.101"}]
-id=14 group_name=AUTOIP2 group_value=[{"ip":"10.66.0.200","comment":""}]
