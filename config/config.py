@@ -133,6 +133,19 @@ class SSHConfig:
     """SSH后台验证配置"""
     router: SSHHostConfig = field(default_factory=SSHHostConfig)
     client: SSHHostConfig = field(default_factory=SSHHostConfig)
+    # GRE隧道对端设备(虚拟专网-GRE L5双端数据面验证用; 与router同凭据)
+    peer: SSHHostConfig = field(default_factory=SSHHostConfig)
+    # OSPF 对端只持久化管理地址；认证属性在 BackendVerifier 中从 router
+    # 运行时对象继承，避免复制第二份凭据。
+    ospf_peer_host: str = ""
+    ospf_peer_port: int = 22
+    ospf_peer_recovery_host: str = ""
+    ospf_peer_recovery_port: int = 22
+    # 主路由备用管理地址同样只持久化地址，凭据复用 router 运行时对象。
+    router_recovery_host: str = ""
+    router_recovery_port: int = 22
+    router_lan_management_host: str = ""
+    router_lan_management_port: int = 22
     iperf3_server: str = "10.66.0.40"
     iperf3_duration: int = 10
     iperf3_tolerance: float = 0.20
@@ -205,6 +218,16 @@ class Config:
                 ssh_config.router = SSHHostConfig(**ssh_data["router"])
             if "client" in ssh_data:
                 ssh_config.client = SSHHostConfig(**ssh_data["client"])
+            if "peer" in ssh_data:
+                ssh_config.peer = SSHHostConfig(**ssh_data["peer"])
+            ssh_config.ospf_peer_host = ssh_data.get("ospf_peer_host", "")
+            ssh_config.ospf_peer_port = int(ssh_data.get("ospf_peer_port", 22))
+            ssh_config.ospf_peer_recovery_host = ssh_data.get("ospf_peer_recovery_host", "")
+            ssh_config.ospf_peer_recovery_port = int(ssh_data.get("ospf_peer_recovery_port", 22))
+            ssh_config.router_recovery_host = ssh_data.get("router_recovery_host", "")
+            ssh_config.router_recovery_port = int(ssh_data.get("router_recovery_port", 22))
+            ssh_config.router_lan_management_host = ssh_data.get("router_lan_management_host", "")
+            ssh_config.router_lan_management_port = int(ssh_data.get("router_lan_management_port", 22))
             ssh_config.iperf3_server = ssh_data.get("iperf3_server", "10.66.0.40")
             ssh_config.iperf3_duration = ssh_data.get("iperf3_duration", 10)
             ssh_config.iperf3_tolerance = ssh_data.get("iperf3_tolerance", 0.20)
@@ -267,6 +290,22 @@ class Config:
                     "password": self.ssh.client.password,
                     "port": self.ssh.client.port,
                 },
+                "peer": {
+                    "host": self.ssh.peer.host,
+                    "username": self.ssh.peer.username,
+                    "password": self.ssh.peer.password,
+                    "port": self.ssh.peer.port,
+                    "console_username": self.ssh.peer.console_username,
+                    "console_password": self.ssh.peer.console_password,
+                },
+                "ospf_peer_host": self.ssh.ospf_peer_host,
+                "ospf_peer_port": self.ssh.ospf_peer_port,
+                "ospf_peer_recovery_host": self.ssh.ospf_peer_recovery_host,
+                "ospf_peer_recovery_port": self.ssh.ospf_peer_recovery_port,
+                "router_recovery_host": self.ssh.router_recovery_host,
+                "router_recovery_port": self.ssh.router_recovery_port,
+                "router_lan_management_host": self.ssh.router_lan_management_host,
+                "router_lan_management_port": self.ssh.router_lan_management_port,
                 "iperf3_server": self.ssh.iperf3_server,
                 "iperf3_duration": self.ssh.iperf3_duration,
                 "iperf3_tolerance": self.ssh.iperf3_tolerance,
@@ -325,7 +364,10 @@ def apply_env_overrides(config: Config) -> Config:
     环境变量映射:
     - DEVICE_IP / DEVICE_USERNAME / DEVICE_PASSWORD / DEVICE_PORT: 设备配置
     - SSH_ROUTER_HOST / SSH_ROUTER_USERNAME / SSH_ROUTER_PASSWORD / SSH_ROUTER_PORT: SSH路由器配置
+    - SSH_CLIENT_HOST / SSH_CLIENT_USERNAME / SSH_CLIENT_PASSWORD / SSH_CLIENT_PORT: SSH测试客户端配置
     - SSH_CONSOLE_USERNAME / SSH_CONSOLE_PASSWORD: 控制台登录凭据
+    - SSH_OSPF_PEER_HOST / SSH_OSPF_PEER_PORT: OSPF 对端（仅地址）
+    - IPERF3_SERVER / IPERF3_DURATION / IPERF3_TOLERANCE: 实流验证配置
     - TESTER / TEST_VERSION: 报告配置
     """
     # 设备配置覆盖
@@ -348,11 +390,57 @@ def apply_env_overrides(config: Config) -> Config:
     if os.environ.get("SSH_ROUTER_PORT"):
         config.ssh.router.port = int(os.environ["SSH_ROUTER_PORT"])
 
+    # SSH测试客户端配置覆盖（GUI会传递这些变量，L5打流必须使用同一套客户端）
+    if os.environ.get("SSH_CLIENT_HOST"):
+        config.ssh.client.host = os.environ["SSH_CLIENT_HOST"]
+    if os.environ.get("SSH_CLIENT_USERNAME"):
+        config.ssh.client.username = os.environ["SSH_CLIENT_USERNAME"]
+    if os.environ.get("SSH_CLIENT_PASSWORD"):
+        config.ssh.client.password = os.environ["SSH_CLIENT_PASSWORD"]
+    if os.environ.get("SSH_CLIENT_PORT"):
+        config.ssh.client.port = int(os.environ["SSH_CLIENT_PORT"])
+
+    # GRE隧道对端设备配置覆盖(虚拟专网-GRE L5双端数据面验证)
+    if os.environ.get("SSH_PEER_HOST"):
+        config.ssh.peer.host = os.environ["SSH_PEER_HOST"]
+    if os.environ.get("SSH_PEER_USERNAME"):
+        config.ssh.peer.username = os.environ["SSH_PEER_USERNAME"]
+    if os.environ.get("SSH_PEER_PASSWORD"):
+        config.ssh.peer.password = os.environ["SSH_PEER_PASSWORD"]
+    if os.environ.get("SSH_PEER_PORT"):
+        config.ssh.peer.port = int(os.environ["SSH_PEER_PORT"])
+
+    # OSPF peer 严格只接收非敏感地址；运行时复用 router 凭据。
+    if os.environ.get("SSH_OSPF_PEER_HOST"):
+        config.ssh.ospf_peer_host = os.environ["SSH_OSPF_PEER_HOST"]
+    if os.environ.get("SSH_OSPF_PEER_PORT"):
+        config.ssh.ospf_peer_port = int(os.environ["SSH_OSPF_PEER_PORT"])
+    if os.environ.get("SSH_OSPF_PEER_RECOVERY_HOST"):
+        config.ssh.ospf_peer_recovery_host = os.environ["SSH_OSPF_PEER_RECOVERY_HOST"]
+    if os.environ.get("SSH_OSPF_PEER_RECOVERY_PORT"):
+        config.ssh.ospf_peer_recovery_port = int(os.environ["SSH_OSPF_PEER_RECOVERY_PORT"])
+    if os.environ.get("SSH_ROUTER_RECOVERY_HOST"):
+        config.ssh.router_recovery_host = os.environ["SSH_ROUTER_RECOVERY_HOST"]
+    if os.environ.get("SSH_ROUTER_RECOVERY_PORT"):
+        config.ssh.router_recovery_port = int(os.environ["SSH_ROUTER_RECOVERY_PORT"])
+    if os.environ.get("SSH_ROUTER_LAN_MANAGEMENT_HOST"):
+        config.ssh.router_lan_management_host = os.environ["SSH_ROUTER_LAN_MANAGEMENT_HOST"]
+    if os.environ.get("SSH_ROUTER_LAN_MANAGEMENT_PORT"):
+        config.ssh.router_lan_management_port = int(os.environ["SSH_ROUTER_LAN_MANAGEMENT_PORT"])
+
     # 控制台登录凭据覆盖
     if os.environ.get("SSH_CONSOLE_USERNAME"):
         config.ssh.router.console_username = os.environ["SSH_CONSOLE_USERNAME"]
     if os.environ.get("SSH_CONSOLE_PASSWORD"):
         config.ssh.router.console_password = os.environ["SSH_CONSOLE_PASSWORD"]
+
+    # 实流验证配置覆盖
+    if os.environ.get("IPERF3_SERVER"):
+        config.ssh.iperf3_server = os.environ["IPERF3_SERVER"]
+    if os.environ.get("IPERF3_DURATION"):
+        config.ssh.iperf3_duration = int(os.environ["IPERF3_DURATION"])
+    if os.environ.get("IPERF3_TOLERANCE"):
+        config.ssh.iperf3_tolerance = float(os.environ["IPERF3_TOLERANCE"])
 
     # 报告配置覆盖
     if os.environ.get("TESTER"):

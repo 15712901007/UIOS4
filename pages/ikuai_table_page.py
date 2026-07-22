@@ -636,6 +636,31 @@ class IkuaiTablePage(BasePage):
             self.click_import()
             self.page.wait_for_timeout(500)
 
+            # 导入属于高风险操作：无论弹窗默认值或上次残留状态如何，都必须把
+            # “是否清空现有配置”显式设置并复读确认，不能把“不点击”当作 False。
+            dialog_checkboxes = self.page.locator(
+                "dialog input[type='checkbox'], [role='dialog'] input[type='checkbox'], "
+                ".ant-modal-wrap:visible input[type='checkbox']"
+            )
+            if (getattr(self, "IMPORT_REQUIRES_CLEAR_GUARD", False) and
+                    dialog_checkboxes.count() == 0):
+                print("[ERROR] 导入弹窗未找到可复读的清空选项，拒绝继续")
+                self.close_modal_if_exists()
+                return False
+            for i in range(dialog_checkboxes.count()):
+                checkbox = dialog_checkboxes.nth(i)
+                try:
+                    if checkbox.is_checked() != bool(clear_existing):
+                        checkbox.set_checked(bool(clear_existing), force=True)
+                    if checkbox.is_checked() != bool(clear_existing):
+                        print("[ERROR] 导入弹窗清空选项未达到期望状态")
+                        self.close_modal_if_exists()
+                        return False
+                except Exception as e:
+                    print(f"[ERROR] 导入弹窗清空选项校验失败: {str(e)[:80]}")
+                    self.close_modal_if_exists()
+                    return False
+
             if clear_existing:
                 # 多文案匹配"清空"checkbox(各模块导入弹窗文案可能不同:
                 # "清空现有配置数据"/"清除全部数据"/"清除原有数据"等)

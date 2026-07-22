@@ -5,6 +5,7 @@ GUI主窗口
 """
 import sys
 import os
+import html
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -16,13 +17,13 @@ from PySide6.QtWidgets import (
     QDialog
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer
-from PySide6.QtGui import QAction, QIcon, QFont, QColor, QPalette
+from PySide6.QtGui import QAction, QIcon, QFont, QColor, QPalette, QTextCursor
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.config import get_config, Config, SSHHostConfig
-from gui.test_runner import TestRunner
+from gui.test_runner import TestRunner, get_runtime_root, redact_user_paths
 from gui.config_dialog import ConfigDialog
 
 
@@ -613,6 +614,8 @@ class MainWindow(QMainWindow):
         # 日志文本框
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        self.log_text.setUndoRedoEnabled(False)
+        self.log_text.setLineWrapMode(QTextEdit.NoWrap)
         self.log_text.setStyleSheet("""
             QTextEdit {
                 background-color: #1e1e1e;
@@ -622,6 +625,13 @@ class MainWindow(QMainWindow):
             }
         """)
         layout.addWidget(self.log_text)
+
+        # QTextEdit.append() forces a document layout for every subprocess
+        # line. Batch short bursts so verbose pytest output remains responsive.
+        self._pending_log_entries = []
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.timeout.connect(self._flush_log_entries)
 
         return group
 
@@ -700,6 +710,16 @@ class MainWindow(QMainWindow):
                         "groups": {
                             "综合测试（推荐）": [
                                 "test_static_route_comprehensive.py::TestStaticRouteComprehensive::test_static_route_comprehensive",
+                            ],
+                        }
+                    },
+                    "OSPF": {
+                        "testcases": [
+                            "test_ospf_comprehensive.py::TestOspfComprehensive::test_ospf_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "test_ospf_comprehensive.py::TestOspfComprehensive::test_ospf_comprehensive",
                             ],
                         }
                     },
@@ -1002,16 +1022,6 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
-                            "IPSec VPN": {
-                                "testcases": [
-                                    "test_ipsec_vpn_comprehensive.py::TestIpsecVpnComprehensive::test_ipsec_vpn_comprehensive",
-                                ],
-                                "groups": {
-                                    "综合测试（推荐）": [
-                                        "test_ipsec_vpn_comprehensive.py::TestIpsecVpnComprehensive::test_ipsec_vpn_comprehensive",
-                                    ],
-                                }
-                            },
                             "IKEv2/IPSec": {
                                 "testcases": [
                                     "test_ike_client_comprehensive.py::TestIkeClientComprehensive::test_ike_client_comprehensive",
@@ -1068,12 +1078,225 @@ class MainWindow(QMainWindow):
                             ],
                         }
                     },
+                    "路由对象": {
+                        "children": {
+                            "IP分组": {
+                                "testcases": [
+                                    "test_route_object_comprehensive.py::TestIpGroupComprehensive::test_ip_group_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_route_object_comprehensive.py::TestIpGroupComprehensive::test_ip_group_comprehensive",
+                                    ],
+                                }
+                            },
+                            "MAC分组": {
+                                "testcases": [
+                                    "test_route_object_comprehensive.py::TestMacGroupComprehensive::test_mac_group_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_route_object_comprehensive.py::TestMacGroupComprehensive::test_mac_group_comprehensive",
+                                    ],
+                                }
+                            },
+                            "端口分组": {
+                                "testcases": [
+                                    "test_route_object_comprehensive.py::TestPortGroupComprehensive::test_port_group_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_route_object_comprehensive.py::TestPortGroupComprehensive::test_port_group_comprehensive",
+                                    ],
+                                }
+                            },
+                            "域名分组": {
+                                "testcases": [
+                                    "test_route_object_comprehensive.py::TestDomainGroupComprehensive::test_domain_group_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_route_object_comprehensive.py::TestDomainGroupComprehensive::test_domain_group_comprehensive",
+                                    ],
+                                }
+                            },
+                            "时间计划": {
+                                "testcases": [
+                                    "test_route_object_comprehensive.py::TestTimePlanComprehensive::test_time_plan_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_route_object_comprehensive.py::TestTimePlanComprehensive::test_time_plan_comprehensive",
+                                    ],
+                                }
+                            },
+                            "协议分组": {
+                                "testcases": [
+                                    "test_route_object_comprehensive.py::TestProtocolGroupComprehensive::test_protocol_group_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "test_route_object_comprehensive.py::TestProtocolGroupComprehensive::test_protocol_group_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            "设备设置": {
+                "children": {
+                    "基础设置": {
+                        "testcases": [
+                            "device_setting/test_basic_setting_comprehensive.py::TestBasicSettingComprehensive::test_basic_setting_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "device_setting/test_basic_setting_comprehensive.py::TestBasicSettingComprehensive::test_basic_setting_comprehensive",
+                            ],
+                        }
+                    },
+                    "高级管理": {
+                        "children": {
+                            "ALG设置": {
+                                "testcases": [
+                                    "device_setting/test_alg_setting_comprehensive.py::TestAlgSettingComprehensive::test_alg_setting_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "device_setting/test_alg_setting_comprehensive.py::TestAlgSettingComprehensive::test_alg_setting_comprehensive",
+                                    ],
+                                }
+                            },
+                            "协议控制": {
+                                "testcases": [
+                                    "device_setting/test_protocol_control_comprehensive.py::TestProtocolControlComprehensive::test_protocol_control_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "device_setting/test_protocol_control_comprehensive.py::TestProtocolControlComprehensive::test_protocol_control_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
                 }
             },
             "监控中心": {
                 "children": {
                     "线路监控": {
                         "testcases": []
+                    },
+                }
+            },
+            "高级服务": {
+                "children": {
+                    "本地服务": {
+                        "children": {
+                            "FTP服务": {
+                                "testcases": [
+                                    "advanced_service/test_ftp_server_comprehensive.py::TestFtpServerComprehensive::test_ftp_server_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "advanced_service/test_ftp_server_comprehensive.py::TestFtpServerComprehensive::test_ftp_server_comprehensive",
+                                    ],
+                                }
+                            },
+                            "Samba服务": {
+                                "testcases": [
+                                    "advanced_service/test_samba_server_comprehensive.py::TestSambaServerComprehensive::test_samba_server_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "advanced_service/test_samba_server_comprehensive.py::TestSambaServerComprehensive::test_samba_server_comprehensive",
+                                    ],
+                                }
+                            },
+                            "HTTP服务": {
+                                "testcases": [
+                                    "advanced_service/test_http_server_comprehensive.py::TestHttpServerComprehensive::test_http_server_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "advanced_service/test_http_server_comprehensive.py::TestHttpServerComprehensive::test_http_server_comprehensive",
+                                    ],
+                                }
+                            },
+                            "SNMP服务": {
+                                "testcases": [
+                                    "advanced_service/test_snmp_server_comprehensive.py::TestSnmpServerComprehensive::test_snmp_server_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "advanced_service/test_snmp_server_comprehensive.py::TestSnmpServerComprehensive::test_snmp_server_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
+                    "虚拟机": {
+                        "testcases": [
+                            "advanced_service/test_virtual_machine_comprehensive.py::TestVirtualMachineComprehensive::test_virtual_machine_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "advanced_service/test_virtual_machine_comprehensive.py::TestVirtualMachineComprehensive::test_virtual_machine_comprehensive",
+                            ],
+                        }
+                    },
+                }
+            },
+            "虚拟专网": {
+                "children": {
+                    "IPsec VPN": {
+                        "testcases": [
+                            "network/test_ipsec_vpn_comprehensive.py::TestIpsecVpnComprehensive::test_ipsec_vpn_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "network/test_ipsec_vpn_comprehensive.py::TestIpsecVpnComprehensive::test_ipsec_vpn_comprehensive",
+                            ],
+                        }
+                    },
+                    "GRE": {
+                        "testcases": [
+                            # GRE隧道 完整6用例(综合CRUD + 配置真生效 + 边界 + 生命周期 + UI提示 + 数据面抓包)
+                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_tunnel_comprehensive",
+                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_config_effect",
+                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_boundary",
+                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_lifecycle",
+                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_ui_prompts",
+                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_dataplane_capture",
+                        ],
+                        "groups": {
+                            "完整回归（6用例,推荐）": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_tunnel_comprehensive",
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_config_effect",
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_boundary",
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_lifecycle",
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_ui_prompts",
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_dataplane_capture",
+                            ],
+                            "综合测试": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_tunnel_comprehensive",
+                            ],
+                            "配置真生效(内核ip -d)": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_config_effect",
+                            ],
+                            "边界值校验": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_boundary",
+                            ],
+                            "生命周期/残留": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_lifecycle",
+                            ],
+                            "UI提示规范": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_ui_prompts",
+                            ],
+                            "数据面抓包": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_dataplane_capture",
+                            ],
+                        }
                     },
                 }
             },
@@ -1140,6 +1363,48 @@ class MainWindow(QMainWindow):
                             "综合测试（推荐）": [
                                 "security/test_other_control_comprehensive.py::TestOtherControlComprehensive::test_other_control_comprehensive",
                             ]
+                        }
+                    },
+                    "ARP设置": {
+                        "testcases": [
+                            "security/test_arp_setting_comprehensive.py::TestArpSettingComprehensive::test_arp_setting_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "security/test_arp_setting_comprehensive.py::TestArpSettingComprehensive::test_arp_setting_comprehensive",
+                            ]
+                        }
+                    },
+                    "终端名称管理": {
+                        "testcases": [
+                            "security/test_terminal_name_comprehensive.py::TestTerminalNameComprehensive::test_terminal_name_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "security/test_terminal_name_comprehensive.py::TestTerminalNameComprehensive::test_terminal_name_comprehensive",
+                            ]
+                        }
+                    },
+                    # 威胁情报中心默认关闭；一个综合用例按页面逐项覆盖六个一级页，
+                    # 页面清单作为GUI树的显式三级节点，避免默认关闭时漏选/漏测。
+                    "威胁情报中心": {
+                        "children": {
+                            "综合测试（六页，推荐）": {
+                                "testcases": [
+                                    "security/test_threat_intelligence_comprehensive.py::TestThreatIntelligenceComprehensive::test_threat_intelligence_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（六页，推荐）": [
+                                        "security/test_threat_intelligence_comprehensive.py::TestThreatIntelligenceComprehensive::test_threat_intelligence_comprehensive",
+                                    ]
+                                }
+                            },
+                            "威胁态势": {"testcases": []},
+                            "威胁监控": {"testcases": []},
+                            "IOC管理": {"testcases": []},
+                            "命中告警": {"testcases": []},
+                            "事件响应": {"testcases": []},
+                            "报表中心": {"testcases": []},
                         }
                     },
                 }
@@ -1442,7 +1707,6 @@ class MainWindow(QMainWindow):
         self.test_runner.start()
 
         self.status_label.setText("测试执行中...")
-        self._log("INFO", f"开始执行 {len(selected_testcases)} 个测试用例")
 
     def _stop_tests(self):
         """停止测试"""
@@ -1486,6 +1750,7 @@ class MainWindow(QMainWindow):
 
     def _on_tests_finished(self, report_path):
         """测试完成"""
+        self._flush_log_entries()
         self.start_action.setEnabled(True)
         self.stop_action.setEnabled(False)
         self.status_label.setText("测试完成")
@@ -1509,6 +1774,7 @@ class MainWindow(QMainWindow):
     def _log(self, level, message):
         """添加日志"""
         timestamp = datetime.now().strftime("%H:%M:%S")
+        message = redact_user_paths(message)
 
         # 根据级别设置颜色
         colors = {
@@ -1519,22 +1785,38 @@ class MainWindow(QMainWindow):
         }
         color = colors.get(level, "#d4d4d4")
 
-        # 构建日志条目
-        log_entry = (
-            f'<span style="color: #888;">[{timestamp}]</span> '
-            f'<span style="color: {color};">[{level}]</span> '
-            f'{message}'
-        )
-
-        # 存储日志（用于过滤）
+        # A pytest traceback can contain angle brackets. Escape every line so
+        # QTextEdit does not interpret test output as markup and hide content.
+        lines = str(message).splitlines() or [""]
         if not hasattr(self, '_log_entries'):
             self._log_entries = []
-        self._log_entries.append((level, log_entry))
-
-        # 根据当前过滤级别决定是否显示
         current_filter = self.log_level_combo.currentText()
-        if self._should_show_log(level, current_filter):
-            self.log_text.append(log_entry)
+        for line in lines:
+            escaped = html.escape(line, quote=False)
+            log_entry = (
+                f'<span style="color: #888;">[{timestamp}]</span> '
+                f'<span style="color: {color};">[{level}]</span> '
+                f'{escaped}'
+            )
+            self._log_entries.append((level, log_entry))
+            if self._should_show_log(level, current_filter):
+                self._pending_log_entries.append(log_entry)
+
+        if self._pending_log_entries and not self._log_flush_timer.isActive():
+            self._log_flush_timer.start(50)
+
+    def _flush_log_entries(self):
+        """Render queued log lines in one document update."""
+        if not getattr(self, '_pending_log_entries', None):
+            return
+        entries = self._pending_log_entries
+        self._pending_log_entries = []
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        prefix = "" if self.log_text.document().isEmpty() else "<br>"
+        cursor.insertHtml(prefix + "<br>".join(entries))
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
 
     def _should_show_log(self, level, filter_level):
         """判断日志是否应该显示"""
@@ -1546,6 +1828,8 @@ class MainWindow(QMainWindow):
 
     def _clear_logs(self):
         """清空日志"""
+        self._log_flush_timer.stop()
+        self._pending_log_entries = []
         self.log_text.clear()
         self._log_entries = []
 
@@ -1554,13 +1838,16 @@ class MainWindow(QMainWindow):
         if not hasattr(self, '_log_entries'):
             return
 
-        # 清空当前显示
-        self.log_text.clear()
-
-        # 根据过滤级别重新显示日志
-        for log_level, log_entry in self._log_entries:
-            if self._should_show_log(log_level, level):
-                self.log_text.append(log_entry)
+        self._log_flush_timer.stop()
+        self._pending_log_entries = []
+        visible = [
+            entry for log_level, entry in self._log_entries
+            if self._should_show_log(log_level, level)
+        ]
+        self.log_text.setHtml("<br>".join(visible))
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.log_text.setTextCursor(cursor)
 
     def _open_config(self):
         """打开配置文件"""
@@ -1597,16 +1884,25 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QMessageBox, QFileDialog
         from datetime import datetime
 
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        json_path = os.path.join(project_root, "reports", "output", "test_results.json")
-        if not os.path.exists(json_path):
+        runtime_root = get_runtime_root()
+        configured_dir = getattr(self.config.report, "output_dir", "") or "reports/output"
+        if not os.path.isabs(configured_dir):
+            configured_dir = os.path.join(runtime_root, configured_dir)
+        configured_json = os.path.join(configured_dir, "test_results.json")
+        default_json = os.path.join(runtime_root, "reports", "output", "test_results.json")
+        candidates = [configured_json]
+        if os.path.normcase(os.path.abspath(default_json)) != os.path.normcase(os.path.abspath(configured_json)):
+            candidates.append(default_json)
+        json_path = next((path for path in candidates if os.path.exists(path)), None)
+        if json_path is None:
             QMessageBox.warning(
                 self, "无测试结果",
-                "未找到测试结果 JSON。\n请先在 GUI 运行测试, 跑完会自动生成:\n" + json_path
+                "未找到测试结果 JSON。\n请先在 GUI 运行测试。\n\n已检查:\n"
+                + "\n".join(candidates)
             )
             return
         default_name = f"测试结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        default_path = os.path.join(project_root, "reports", default_name)
+        default_path = os.path.join(runtime_root, "reports", default_name)
         path, _ = QFileDialog.getSaveFileName(
             self, "导出测试结果", default_path, "Excel 文件 (*.xlsx)")
         if not path:
@@ -1648,14 +1944,14 @@ class MainWindow(QMainWindow):
         import glob
 
         # 获取项目根目录（用于转换相对路径）
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        runtime_root = get_runtime_root()
 
         if report_path is None:
             # 查找最新的报告
             report_dir = self.config.report.output_dir
             # 转换为绝对路径
             if not os.path.isabs(report_dir):
-                report_dir = os.path.join(project_root, report_dir)
+                report_dir = os.path.join(runtime_root, report_dir)
 
             self._log("INFO", f"查找报告目录: {report_dir}")
 
@@ -1693,7 +1989,7 @@ class MainWindow(QMainWindow):
 
         # 确保是绝对路径
         if not os.path.isabs(report_path):
-            report_path = os.path.join(project_root, report_path)
+            report_path = os.path.join(runtime_root, report_path)
 
         # 检查文件是否存在
         if not os.path.exists(report_path):

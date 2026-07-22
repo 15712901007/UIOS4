@@ -1,6 +1,6 @@
 # 爱快路由器4.0自动化测试配置文件
 
-# 设备配置
+# 设备配置（主身份保持10.66.0.150；OSPF实机定位时可用DEVICE_IP临时覆盖为LAN1）
 device:
   ip: "10.66.0.150"
   username: "admin"
@@ -26,7 +26,15 @@ report:
 
 # SSH后台验证配置
 ssh:
-  # 路由器SSH
+  ospf_peer_host: "10.66.0.56"
+  ospf_peer_port: 22
+  ospf_peer_recovery_host: "10.66.0.57"
+  ospf_peer_recovery_port: 22
+  router_recovery_host: "10.66.0.27"
+  router_recovery_port: 22
+  router_lan_management_host: "192.168.148.1"
+  router_lan_management_port: 22
+  # 路由器SSH主身份；LAN1独立恢复通道见router_lan_management_host
   router:
     host: "10.66.0.150"
     username: "sshd"
@@ -41,6 +49,14 @@ ssh:
     username: "iktest"
     password: "iktest"
     port: 22
+  # GRE隧道对端设备SSH(虚拟专网-GRE L5双端数据面验证; 与router同凭据)
+  peer:
+    host: "10.66.0.56"
+    username: "sshd"
+    password: "ikuai8.com"
+    port: 22
+    console_username: "whoami"
+    console_password: "haohao!!xuexi@@tiantian##xiangshang"
   # iperf3测速服务器
   iperf3_server: "10.66.0.40"
   # iperf3测速参数
@@ -159,6 +175,38 @@ test_data:
     wireguard:
       export_filename: "wireguard_config.csv"
       import_filename: "wireguard_import.csv"
+    # 设备设置>高级管理>ALG设置（单例表单无导入导出，占位保持统一配置契约）
+    alg_setting:
+      export_filename: "alg_setting_config.csv"
+      import_filename: "alg_setting_import.csv"
+    # 设备设置>高级管理>协议控制（单例双模式页，无导入导出）
+    protocol_control:
+      export_filename: "protocol_control_config.csv"
+      import_filename: "protocol_control_import.csv"
+    # 高级服务>本地服务>FTP服务
+    ftp_server:
+      export_filename: "ftp_server_config.csv"
+      import_filename: "ftp_server_import.csv"
+    # 高级服务>本地服务>Samba服务
+    samba_server:
+      export_filename: "samba_server_config.csv"
+      import_filename: "samba_server_import.csv"
+    # 高级服务>本地服务>HTTP服务
+    http_server:
+      export_filename: "http_server_config.csv"
+      import_filename: "http_server_import.csv"
+    # 高级服务>本地服务>SNMP服务
+    snmp_server:
+      export_filename: "snmp_server_config.csv"
+      import_filename: "snmp_server_import.csv"
+    # 高级服务>虚拟机（页面不提供导入导出，文件名仅用于统一配置契约）
+    virtual_machine:
+      export_filename: "virtual_machine_config.csv"
+      import_filename: "virtual_machine_import.csv"
+    # 虚拟专网>GRE(前端未暴露导入导出入口, 占位保持一致; 底层脚本支持txt)
+    gre_tunnel:
+      export_filename: "gre_tunnel_config.txt"
+      import_filename: "gre_tunnel_import.txt"
     # 内外网设置(网络配置>内外网设置>内外网设置, 编辑型无导入导出, 仅占位保持配置一致)
     interface_settings:
       export_filename: "interface_settings_config.csv"

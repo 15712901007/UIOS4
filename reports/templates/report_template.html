@@ -89,7 +89,10 @@
         .stat-card.total .number { color: #1890ff; }
         .stat-card.passed .number { color: #52c41a; }
         .stat-card.failed .number { color: #ff4d4f; }
-        .stat-card.skipped .number { color: #faad14; }
+        .stat-card.warning .number { color: #fa8c16; }
+        .stat-card.not-applicable .number,
+        .stat-card.not_applicable .number,
+        .stat-card.skipped .number { color: #8c8c8c; }
 
         /* 进度条 */
         .progress-container {
@@ -115,7 +118,10 @@
 
         .progress-segment.passed { background: #52c41a; }
         .progress-segment.failed { background: #ff4d4f; }
-        .progress-segment.skipped { background: #faad14; }
+        .progress-segment.warning { background: #fa8c16; }
+        .progress-segment.not-applicable,
+        .progress-segment.not_applicable,
+        .progress-segment.skipped { background: #8c8c8c; }
 
         .progress-legend {
             display: flex;
@@ -139,7 +145,10 @@
 
         .legend-dot.passed { background: #52c41a; }
         .legend-dot.failed { background: #ff4d4f; }
-        .legend-dot.skipped { background: #faad14; }
+        .legend-dot.warning { background: #fa8c16; }
+        .legend-dot.not-applicable,
+        .legend-dot.not_applicable,
+        .legend-dot.skipped { background: #8c8c8c; }
 
         /* 测试用例表格 */
         .test-cases-section {
@@ -198,16 +207,24 @@
             border: 1px solid #b7eb8f;
         }
 
-        .status-failed {
+        .status-failed,
+        .status-error {
             background: #fff2f0;
             color: #ff4d4f;
             border: 1px solid #ffccc7;
         }
 
+        .status-warning {
+            background: #fff7e6;
+            color: #d46b08;
+            border: 1px solid #ffd591;
+        }
+
+        .status-not_applicable,
         .status-skipped {
-            background: #fffbe6;
-            color: #faad14;
-            border: 1px solid #fff1b8;
+            background: #fafafa;
+            color: #595959;
+            border: 1px solid #d9d9d9;
         }
 
         .test-case-details {
@@ -395,19 +412,23 @@
             color: #52c41a;
         }
 
-        .step-status.failed {
+        .step-status.failed,
+        .step-status.error {
             background: #fff2f0;
             color: #ff4d4f;
         }
 
-        .step-status.skipped {
-            background: #fffbe6;
-            color: #faad14;
+        .step-status.warning,
+        .step-status.pending,
+        .step-status.running {
+            background: #fff7e6;
+            color: #d46b08;
         }
 
-        .step-status.running {
-            background: #e6f7ff;
-            color: #1890ff;
+        .step-status.not_applicable,
+        .step-status.skipped {
+            background: #fafafa;
+            color: #595959;
         }
 
         /* 步骤详情列表 */
@@ -429,6 +450,409 @@
         .step-detail-item::before {
             content: "•";
             color: #1890ff;
+        }
+
+        .step-detail-item.detail-test-action,
+        .step-detail-item.detail-page-verification,
+        .step-detail-item.detail-backend-verification,
+        .step-detail-item.detail-runtime-verification,
+        .step-detail-item.detail-protocol-verification,
+        .step-detail-item.detail-cleanup-result,
+        .step-detail-item.detail-not-applicable {
+            margin: 5px 0;
+            padding: 8px 10px;
+            border-radius: 6px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .step-detail-item.detail-test-action {
+            color: #434343;
+            background: #fafafa;
+            border: 1px solid #d9d9d9;
+        }
+
+        .step-detail-item.detail-test-action::before {
+            content: "操作";
+        }
+
+        .step-detail-item.detail-page-verification {
+            color: #237804;
+            background: #f6ffed;
+            border: 1px solid #b7eb8f;
+        }
+
+        .step-detail-item.detail-page-verification::before {
+            content: "UI";
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 26px;
+            height: 18px;
+            margin-right: 7px;
+            padding: 0 3px;
+            color: #237804;
+            font-size: 10px;
+            font-weight: 700;
+            line-height: 18px;
+            white-space: nowrap;
+            vertical-align: top;
+        }
+
+        .step-detail-item.detail-backend-verification {
+            color: #0958d9;
+            background: #e6f4ff;
+            border: 1px solid #91caff;
+        }
+
+        .step-detail-item.detail-backend-verification::before {
+            content: "后台";
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 26px;
+            height: 18px;
+            margin-right: 7px;
+            padding: 0 3px;
+            color: #0958d9;
+            font-size: 10px;
+            font-weight: 700;
+            line-height: 18px;
+            white-space: nowrap;
+            vertical-align: top;
+        }
+
+        .step-detail-item.detail-runtime-verification {
+            color: #006d75;
+            background: #e6fffb;
+            border: 1px solid #87e8de;
+        }
+
+        .step-detail-item.detail-runtime-verification::before {
+            content: "运行";
+            color: #006d75;
+        }
+
+        .step-detail-item.detail-protocol-verification {
+            color: #874d00;
+            background: #fffbe6;
+            border: 1px solid #ffe58f;
+        }
+
+        .step-detail-item.detail-protocol-verification::before {
+            content: "协议";
+            color: #874d00;
+        }
+
+        .step-detail-item.detail-cleanup-result {
+            color: #237804;
+            background: #f6ffed;
+            border: 1px solid #b7eb8f;
+        }
+
+        .step-detail-item.detail-cleanup-result::before {
+            content: "清理";
+            color: #237804;
+        }
+
+        .step-detail-item.detail-not-applicable {
+            color: #595959;
+            background: #f5f5f5;
+            border: 1px dashed #bfbfbf;
+        }
+
+        .step-detail-item.detail-not-applicable::before {
+            content: "N/A";
+            color: #595959;
+        }
+
+        .step-detail-item.detail-test-action::before,
+        .step-detail-item.detail-runtime-verification::before,
+        .step-detail-item.detail-protocol-verification::before,
+        .step-detail-item.detail-cleanup-result::before,
+        .step-detail-item.detail-not-applicable::before {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 26px;
+            height: 18px;
+            margin-right: 7px;
+            padding: 0 3px;
+            font-size: 10px;
+            font-weight: 700;
+            line-height: 18px;
+            white-space: nowrap;
+            vertical-align: top;
+        }
+
+        .step-detail-item.detail-verification-failed {
+            color: #a8071a;
+            background: #fff1f0;
+            border-color: #ffa39e;
+        }
+
+        .step-detail-item.detail-verification-failed::before {
+            color: #a8071a;
+        }
+
+        .step-detail-item.detail-verification-warning {
+            color: #874d00;
+            background: #fffbe6;
+            border-color: #ffe58f;
+        }
+
+        .step-detail-item.detail-verification-warning::before {
+            color: #874d00;
+        }
+
+        .backend-data-detail {
+            margin: 6px 0;
+            border: 1px solid #d9d9d9;
+            border-radius: 6px;
+            background: #fafafa;
+            overflow: hidden;
+        }
+
+        .backend-data-detail summary {
+            padding: 8px 10px;
+            color: #595959;
+            background: #f0f0f0;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            user-select: none;
+        }
+
+        .backend-data-detail summary::marker {
+            color: #1890ff;
+        }
+
+        .backend-data-toggle-hint {
+            margin-left: 8px;
+            color: #8c8c8c;
+            font-size: 11px;
+            font-weight: 400;
+        }
+
+        .backend-data-content {
+            margin: 0;
+            padding: 10px 12px;
+            color: #262626;
+            background: white;
+            font-family: Consolas, "Courier New", monospace;
+            font-size: 11px;
+            line-height: 1.55;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            max-height: 360px;
+            overflow: auto;
+        }
+
+        /* 结构化人工复验命令 */
+        .verification-commands {
+            margin-top: 12px;
+            padding: 12px;
+            border: 1px solid #adc6ff;
+            border-radius: 8px;
+            background: #f0f5ff;
+        }
+
+        .verification-commands-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 0;
+            color: #1d39c4;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            list-style: none;
+        }
+
+        .verification-commands-title::-webkit-details-marker {
+            display: none;
+        }
+
+        .verification-commands-title::before {
+            content: "▸";
+            flex: 0 0 auto;
+            color: #2f54eb;
+            font-size: 15px;
+            line-height: 1;
+        }
+
+        .verification-commands[open] .verification-commands-title {
+            margin-bottom: 10px;
+        }
+
+        .verification-commands[open] .verification-commands-title::before {
+            content: "▾";
+        }
+
+        .verification-command-count {
+            flex: 0 0 auto;
+            padding: 1px 8px;
+            border-radius: 10px;
+            color: #2f54eb;
+            background: #d6e4ff;
+            font-size: 11px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .verification-command-card {
+            margin-top: 9px;
+            padding: 10px;
+            border: 1px solid #d6e4ff;
+            border-radius: 6px;
+            background: white;
+            break-inside: auto;
+        }
+
+        .verification-command-card:first-of-type {
+            margin-top: 0;
+        }
+
+        .verification-command-header {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+
+        .verification-target,
+        .verification-host,
+        .verification-shell,
+        .verification-effect,
+        .verification-sensitive {
+            display: inline-flex;
+            align-items: center;
+            min-height: 22px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+        }
+
+        .verification-target {
+            color: #003a8c;
+            background: #e6f7ff;
+            border: 1px solid #91d5ff;
+            font-weight: 700;
+        }
+
+        .verification-host {
+            color: #531dab;
+            background: #f9f0ff;
+            border: 1px solid #d3adf7;
+            font-family: Consolas, "Courier New", monospace;
+        }
+
+        .verification-shell {
+            color: #006d75;
+            background: #e6fffb;
+            border: 1px solid #87e8de;
+            font-family: Consolas, "Courier New", monospace;
+        }
+
+        .verification-effect {
+            color: #595959;
+            background: #fafafa;
+            border: 1px solid #d9d9d9;
+        }
+
+        .verification-effect.verification-effect-write {
+            color: #874d00;
+            background: #fffbe6;
+            border-color: #ffe58f;
+            font-weight: 600;
+        }
+
+        .verification-sensitive {
+            color: #a8071a;
+            background: #fff1f0;
+            border: 1px solid #ffa39e;
+            font-weight: 700;
+        }
+
+        .copy-verification-command {
+            margin-left: auto;
+            padding: 4px 10px;
+            border: 1px solid #597ef7;
+            border-radius: 4px;
+            color: #2f54eb;
+            background: white;
+            cursor: pointer;
+            font-size: 11px;
+            transition: color 0.15s ease, background 0.15s ease;
+        }
+
+        .copy-verification-command:hover {
+            color: white;
+            background: #597ef7;
+        }
+
+        .verification-command-purpose,
+        .verification-command-expected,
+        .verification-command-actual,
+        .verification-command-valid-when,
+        .verification-command-interactive {
+            margin: 5px 0;
+            color: #595959;
+            font-size: 12px;
+            line-height: 1.55;
+        }
+
+        .verification-command-purpose strong,
+        .verification-command-expected strong,
+        .verification-command-actual strong,
+        .verification-command-valid-when strong,
+        .verification-command-interactive strong {
+            color: #262626;
+        }
+
+        .verification-command-actual,
+        .step-actual-result {
+            padding: 7px 9px;
+            border-left: 3px solid #52c41a;
+            color: #135200;
+            background: #f6ffed;
+            overflow-wrap: anywhere;
+        }
+
+        .step-actual-result {
+            margin-top: 8px;
+            font-size: 12px;
+            line-height: 1.55;
+        }
+
+        .verification-command-interactive {
+            padding: 7px 9px;
+            border-left: 3px solid #faad14;
+            color: #874d00;
+            background: #fffbe6;
+        }
+
+        .verification-command-code {
+            margin: 8px 0 0;
+            padding: 10px 12px;
+            border: 1px solid #30363d;
+            border-radius: 5px;
+            color: #e6edf3;
+            background: #161b22;
+            font-family: Consolas, "Courier New", monospace;
+            font-size: 11px;
+            line-height: 1.55;
+            white-space: pre;
+            overflow-x: auto;
+            tab-size: 4;
+        }
+
+        .verification-command-code code {
+            font: inherit;
+            color: inherit;
         }
 
         /* 无步骤提示 */
@@ -611,6 +1035,10 @@
                 align-items: flex-start;
                 gap: 10px;
             }
+
+            .copy-verification-command {
+                margin-left: 0;
+            }
         }
 
         /* 打印样式 */
@@ -630,6 +1058,38 @@
 
             .test-case-details {
                 display: block !important;
+            }
+
+            .copy-verification-command {
+                display: none !important;
+            }
+
+            .verification-commands,
+            .verification-command-card,
+            .verification-command-code,
+            .backend-data-content {
+                color: black;
+                background: white;
+                box-shadow: none;
+            }
+
+            .verification-command-card {
+                border-color: #bfbfbf;
+            }
+
+            .verification-command-code {
+                white-space: pre-wrap;
+                overflow-wrap: anywhere;
+            }
+
+            details.backend-data-detail > .backend-data-content {
+                display: block !important;
+                max-height: none;
+                overflow: visible;
+            }
+
+            .backend-data-toggle-hint {
+                display: none;
             }
         }
     </style>
@@ -678,6 +1138,11 @@
             </div>
         </div>
 
+        {% set warning_count = test_cases|selectattr('status','equalto','warning')|list|length %}
+        {% set not_applicable_case_count = test_cases|selectattr('status','equalto','not_applicable')|list|length %}
+        {% set historical_skipped_count = test_cases|selectattr('status','equalto','skipped')|list|length %}
+        {% set not_applicable_count = not_applicable_case_count + historical_skipped_count %}
+
         <!-- 统计卡片 -->
         <div class="stats-container">
             <div class="stat-card total">
@@ -696,9 +1161,13 @@
                 <div class="number">{{ failed }}</div>
                 <div class="label">失败用例</div>
             </div>
-            <div class="stat-card skipped">
-                <div class="number">{{ skipped }}</div>
-                <div class="label">跳过用例</div>
+            <div class="stat-card warning">
+                <div class="number">{{ warning_count }}</div>
+                <div class="label">警告用例</div>
+            </div>
+            <div class="stat-card not-applicable">
+                <div class="number">{{ not_applicable_count }}</div>
+                <div class="label">不适用用例</div>
             </div>
         </div>
 
@@ -708,7 +1177,8 @@
                 {% if total > 0 %}
                 <div class="progress-segment passed" style="width: {{ (passed / total * 100) }}%"></div>
                 <div class="progress-segment failed" style="width: {{ (failed / total * 100) }}%"></div>
-                <div class="progress-segment skipped" style="width: {{ (skipped / total * 100) }}%"></div>
+                <div class="progress-segment warning" style="width: {{ (warning_count / total * 100) }}%"></div>
+                <div class="progress-segment not-applicable" style="width: {{ (not_applicable_count / total * 100) }}%"></div>
                 {% endif %}
             </div>
             <div class="progress-legend">
@@ -721,8 +1191,12 @@
                     <span>失败 {{ failed }} ({{ "%.1f"|format(failed / total * 100 if total > 0 else 0) }}%)</span>
                 </div>
                 <div class="legend-item">
-                    <div class="legend-dot skipped"></div>
-                    <span>跳过 {{ skipped }} ({{ "%.1f"|format(skipped / total * 100 if total > 0 else 0) }}%)</span>
+                    <div class="legend-dot warning"></div>
+                    <span>警告 {{ warning_count }} ({{ "%.1f"|format(warning_count / total * 100 if total > 0 else 0) }}%)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-dot not-applicable"></div>
+                    <span>不适用 {{ not_applicable_count }} ({{ "%.1f"|format(not_applicable_count / total * 100 if total > 0 else 0) }}%)</span>
                 </div>
             </div>
         </div>
@@ -771,18 +1245,19 @@
                 <button class="filter-btn active" onclick="filterCases('all', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:#1890ff; color:white; font-size:13px;">全部 ({{ test_cases|length }})</button>
                 <button class="filter-btn" onclick="filterCases('passed', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:white; color:#52c41a; font-size:13px;">✅ 通过 ({{ test_cases|selectattr('status','equalto','passed')|list|length }})</button>
                 <button class="filter-btn" onclick="filterCases('failed', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:white; color:#ff4d4f; font-size:13px;">❌ 失败 ({{ test_cases|selectattr('status','equalto','failed')|list|length }})</button>
-                <button class="filter-btn" onclick="filterCases('skipped', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:white; color:#faad14; font-size:13px;">⏭️ 跳过 ({{ test_cases|selectattr('status','equalto','skipped')|list|length }})</button>
+                <button class="filter-btn" onclick="filterCases('warning', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:white; color:#d46b08; font-size:13px;">⚠ 警告 ({{ warning_count }})</button>
+                <button class="filter-btn" onclick="filterCases('not_applicable', this)" style="padding:6px 16px; border:1px solid #d9d9d9; border-radius:6px; cursor:pointer; background:white; color:#595959; font-size:13px;">○ 不适用 ({{ not_applicable_count }})</button>
             </div>
             {% for case in test_cases %}
             {% set case_idx = loop.index %}
             <div class="test-case" data-status="{{ case.status }}">
                 <div class="test-case-header" onclick="toggleDetails({{ case_idx }})">
                     <div class="test-case-name">
-                        <span>{% if case.status == 'passed' %}✅{% elif case.status == 'failed' %}❌{% else %}⏭️{% endif %}</span>
+                        <span>{% if case.status == 'passed' %}✅{% elif case.status in ['failed', 'error'] %}❌{% elif case.status in ['not_applicable', 'skipped'] %}○{% else %}⚠{% endif %}</span>
                         <span>{{ case.name }}</span>
                     </div>
                     <span class="test-case-status status-{{ case.status }}">
-                        {% if case.status == 'passed' %}通过{% elif case.status == 'failed' %}失败{% else %}跳过{% endif %}
+                        {% if case.status == 'passed' %}通过{% elif case.status in ['failed', 'error'] %}失败{% elif case.status in ['not_applicable', 'skipped'] %}不适用{% else %}警告{% endif %}
                     </span>
                 </div>
                 <div class="test-case-details" id="details-{{ case_idx }}">
@@ -809,6 +1284,7 @@
                             </div>
                             <div class="test-steps-content">
                                 {% for step in case.steps %}
+                                {% set step_idx = loop.index %}
                                 <div class="step-item" id="step-{{ case_idx }}-{{ loop.index }}">
                                     <div class="step-number">{{ loop.index }}</div>
                                     <div class="step-content">
@@ -816,22 +1292,165 @@
                                         {% if step.description %}
                                         <div class="step-description">{{ step.description }}</div>
                                         {% endif %}
+                                        {% if '操作：' in step.name and '；验证：' in step.name %}
+                                        {% set action_text = step.name.split('操作：', 1)[1].split('；验证：', 1)[0] %}
+                                        {% set expected_text = step.name.split('；验证：', 1)[1] %}
+                                        {% else %}
+                                        {% set action_text = step.description or step.name %}
+                                        {% set expected_text = step.description or '按本步骤检查项判定' %}
+                                        {% endif %}
+                                        <div class="step-details" style="margin-top:10px;">
+                                            <div class="step-detail-item detail-test-action"><strong>操作：</strong>{{ action_text }}</div>
+                                            <div class="step-detail-item detail-page-verification"><strong>期望结果：</strong>{{ expected_text }}</div>
+                                            <div class="step-detail-item{% if step.status in ['failed', 'error'] %} detail-verification-failed{% elif step.status == 'warning' %} detail-verification-warning{% endif %}"><strong>实际现象：</strong>{% if step.status in ['failed', 'error'] %}{{ step.error_message or '存在检查项未达到期望，详见下方证据' }}{% elif step.status == 'warning' %}当前环境存在不适用项或限制，详见下方证据{% elif step.status in ['not_applicable', 'skipped'] %}前置条件不满足或当前环境不适用{% else %}本步骤各项检查达到期望{% endif %}</div>
+                                            <div class="step-detail-item detail-backend-verification"><strong>后端证据：</strong>下方共 {{ step.details|length }} 条页面、后台、运行时及协议检查记录</div>
+                                            <div class="step-detail-item"><strong>人工复验命令：</strong>{{ step.verification_commands|length if step.verification_commands else 0 }} 条，失败步骤默认展开</div>
+                                        </div>
                                         <div class="step-meta">
                                             <span class="step-duration">耗时: {{ step.duration }}</span>
                                             <span class="step-status {{ step.status }}">
-                                                {% if step.status == 'passed' %}✓ 通过{% elif step.status == 'failed' %}✗ 失败{% elif step.status == 'skipped' %}○ 跳过{% else %}○ 进行中{% endif %}
+                                                {% if step.status == 'passed' %}✓ 通过{% elif step.status in ['failed', 'error'] %}✗ 失败{% elif step.status in ['not_applicable', 'skipped'] %}○ 不适用{% else %}⚠ 警告{% endif %}
                                             </span>
                                         </div>
                                         {% if step.details and step.details|length > 0 %}
                                         <div class="step-details">
                                             {% for detail in step.details %}
+                                            {% if '【后端数据】' in detail %}
+                                            <details class="backend-data-detail">
+                                                <summary>
+                                                    后端数据
+                                                    <span class="backend-data-toggle-hint">默认折叠，点击展开</span>
+                                                </summary>
+                                                <pre class="backend-data-content">{{ detail|replace('【后端数据】', '') }}</pre>
+                                            </details>
+                                            {% elif '【测试操作' in detail %}
+                                            <div class="step-detail-item detail-test-action{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
+                                            {% elif '【页面验证' in detail %}
+                                            <div class="step-detail-item detail-page-verification{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
+                                            {% elif '【后端验证' in detail %}
+                                            <div class="step-detail-item detail-backend-verification{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
+                                            {% elif '【运行时验证' in detail %}
+                                            <div class="step-detail-item detail-runtime-verification{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
+                                            {% elif '【协议验证' in detail %}
+                                            <div class="step-detail-item detail-protocol-verification{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
+                                            {% elif '【清理结果' in detail %}
+                                            <div class="step-detail-item detail-cleanup-result{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
+                                            {% elif '【不适用' in detail %}
+                                            <div class="step-detail-item detail-not-applicable">{{ detail }}</div>
+                                            {% else %}
                                             <div class="step-detail-item">{{ detail }}</div>
+                                            {% endif %}
                                             {% endfor %}
                                         </div>
                                         {% endif %}
+                                        {% if step.actual %}
+                                        <div class="step-actual-result">
+                                            <strong>实际结果:</strong>
+                                            {% set step_actual_text = step.actual|string %}
+                                            {% if 'community=' in step_actual_text or 'auth_pass=' in step_actual_text or 'priv_pass=' in step_actual_text or 'password=' in step_actual_text or '"community"' in step_actual_text or '"auth_pass"' in step_actual_text or '"priv_pass"' in step_actual_text %}
+                                                [实际结果已隐藏：包含敏感信息]
+                                            {% else %}
+                                                {{ step.actual }}
+                                            {% endif %}
+                                        </div>
+                                        {% endif %}
+                                        {% if step.verification_commands and step.verification_commands|length > 0 %}
+                                        <details class="verification-commands"{% if step.status in ['failed', 'error'] %} open{% endif %}>
+                                            <summary class="verification-commands-title">
+                                                <span>后端人工复验命令（逐条复制执行）</span>
+                                                <span class="verification-command-count">{{ step.verification_commands|length }} 条</span>
+                                            </summary>
+                                            {% for verification_command in step.verification_commands %}
+                                            {% set command_id = 'verification-command-' ~ case_idx ~ '-' ~ step_idx ~ '-' ~ loop.index %}
+                                            {% set command_text = verification_command.command or '' %}
+                                            {% set actual_text = (verification_command.actual|string) if verification_command.actual else '' %}
+                                            {% set raw_snmp_secret = ('snmpget' in command_text or 'snmpwalk' in command_text or 'snmpbulkwalk' in command_text) and (' -c ' in command_text or ' -A ' in command_text or ' -X ' in command_text or '--community ' in command_text or '--auth-pass ' in command_text or '--priv-pass ' in command_text) %}
+                                            {% set command_contains_secret = verification_command.contains_secret is sameas true or verification_command.contains_secret in ['true', 'True', 'TRUE', 'yes', 'Yes', 'YES', 'on', 'On', 'ON', 'y', 'Y', '1', '是'] or raw_snmp_secret or 'community=' in command_text or 'auth_pass=' in command_text or 'priv_pass=' in command_text %}
+                                            {% set actual_contains_secret = command_contains_secret or 'community=' in actual_text or 'auth_pass=' in actual_text or 'priv_pass=' in actual_text or 'password=' in actual_text or '"community"' in actual_text or '"auth_pass"' in actual_text or '"priv_pass"' in actual_text %}
+                                            {% set command_read_only = verification_command.effect in ['read_only', 'read-only', 'readonly'] %}
+                                            <div class="verification-command-card">
+                                                <div class="verification-command-header">
+                                                    <span class="verification-target">{{ verification_command.target_label or verification_command.target or '未标注目标' }}</span>
+                                                    <span class="verification-host">{{ verification_command.host or '未提供IP' }}</span>
+                                                    {% if verification_command.shell %}
+                                                    <span class="verification-shell">{{ verification_command.shell }}</span>
+                                                    {% endif %}
+                                                    <span class="verification-effect{% if not command_read_only %} verification-effect-write{% endif %}">影响:
+                                                        {% if command_read_only %}
+                                                            只读（不修改配置）
+                                                        {% else %}
+                                                            {{ verification_command.effect or '未标注' }}
+                                                        {% endif %}
+                                                    </span>
+                                                    {% if command_contains_secret %}
+                                                    <span class="verification-sensitive">涉及敏感输入</span>
+                                                    {% endif %}
+                                                    {% if verification_command.copy_ready is sameas true and not command_contains_secret %}
+                                                    <button
+                                                        type="button"
+                                                        class="copy-verification-command"
+                                                        onclick="copyVerificationCommand(this, '{{ command_id }}')"
+                                                        aria-label="复制第 {{ loop.index }} 条人工复验命令"
+                                                    >复制命令</button>
+                                                    {% endif %}
+                                                </div>
+                                                <div class="verification-command-purpose">
+                                                    <strong>用途:</strong> {{ verification_command.purpose or '未说明' }}
+                                                </div>
+                                                <div class="verification-command-valid-when">
+                                                    <strong>有效时机:</strong> {{ verification_command.valid_when or '未限定' }}
+                                                </div>
+                                                {% if verification_command.interactive or verification_command.interactive_hint %}
+                                                <div class="verification-command-interactive">
+                                                    <strong>交互提示:</strong>
+                                                    {% if verification_command.interactive is sameas true %}
+                                                        执行后需按终端提示继续
+                                                    {% elif verification_command.interactive %}
+                                                        {{ verification_command.interactive }}
+                                                    {% else %}
+                                                        执行时需要人工交互
+                                                    {% endif %}
+                                                    {% if verification_command.interactive_hint %}
+                                                        ；{{ verification_command.interactive_hint }}
+                                                    {% endif %}
+                                                </div>
+                                                {% endif %}
+                                                {% if command_contains_secret %}
+                                                <pre class="verification-command-code"><code id="{{ command_id }}">[命令已隐藏：包含敏感信息]</code></pre>
+                                                {% else %}
+                                                <pre class="verification-command-code"><code id="{{ command_id }}">{{ verification_command.command }}</code></pre>
+                                                {% endif %}
+                                                <div class="verification-command-expected">
+                                                    <strong>预期:</strong> {{ verification_command.expected or '未说明' }}
+                                                </div>
+                                                <div class="verification-command-actual">
+                                                    <strong>实际:</strong>
+                                                    {% if actual_contains_secret %}
+                                                        [命令已隐藏：包含敏感信息]
+                                                    {% else %}
+                                                        {{ verification_command.actual or '未记录' }}
+                                                    {% endif %}
+                                                </div>
+                                            </div>
+                                            {% endfor %}
+                                        </details>
+                                        {% endif %}
                                         {% if step.error_message %}
-                                        <div class="step-details" style="border-left-color: #ff4d4f;">
-                                            <div class="step-detail-item" style="color: #ff4d4f;">错误: {{ step.error_message }}</div>
+                                        {% if step.status in ['failed', 'error'] %}
+                                            {% set step_message_border = '#ff4d4f' %}
+                                            {% set step_message_color = '#ff4d4f' %}
+                                            {% set step_message_label = '错误' %}
+                                        {% elif step.status == 'warning' %}
+                                            {% set step_message_border = '#fa8c16' %}
+                                            {% set step_message_color = '#d46b08' %}
+                                            {% set step_message_label = '警告' %}
+                                        {% else %}
+                                            {% set step_message_border = '#8c8c8c' %}
+                                            {% set step_message_color = '#595959' %}
+                                            {% set step_message_label = '说明' %}
+                                        {% endif %}
+                                        <div class="step-details" style="border-left-color: {{ step_message_border }};">
+                                            <div class="step-detail-item" style="color: {{ step_message_color }};">{{ step_message_label }}: {{ step.error_message }}</div>
                                         </div>
                                         {% endif %}
                                     </div>
@@ -940,6 +1559,58 @@
             {% endfor %}
         });
 
+        function showVerificationCopyState(button, text) {
+            var original = button.getAttribute('data-original-text') || button.textContent;
+            button.setAttribute('data-original-text', original);
+            button.textContent = text;
+            window.setTimeout(function() {
+                button.textContent = original;
+            }, 1600);
+        }
+
+        function fallbackCopyVerificationText(text) {
+            var textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.setAttribute('readonly', '');
+            textarea.style.position = 'fixed';
+            textarea.style.left = '-9999px';
+            textarea.style.top = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            var copied = false;
+            try {
+                copied = document.execCommand('copy');
+            } finally {
+                document.body.removeChild(textarea);
+            }
+            return copied;
+        }
+
+        function copyVerificationCommand(button, commandId) {
+            var commandElement = document.getElementById(commandId);
+            if (!commandElement) {
+                showVerificationCopyState(button, '复制失败');
+                return;
+            }
+            // 只从 code.textContent 取值；不复制主机标签、用途、预期或 HTML 实体。
+            var commandText = commandElement.textContent;
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(commandText).then(function() {
+                    showVerificationCopyState(button, '已复制');
+                }).catch(function() {
+                    showVerificationCopyState(
+                        button,
+                        fallbackCopyVerificationText(commandText) ? '已复制' : '复制失败'
+                    );
+                });
+                return;
+            }
+            showVerificationCopyState(
+                button,
+                fallbackCopyVerificationText(commandText) ? '已复制' : '复制失败'
+            );
+        }
+
         // 截图懒加载: 点击按钮才加载base64图片(避免报告打开时渲染所有大图导致卡顿)
         function toggleScreenshot(btn) {
             var img = btn.nextElementSibling;
@@ -956,13 +1627,23 @@
             }
         }
 
-        // 筛选用例: 全部/通过/失败/跳过
+        // 筛选用例: 全部/通过/失败/警告/不适用
         function filterCases(status, btn) {
             // 更新按钮样式
             document.querySelectorAll('.filter-btn').forEach(function(b) {
                 b.classList.remove('active');
                 b.style.background = 'white';
-                b.style.color = b.textContent.includes('通过') ? '#52c41a' : (b.textContent.includes('失败') ? '#ff4d4f' : (b.textContent.includes('跳过') ? '#faad14' : '#333'));
+                if (b.textContent.includes('通过')) {
+                    b.style.color = '#52c41a';
+                } else if (b.textContent.includes('失败')) {
+                    b.style.color = '#ff4d4f';
+                } else if (b.textContent.includes('警告')) {
+                    b.style.color = '#d46b08';
+                } else if (b.textContent.includes('不适用')) {
+                    b.style.color = '#595959';
+                } else {
+                    b.style.color = '#333';
+                }
             });
             btn.classList.add('active');
             btn.style.background = '#1890ff';
@@ -970,7 +1651,14 @@
 
             // 筛选用例显示
             document.querySelectorAll('.test-case[data-status]').forEach(function(tc) {
-                if (status === 'all' || tc.getAttribute('data-status') === status) {
+                var caseStatus = tc.getAttribute('data-status');
+                var matches = status === 'all' || caseStatus === status;
+                if (status === 'not_applicable') {
+                    matches = caseStatus === 'not_applicable' || caseStatus === 'skipped';
+                } else if (status === 'failed') {
+                    matches = caseStatus === 'failed' || caseStatus === 'error';
+                }
+                if (matches) {
                     tc.style.display = '';
                 } else {
                     tc.style.display = 'none';

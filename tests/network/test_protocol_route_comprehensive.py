@@ -994,20 +994,30 @@ class TestProtocolRouteComprehensive:
 @pytest.mark.protocol_route
 @pytest.mark.network
 class TestProtocolRouteFlowVerification:
-    """协议分流功能验证(命中+选路, 硬断言): 两场景(指定IP/不指定)×多域名→mangle Δpkts>0 + client连接mark==规则mark.
+    """协议分流功能验证(命中+选路, 硬断言): 具体协议(腾讯网/百度)为主 + 所有协议辅助.
 
     命中=mangle STREAM_LAYER7_NEW counter Δpkts>0(规则匹配流量) + cflow L7增量辅助.
     选路=规则--set-mark值出现在client连接mark里(被规则匹配+打标+--set-ifname wan选路).
-    ⚠️conntrack remote_if对协议分流(L7)不可靠: curl的http未必在appset里→未匹配mark=0走默认WAN(remote_if=wan1);
-    匹配的流量(如DNS)被打rule mark+--set-ifname选路, 故用client连接mark==规则mark作选路铁证(非remote_if).
-    DPI正常(识别baidu appid/domain); 协议分流功能正常(匹配流量打mark选路). 历史"6.12 user_dpi坏"误判, 实为read_mangle_counter comment格式bug+选路信号错.
-    两场景: ①ip_mac_group=临时IP分组(含client_ip, 仅该IP生效; 协议分流UI无直接src_addr字段, 用IP分组限定)
-    ②不指定(全IP生效). 多域名(baidu/qq)逐个curl验."""
+    选路铁证=client连接mark==规则--set-mark(实测4000011, remote_if=目标wan); conntrack remote_if对L7不可靠.
+
+    场景设计(2026-07-16重构, 响应"只测所有协议功能不完善"):
+    - 主场景-具体协议: 选"腾讯网"→打流www.qq.com(DPI识别腾讯网appid=5030115, appset命中);
+      选"百度"→www.baidu.com(百度5060173). 验证DPI识别+appset匹配+选路完整链路(协议分流核心价值).
+      具体协议在协议树深层, select_protocol树展开定位不到→自动回退dialog搜索选中(page._search_and_select_proto).
+    - 辅助场景-所有协议: 根节点全选(appid_all_flag匹配所有流量)→baidu/qq命中+选路, 验证选路机制+src IP分组限定.
+    !! 历史"网络协议"+http误判: baidu/qq是具体应用(百度/QQ appid), 不属"网络协议"(DNS/NTP/ICMP通用协议)分类
+    appset→Δpkts=0. 改用具体协议匹配对应appid域名, 或"所有协议"全匹配. 协议分流功能本身完全正常, 非功能bug."""
 
     PREFIX = "prflow_"
     TARGET_WAN = "wan2"
     TEST_DOMAINS = ["www.baidu.com", "www.qq.com"]
     IP_GROUP_NAME = "prflow_ipsrc"
+    # 具体协议→验证域名(DPI识别该域名为对应协议的appid, 选该协议→appset含此appid→命中+选路).
+    # 实测appid: www.qq.com→腾讯网(5030115), www.baidu.com→百度(5060173). 主场景验证DPI识别+appset匹配+选路.
+    PROTO_DOMAIN_CASES = [
+        {"proto": "腾讯网", "domain": "www.qq.com", "rule": "prflow_qq"},
+        {"proto": "百度", "domain": "www.baidu.com", "rule": "prflow_bd"},
+    ]
 
     def test_protocol_route_flow(self, protocol_route_page_logged_in, step_recorder, request):
         page = protocol_route_page_logged_in
@@ -1035,9 +1045,8 @@ class TestProtocolRouteFlowVerification:
 
             命中=mangle STREAM_LAYER7_NEW counter Δpkts>0(规则匹配流量); cflow L7增量辅助.
             选路=规则--set-mark值出现在client连接mark里(被规则匹配+打标+--set-ifname wan选路).
-            ⚠️conntrack remote_if对协议分流(L7)不可靠: curl的http未必在"网络协议"appset里→未匹配mark=0走默认WAN;
-            匹配的流量(如DNS)被打rule mark+--set-ifname选路, 故用client连接mark==规则mark作选路铁证(非remote_if).
-            DPI正常(识别baidu appid/domain); 协议分流功能正常(匹配流量打mark选路)."""
+            规则用"所有协议"(appid_all_flag匹配所有流量), http流量稳定命中+被打rule mark+--set-ifname选路.
+            选路铁证=client连接mark==规则--set-mark(实测4000011, remote_if=目标wan)."""
             bv.clear_client_conntrack(client_ip)
             bv.reset_cflow_stats()
             cf_b = bv.read_cflow_stats()["l7"]
@@ -1065,9 +1074,10 @@ class TestProtocolRouteFlowVerification:
             if not selected:
                 failures.append(f"{domain} 未选路{target_wan}(wans={wans} mark_sel={mark_selected})")
 
-        def _run_scenario(scenario_label, rule_name, ip_mac_group):
+        def _run_scenario(scenario_label, rule_name, proto, domains, ip_mac_group=None):
             grp_desc = ip_mac_group or "无(全IP生效)"
-            with rec.step(scenario_label, f"proto=网络协议 line={target_wan} ip_mac_group={grp_desc}"):
+            dom_desc = "+".join(domains)
+            with rec.step(scenario_label, f"proto={proto} line={target_wan} 域名={dom_desc} src={grp_desc}"):
                 page.navigate_to_protocol_route()
                 page.page.wait_for_timeout(800)
                 try:
@@ -1076,7 +1086,10 @@ class TestProtocolRouteFlowVerification:
                 except Exception:
                     pass
                 _force_clean()
-                ok = page.add_rule(rule_name, line=target_wan, proto="网络协议",
+                # proto="所有协议"=根节点全选(appid_all匹配所有流量); 具体协议(腾讯网/百度)=协议树深层具体应用,
+                # select_protocol树展开定位不到→自动回退dialog搜索选中(page._search_and_select_proto),
+                # appset含对应appid(DPI识别www.qq.com→腾讯网5030115, www.baidu.com→百度5060173)→命中+选路.
+                ok = page.add_rule(rule_name, line=target_wan, proto=proto,
                                    priority=1, ip_mac_group=ip_mac_group)
                 if not ok:
                     failures.append(f"{scenario_label}建规则失败: {rule_name}")
@@ -1085,7 +1098,7 @@ class TestProtocolRouteFlowVerification:
                 page.page.wait_for_timeout(2000)
                 rule = bv.find_stream_layer7_rule(tagname=rule_name)
                 rid = rule.get("id") if rule else None
-                rec.add_detail(f"  ✓ 建规则 id={rid} ip_mac_group={grp_desc}")
+                rec.add_detail(f"  ✓ 建规则 id={rid} proto={proto}")
                 # L1-L4 后端验证(报告体现: 数据库→iptables(STREAM_LAYER7_NEW)→策略路由→ik_core模块)
                 if rid:
                     for _r in (
@@ -1097,7 +1110,7 @@ class TestProtocolRouteFlowVerification:
                         rec.add_detail(f"  {_r.level}: {'[OK]' if _r.passed else '[FAIL]'} {_r.message}")
                         if not _r.passed:
                             failures.append(f"{_r.level}-{rule_name}: {_r.message}")
-                    for d in self.TEST_DOMAINS:
+                    for d in domains:
                         _verify_domain(rid, d)
                 try:
                     page.navigate_to_protocol_route()
@@ -1123,8 +1136,13 @@ class TestProtocolRouteFlowVerification:
                 ip_ok = ip_page.add_rule(self.IP_GROUP_NAME, ips=[client_ip])
                 rec.add_detail(f"  IP分组{self.IP_GROUP_NAME}(含{client_ip}): {'✓' if ip_ok else '✗'}")
             try:
-                _run_scenario("场景1: 指定内网IP(IP分组限定)", f"{self.PREFIX}srcip", self.IP_GROUP_NAME)
-                _run_scenario("场景2: 不指定内网IP(全IP生效)", f"{self.PREFIX}allip", None)
+                # 主场景: 具体协议(验证DPI识别+appset匹配+选路完整链路, 协议分流核心价值)
+                for case in self.PROTO_DOMAIN_CASES:
+                    _run_scenario(f"具体协议: {case['proto']}→{case['domain']}",
+                                  case["rule"], case["proto"], [case["domain"]])
+                # 辅助场景: 所有协议(IP分组限定src=client, 根节点全选匹配所有→多域名命中, 验证选路机制+src限定)
+                _run_scenario("辅助: 所有协议(IP分组限定)", f"{self.PREFIX}all",
+                              "所有协议", self.TEST_DOMAINS, self.IP_GROUP_NAME)
             finally:
                 try:
                     ip_page.navigate_back_to_list()
@@ -1135,7 +1153,7 @@ class TestProtocolRouteFlowVerification:
             try:
                 page.navigate_to_protocol_route()
                 page.page.wait_for_timeout(500)
-                for rn in (f"{self.PREFIX}srcip", f"{self.PREFIX}allip"):
+                for rn in (f"{self.PREFIX}all", *[c["rule"] for c in self.PROTO_DOMAIN_CASES]):
                     try:
                         page.delete_rule(rn)
                     except Exception:

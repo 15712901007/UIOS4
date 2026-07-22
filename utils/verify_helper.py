@@ -13,7 +13,9 @@ collect_cmds_since_mark 差量捕获, 命令在 SSHClient.exec 咽喉点录制)�
 特化闭包(mac_access 的 PASS/FAIL格式 / ipv6_lan/wan 的自定义count对比)不套工厂,
 用 attach_cmd_recording_to_closure 包一层即可获得命令显示, 逻辑零改动。
 """
-from typing import Callable, List
+from typing import Any, Callable, List, Optional, Sequence
+
+from utils.replay_commands import build_verification_commands
 
 
 def _format_cmds(cmds: List[str], per_limit: int = 200) -> str:
@@ -21,6 +23,71 @@ def _format_cmds(cmds: List[str], per_limit: int = 200) -> str:
     if not cmds:
         return ""
     return "; ".join(c[:per_limit] for c in cmds)
+
+
+def _is_safe_report_verifier(verify_func: Optional[Callable]) -> bool:
+    """判断是否为禁止回退展示内部脚本的已迁移验证器。"""
+    name = getattr(verify_func, "__name__", "")
+    module = getattr(verify_func, "__module__", "")
+    basic_setting = name.startswith((
+        "get_basic_", "verify_basic_", "run_basic_", "prepare_basic_",
+        "restore_basic_", "cleanup_basic_",
+    ))
+    return (
+        basic_setting or
+        module.endswith("ospf_verifier") or
+        module.endswith("ioc_verifier") or
+        module.endswith("qemu_verifier") or
+        "ospf" in name or
+        "ioc" in name.lower() or
+        any(service in name for service in ("ftp", "samba", "http")) or
+        "alg" in name.lower() or
+        ("snmp" in name and "netsnmpc" not in name)
+    )
+
+
+def _record_verification_commands(
+    bv,
+    rec,
+    mark,
+    *,
+    verify_func: Optional[Callable] = None,
+    verify_args: Sequence[Any] = (),
+    verify_kwargs: Optional[dict] = None,
+    result: Any = None,
+) -> None:
+    """把一次后端验证对应的人工复验命令写入当前步骤。
+
+    基础设置及 FTP/Samba/HTTP/SNMP 使用独立的语义化、逐条可复制命令，
+    绝不回退展示机器内部脚本；L5 命令由生成器明确标注影响。尚未迁移的模块继续
+    走原有命令详情路径，避免影响历史报告。
+    """
+    internal_cmds = bv.collect_cmds_since_mark(mark)
+    manual_commands = None
+    if verify_func is not None:
+        try:
+            manual_commands = build_verification_commands(
+                bv,
+                verify_func,
+                args=tuple(verify_args or ()),
+                kwargs=dict(verify_kwargs or {}),
+                result=result,
+            )
+        except Exception as exc:
+            # 已迁移模块禁止因人工命令生成异常而回退展示含变量/循环/秘密输入的
+            # 自动化脚本；报告保留一条中文提示，便于继续定位生成器问题。
+            if _is_safe_report_verifier(verify_func):
+                manual_commands = []
+                rec.add_detail(f"【人工复验命令】⚠ 生成失败，已隐藏自动化内部脚本：{str(exc)[:160]}")
+
+    if manual_commands is not None:
+        if manual_commands:
+            rec.add_verification_commands(manual_commands)
+        return
+
+    text = _format_cmds(internal_cmds)
+    if text:
+        rec.add_detail(f"      验证命令({len(internal_cmds)}): {text}")
 
 
 def make_ssh_verify(bv, rec, failures, *, soft_assert: bool = False,
@@ -69,10 +136,15 @@ def make_ssh_verify(bv, rec, failures, *, soft_assert: bool = False,
                 failures.append(f"SSH-{label}: 异常被吞 - {str(e)[:80]}")
             return None
         finally:
-            cmds = bv.collect_cmds_since_mark(mark)
-            txt = _format_cmds(cmds)
-            if txt:
-                rec.add_detail(f"      验证命令({len(cmds)}): {txt}")
+            _record_verification_commands(
+                bv,
+                rec,
+                mark,
+                verify_func=verify_func,
+                verify_args=args,
+                verify_kwargs=kwargs,
+                result=locals().get("result"),
+            )
     return ssh_verify
 
 
@@ -129,12 +201,34 @@ def attach_cmd_recording_to_closure(bv, rec, closure):
     """
     def wrapper(*args, **kwargs):
         mark = bv.mark_cmd_start() if bv is not None else None
+        result = None
         try:
-            return closure(*args, **kwargs)
+            result = closure(*args, **kwargs)
+            return result
         finally:
             if bv is not None and mark is not None:
-                cmds = bv.collect_cmds_since_mark(mark)
-                txt = _format_cmds(cmds)
-                if txt:
-                    rec.add_detail(f"      验证命令({len(cmds)}): {txt}")
+                # 本项目保留的特化闭包通常形如
+                # ssh_verify(label, verify_func, *verify_args, must_pass=..., **verify_kwargs)。
+                # 只有第二个位置参数确实可调用时才按该约定提取；其他历史闭包
+                # 自动保留旧命令展示路径。
+                called_verifier = (
+                    args[1] if len(args) > 1 and callable(args[1]) else None
+                )
+                # 允许带重试/等待的本地闭包显式声明其底层公开验证器，
+                # 人工命令仍按底层验证器的稳定签名生成。
+                verify_func = getattr(
+                    called_verifier, "__report_verifier__", called_verifier
+                )
+                verify_args = args[2:] if verify_func is not None else ()
+                verify_kwargs = dict(kwargs)
+                verify_kwargs.pop("must_pass", None)
+                _record_verification_commands(
+                    bv,
+                    rec,
+                    mark,
+                    verify_func=verify_func,
+                    verify_args=verify_args,
+                    verify_kwargs=verify_kwargs,
+                    result=result,
+                )
     return wrapper

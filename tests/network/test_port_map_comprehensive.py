@@ -1103,14 +1103,6 @@ class TestPortMapFlowVerification:
             except Exception:
                 pass
 
-        def _trigger_dnat():
-            """client外网侧(10.66.0.18)发SYN到wan3:WAN_PORT, 触发PREROUTING DNAT建conntrack条目."""
-            bv.connect_client()
-            for _ in range(3):
-                bv._client.exec(
-                    f"curl -s -o /dev/null --connect-timeout 2 -m 3 http://{self.WAN_IP}:{self.WAN_PORT}/ 2>/dev/null",
-                    timeout=8)
-
         try:
             # 环境检查: 动态获取wan3 IP + client外网侧可达
             with rec.step("环境检查", "动态获取wan3 IP + client可达"):
@@ -1163,18 +1155,25 @@ class TestPortMapFlowVerification:
                         if not r.passed:
                             failures.append(f"{r.level}: {r.message}")
 
-                # L5: 触发DNAT + 查conntrack DNAT条目(铁证)
-                with rec.step("L5 DNAT验证", f"外网访问{self.WAN_IP}:{self.WAN_PORT}→conntrack DNAT到{self.LAN_IP}:{self.LAN_PORT}"):
-                    _trigger_dnat()
-                    res = bv.verify_dnat_conntrack(self.WAN_IP, self.WAN_PORT, self.LAN_IP, self.LAN_PORT)
+                # L5: DNAT数据平面验证(计数增量法, 不受conntrack 5秒超时影响, 0 flaky)
+                with rec.step("L5 DNAT验证", f"外网访问{self.WAN_IP}:{self.WAN_PORT}→DNAT到{self.LAN_IP}:{self.LAN_PORT}"):
+                    # 主验证: DSTNAT规则pkts计数增量(SYN命中规则=DNAT执行, 内部已含触发)
+                    res = bv.verify_dnat_counter_increment(
+                        self.WAN_IP, self.WAN_PORT, self.LAN_IP, self.LAN_PORT)
                     rec.add_detail(f"  {res.message}")
                     if res.raw_output:
-                        rec.add_detail(f"  conntrack: {res.raw_output}")
+                        rec.add_detail(f"  规则计数: {res.raw_output}")
                     if res.passed:
                         rec.add_detail("  ✓ 端口映射DNAT生效(数据平面)")
                     else:
-                        rec.add_detail("  ✗ 端口映射未生效(无DNAT条目)")
+                        rec.add_detail("  ✗ 端口映射未生效(SYN未命中DNAT规则)")
                         failures.append(f"端口映射DNAT未生效: {res.message}")
+                    # 辅助: conntrack条目(仅信息, 不作判定; iKuai syn_sent=5秒可能已清)
+                    try:
+                        cres = bv.verify_dnat_conntrack(self.WAN_IP, self.WAN_PORT, self.LAN_IP, self.LAN_PORT)
+                        rec.add_detail(f"  [辅助] conntrack: {cres.message}")
+                    except Exception:
+                        pass
 
                 # 删规则→验证DNAT消失(恢复)
                 with rec.step("删规则恢复", "删映射→再访问→DNAT应消失"):
@@ -1186,10 +1185,12 @@ class TestPortMapFlowVerification:
                         pass
                     _force_clean()
                     page.page.wait_for_timeout(1500)
-                    _trigger_dnat()
-                    res2 = bv.verify_dnat_conntrack(self.WAN_IP, self.WAN_PORT, self.LAN_IP, self.LAN_PORT)
+                    # 计数法: 删规则后DSTNAT应无匹配规则(passed=False=恢复, passed=True=残留)
+                    res2 = bv.verify_dnat_counter_increment(
+                        self.WAN_IP, self.WAN_PORT, self.LAN_IP, self.LAN_PORT)
+                    rec.add_detail(f"  {res2.message}")
                     if res2.passed:
-                        rec.add_detail("  ✗ 删规则后仍有DNAT(规则残留)")
+                        rec.add_detail("  ✗ 删规则后DNAT仍生效(规则残留)")
                         failures.append("删规则后DNAT仍存在(残留)")
                     else:
                         rec.add_detail("  ✓ 删规则后DNAT消失(恢复)")

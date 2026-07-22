@@ -10,6 +10,20 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from jinja2 import Environment, FileSystemLoader
 
+from utils.step_recorder import redact_sensitive_text
+
+
+def _sanitize_report_value(value):
+    if isinstance(value, dict):
+        return {key: _sanitize_report_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_report_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_report_value(item) for item in value)
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    return value
+
 
 class ReportGenerator:
     """测试报告生成器"""
@@ -52,7 +66,12 @@ class ReportGenerator:
         template = self.env.get_template("report_template.html")
 
         # 准备模板数据
-        data = self._prepare_template_data(test_results, report_title, device_info, tester)
+        data = self._prepare_template_data(
+            _sanitize_report_value(test_results),
+            redact_sensitive_text(report_title),
+            _sanitize_report_value(device_info or {}),
+            redact_sensitive_text(tester),
+        )
 
         # 渲染模板
         html_content = template.render(**data)
@@ -83,6 +102,35 @@ class ReportGenerator:
         name = case.get('name') or case.get('original_name') or ''
         text = f"{err}\n{tb}"
         lower = text.lower()
+
+        # OSPF/IPsec综合用例已经在步骤层区分产品、自动化和环境失败。
+        # 优先采用该分类，避免因正文出现“数据库/后端”等证据词而误判成
+        # “SSH验证失败”，让非研发读者先看到业务结论。
+        if "OSPF综合测试失败" in text and "产品根因" in text:
+            return {
+                'category': 'OSPF产品功能缺陷',
+                'reason': (
+                    f"【{name}】自动化已完成页面、后台和真实协议验证。"
+                    "报告保留了真实产品问题；自动化及恢复问题已单独统计。"
+                ),
+                'suggestion': (
+                    '先查看“失败步骤摘要”中的操作、期望结果和实际现象；'
+                    '需要研发定位时，再展开后端证据和人工复验命令。'
+                ),
+            }
+
+        if "IPsec VPN综合验证失败" in text and "产品=" in text:
+            return {
+                'category': 'IPsec产品功能缺陷',
+                'reason': (
+                    f"【{name}】自动化已完成页面、后台和真实连接验证。"
+                    "失败项已按测试步骤写成中文现象，不是测试脚本或网络环境中断。"
+                ),
+                'suggestion': (
+                    '先查看报告顶部“失败步骤摘要”，按操作、实际现象和期望结果逐项复现；'
+                    '需要研发定位时，再展开对应步骤中的后端证据和人工复验命令。'
+                ),
+            }
 
         # 1. 保存接口报错 code2006（磁盘满典型表现）
         if '2006' in text or '写入数据失败' in text or '写入失败' in text:

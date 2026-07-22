@@ -4,7 +4,10 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
+# Ignore generated build contents, but keep the two PyInstaller specs versionable.
+build/*
+!build/ikuai_test.spec
+!build/ikuai_test_onefile.spec
 develop-eggs/
 dist/
 downloads/

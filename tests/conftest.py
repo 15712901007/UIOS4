@@ -14,9 +14,17 @@ from typing import Generator, Dict, List, Optional
 # 解决Windows控制台GBK编码问题（全局只执行一次）
 if sys.platform == 'win32':
     try:
-        if hasattr(sys.stdout, 'buffer') and not sys.stdout.closed:
+        stdout_encoding = str(getattr(sys.stdout, "encoding", "") or "").lower()
+        stderr_encoding = str(getattr(sys.stderr, "encoding", "") or "").lower()
+        if (
+            hasattr(sys.stdout, 'buffer') and not sys.stdout.closed
+            and stdout_encoding.replace("-", "") != "utf8"
+        ):
             sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', write_through=True)
-        if hasattr(sys.stderr, 'buffer') and not sys.stderr.closed:
+        if (
+            hasattr(sys.stderr, 'buffer') and not sys.stderr.closed
+            and stderr_encoding.replace("-", "") != "utf8"
+        ):
             sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', write_through=True)
     except Exception:
         pass
@@ -74,10 +82,79 @@ def browser_context_args() -> Dict:
     return {}
 
 
+def _is_threat_intelligence_item(item) -> bool:
+    """Return whether a test must not emit visual/network browser artifacts.
+
+    IOC pages can render raw indicators and external log payloads. Those
+    values are not reliably redactable once captured in a PNG, video, HAR, or
+    Playwright trace, so this guard is tied to the explicit marker (with a
+    node-id fallback for setup failures).
+    """
+    try:
+        marker = item.get_closest_marker("threat_intelligence")
+        if marker is not None:
+            return True
+    except Exception:
+        pass
+    nodeid = str(getattr(item, "nodeid", "") or getattr(item, "name", ""))
+    return "test_threat_intelligence_comprehensive" in nodeid
+
+
+def _is_threat_intelligence_report(report) -> bool:
+    """Marker-aware counterpart used after pytest creates a TestReport."""
+    try:
+        keywords = getattr(report, "keywords", {}) or {}
+        if "threat_intelligence" in keywords:
+            return True
+    except Exception:
+        pass
+    return _is_threat_intelligence_item(report)
+
+
+@pytest.fixture(autouse=True)
+def _threat_intelligence_artifact_guard(request):
+    """Disable Playwright visual/trace capture for IOC tests only.
+
+    The pytest-playwright plugin reads these options while creating its
+    artifact recorder. This autouse fixture runs before ordinary function
+    fixtures, then restores the process options after teardown so unrelated
+    tests retain their configured capture behavior.
+    """
+    if not _is_threat_intelligence_item(request.node):
+        yield
+        return
+
+    option = getattr(request.config, "option", None)
+    previous = {}
+    for name in ("screenshot", "video", "tracing"):
+        if option is None or not hasattr(option, name):
+            continue
+        previous[name] = getattr(option, name)
+        setattr(option, name, "off")
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            setattr(option, name, value)
+
+
 @pytest.fixture(scope="function")
-def context(browser: Browser, browser_context_args: Dict) -> Generator[BrowserContext, None, None]:
+def context(
+    browser: Browser,
+    browser_context_args: Dict,
+    request,
+) -> Generator[BrowserContext, None, None]:
     """浏览器上下文"""
-    context = browser.new_context(**browser_context_args)
+    context_args = dict(browser_context_args or {})
+    if _is_threat_intelligence_item(request.node):
+        # Defensive cleanup for callers or plugins that provide capture args
+        # through ``browser_context_args`` instead of pytest CLI options.
+        for key in (
+            "record_video_dir", "record_video_size", "record_har_path",
+            "record_har_content", "record_har_mode", "record_har_omit_content",
+        ):
+            context_args.pop(key, None)
+    context = browser.new_context(**context_args)
     yield context
     context.close()
 
@@ -99,6 +176,7 @@ from pages.network.static_route_page import StaticRoutePage
 from pages.network.cross_layer_service_page import CrossLayerServicePage
 from pages.network.multi_wan_lb_page import MultiWanLbPage
 from pages.network.protocol_route_page import ProtocolRoutePage
+from pages.network.ospf_page import OspfPage
 from pages.network.port_route_page import PortRoutePage
 from pages.network.domain_route_page import DomainRoutePage
 from pages.network.updown_route_page import UpdownRoutePage
@@ -138,11 +216,29 @@ from pages.security.acl_page import AclPage
 from pages.security.conn_limit_page import ConnLimitPage
 from pages.security.mac_access_control_page import MacAccessControlPage
 from pages.security.arp_setting_page import ArpSettingPage
+from pages.security.terminal_name_page import TerminalNamePage
+from pages.security.threat_intelligence_page import ThreatIntelligencePage
 from pages.security.app_protocol_page import AppProtocolPage
 from pages.security.advanced_page import AdvancedPage
 from pages.security.other_control_page import OtherControlPage
+from pages.device_setting.basic_setting_page import BasicSettingPage
+from pages.device_setting.alg_setting_page import AlgSettingPage
+from pages.device_setting.protocol_control_page import ProtocolControlPage
+from pages.advanced_service.ftp_server_page import FtpServerPage
+from pages.advanced_service.samba_server_page import SambaServerPage
+from pages.advanced_service.http_server_page import HttpServerPage
+from pages.advanced_service.snmp_server_page import SnmpServerPage
+from pages.advanced_service.virtual_machine_page import VirtualMachinePage
+from pages.advanced_service.gre_tunnel_page import GreTunnelPage
 from utils.report_generator import ReportGenerator
-from utils.step_recorder import StepRecorder, get_step_recorder
+from utils.step_recorder import (
+    StepRecorder,
+    get_step_recorder,
+    redact_sensitive_text,
+    register_sensitive_values,
+    get_registered_sensitive_values,
+    clear_registered_sensitive_values,
+)
 
 
 # ==================== SSH后台验证 ====================
@@ -194,6 +290,7 @@ TEST_NAME_MAPPING = {
     'test_ip_rate_limit_comprehensive': 'IP限速综合测试',
     'test_mac_rate_limit_comprehensive': 'MAC限速综合测试',
     'test_static_route_comprehensive': '静态路由综合测试',
+    'test_ospf_comprehensive': '网络配置-OSPF综合测试',
     'test_static_route_flow': '静态路由功能验证(ping环回)',
     'test_cross_layer_service_comprehensive': '跨三层服务综合测试',
     'test_multi_wan_lb_comprehensive': '多线负载综合测试',
@@ -239,6 +336,8 @@ TEST_NAME_MAPPING = {
     'test_app_protocol_flow_verification': '安全中心-应用协议控制功能验证(端到端drop+停用BUG三重信号)',
     'test_advanced_comprehensive': '安全中心-高级设置综合测试',
     'test_other_control_comprehensive': '安全中心-其他控制综合测试',
+    'test_terminal_name_comprehensive': '安全中心-终端名称管理综合测试',
+    'test_threat_intelligence_comprehensive': '安全中心-威胁情报中心综合测试',
     'test_ipv6_static_comprehensive': 'IPv6前缀静态分配综合测试',
     'test_ipv6_wan_comprehensive': 'IPv6外网设置综合测试',
     'test_ipv6_lan_comprehensive': 'IPv6内网设置综合测试',
@@ -257,6 +356,20 @@ TEST_NAME_MAPPING = {
     'test_ipsec_vpn_comprehensive': 'IPSec VPN综合测试',
     'test_ike_client_comprehensive': 'IKEv2/IPSec客户端综合测试',
     'test_wireguard_comprehensive': 'WireGuard客户端综合测试',
+    'test_ftp_server_comprehensive': '高级服务-本地服务-FTP服务',
+    'test_samba_server_comprehensive': '高级服务-本地服务-Samba服务',
+    'test_http_server_comprehensive': '高级服务-本地服务-HTTP服务',
+    'test_snmp_server_comprehensive': '高级服务-本地服务-SNMP服务',
+    'test_virtual_machine_comprehensive': '高级服务-虚拟机',
+    'test_gre_tunnel_comprehensive': '虚拟专网-GRE隧道-综合测试',
+    'test_gre_config_effect': '虚拟专网-GRE隧道-配置真生效(内核ip -d)',
+    'test_gre_boundary': '虚拟专网-GRE隧道-边界值校验',
+    'test_gre_lifecycle': '虚拟专网-GRE隧道-生命周期/残留',
+    'test_gre_ui_prompts': '虚拟专网-GRE隧道-UI提示规范',
+    'test_gre_dataplane_capture': '虚拟专网-GRE隧道-数据面抓包',
+    'test_basic_setting_comprehensive': '设备设置-基础设置',
+    'test_alg_setting_comprehensive': '设备设置-高级管理-ALG设置',
+    'test_protocol_control_comprehensive': '设备设置-高级管理-协议控制',
 }
 
 
@@ -300,7 +413,21 @@ def config() -> Config:
     Returns:
         Config对象
     """
-    return get_config_with_env()
+    loaded = get_config_with_env()
+    # Credentials stay in process memory only.  Register every configured
+    # password before browser/SSH fixtures can place an exception or command
+    # result into the shared JSON/HTML/Excel report pipeline.
+    register_sensitive_values((
+        loaded.device.username,
+        loaded.device.password,
+        loaded.ssh.router.username,
+        loaded.ssh.router.password,
+        loaded.ssh.router.console_username,
+        loaded.ssh.router.console_password,
+        loaded.ssh.client.username,
+        loaded.ssh.client.password,
+    ))
+    return loaded
 
 
 # ==================== 浏览器配置fixtures ====================
@@ -955,6 +1082,36 @@ def arp_setting_page_logged_in(logged_in_page: Page, config: Config) -> ArpSetti
 
 
 @pytest.fixture(scope="function")
+def terminal_name_page(page: Page, config: Config) -> TerminalNamePage:
+    """创建终端名称管理页面实例(安全中心>终端名称管理)"""
+    return TerminalNamePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def terminal_name_page_logged_in(logged_in_page: Page, config: Config) -> TerminalNamePage:
+    """已登录并导航到终端名称管理列表页的实例(安全中心>终端名称管理)"""
+    pg = TerminalNamePage(logged_in_page, config.get_base_url())
+    pg.navigate_to_terminal_name()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def threat_intelligence_page(page: Page, config: Config) -> ThreatIntelligencePage:
+    """创建安全中心-威胁情报中心页面实例（默认可能关闭）。"""
+    return ThreatIntelligencePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def threat_intelligence_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> ThreatIntelligencePage:
+    """返回已登录并进入威胁情报中心根页面的实例。"""
+    pg = ThreatIntelligencePage(logged_in_page, config.get_base_url())
+    pg.navigate_to_threat_intelligence()
+    return pg
+
+
+@pytest.fixture(scope="function")
 def app_protocol_page(page: Page, config: Config) -> AppProtocolPage:
     """创建应用协议控制页面实例(安全中心>应用协议控制)"""
     return AppProtocolPage(page, config.get_base_url())
@@ -1096,6 +1253,156 @@ def wireguard_page_logged_in(logged_in_page: Page, config: Config) -> 'Wireguard
     return pg
 
 
+@pytest.fixture(scope="function")
+def basic_setting_page(page: Page, config: Config) -> BasicSettingPage:
+    """创建设备设置-基础设置页面实例。"""
+    return BasicSettingPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def basic_setting_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> BasicSettingPage:
+    """返回已登录并进入设备设置-基础设置的页面实例。"""
+    basic_page = BasicSettingPage(logged_in_page, config.get_base_url())
+    basic_page.navigate_to_basic_setting()
+    return basic_page
+
+
+@pytest.fixture(scope="function")
+def alg_setting_page(page: Page, config: Config) -> AlgSettingPage:
+    """创建设备设置-高级管理-ALG设置页面实例。"""
+    return AlgSettingPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def alg_setting_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> AlgSettingPage:
+    """返回已登录并进入设备设置-高级管理-ALG设置的页面实例。"""
+    alg_page = AlgSettingPage(logged_in_page, config.get_base_url())
+    if not alg_page.navigate_to_alg_setting():
+        pytest.fail("无法导航到设备设置-高级管理-ALG设置")
+    return alg_page
+
+
+@pytest.fixture(scope="function")
+def protocol_control_page(page: Page, config: Config) -> ProtocolControlPage:
+    """创建设备设置-高级管理-协议控制页面实例。"""
+    return ProtocolControlPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def protocol_control_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> ProtocolControlPage:
+    """返回已登录并进入设备设置-高级管理-协议控制的页面实例。"""
+    protocol_page = ProtocolControlPage(logged_in_page, config.get_base_url())
+    if not protocol_page.navigate_to_protocol_control():
+        pytest.fail("无法导航到设备设置-高级管理-协议控制")
+    return protocol_page
+
+
+@pytest.fixture(scope="function")
+def ospf_page(page: Page, config: Config) -> OspfPage:
+    """创建网络配置-OSPF页面实例。"""
+    return OspfPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def ospf_page_logged_in(logged_in_page: Page, config: Config) -> OspfPage:
+    """返回已登录并进入网络配置-OSPF的页面实例。"""
+    ospf = OspfPage(logged_in_page, config.get_base_url())
+    ospf.navigate_to_ospf()
+    return ospf
+
+
+@pytest.fixture(scope="function")
+def ftp_server_page(page: Page, config: Config) -> FtpServerPage:
+    """创建高级服务-本地服务-FTP服务页面实例"""
+    return FtpServerPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def ftp_server_page_logged_in(logged_in_page: Page, config: Config) -> FtpServerPage:
+    """已登录并导航到高级服务-本地服务-FTP服务页面的实例"""
+    pg = FtpServerPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_ftp_server()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def samba_server_page(page: Page, config: Config) -> SambaServerPage:
+    """创建高级服务-本地服务-Samba服务页面实例"""
+    return SambaServerPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def samba_server_page_logged_in(logged_in_page: Page, config: Config) -> SambaServerPage:
+    """已登录并导航到高级服务-本地服务-Samba服务页面的实例"""
+    pg = SambaServerPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_samba_server()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def http_server_page(page: Page, config: Config) -> HttpServerPage:
+    """创建高级服务-本地服务-HTTP服务页面实例"""
+    return HttpServerPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def http_server_page_logged_in(logged_in_page: Page, config: Config) -> HttpServerPage:
+    """已登录并导航到高级服务-本地服务-HTTP服务页面的实例"""
+    pg = HttpServerPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_http_server()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def snmp_server_page(page: Page, config: Config) -> SnmpServerPage:
+    """创建高级服务-本地服务-SNMP服务页面实例"""
+    return SnmpServerPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def snmp_server_page_logged_in(logged_in_page: Page, config: Config) -> SnmpServerPage:
+    """已登录并导航到高级服务-本地服务-SNMP服务页面的实例"""
+    pg = SnmpServerPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_snmp_server()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def virtual_machine_page(page: Page, config: Config) -> VirtualMachinePage:
+    """创建高级服务-虚拟机页面实例。"""
+    return VirtualMachinePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def virtual_machine_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> VirtualMachinePage:
+    """返回已登录并导航到高级服务-虚拟机的页面实例。"""
+    pg = VirtualMachinePage(logged_in_page, config.get_base_url())
+    pg.navigate_to_virtual_machine()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def gre_tunnel_page(page: Page, config: Config) -> GreTunnelPage:
+    """创建虚拟专网-GRE隧道页面实例"""
+    return GreTunnelPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def gre_tunnel_page_logged_in(logged_in_page: Page, config: Config) -> GreTunnelPage:
+    """已登录并导航到虚拟专网-GRE隧道页面的实例"""
+    pg = GreTunnelPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_gre()
+    return pg
+
+
 # ==================== 测试数据fixtures ====================
 
 @pytest.fixture(scope="session")
@@ -1133,6 +1440,23 @@ def backend_verifier():
         yield verifier
     finally:
         verifier.close()
+
+
+@pytest.fixture(scope="function")
+def ospf_verifier(backend_verifier):
+    """OSPF L1-L5验证器，复用BackendVerifier的三端安全连接。"""
+    if backend_verifier is None:
+        pytest.fail("OSPF综合测试必须启用SSH backend_verifier")
+    return backend_verifier.get_ospf_verifier()
+
+
+@pytest.fixture(scope="function")
+def ipsec_verifier(backend_verifier):
+    """新版“虚拟专网 -> IPsec VPN”双端 L1-L5 验证器。"""
+    if backend_verifier is None:
+        pytest.fail("IPsec VPN综合测试必须启用SSH backend_verifier")
+    from utils.ipsec_verifier import IpsecVerifier
+    return IpsecVerifier(backend_verifier)
 
 
 @pytest.fixture(scope="function")
@@ -1292,8 +1616,16 @@ def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
 
-    # 只在测试调用阶段（非setup/teardown）且失败时处理
-    if call.when == "call" and report.failed:
+    # call/setup 失败都尽量截图；登录或页面fixture失败同样需要证据。
+    if call.when in ("setup", "call") and report.failed:
+        # 基础设置页面会显示原设备名称和自定义NTP地址。失败截图以
+        # base64直接嵌入HTML，无法可靠逐像素脱敏，因此该高风险单例模块
+        # 明确禁用截图，改用六段结构化证据、API契约与后端运行态定位。
+        if (
+            item.get_closest_marker("basic_setting") is not None
+            or _is_threat_intelligence_item(item)
+        ):
+            return
         # 获取page fixture(优先用实际测试的page,而不是底层空白page)
         # 测试用例通常用 xxx_page_logged_in fixture,它内部的page才是有内容的
         screenshot_page = None
@@ -1340,7 +1672,7 @@ def pytest_runtest_makereport(item, call):
                     "type": "image",
                 })
             except Exception as e:
-                print(f"截图失败: {e}")
+                print(f"截图失败: {type(e).__name__}")
 
 
 def pytest_configure(config):
@@ -1484,12 +1816,56 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "wireguard: WireGuard客户端模块测试"
     )
+    config.addinivalue_line(
+        "markers", "device_setting: 设备设置模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "basic_setting: 设备设置-基础设置模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "alg_setting: 设备设置-高级管理-ALG设置模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "advanced_service: 高级服务模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "ftp_server: 高级服务-本地服务-FTP服务模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "samba_server: 高级服务-本地服务-Samba服务模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "http_server: 高级服务-本地服务-HTTP服务模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "snmp_server: 高级服务-本地服务-SNMP服务模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "virtual_machine: 高级服务-虚拟机模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "gre_tunnel: 虚拟专网-GRE隧道模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "threat_intelligence: 安全中心-威胁情报中心模块测试"
+    )
     config.addinivalue_line("markers", "p0: P0冒烟-核心CRUD/导入导出/批量(必跑)")
     config.addinivalue_line("markers", "p1: P1功能-全协议/全动作/优先级排序(常规回归)")
     config.addinivalue_line("markers", "p2: P2边界-异常输入/越界/极端值(可选)")
 
-    # 记录开始时间
-    _test_results['start_time'] = datetime.now()
+    # pytest.main() 在打包GUI中可能同进程重复调用，每次会话必须全量清零。
+    _test_results.clear()
+    _test_results.update({
+        'total': 0,
+        'passed': 0,
+        'failed': 0,
+        'skipped': 0,
+        'test_cases': [],
+        'start_time': datetime.now(),
+        'end_time': None,
+        'total_steps': 0,
+    })
+    clear_registered_sensitive_values()
 
 
 def _dt_to_str(v):
@@ -1504,8 +1880,20 @@ def _dt_to_str(v):
         return str(v)
 
 
-def _find_screenshot_path(screenshot_dir, original_name):
-    """按用例名在截图目录找最新的失败截图文件路径(文件名含时间戳)"""
+def _artifact_log_path(path, project_root):
+    """Return a portable path label without exposing the local user directory."""
+    absolute = os.path.abspath(path)
+    root = os.path.abspath(project_root)
+    try:
+        if os.path.commonpath((absolute, root)) == root:
+            return os.path.relpath(absolute, root).replace(os.sep, "/")
+    except (OSError, ValueError):
+        pass
+    return os.path.basename(absolute)
+
+
+def _find_screenshot_path(screenshot_dir, original_name, project_root=None):
+    """查找最新失败截图，并返回相对项目根目录的可移植路径。"""
     if not screenshot_dir or not os.path.isdir(screenshot_dir) or not original_name:
         return ""
     try:
@@ -1515,16 +1903,33 @@ def _find_screenshot_path(screenshot_dir, original_name):
         if not matches:
             return ""
         matches.sort(reverse=True)  # 文件名含时间戳, 倒序取最新
-        return os.path.join(screenshot_dir, matches[0])
+        absolute_path = os.path.abspath(os.path.join(screenshot_dir, matches[0]))
+        base_dir = os.path.abspath(
+            project_root or os.path.dirname(os.path.dirname(__file__))
+        )
+        relative = os.path.relpath(absolute_path, base_dir)
+        if relative == ".." or relative.startswith(".." + os.sep):
+            return os.path.basename(absolute_path)
+        return relative.replace(os.sep, "/")
     except Exception:
         return ""
 
 
-def _dump_test_results_json(results, output_dir, screenshot_dir):
+def _is_threat_intelligence_case_name(original_name) -> bool:
+    """Recognize the IOC case even when pytest appends a browser parameter."""
+    return str(original_name or "").split("[", 1)[0] == (
+        "test_threat_intelligence_comprehensive"
+    )
+
+
+def _dump_test_results_json(
+    results, output_dir, screenshot_dir, project_root=None
+):
     """把 _test_results dump 成 JSON(供 GUI 导出真实测试结果 Excel)。
     截图只存文件路径不存 base64, 避免文件过大。"""
     import json
     data = {
+        "schema_version": 2,
         "total": results.get("total", 0),
         "passed": results.get("passed", 0),
         "failed": results.get("failed", 0),
@@ -1538,7 +1943,15 @@ def _dump_test_results_json(results, output_dir, screenshot_dir):
     for tc in results.get("test_cases", []):
         orig = tc.get("original_name", "")
         # 有 base64 截图才去找文件路径
-        shot_path = _find_screenshot_path(screenshot_dir, orig) if tc.get("screenshot") else ""
+        threat_case = _is_threat_intelligence_case_name(orig)
+        shot_path = (
+            ""
+            if threat_case
+            else (
+                _find_screenshot_path(screenshot_dir, orig, project_root)
+                if tc.get("screenshot") else ""
+            )
+        )
         data["test_cases"].append({
             "name": tc.get("name", ""),
             "original_name": orig,
@@ -1548,12 +1961,38 @@ def _dump_test_results_json(results, output_dir, screenshot_dir):
             "error_traceback": tc.get("error_traceback"),
             "steps": tc.get("steps", []),
             "step_count": tc.get("step_count", 0),
-            "screenshot_path": shot_path,
+            "screenshot_path": "" if threat_case else shot_path,
         })
     json_path = os.path.join(output_dir, "test_results.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return json_path
+
+
+def _sanitize_report_payload(value):
+    """Apply the in-memory credential registry at the final report boundary."""
+    if isinstance(value, dict):
+        sanitized = {
+            key: _sanitize_report_payload(item) for key, item in value.items()
+        }
+        if _is_threat_intelligence_case_name(sanitized.get("original_name")):
+            # A caller/plugin may attach binary or network artifacts without
+            # going through pytest_runtest_makereport. Never serialize those
+            # fields for an IOC case, where pixel-level redaction is unsafe.
+            for key in (
+                "screenshot", "screenshot_path", "video", "video_path",
+                "trace", "trace_path", "har", "har_path", "extra",
+            ):
+                if key in sanitized:
+                    sanitized[key] = [] if key in {"extra", "trace"} else ""
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_report_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_report_payload(item) for item in value)
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    return value
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -1573,10 +2012,10 @@ def pytest_sessionfinish(session, exitstatus):
             # 获取配置
             config = get_config()
             output_dir = config.report.output_dir
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
             # 转换为绝对路径（确保路径不受工作目录影响）
             if not os.path.isabs(output_dir):
-                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 output_dir = os.path.join(project_root, output_dir)
 
             os.makedirs(output_dir, exist_ok=True)
@@ -1588,7 +2027,6 @@ def pytest_sessionfinish(session, exitstatus):
             generator = ReportGenerator()
             device_info = {
                 'ip': config.device.ip,
-                'username': config.device.username,
                 'browser': 'Chromium',
                 'version': os.environ.get('TEST_VERSION', getattr(config.report, 'version', 'v4.0')),
             }
@@ -1596,28 +2034,58 @@ def pytest_sessionfinish(session, exitstatus):
             # 获取测试人员（优先从环境变量获取，这样GUI设置的值可以传递）
             tester = os.environ.get('TESTER', getattr(config.report, 'tester', '自动化测试'))
 
+            safe_results = _sanitize_report_payload(_test_results)
             generator.generate_report(
-                _test_results,
+                safe_results,
                 output_path,
                 report_title="爱快路由器4.0自动化测试报告",
                 device_info=device_info,
                 tester=tester
             )
 
-            print(f"\n[报告] 自定义HTML报告已生成: {output_path}")
+            print(
+                "\n[报告] 自定义HTML报告已生成: "
+                + _artifact_log_path(output_path, project_root)
+            )
 
             # 保存测试结果 JSON(供 GUI "导出测试结果" 使用)
             try:
                 screenshot_dir = config.report.screenshot_dir
                 if not os.path.isabs(screenshot_dir):
                     screenshot_dir = os.path.join(project_root, screenshot_dir)
-                json_path = _dump_test_results_json(_test_results, output_dir, screenshot_dir)
-                print(f"[报告] 测试结果JSON已保存: {json_path}")
+                json_path = _dump_test_results_json(
+                    safe_results, output_dir, screenshot_dir, project_root
+                )
+                print(
+                    "[报告] 测试结果JSON已保存: "
+                    + _artifact_log_path(json_path, project_root)
+                )
+                artifact_paths = [json_path, output_path]
+                leaked_artifacts = []
+                registered = get_registered_sensitive_values()
+                for artifact_path in artifact_paths:
+                    with open(artifact_path, "r", encoding="utf-8") as artifact_file:
+                        artifact_text = artifact_file.read()
+                    if any(secret in artifact_text for secret in registered):
+                        leaked_artifacts.append(os.path.basename(artifact_path))
+                if leaked_artifacts:
+                    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+                    print(
+                        "[安全失败] 报告产物命中内存登记敏感值："
+                        f"文件数={len(leaked_artifacts)}"
+                    )
+                else:
+                    print(
+                        "[安全] JSON/HTML内存登记敏感值扫描通过："
+                        f"登记值数={len(registered)}"
+                    )
             except Exception as je:
-                print(f"[警告] 保存测试结果JSON失败: {je}")
+                print(f"[警告] 保存测试结果JSON失败: {type(je).__name__}")
 
         except Exception as e:
-            print(f"\n[警告] 生成自定义报告失败: {e}")
+            print(f"\n[警告] 生成自定义报告失败: {type(e).__name__}")
+        finally:
+            clear_registered_sensitive_values()
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -1625,8 +2093,12 @@ def pytest_runtest_logreport(report):
     """收集测试结果"""
     yield
 
-    # 只处理测试调用阶段的结果
-    if report.when == 'call':
+    # 正常用例记录call结果；setup失败/跳过时没有call，也必须生成本次报告。
+    collect_result = (
+        report.when == 'call'
+        or (report.when == 'setup' and (report.failed or report.skipped))
+    )
+    if collect_result:
         _test_results['total'] += 1
 
         # 提取测试用例名称
@@ -1665,6 +2137,17 @@ def pytest_runtest_logreport(report):
             'step_count': step_count,  # 添加步骤数
             'screenshot': None
         }
+        privacy_report = _is_threat_intelligence_report(report)
+
+        # 含BUG记录(【⚠ BUG记录】)的 passed case → status=warning,
+        # 让报告顶部"警告用例"统计+用例黄色突出BUG(仅识别record_bug标记, 不影响普通软断言)
+        if report.outcome == 'passed':
+            _has_bug = any(
+                '【⚠ BUG记录】' in ' '.join(_s.get('details', []))
+                for _s in steps
+            )
+            if _has_bug:
+                test_case['status'] = 'warning'
 
         # 处理失败情况
         if report.failed:
@@ -1688,15 +2171,45 @@ def pytest_runtest_logreport(report):
                         if line.strip().startswith('E '):
                             short_error = line.strip()[2:].strip()
                             break
-                test_case['error_message'] = short_error or longrepr[-500:]
-                test_case['error_traceback'] = longrepr  # 保留完整traceback备用
+                safe_error = redact_sensitive_text(short_error or longrepr[-500:])
+                # Pytest's full longrepr embeds source lines.  Password-shaped
+                # invalid test literals must not enter JSON/HTML/Excel even when
+                # the test itself fails, so retain only redacted location and
+                # exception evidence rather than executable source text.
+                import re
+                locations = []
+                for match in re.finditer(
+                    r"(?m)^([^\r\n]*?\.py:\d+)(?::|\s*$)", longrepr
+                ):
+                    location = match.group(1).strip()
+                    if location and location not in locations:
+                        locations.append(location)
+                trace_lines = ["完整源码堆栈已按凭据安全策略隐藏。"]
+                if locations:
+                    trace_lines.append("定位：" + "；".join(locations[-8:]))
+                trace_lines.append("异常：" + safe_error)
+                test_case['error_message'] = safe_error
+                test_case['error_traceback'] = "\n".join(trace_lines)
+            if privacy_report:
+                # A pytest longrepr can contain raw DOM/log values that are
+                # unknown to the credential registry. Keep only a stable,
+                # actionable statement for IOC reports; structured step
+                # evidence remains the source of diagnostic detail.
+                test_case['error_message'] = (
+                    "威胁情报中心综合测试未通过；原始异常文本已隐藏，"
+                    "请查看脱敏后的结构化步骤证据。"
+                )
+                test_case['error_traceback'] = (
+                    "威胁情报中心报告已禁用原始 traceback、截图、视频和 trace；"
+                    "仅保留脱敏后的结构化步骤证据。"
+                )
         elif report.passed:
             _test_results['passed'] += 1
         else:
             _test_results['skipped'] += 1
 
         # 检查是否有截图
-        if hasattr(report, 'extra') and report.extra:
+        if not privacy_report and hasattr(report, 'extra') and report.extra:
             for extra in report.extra:
                 if extra.get('type') == 'image':
                     test_case['screenshot'] = extra.get('content')

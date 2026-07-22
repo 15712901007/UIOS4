@@ -3,7 +3,9 @@
 真实测试结果 -> Excel 导出器
 
 读取 conftest 在 sessionfinish dump 的 reports/output/test_results.json,
-生成 8 列 Excel(复用 VLAN 更新版样式)。
+生成 8 列 Excel(复用 VLAN 更新版样式)，并把每个测试步骤的完整详情
+写入独立的“步骤明细”sheet，人工复验命令写入“复验命令”sheet。
+超长文本会无损分片，避免触发 Excel 单元格 32767 字符上限。
 
 内容来自真实测试执行: 每步标题+状态+SSH验证输出、用例真实 PASS/FAIL、
 失败错误信息、失败截图文件路径。比手写 YAML 用例更全面、更真实。
@@ -16,6 +18,7 @@ import os
 import json
 import logging
 import argparse
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,8 @@ try:
     _HAS_OPENPYXL = True
 except ImportError:  # pragma: no cover
     _HAS_OPENPYXL = False
+
+from utils.step_recorder import redact_sensitive_text as _registry_redact_sensitive_text
 
 # 8 列表头与列宽(与 VLAN 更新版对齐; 内联以保持本模块独立可运行)
 HEADERS = ["模块", "测试项", "前提条件", "测试场景", "测试步骤", "预期结果", "测试结果", "备注"]
@@ -68,10 +73,68 @@ _MODULE_NAMES = {
     "advanced": "安全中心-高级设置", "acl": "安全中心-ACL规则",
     "conn_limit": "安全中心-连接数限制", "mac_access_control": "安全中心-MAC访问控制",
     "app_protocol": "安全中心-应用协议控制",
+    "ftp_server": "高级服务-本地服务-FTP服务",
+    "samba_server": "高级服务-本地服务-Samba服务",
+    "http_server": "高级服务-本地服务-HTTP服务",
+    "snmp_server": "高级服务-本地服务-SNMP服务",
+    "virtual_machine": "高级服务-虚拟机",
+    "basic_setting": "设备设置-基础设置",
+    "alg_setting": "设备设置-高级管理-ALG设置",
+    "protocol_control": "设备设置-高级管理-协议控制",
 }
 
-_STATUS_CN = {"passed": "通过", "failed": "失败", "skipped": "跳过", "error": "错误"}
-_STATUS_MARK = {"passed": "✓", "failed": "✗", "skipped": "○"}
+_STATUS_CN = {
+    "passed": "通过",
+    "failed": "失败",
+    "error": "失败",
+    "warning": "警告",
+    "not_applicable": "不适用",
+    # Historical pytest/report spelling; external reports use the four-state
+    # Chinese vocabulary required by the project.
+    "skipped": "不适用",
+}
+_STATUS_MARK = {
+    "passed": "✓",
+    "failed": "✗",
+    "error": "✗",
+    "warning": "!",
+    "not_applicable": "○",
+    "skipped": "○",
+}
+_EXCEL_CELL_LIMIT = 32767
+# 为不同 Excel/WPS 版本和 openpyxl 的内部处理留少量余量。
+_EXCEL_CHUNK_SIZE = 32000
+_SENSITIVE_TEXT_RE = re.compile(
+    r"(?i)(community|auth(?:entication)?[_ -]?(?:pass(?:word)?|key)|"
+    r"priv(?:acy)?[_ -]?(?:pass(?:word)?|key)|password|passwd|secret|"
+    r"团体名|认证(?:口令|密码|密钥)|隐私(?:口令|密码|密钥))"
+    r"\s*[:=]\s*([^,;，\r\n}\]]+)"
+)
+_SENSITIVE_JSON_RE = re.compile(
+    r"(?i)([\"'](?:community|auth(?:entication)?[_ -]?(?:pass(?:word)?|key)|"
+    r"priv(?:acy)?[_ -]?(?:pass(?:word)?|key)|password|passwd|secret|"
+    r"团体名|认证(?:口令|密码|密钥)|隐私(?:口令|密码|密钥))[\"']\s*:\s*)"
+    r"([\"'])(.*?)\2"
+)
+_SENSITIVE_SNMP_ARG_RE = re.compile(
+    r"(?i)\b(?:snmpget|snmpwalk|snmpbulkwalk)\b.*"
+    r"(?:^|\s)(?:-c|-A|-X|--community|--auth-pass|--priv-pass)\s+\S+"
+)
+
+
+def _status_cn(status) -> str:
+    """Expose only the project's four Chinese report states."""
+    return _STATUS_CN.get(str(status or "").strip().lower(), "警告")
+
+
+def _redact_sensitive_text(value) -> str:
+    text = _registry_redact_sensitive_text(value)
+    text = _SENSITIVE_JSON_RE.sub(
+        lambda match: f'{match.group(1)}"[已隐藏]"', text
+    )
+    return _SENSITIVE_TEXT_RE.sub(
+        lambda match: f"{match.group(1)}=[已隐藏]", text
+    )
 
 
 def _module_key(original_name: str) -> str:
@@ -90,8 +153,48 @@ def _module_cn(original_name: str, name: str) -> str:
     return _MODULE_NAMES.get(key, name or key or "未分类")
 
 
+def _split_excel_text(value, chunk_size: int = _EXCEL_CHUNK_SIZE):
+    """无损拆分超长文本，确保每个 Excel 单元格都低于长度上限。"""
+    text = "" if value is None else str(value)
+    if not text:
+        return [""]
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def _fit_excel_cell(value, overflow_hint: str = "完整内容见“步骤明细”sheet") -> str:
+    """把单值安全放入一个单元格；完整长文本由步骤明细sheet承载。"""
+    text = "" if value is None else str(value)
+    if len(text) <= _EXCEL_CELL_LIMIT:
+        return text
+    suffix = f"\n…（{overflow_hint}）"
+    return text[:_EXCEL_CELL_LIMIT - len(suffix)] + suffix
+
+
+def _neutralize_excel_formulas(workbook):
+    """Store every report string as an XLSX string, never as a formula.
+
+    Report content originates in UI labels, API/SSH output, error messages and
+    user-entered values.  openpyxl automatically treats a value beginning with
+    ``=`` as a formula; spreadsheet applications also recognize other formula
+    prefixes in imported content.  Marking every string cell explicitly as a
+    string preserves its visible value (including ``=``, ``+``, ``-`` or ``@``)
+    while preventing execution.  A workbook-wide final pass also protects new
+    report columns added later.
+    """
+    for worksheet in workbook.worksheets:
+        for row in worksheet.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str):
+                    cell.data_type = "s"
+
+
 def _render_steps(steps) -> str:
-    """测试步骤列: 每步 [✓/✗] 标题(用时) + details(SSH验证输出) + 步骤错误"""
+    """测试步骤列: 紧凑保留每一步的状态、标题和用时。
+
+    SSH输出和逐项断言改由“步骤明细”sheet完整保存。当前25步场景会全部
+    出现在本单元格；极端超长用例则只在完整行边界截断并明确指向明细sheet，
+    不会出现 openpyxl 在某个步骤中间静默截断的情况。
+    """
     lines = []
     for i, st in enumerate(steps or [], 1):
         status = st.get("status", "")
@@ -102,20 +205,298 @@ def _render_steps(steps) -> str:
         if dur:
             head += f"  ({dur})"
         lines.append(head)
-        for d in st.get("details", []):
-            lines.append(f"      {d}")
-        if st.get("error_message"):
-            lines.append(f"      [步骤错误] {st['error_message']}")
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    if len(rendered) <= _EXCEL_CELL_LIMIT:
+        return rendered
+
+    kept = []
+    for index, line in enumerate(lines):
+        remaining = len(lines) - index
+        pointer = f"… 另有 {remaining} 步，完整内容见“步骤明细”sheet"
+        candidate = "\n".join(kept + [line, pointer])
+        if len(candidate) > _EXCEL_CELL_LIMIT:
+            return "\n".join(kept + [pointer])
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def _render_result(tc) -> str:
     status = tc.get("status", "")
-    text = _STATUS_CN.get(status, status)
+    text = _status_cn(status)
     err = tc.get("error_message")
     if err:
         text += f"\n错误: {err}"
-    return text
+    return _fit_excel_cell(text, "完整错误见“步骤明细”sheet")
+
+
+def _chunk_value(chunks, index: int, repeat_single: bool = False) -> str:
+    """取分片；单片元数据可按行重复，长文本分片则逐行展开。"""
+    if repeat_single and len(chunks) == 1:
+        return chunks[0]
+    return chunks[index] if index < len(chunks) else ""
+
+
+def _boolean_label(value, *, unknown: str = "未标注") -> str:
+    """把 JSON 布尔值或常见字符串转为中文状态。"""
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if value is None or value == "":
+        return unknown
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y", "是"}:
+        return "是"
+    if normalized in {"0", "false", "no", "off", "n", "否"}:
+        return "否"
+    return unknown
+
+
+def _read_only_label(command) -> str:
+    """优先读显式 read_only，否则由 effect 判定是否只读。"""
+    if not isinstance(command, dict):
+        return "未标注"
+    if "read_only" in command:
+        explicit = _boolean_label(command.get("read_only"))
+        return "只读（不修改配置）" if explicit == "是" else explicit
+    effect = str(command.get("effect") or "").strip().lower()
+    if not effect:
+        return "未标注"
+    normalized = effect.replace("-", "_").replace(" ", "_")
+    if normalized in {
+        "read_only", "readonly", "query", "diagnostic", "no_side_effects",
+        "只读", "无副作用",
+    }:
+        return "只读（不修改配置）"
+    return "否"
+
+
+def _interactive_metadata(command):
+    """返回 ``(是否交互, 交互提示)``，兼容布尔值和文本写法。"""
+    if not isinstance(command, dict):
+        return "未标注", ""
+    raw = command.get("interactive")
+    hint = (command.get("interactive_hint") or
+            command.get("interaction_hint") or "")
+    status = _boolean_label(raw)
+    if status == "未标注" and raw not in (None, ""):
+        status = "是"
+        if not hint:
+            hint = str(raw)
+    elif status == "未标注" and hint:
+        status = "是"
+    return status, str(hint)
+
+
+def _write_step_details(ws, data, styles):
+    """逐 detail 写行；任何超长字段均拆成多行且不丢失字符。"""
+    border, hfill, hfont, halign, dfon, daligns = styles
+    headers = [
+        "用例", "模块", "步骤序号", "步骤名称", "步骤描述", "步骤状态",
+        "步骤耗时", "详情序号", "详情", "步骤实际", "步骤错误", "用例错误",
+    ]
+    widths = [30, 30, 10, 38, 48, 12, 12, 12, 90, 55, 55, 55]
+    for ci, title in enumerate(headers, 1):
+        cell = ws.cell(1, ci, title)
+        cell.fill = hfill
+        cell.font = hfont
+        cell.alignment = halign
+        cell.border = border
+        ws.column_dimensions[get_column_letter(ci)].width = widths[ci - 1]
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
+
+    row_index = 2
+    for tc in data.get("test_cases", []):
+        case_chunks = _split_excel_text(tc.get("name", ""))
+        module_chunks = _split_excel_text(_module_cn(
+            tc.get("original_name", ""), tc.get("name", "")
+        ))
+        case_error_chunks = _split_excel_text(
+            _redact_sensitive_text(tc.get("error_message") or "")
+        )
+        steps = tc.get("steps", []) or []
+        for step_no, step in enumerate(steps, 1):
+            name_chunks = _split_excel_text(step.get("name", f"步骤{step_no}"))
+            description_chunks = _split_excel_text(step.get("description", ""))
+            status_chunks = _split_excel_text(_status_cn(step.get("status", "")))
+            duration_chunks = _split_excel_text(step.get("duration", ""))
+            actual_chunks = _split_excel_text(
+                _redact_sensitive_text(step.get("actual", ""))
+            )
+            step_error_chunks = _split_excel_text(
+                _redact_sensitive_text(step.get("error_message") or "")
+            )
+
+            detail_rows = []
+            details = step.get("details", []) or []
+            if not details:
+                detail_rows.append(("", ""))
+            for detail_no, detail in enumerate(details, 1):
+                detail_chunks = _split_excel_text(_redact_sensitive_text(detail))
+                total_parts = len(detail_chunks)
+                for part_no, chunk in enumerate(detail_chunks, 1):
+                    number = (str(detail_no) if total_parts == 1 else
+                              f"{detail_no}.{part_no}/{total_parts}")
+                    detail_rows.append((number, chunk))
+
+            row_count = max(
+                len(detail_rows), len(case_chunks), len(module_chunks),
+                len(name_chunks), len(description_chunks), len(status_chunks),
+                len(duration_chunks), len(actual_chunks), len(step_error_chunks),
+                len(case_error_chunks), 1,
+            )
+            for part_index in range(row_count):
+                detail_no, detail_text = (
+                    detail_rows[part_index]
+                    if part_index < len(detail_rows) else ("", "")
+                )
+                values = [
+                    _chunk_value(case_chunks, part_index, repeat_single=True),
+                    _chunk_value(module_chunks, part_index, repeat_single=True),
+                    step_no,
+                    _chunk_value(name_chunks, part_index, repeat_single=True),
+                    _chunk_value(description_chunks, part_index, repeat_single=True),
+                    _chunk_value(status_chunks, part_index, repeat_single=True),
+                    _chunk_value(duration_chunks, part_index, repeat_single=True),
+                    detail_no,
+                    detail_text,
+                    _chunk_value(actual_chunks, part_index),
+                    _chunk_value(step_error_chunks, part_index),
+                    _chunk_value(case_error_chunks, part_index),
+                ]
+                for ci, value in enumerate(values, 1):
+                    # 所有字符串在进入单元格前均已分片；这里再作防御性保护。
+                    safe_value = (_fit_excel_cell(value)
+                                  if isinstance(value, str) else value)
+                    cell = ws.cell(row_index, ci, safe_value)
+                    cell.font = dfon
+                    cell.alignment = Alignment(
+                        horizontal="center" if ci in {3, 6, 7, 8} else "left",
+                        vertical="top", wrap_text=True,
+                    )
+                    cell.border = border
+                row_index += 1
+
+
+def _write_verification_commands(ws, data, styles):
+    """每条人工复验命令独立成行；超长字段按完整字符串无损分片。"""
+    border, hfill, hfont, halign, dfon, daligns = styles
+    headers = [
+        "用例", "步骤序号", "步骤", "命令序号", "目标", "目标类型", "IP", "Shell",
+        "用途", "有效时机", "交互", "交互提示", "命令分片", "命令", "预期",
+        "实际", "只读", "可复制", "含敏感信息",
+    ]
+    widths = [30, 10, 38, 10, 16, 14, 18, 14, 40, 36, 10, 42, 12, 90, 48, 48, 22, 10, 14]
+    for ci, title in enumerate(headers, 1):
+        cell = ws.cell(1, ci, title)
+        cell.fill = hfill
+        cell.font = hfont
+        cell.alignment = halign
+        cell.border = border
+        ws.column_dimensions[get_column_letter(ci)].width = widths[ci - 1]
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
+
+    command_font = Font(name="Consolas", size=10, bold=False)
+    row_index = 2
+    for tc in data.get("test_cases", []):
+        case_name = tc.get("name", "")
+        steps = tc.get("steps", []) or []
+        for step_no, step in enumerate(steps, 1):
+            commands = step.get("verification_commands", []) or []
+            if isinstance(commands, (str, bytes, dict)):
+                commands = [commands]
+            for command_no, raw_command in enumerate(commands, 1):
+                command = (dict(raw_command) if isinstance(raw_command, dict)
+                           else {"command": raw_command})
+                contains_secret = (
+                    _boolean_label(command.get("contains_secret")) == "是"
+                )
+                command_text = str(command.get("command", ""))
+                if (
+                    _SENSITIVE_TEXT_RE.search(command_text) or
+                    _SENSITIVE_JSON_RE.search(command_text) or
+                    _SENSITIVE_SNMP_ARG_RE.search(command_text)
+                ):
+                    contains_secret = True
+                if contains_secret:
+                    # 兼容绕过 StepRecorder 直接构造的旧/外部 JSON：Excel
+                    # 展示层再次不可逆隐藏正文，并禁止标为可复制。
+                    command["command"] = "[命令已隐藏：包含敏感信息]"
+                    command["actual"] = "[命令已隐藏：包含敏感信息]"
+                    command["copy_ready"] = False
+                interactive_status, interactive_hint = _interactive_metadata(command)
+                field_chunks = {
+                    "case": _split_excel_text(case_name),
+                    "step": _split_excel_text(step.get("name", f"步骤{step_no}")),
+                    "target": _split_excel_text(
+                        command.get("target_label") or command.get("target", "")
+                    ),
+                    "target_type": _split_excel_text(command.get("target", "")),
+                    "host": _split_excel_text(command.get("host", "")),
+                    "shell": _split_excel_text(command.get("shell", "")),
+                    "purpose": _split_excel_text(
+                        _redact_sensitive_text(command.get("purpose", ""))
+                    ),
+                    "valid_when": _split_excel_text(
+                        _redact_sensitive_text(command.get("valid_when", ""))
+                    ),
+                    "interactive": _split_excel_text(interactive_status),
+                    "interactive_hint": _split_excel_text(
+                        _redact_sensitive_text(interactive_hint)
+                    ),
+                    "command": _split_excel_text(command.get("command", "")),
+                    "expected": _split_excel_text(
+                        _redact_sensitive_text(command.get("expected", ""))
+                    ),
+                    "actual": _split_excel_text(
+                        _redact_sensitive_text(command.get("actual", ""))
+                    ),
+                }
+                row_count = max(len(chunks) for chunks in field_chunks.values())
+                command_part_count = len(field_chunks["command"])
+                for part_index in range(row_count):
+                    if part_index < command_part_count:
+                        command_part = ("1" if command_part_count == 1 else
+                                        f"{part_index + 1}/{command_part_count}")
+                    else:
+                        command_part = ""
+                    values = [
+                        _chunk_value(field_chunks["case"], part_index, repeat_single=True),
+                        step_no,
+                        _chunk_value(field_chunks["step"], part_index, repeat_single=True),
+                        command_no,
+                        _chunk_value(field_chunks["target"], part_index, repeat_single=True),
+                        _chunk_value(field_chunks["target_type"], part_index, repeat_single=True),
+                        _chunk_value(field_chunks["host"], part_index, repeat_single=True),
+                        _chunk_value(field_chunks["shell"], part_index, repeat_single=True),
+                        _chunk_value(field_chunks["purpose"], part_index, repeat_single=True),
+                        _chunk_value(field_chunks["valid_when"], part_index, repeat_single=True),
+                        _chunk_value(field_chunks["interactive"], part_index, repeat_single=True),
+                        _chunk_value(field_chunks["interactive_hint"], part_index,
+                                     repeat_single=True),
+                        command_part,
+                        _chunk_value(field_chunks["command"], part_index),
+                        _chunk_value(field_chunks["expected"], part_index, repeat_single=True),
+                        _chunk_value(field_chunks["actual"], part_index, repeat_single=True),
+                        _read_only_label(command),
+                        _boolean_label(command.get("copy_ready")),
+                        _boolean_label(command.get("contains_secret")),
+                    ]
+                    for ci, value in enumerate(values, 1):
+                        safe_value = (_fit_excel_cell(value, "完整内容见后续分片")
+                                      if isinstance(value, str) else value)
+                        cell = ws.cell(row_index, ci, safe_value)
+                        cell.font = command_font if ci == 14 else dfon
+                        cell.alignment = Alignment(
+                            horizontal=("center" if ci in {
+                                2, 4, 5, 6, 7, 8, 11, 13, 17, 18, 19,
+                            }
+                                        else "left"),
+                            vertical="top",
+                            wrap_text=True,
+                        )
+                        cell.border = border
+                    row_index += 1
 
 
 def _merge_module_col(ws, col: str, first_row: int, keys):
@@ -139,7 +520,20 @@ def _write_summary(ws, data, styles):
         ("总计", data.get("total", 0)),
         ("通过", data.get("passed", 0)),
         ("失败", data.get("failed", 0)),
-        ("跳过", data.get("skipped", 0)),
+        (
+            "警告",
+            sum(
+                1 for case in data.get("test_cases", [])
+                if case.get("status") == "warning"
+            ),
+        ),
+        (
+            "不适用",
+            sum(
+                1 for case in data.get("test_cases", [])
+                if case.get("status") in {"not_applicable", "skipped"}
+            ),
+        ),
         ("总步骤", data.get("total_steps", 0)),
         ("用时", data.get("duration", "")),
         ("开始", data.get("start_time", "")),
@@ -147,7 +541,7 @@ def _write_summary(ws, data, styles):
     ]
     for i, (k, v) in enumerate(stats, start=3):
         ws.cell(i, 1, k).font = dfon
-        ws.cell(i, 2, v).font = dfon
+        ws.cell(i, 2, _fit_excel_cell(v)).font = dfon
 
     # 用例简表
     headers = ["用例", "模块", "状态", "用时", "步骤数", "错误信息"]
@@ -159,13 +553,13 @@ def _write_summary(ws, data, styles):
         vals = [
             tc.get("name", ""),
             _module_cn(tc.get("original_name", ""), tc.get("name", "")),
-            _STATUS_CN.get(tc.get("status", ""), tc.get("status", "")),
+            _status_cn(tc.get("status", "")),
             tc.get("duration", ""),
             tc.get("step_count", 0),
             tc.get("error_message") or "",
         ]
         for ci, v in enumerate(vals, 1):
-            cell = ws.cell(idx, ci, v)
+            cell = ws.cell(idx, ci, _fit_excel_cell(v))
             cell.font = dfon
             cell.alignment = daligns[ci]
             cell.border = border
@@ -217,7 +611,8 @@ def export_results_to_excel(json_path: str, output_path: str):
         remark = f"失败截图: {shot}" if shot else ""
         values = [module_cn, name, "", scenario, steps_text, "", result_text, remark]
         for ci, val in enumerate(values, 1):
-            cell = ws.cell(row, ci, val)
+            safe_val = _fit_excel_cell(val)
+            cell = ws.cell(row, ci, safe_val)
             cell.font = dfon
             cell.alignment = daligns[ci]
             cell.border = border
@@ -229,13 +624,24 @@ def export_results_to_excel(json_path: str, output_path: str):
     ws_summary = wb.create_sheet("汇总", 0)
     _write_summary(ws_summary, data, styles)
 
+    # 完整步骤明细：逐项断言/SSH输出各占一行，超长详情自动无损分片。
+    ws_steps = wb.create_sheet("步骤明细")
+    _write_step_details(ws_steps, data, styles)
+
+    # 结构化人工复验命令：正常命令一行，超长命令按分片顺序无损展开。
+    ws_commands = wb.create_sheet("复验命令")
+    _write_verification_commands(ws_commands, data, styles)
+
     try:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        _neutralize_excel_formulas(wb)
         wb.save(output_path)
     except Exception as e:
         return False, f"保存失败: {e}"
 
-    return True, f"已导出 {len(cases)} 条用例 → {output_path}（含汇总sheet + 明细sheet）"
+    return True, (f"已导出 {len(cases)} 条用例 → {output_path}"
+                  "（含汇总sheet + 测试结果明细sheet + 步骤明细sheet"
+                  " + 复验命令sheet）")
 
 
 def _main():

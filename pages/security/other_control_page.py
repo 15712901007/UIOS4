@@ -392,25 +392,26 @@ class OtherControlPage(IkuaiTablePage):
     def select_time_plan(self, plan_name: str) -> bool:
         """时间计划模式: 在禁止时间combobox选时间计划(plan_name=计划的tagname).
 
-        选中'时间计划'radio后出现该combobox(placeholder含'时间计划'). option异步加载→wait_for等渲染."""
+        ⚠️两个叠加bug(2026-07-15 select_time_plan假成功确诊, 实测验证修复):
+        1. 切到'时间计划'模式后, Ant Select会默认选中第一个时间计划, combobox显示
+           选中值而非placeholder → 旧逻辑靠placeholder含'时间计划'定位必失败(nofind).
+           改用所在form-item的label'禁止时间'定位(稳定锚点, 避开例外IP分组select).
+        2. 用evaluate里的selector.click()是JS click, 不触发Ant Select打开dropdown
+           (React不响应) → option永远count=0. 改用Playwright原生.locator().click().
+        (save_config不检查本方法返回值, 失败会被静默吞→保存默认选中项→L1 SSH才暴露,
+         故本方法必须真实成功.) option异步加载→wait_for等渲染."""
         try:
-            # 精确找placeholder含"时间计划"的select(避开例外IP分组select)
-            opened = self.page.evaluate("""() => {
-                const sels = Array.from(document.querySelectorAll('.ant-select'));
-                for (const s of sels) {
-                    if (s.offsetParent === null) continue;
-                    const ph = s.querySelector('.ant-select-selection-placeholder');
-                    if (ph && (ph.textContent || '').includes('时间计划')) {
-                        const selector = s.querySelector('.ant-select-selector');
-                        if (selector) { selector.click(); return 'opened'; }
-                    }
-                }
-                return 'nofind';
-            }""")
-            if opened != 'opened':
-                logger.warning("[时间计划] 未找到时间计划combobox(可能已选或未渲染)")
+            # 靠form-item label"禁止时间"定位combobox(不依赖placeholder, 避开例外IP分组)
+            combo = self.page.locator(
+                '.ant-form-item:has(.ant-form-item-label:has-text("禁止时间"))'
+            ).locator('.ant-select-selector').first
+            try:
+                combo.wait_for(state="visible", timeout=3000)
+            except Exception:
+                logger.warning("[时间计划] 未找到禁止时间combobox(form-item label=禁止时间)")
                 return False
-            self.page.wait_for_timeout(600)
+            combo.click()  # Playwright原生click触发React打开dropdown(JS click无效)
+            self.page.wait_for_timeout(700)
             # 等option异步加载渲染后点击(wait_for避count==0时序误判)
             opt = self.page.locator(f'.ant-select-item-option:has-text("{plan_name}")').first
             try:

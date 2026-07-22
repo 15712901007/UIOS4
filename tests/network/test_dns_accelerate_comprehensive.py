@@ -107,6 +107,15 @@ class TestDnsAccelerateComprehensive:
             closed = not page.is_enabled()
             ui_check("DNS加速已关闭", closed)
 
+            # !! 残留清理(2026-07-16): 某些路径(restore_dns_accel历史用init)只改数据库enabled=no
+            # 不调dns.sh stop→ikdnsd进程残留运行+ikdnsd.conf/status文件残留. 初始若处此不一致状态,
+            # 后续L4(进程应停止)/L2(文件应清理)必误判[FAIL], 经conftest details扫描把步骤1标红.
+            # 主动强制清理(幂等), 确保干净关闭起点.
+            if backend_verifier:
+                cleanup = backend_verifier.cleanup_dns_accel_residual()
+                print(f"  [残留清理] {cleanup.message}")
+                rec.add_detail(f"[残留清理] {cleanup.message}")
+
             # 清理残留反向代理规则
             cleaned = 0
             for domain in LEGACY_DOMAINS:
@@ -596,6 +605,12 @@ class TestDnsAccelerateComprehensive:
             restored = not page.is_enabled()
             print(f"  [恢复] DNS加速已关闭={restored}")
             rec.add_detail(f"[恢复] 关闭={restored}")
+
+            # !! 残留清理(同步骤1): 关闭后强制清理ikdnsd残留进程/文件, 确保L4验证干净不标红
+            if backend_verifier:
+                cleanup = backend_verifier.cleanup_dns_accel_residual()
+                print(f"  [残留清理] {cleanup.message}")
+                rec.add_detail(f"[残留清理] {cleanup.message}")
 
             ssh_verify("L1-最终关闭", backend_verifier.verify_dns_config_database,
                        must_pass=True, expected_fields={"enabled": "no"})

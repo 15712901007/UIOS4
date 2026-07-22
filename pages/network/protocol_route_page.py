@@ -282,6 +282,11 @@ class ProtocolRoutePage(IkuaiTablePage):
                 return 'not_found: ' + protoName;
             }""", proto_name)
             print(f"[DEBUG] select_protocol({proto_name}): {result}")
+            # 深层具体应用协议(腾讯网/百度/网易等, PROTO_TREE_PATH无路径)树展开定位不到,
+            # 回退用dialog搜索框过滤后选(协议选择器支持搜索)
+            if 'not_found' in result:
+                result = self._search_and_select_proto(proto_name)
+                print(f"[DEBUG] select_protocol({proto_name}) 搜索回退: {result}")
             self.page.wait_for_timeout(500)
 
             # 点击确定按钮关闭modal
@@ -304,6 +309,64 @@ class ProtocolRoutePage(IkuaiTablePage):
             except Exception:
                 pass
         return self
+
+    def _search_and_select_proto(self, proto_name: str) -> str:
+        """在已打开的协议选择dialog里, 用搜索框过滤树后选可见匹配节点(深层具体应用协议).
+
+        协议树深层协议(腾讯网/百度/网易等具体应用appid)默认只显示顶层分类, 树展开定位不到;
+        dialog带搜索框, 输入协议名过滤后选精确匹配的可见节点. 由select_protocol在树展开
+        not_found时回退调用. 返回'ok: name'/'not_found: name'/'no_search_input'等.
+
+        Args:
+            proto_name: 协议名称, 如 "腾讯网", "百度"
+        """
+        try:
+            # 在dialog搜索框输入协议名(自适应找可见可编辑text input, 排除checkbox/radio/combobox)
+            searched = self.page.evaluate("""(name) => {
+                const dialog = document.querySelector('[role="dialog"]');
+                if (!dialog) return 'no_dialog';
+                const inputs = Array.from(dialog.querySelectorAll('input'));
+                // 优先placeholder含搜索关键词的input, 否则第一个可见可编辑text input
+                let target = inputs.find(i => i.offsetParent !== null
+                    && !i.readOnly && i.type !== 'checkbox' && i.type !== 'radio'
+                    && i.getAttribute('role') !== 'combobox'
+                    && /搜索|输入|查找|过滤|名称|关键字/.test(i.placeholder || ''));
+                if (!target) {
+                    target = inputs.find(i => i.offsetParent !== null
+                        && !i.readOnly && i.type !== 'checkbox' && i.type !== 'radio'
+                        && i.getAttribute('role') !== 'combobox');
+                }
+                if (!target) return 'no_search_input';
+                target.focus();
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(target, name);
+                target.dispatchEvent(new Event('input', {bubbles: true}));
+                target.dispatchEvent(new Event('change', {bubbles: true}));
+                return 'searched:' + (target.placeholder || 'input');
+            }""", proto_name)
+            if 'no_search_input' in str(searched) or 'no_dialog' in str(searched):
+                return str(searched)
+            self.page.wait_for_timeout(1000)
+
+            # 选过滤后可见的精确匹配节点(textContent忽略搜索高亮span标记, 仍纯文本匹配)
+            result = self.page.evaluate("""(name) => {
+                const items = document.querySelectorAll('.ant-tree-treenode');
+                for (let item of items) {
+                    if (item.offsetParent === null) continue;
+                    const title = item.querySelector('.ant-tree-title, .ant-tree-node-content-wrapper');
+                    if (title && title.textContent.trim() === name) {
+                        const cb = item.querySelector('.ant-tree-checkbox');
+                        if (cb && !cb.classList.contains('ant-tree-checkbox-checked')) {
+                            cb.click();
+                        }
+                        return 'ok: ' + name;
+                    }
+                }
+                return 'not_found: ' + name;
+            }""", proto_name)
+            return result
+        except Exception as e:
+            return f'error: {str(e)[:80]}'
 
     def _expand_tree_node(self, node_title: str):
         """展开指定标题的树节点

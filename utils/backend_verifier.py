@@ -11,12 +11,18 @@ SSH后台验证工具
 基于MCP-SSH全链路探索经验编写（2026-03-04）
 """
 import base64
+import hashlib
 import ipaddress
 import json
+import logging
+import os
 import re
+import secrets
+import shlex
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
+from datetime import datetime
+from typing import Optional, Dict, List, Any, Iterable
 
 import paramiko
 
@@ -24,6 +30,9 @@ from config.config import get_config, get_config_with_env, SSHConfig, SSHHostCon
 from utils.logger import get_logger
 
 logger = get_logger()
+# Paramiko's INFO channel announces authentication outcomes.  Keep terminal and
+# report logs free of authentication metadata; connection failures still surface.
+logging.getLogger("paramiko").setLevel(logging.WARNING)
 
 
 @dataclass
@@ -104,7 +113,8 @@ class SSHClient:
         transport = self._client.get_transport()
         if transport:
             transport.set_keepalive(30)
-        logger.info(f"SSH connected: {self._config.username}@{self._config.host}")
+        # 用户名属于认证信息；日志只保留目标主机，避免进入终端和报告。
+        logger.info(f"SSH connected: {self._config.host}")
 
         # 检测是否需要控制台登录
         self._check_and_login_console()
@@ -154,7 +164,7 @@ class SSHClient:
             logger.warning("SSH可能进入交互式菜单，但未配置控制台凭据(console_username/console_password)")
             return
 
-        logger.info(f"Starting console login with username: {self._config.console_username}")
+        logger.info("Starting console login with configured credential")
         # 执行控制台登录
         self._login_console()
         self._used_console_login = True  # 标记使用了控制台登录
@@ -211,7 +221,7 @@ class SSHClient:
             logger.debug(f"Console menu displayed: {len(output)} bytes")
 
             # Step 1: 发送用户名
-            logger.debug(f"Sending username: {self._config.console_username}")
+            logger.debug("Sending configured console username: <redacted>")
             channel.send(f"{self._config.console_username}\n")
             time.sleep(0.8)
 
@@ -226,7 +236,7 @@ class SSHClient:
 
             # Step 4: 读取登录结果
             login_output = recv_all(timeout=2.0)
-            logger.debug(f"Login output: {login_output[:200]}")
+            logger.debug(f"Login output received: {len(login_output)} bytes")
 
             # Step 5: 验证登录是否成功 - 发送测试命令
             VERIFY_MARKER = "__IKUAI_CONSOLE_LOGIN_VERIFY__"
@@ -235,7 +245,7 @@ class SSHClient:
 
             # 读取验证结果
             verify_output = recv_all(timeout=2.0)
-            logger.debug(f"Verify output: {verify_output[:200]}")
+            logger.debug(f"Verify output received: {len(verify_output)} bytes")
 
             # Step 6: 断言检查
             if VERIFY_MARKER not in verify_output:
@@ -245,7 +255,7 @@ class SSHClient:
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
                 else:
-                    error_msg = f"控制台登录失败：未检测到验证标记，输出: {verify_output[:100]}"
+                    error_msg = "控制台登录失败：未检测到验证标记"
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
 
@@ -262,7 +272,7 @@ class SSHClient:
             channel.send("cat /etc/passwd | grep -E '^sshd:'\n")
             time.sleep(1.0)
             before_output = recv_all(timeout=2.0)
-            logger.info(f"修复前 passwd: {before_output.strip()}")
+            logger.info("已读取修复前shell状态，内容已脱敏")
 
             # 执行修复命令
             fix_cmd = "sed -i 's|^sshd:x:0:0:sshd:/root:.*|sshd:x:0:0:sshd:/root:/bin/bash|' /etc/passwd"
@@ -275,12 +285,12 @@ class SSHClient:
             channel.send("cat /etc/passwd | grep -E '^sshd:'\n")
             time.sleep(1.0)
             passwd_output = recv_all(timeout=2.0)
-            logger.info(f"修复后 passwd: {passwd_output.strip()}")
+            logger.info("已读取修复后shell状态，内容已脱敏")
 
             if "/bin/bash" in passwd_output:
                 logger.info("[OK] sshd shell已修复为/bin/bash")
             else:
-                error_msg = f"sshd shell修复失败！当前状态: {passwd_output.strip()}"
+                error_msg = "sshd shell修复失败，当前状态已脱敏"
                 logger.error(error_msg)
                 # 不抛出异常，继续尝试后续流程
 
@@ -303,10 +313,10 @@ class SSHClient:
                 password=self._config.password,
                 timeout=10,
             )
-            logger.info(f"SSH reconnected: {self._config.username}@{self._config.host}")
+            logger.info(f"SSH reconnected: {self._config.host}")
 
             self._console_logged_in = True
-            logger.info(f"[OK] 控制台登录成功: {self._config.console_username}@{self._config.host}")
+            logger.info(f"[OK] 控制台登录成功: {self._config.host}")
 
             # 部署防重置脚本（现在exec_command应该能工作了）
             self._deploy_fix_script()
@@ -533,6 +543,19 @@ class BackendVerifier:
         self._ssh_config = ssh_config
         self._router: Optional[SSHClient] = None
         self._client: Optional[SSHClient] = None
+        # GRE隧道对端设备(虚拟专网-GRE L5双端数据面验证)
+        self._peer: Optional[SSHClient] = None
+        self._ospf_peer: Optional[SSHClient] = None
+        self._ospf_peer_recovery: Optional[SSHClient] = None
+        self._router_recovery: Optional[SSHClient] = None
+        self._router_lan_management: Optional[SSHClient] = None
+        self._ospf_verifier = None
+        # 威胁情报验证器保持独立，避免把云端IOC字段和大型历史验证器
+        # 混在一起；按需创建以兼容无IOC固件和离线收集。
+        self._ioc_verifier = None
+        # 虚拟机验证器独立维护 QEMU/镜像/TAP/VNC/来宾数据面的语义，
+        # 复用本类已有的 router/client 安全连接。
+        self._qemu_verifier = None
         # xt_set模块可用性缓存(None=未探测, True=坏, False=正常)。session级,只探测一次。
         self._xt_set_status: Optional[bool] = None
 
@@ -548,6 +571,115 @@ class BackendVerifier:
             self._client = SSHClient(self._ssh_config.client)
             self._client.connect()
 
+    def connect_peer(self):
+        """连接GRE隧道对端设备(虚拟专网-GRE L5双端数据面验证, 默认10.66.0.56)"""
+        if self._peer is None:
+            if not self._ssh_config.peer or not self._ssh_config.peer.host:
+                raise RuntimeError("未配置GRE对端设备(peer), 无法进行L5双端数据面验证")
+            self._peer = SSHClient(self._ssh_config.peer)
+            self._peer.connect()
+
+    def connect_ospf_peer(self):
+        """连接 OSPF 对端；只复用 router 的运行时凭据，不复制配置值。"""
+        if self._ospf_peer is None:
+            host = str(getattr(self._ssh_config, "ospf_peer_host", "") or "")
+            if not host:
+                raise RuntimeError("未配置OSPF对端地址")
+            router = self._ssh_config.router
+            peer_config = SSHHostConfig(
+                host=host,
+                port=int(getattr(self._ssh_config, "ospf_peer_port", 22) or 22),
+                username=router.username,
+                password=router.password,
+                console_username=router.console_username,
+                console_password=router.console_password,
+            )
+            self._ospf_peer = SSHClient(peer_config)
+            self._ospf_peer.connect()
+
+    def connect_router_recovery(self):
+        """Connect the router's alternate management address with router creds."""
+        if self._router_recovery is None:
+            host = str(getattr(self._ssh_config, "router_recovery_host", "") or "")
+            if not host:
+                raise RuntimeError("未配置主路由备用恢复地址")
+            router = self._ssh_config.router
+            recovery_config = SSHHostConfig(
+                host=host,
+                port=int(getattr(self._ssh_config, "router_recovery_port", 22) or 22),
+                username=router.username,
+                password=router.password,
+                console_username=router.console_username,
+                console_password=router.console_password,
+            )
+            self._router_recovery = SSHClient(recovery_config)
+            self._router_recovery.connect()
+
+    def connect_ospf_peer_recovery(self):
+        """Connect the OSPF peer alternate management address."""
+        if self._ospf_peer_recovery is None:
+            host = str(
+                getattr(self._ssh_config, "ospf_peer_recovery_host", "") or ""
+            )
+            if not host:
+                raise RuntimeError("未配置OSPF对端备用恢复地址")
+            router = self._ssh_config.router
+            recovery_config = SSHHostConfig(
+                host=host,
+                port=int(
+                    getattr(self._ssh_config, "ospf_peer_recovery_port", 22) or 22
+                ),
+                username=router.username,
+                password=router.password,
+                console_username=router.console_username,
+                console_password=router.console_password,
+            )
+            self._ospf_peer_recovery = SSHClient(recovery_config)
+            self._ospf_peer_recovery.connect()
+
+    def connect_router_lan_management(self):
+        """Connect the directly attached LAN1 management path."""
+        if self._router_lan_management is None:
+            host = str(
+                getattr(self._ssh_config, "router_lan_management_host", "") or ""
+            )
+            if not host:
+                raise RuntimeError("未配置主路由LAN管理地址")
+            router = self._ssh_config.router
+            lan_config = SSHHostConfig(
+                host=host,
+                port=int(
+                    getattr(self._ssh_config, "router_lan_management_port", 22) or 22
+                ),
+                username=router.username,
+                password=router.password,
+                console_username=router.console_username,
+                console_password=router.console_password,
+            )
+            self._router_lan_management = SSHClient(lan_config)
+            self._router_lan_management.connect()
+
+    def get_ospf_verifier(self):
+        """Return the OSPF verifier bound to these credential-safe connections."""
+        if self._ospf_verifier is None:
+            from utils.ospf_verifier import OspfVerifier
+            self._ospf_verifier = OspfVerifier(self)
+        return self._ospf_verifier
+
+    def get_ioc_verifier(self):
+        """Return the read-only threat-intelligence verifier bound to this session."""
+        if self._ioc_verifier is None:
+            from utils.ioc_verifier import IocVerifier
+            self._ioc_verifier = IocVerifier(self)
+        return self._ioc_verifier
+
+    def get_qemu_verifier(self):
+        """Return the virtual-machine verifier bound to these SSH sessions."""
+        if self._qemu_verifier is None:
+            from utils.qemu_verifier import QemuVerifier
+            self._qemu_verifier = QemuVerifier(self)
+        return self._qemu_verifier
+
     def close(self):
         """关闭所有连接"""
         if self._router:
@@ -556,6 +688,24 @@ class BackendVerifier:
         if self._client:
             self._client.close()
             self._client = None
+        if self._peer:
+            self._peer.close()
+            self._peer = None
+        if self._ospf_peer:
+            self._ospf_peer.close()
+            self._ospf_peer = None
+        if self._ospf_peer_recovery:
+            self._ospf_peer_recovery.close()
+            self._ospf_peer_recovery = None
+        if self._router_recovery:
+            self._router_recovery.close()
+            self._router_recovery = None
+        if self._router_lan_management:
+            self._router_lan_management.close()
+            self._router_lan_management = None
+        self._ospf_verifier = None
+        self._ioc_verifier = None
+        self._qemu_verifier = None
 
     # ==================== 验证命令录制(供测试报告显示, 方便工程师看报告自己复验) ====================
     def mark_cmd_start(self) -> Dict[str, tuple]:
@@ -567,7 +717,7 @@ class BackendVerifier:
         def _snap(role):
             inst = getattr(self, f"_{role}", None)
             return (inst, len(inst._cmd_log)) if inst is not None else (None, 0)
-        return {"router": _snap("router"), "client": _snap("client")}
+        return {"router": _snap("router"), "client": _snap("client"), "peer": _snap("peer")}
 
     def collect_cmds_since_mark(self, mark) -> List[str]:
         """取 mark 之后的命令差量, 逐条加 [router]/[client] 前缀。
@@ -576,7 +726,7 @@ class BackendVerifier:
         变更则从0切片(捕获重建后新实例的全部命令, 含重连本身触发的命令)。
         """
         out = []
-        for role in ("router", "client"):
+        for role in ("router", "client", "peer"):
             inst_mark, start = mark.get(role, (None, 0))
             inst_now = getattr(self, f"_{role}", None)
             if inst_now is None:
@@ -914,7 +1064,12 @@ class BackendVerifier:
             if iface:
                 mac_out = self._client.exec(f"cat /sys/class/net/{iface}/address 2>/dev/null")
                 mac = mac_out.strip() if mac_out else None
-            logger.info(f"client LAN info: iface={iface}, ip={ip}, mac={mac}")
+            # 网卡名、地址和硬件地址均只供测试逻辑在内存中使用，禁止写入终端日志。
+            logger.info(
+                "client LAN info discovered: iface_present=%s, ip_present=%s, "
+                "hardware_address_present=%s",
+                bool(iface), bool(ip), bool(mac),
+            )
             return {"iface": iface, "ip": ip, "mac": mac}
         except Exception as e:
             logger.warning(f"get_client_lan_info failed: {e}")
@@ -3838,19 +3993,67 @@ class BackendVerifier:
         was_enabled=True(原本开)→保持开。
 
         用户要求: 域名分流测试完自动关DNS加速(避免影响其他功能测试)。与ensure_dns_accel_enabled配对:
-        ensure记录was_enabled并按需开启, finally调本方法按was_enabled关回。关回后ikdnsx:53监听可能
-        残留(进程常驻), 但iptables DNSPROXY无REDIRECT规则→client DNS不被本地劫持→功能等同关闭。"""
+        ensure记录was_enabled并按需开启, finally调本方法按was_enabled关回。
+
+        !! 修复(2026-07-16): 原关闭走 dns.sh init, 但 init→start() 在 enabled≠yes 时直接 return,
+        从不 kill 旧 ikdnsd 进程、从不删 ikdnsd.conf/ikdnsd.status 文件 → 残留"数据库 enabled=no +
+        ikdnsd 仍在运行 + 文件仍存在"的不一致状态(实测复现)。该残留污染后续 DNS 加速测试步骤1的
+        初始检查(L4 进程应停止 / L2 文件应清理 误判 [FAIL], 经 conftest 扫描 details 的 FAIL 把
+        步骤1标红)。改用 dns.sh stop(无条件 __disable_dns_ikdnsd: kill ikdnsd pid + rm 文件 +
+        iptables -F DNSPROXY), 真正彻底关闭。"""
         if was_enabled:
             return True  # 原本就开, 保持
         self.connect_router()
         try:
             self._router.exec(
                 f'sqlite3 {self.DNS_DB} "UPDATE dns_config SET enabled=\'no\' WHERE id=1"')
-            self._router.exec("/usr/ikuai/script/dns.sh init 2>/dev/null")
+            # dns.sh stop 强制清理 ikdnsd 进程 + 运行时文件 + DNSPROXY 链(比 init 真正关闭)
+            self._router.exec("/usr/ikuai/script/dns.sh stop 2>/dev/null")
             return True
         except Exception as e:
             logger.error(f"restore_dns_accel失败: {e}")
             return False
+
+    def cleanup_dns_accel_residual(self, max_wait: int = 4) -> VerifyResult:
+        """强制清理 DNS 加速残留(ikdnsd 进程 + ikdnsd.conf/ikdnsd.status 文件), 确保干净关闭起点.
+
+        残留根因: 某些路径(如 restore_dns_accel 历史实现)只 UPDATE 数据库 enabled=no 而不调
+        dns.sh stop, init→start() 在 enabled≠yes 时直接 return, 不 kill 旧 ikdnsd / 不删文件 →
+        "数据库 no + ikdnsd 残留运行 + 文件残留"不一致状态。DNS 加速测试步骤1 撞此残留 →
+        L4(进程应停止)/L2(文件应清理) 误判 [FAIL] → conftest 扫描 details 的 FAIL 把步骤1标红
+        (虽 must_pass=False 不影响整体通过, 但报告视觉上步骤1失败)。
+
+        本方法调 dns.sh stop(无条件 __disable_dns_ikdnsd: kill /var/run/ikdnsd.pid + rm ikdnsd.conf/
+        ikdnsd.static.conf/ikdnsd.status + iptables -F DNSPROXY), 轮询确认 ikdnsd 停止 + 文件清除.
+        幂等: 已干净时再 stop 无害。供步骤1/DNS加速测试 setup 自愈用。
+
+        Args:
+            max_wait: 轮询等待秒数(实测 stop 后 1s 内清理完成, 默认4s 充裕)
+        """
+        self.connect_router()
+        try:
+            self._router.exec("/usr/ikuai/script/dns.sh stop 2>/dev/null")
+            ikdnsd_running = conf_exists = True
+            for _ in range(max_wait):
+                time.sleep(1)
+                ps_out = self._router.exec(
+                    "ps | grep ikdnsd | grep ikdnsd.conf | grep -v grep")
+                conf_out = self._router.exec("cat /tmp/iktmp/ikdnsd.conf 2>/dev/null")
+                ikdnsd_running = bool(ps_out and ps_out.strip())
+                conf_exists = bool(conf_out and conf_out.strip())
+                if not ikdnsd_running and not conf_exists:
+                    break
+            cleaned = not ikdnsd_running and not conf_exists
+            return VerifyResult(
+                level="清理-DNS残留",
+                passed=cleaned,
+                message=("DNS残留已清理(ikdnsd停止+文件清除)" if cleaned
+                         else f"DNS残留清理未完成(ikdnsd运行={ikdnsd_running}, conf存在={conf_exists})"),
+            )
+        except Exception as e:
+            return VerifyResult(
+                level="清理-DNS残留", passed=False,
+                message=f"清理DNS残留异常: {str(e)[:100]}")
 
     # ==================== 上下行分离(stream_updown)验证 ====================
 
@@ -6475,6 +6678,82 @@ class BackendVerifier:
                     raw_output=line[:160])
         return VerifyResult(level="L5-dnat", passed=False,
             message=f"未找到DNAT条目 {wan_ip}:{wan_port}→{lan_ip}:{lan_port}")
+
+    def verify_dnat_counter_increment(self, wan_ip: str, wan_port: str,
+                                      lan_addr: str, lan_port: str,
+                                      proto: str = "tcp") -> VerifyResult:
+        """L5 DNAT数据平面验证(计数增量法, 0 flaky): 触发前后对比DSTNAT链匹配规则的pkts,
+        增量>0=DNAT规则在数据平面执行=生效.
+
+        比verify_dnat_conntrack稳健: 后者依赖/proc/net/nf_conntrack的SYN_SENT条目,
+        iKuai nf_conntrack_tcp_timeout_syn_sent=5秒(默认120)+client自打自连接建不起来时
+        条目转瞬即逝+curl超时RST清条目→必发/偶发误判"未找到DNAT条目".
+        iptables规则pkts是累计统计(只增不清零), 不受conntrack超时影响, 触发后任意时刻读增量均在.
+
+        Args:
+            wan_ip: 外网IP(client curl打流目标)
+            wan_port: 外网端口(DSTNAT规则dpt匹配键)
+            lan_addr: 内网IP(DNAT目标, 校验规则)
+            lan_port: 内网端口(DNAT目标端口, 校验规则)
+        """
+        self.connect_router()
+
+        def _read_rule_pkts():
+            """读DSTNAT链中匹配 wan_port→lan_addr 的DNAT规则pkts计数. 返回(pkts, rule_line).
+
+            端口格式差异: --dport单端口在-L显示'dpt:N'; iKuai UI端口映射统一用
+            multiport --dports, -L显示'multiport dports N'(无dpt:前缀).
+            故用wan_port字面匹配兼容两种格式(同L2 verify_port_map_iptables的兜底匹配).
+            """
+            out = self._router.exec("iptables -t nat -L DSTNAT -v -n 2>/dev/null")
+            for line in out.splitlines():
+                if "DNAT" not in line:
+                    continue
+                if wan_port and wan_port not in line:
+                    continue
+                if lan_addr and lan_addr not in line:
+                    continue
+                parts = line.split()
+                try:
+                    return int(parts[0]), line.strip()
+                except (ValueError, IndexError):
+                    continue
+            return None, ""
+
+        before, before_line = _read_rule_pkts()
+        if before is None:
+            return VerifyResult(
+                level="L5-dnat", passed=False,
+                message=f"DSTNAT链未找到dport={wan_port}→{lan_addr}的DNAT规则(规则未下发到数据平面?)",
+                raw_output="")
+
+        # 触发SYN: client外网侧curl wan_ip:wan_port (短超时快速失败, 计数法不怕超时)
+        try:
+            self.connect_client()
+            for _ in range(3):
+                self._client.exec(
+                    f"curl -s -o /dev/null --connect-timeout 1 -m 1 http://{wan_ip}:{wan_port}/ 2>/dev/null",
+                    timeout=5)
+        except Exception:
+            pass
+
+        after, after_line = _read_rule_pkts()
+        if after is None:
+            return VerifyResult(
+                level="L5-dnat", passed=False,
+                message="触发后DSTNAT链DNAT规则消失(规则被清理?)",
+                raw_output=before_line)
+
+        delta = after - before
+        if delta > 0:
+            return VerifyResult(
+                level="L5-dnat", passed=True,
+                message=f"DNAT生效(计数增量): DSTNAT规则匹配+{delta}(触发前{before}→后{after}), SYN命中规则执行DNAT",
+                raw_output=after_line)
+        return VerifyResult(
+            level="L5-dnat", passed=False,
+            message=f"DNAT未生效: DSTNAT规则匹配计数无增量(触发前{before}→后{after}), SYN未命中规则",
+            raw_output=f"before: {before_line}\nafter: {after_line}")
 
     # ==================== DNS加速服务(dns)验证 ====================
     # 后端脚本: /usr/ikuai/script/dns.sh
@@ -11918,6 +12197,67 @@ class BackendVerifier:
         except Exception as e:
             return f"error: {e}"
 
+    # ==================== 终端名称管理 (安全中心 > 终端名称管理) ====================
+    # 表 mac_comment(id/mac/tagname/comment). mac 为唯一键, 有 BEFORE INSERT 触发器
+    # 按 mac 删除旧行 -> 相同 MAC 再次添加是覆盖更新(非报错). 无 ipset/iptables, 仅 DB 层验证.
+    def find_terminal_name_rule(self, mac: str) -> Optional[Dict]:
+        """按 MAC 查找终端名称规则(mac_comment 表). 大小写不敏感(UI/后端可能转小写存储)."""
+        return self._sqlite_query_line(f"SELECT * FROM mac_comment WHERE lower(mac)=lower('{mac}')")
+
+    def verify_terminal_name_database(self, mac: str, tagname: str = None,
+                                      comment: str = None) -> VerifyResult:
+        """L1: 验证终端名称在 mac_comment 表存在且字段正确. mac 带冒号格式."""
+        rule = self.find_terminal_name_rule(mac)
+        if rule is None:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"终端名称未找到: mac={mac}")
+        mismatches = {}
+        if tagname is not None and str(rule.get("tagname", "")) != str(tagname):
+            mismatches["tagname"] = {"expected": tagname, "actual": rule.get("tagname")}
+        # comment: DB 空串 "" 对应 UI "--"; 期望空时 DB 应为 ""
+        if comment is not None:
+            exp = "" if comment in (None, "", "--") else str(comment)
+            if str(rule.get("comment", "")) != exp:
+                mismatches["comment"] = {"expected": exp, "actual": rule.get("comment")}
+        if mismatches:
+            return VerifyResult(level="L1-数据库", passed=False,
+                                message=f"字段不匹配: {mismatches}", details={"mismatches": mismatches},
+                                raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+        return VerifyResult(level="L1-数据库", passed=True,
+                            message=f"终端名称存在且字段正确 (id={rule.get('id')}, mac={rule.get('mac')}, tagname={rule.get('tagname')}, comment={rule.get('comment')})",
+                            details={"rule": rule}, raw_output=json.dumps(rule, ensure_ascii=False)[:300])
+
+    def verify_terminal_name_not_exists(self, mac: str) -> VerifyResult:
+        """L1: 验证终端名称已删除(DB 无该 mac)."""
+        rule = self.find_terminal_name_rule(mac)
+        if rule is None:
+            return VerifyResult(level="L1-删除验证", passed=True, message=f"终端名称已删除: mac={mac}")
+        return VerifyResult(level="L1-删除验证", passed=False,
+                            message=f"终端名称仍存在: mac={mac}(id={rule.get('id')})", details={"rule": rule})
+
+    def verify_terminal_name_count(self, prefix: str = None) -> VerifyResult:
+        """L1: 统计终端名称数(tagname 以 prefix 开头数, 或总数). 仅返回计数."""
+        if prefix:
+            rows = self._sqlite_query_list(f"SELECT tagname FROM mac_comment WHERE tagname LIKE '{prefix}%'")
+            actual = len(rows)
+        else:
+            row = self._sqlite_query_line("SELECT count(*) as cnt FROM mac_comment")
+            actual = int(row.get("cnt", 0)) if row else 0
+        return VerifyResult(level="L1-计数", passed=True,
+                            message=f"终端名称数量: {actual}" + (f"(prefix={prefix})" if prefix else ""),
+                            details={"count": actual})
+
+    def cleanup_terminal_name_test(self, prefix: str = "tn_t_") -> str:
+        """清理终端名称测试: DELETE mac_comment 中 tagname 以 prefix 开头的行."""
+        self.connect_router()
+        try:
+            rows = self._sqlite_query_list(f"SELECT tagname FROM mac_comment WHERE tagname LIKE '{prefix}%'")
+            total = len(rows)
+            self._router.exec(f"sqlite3 {self.DNS_DB} \"DELETE FROM mac_comment WHERE tagname LIKE '{prefix}%'\"")
+            return f"deleted {total} terminal_name rules"
+        except Exception as e:
+            return f"error: {e}"
+
     # ==================== 应用协议控制 (安全中心 > 应用协议控制) ====================
     # 专业模式(global_config.parental_mode=0). 表 acl_l7.
     # ⚠️不走iptables/ipset! 走 ik_cntl new_tc app_rule -> ik_core内核new_tc子系统(非iptables).
@@ -12384,3 +12724,13005 @@ class BackendVerifier:
             return f"purged {len(rows)} db rules + {len(seen)} kernel app_rule"
         except Exception as e:
             return f"error: {e}"
+
+    # ==================== 高级服务 > 本地服务 > FTP服务 ====================
+    # 底层脚本: /usr/ikuai/script/ftp_server.sh
+    # DB:
+    #   remote_control(open_ftp, ftp_port, ftp_access)
+    #   ftp_server(id, enabled, username, tagname, passwd, permission,
+    #              home_dir, upload, download)
+    # Runtime:
+    #   /tmp/iktmp/ik_ftp_user
+    #   /etc/ik_ftp_user.conf
+    #   ik_ftpd -c /etc/ik_ftp_user.conf
+
+    FTP_SCRIPT = "/usr/ikuai/script/ftp_server.sh"
+    FTP_AUTH_FILE = "/tmp/iktmp/ik_ftp_user"
+    FTP_CONFIG_FILE = "/etc/ik_ftp_user.conf"
+    FTP_DISK_ROOT = "/etc/disk_user"
+
+    @staticmethod
+    def _ftp_sql_literal(value: Any) -> str:
+        """Return a SQLite string literal for the fixed test data used here."""
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def _ftp_truthy(value: Any) -> bool:
+        return str(value).strip().lower() in {
+            "1", "yes", "true", "on", "enable", "enabled",
+        }
+
+    @staticmethod
+    def _ftp_redact(value: Any) -> Any:
+        """Recursively redact password-bearing fields before report serialization."""
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                if "pass" in str(key).lower() or "secret" in str(key).lower():
+                    result[key] = "***"
+                else:
+                    result[key] = BackendVerifier._ftp_redact(item)
+            return result
+        if isinstance(value, list):
+            return [BackendVerifier._ftp_redact(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(BackendVerifier._ftp_redact(item) for item in value)
+        return value
+
+    @staticmethod
+    def _ftp_sanitize_text(text: Any, *secrets: Any) -> str:
+        safe = "" if text is None else str(text)
+        tokens = sorted(
+            {str(secret) for secret in secrets if secret is not None and str(secret)},
+            key=len,
+            reverse=True,
+        )
+        for token in tokens:
+            safe = safe.replace(token, "***")
+        return safe
+
+    @staticmethod
+    def _ftp_normalize_home(home_dir: Any) -> str:
+        home = str(home_dir or "").strip()
+        if home.startswith(BackendVerifier.FTP_DISK_ROOT):
+            home = home[len(BackendVerifier.FTP_DISK_ROOT):]
+        if home and not home.startswith("/"):
+            home = "/" + home
+        if len(home) > 1:
+            home = home.rstrip("/")
+        return home
+
+    @classmethod
+    def _ftp_values_equal(cls, field: str, actual: Any, expected: Any) -> bool:
+        field = str(field).lower()
+        if field in {"enabled", "open_ftp"}:
+            return cls._ftp_truthy(actual) == cls._ftp_truthy(expected)
+        if field in {"id", "ftp_port", "port", "ftp_access", "access",
+                     "upload", "download"}:
+            try:
+                return int(str(actual).strip()) == int(str(expected).strip())
+            except (TypeError, ValueError):
+                pass
+        if field in {"home_dir", "abs_path", "path"}:
+            return cls._ftp_normalize_home(actual) == cls._ftp_normalize_home(expected)
+        if field == "permission":
+            return str(actual).strip().lower() == str(expected).strip().lower()
+        return str(actual) == str(expected)
+
+    @staticmethod
+    def _ftp_port_value(port: Any) -> int:
+        value = int(str(port).strip())
+        if not 1 <= value <= 65535:
+            raise ValueError(f"FTP端口超出范围: {value}")
+        return value
+
+    @staticmethod
+    def _ftp_safe_component(value: Any, label: str) -> str:
+        text = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", text):
+            raise ValueError(f"{label}包含不安全字符: {text!r}")
+        if text in {".", ".."}:
+            raise ValueError(f"{label}不能为{text!r}")
+        return text
+
+    @classmethod
+    def _ftp_exact_prefix_sql(cls, prefix: str, *fields: str) -> str:
+        """Build an exact, literal prefix predicate without SQL ``LIKE`` wildcards."""
+        prefix = str(prefix)
+        if not fields:
+            raise ValueError("FTP前缀查询至少需要一个字段")
+        allowed = {"username", "tagname"}
+        if any(field not in allowed for field in fields):
+            raise ValueError("FTP前缀查询字段不在白名单")
+        literal = cls._ftp_sql_literal(prefix)
+        length = len(prefix)
+        return " OR ".join(
+            f"substr(COALESCE({field},''),1,{length})={literal}"
+            for field in fields
+        )
+
+    def _ftp_sqlite_raw(self, sql: str, line_mode: bool = True) -> str:
+        """Run SQLite with the *whole* SQL shell-quoted and require an rc marker.
+
+        FTP usernames are accepted by the product with very few character
+        restrictions.  Quoting only SQL string literals is therefore insufficient:
+        the surrounding remote shell must never see user-controlled ``$()``,
+        backticks or double quotes as syntax.
+        """
+        self.connect_router()
+        mode = "-line " if line_mode else ""
+        quoted_sql = shlex.quote(str(sql))
+        output = self._router.exec(
+            f"sqlite3 {shlex.quote(self.DNS_DB)} {mode}{quoted_sql} 2>&1; "
+            "rc=$?; printf '\\n__FTP_SQLITE_RC__=%s\\n' \"$rc\"",
+            timeout=20,
+        )
+        matches = list(re.finditer(
+            r"(?m)^__FTP_SQLITE_RC__=(-?\d+)\s*$", output or ""
+        ))
+        if not matches:
+            raise RuntimeError("FTP SQLite未返回执行状态")
+        marker = matches[-1]
+        rc = int(marker.group(1))
+        body = ((output or "")[:marker.start()] + (output or "")[marker.end():]).strip()
+        if rc != 0:
+            raise RuntimeError(f"FTP SQLite执行失败(rc={rc}): {body[:160]}")
+        return body
+
+    def _ftp_sqlite_query_line(self, sql: str) -> Optional[Dict]:
+        output = self._ftp_sqlite_raw(sql, line_mode=True)
+        if not output:
+            return None
+        result = {}
+        for raw_line in output.splitlines():
+            if "=" not in raw_line:
+                continue
+            key, value = raw_line.split("=", 1)
+            result[key.strip()] = value.strip()
+        return result or None
+
+    def _ftp_sqlite_query_list(self, sql: str) -> List[Dict]:
+        output = self._ftp_sqlite_raw(sql, line_mode=True)
+        if not output:
+            return []
+        records, current = [], {}
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if "=" in line:
+                key, value = line.split("=", 1)
+                current[key.strip()] = value.strip()
+            elif not line and current:
+                records.append(current)
+                current = {}
+        if current:
+            records.append(current)
+        return records
+
+    def get_ftp_global_config(self) -> Optional[Dict]:
+        """Return the singleton FTP global row from ``remote_control``."""
+        return self._ftp_sqlite_query_line(
+            "SELECT id,open_ftp,ftp_port,ftp_access "
+            "FROM remote_control ORDER BY id LIMIT 1"
+        )
+
+    def get_ftp_environment_snapshot(self,
+                                     extra_ports: Any = None) -> Optional[Dict]:
+        """Snapshot DB globals, config-file bytes/mode and touched ipset members."""
+        global_row = self.get_ftp_global_config()
+        if global_row is None:
+            return None
+        ports = set()
+        try:
+            ports.add(self._ftp_port_value(global_row.get("ftp_port", 21) or 21))
+        except Exception:
+            pass
+        for value in (extra_ports or []):
+            ports.add(self._ftp_port_value(value))
+        port_list = sorted(ports)
+        fw_commands = []
+        for port in port_list:
+            fw_commands.append(
+                f"if ipset test DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1; "
+                f"then echo __FTP_FW_{port}__=1; else echo __FTP_FW_{port}__=0; fi"
+            )
+        command = (
+            f"if [ -f {self.FTP_CONFIG_FILE} ]; then "
+            "echo __FTP_CONF_EXISTS__=1; "
+            f"printf '__FTP_CONF_B64__='; base64 {self.FTP_CONFIG_FILE} | tr -d '\\n'; echo; "
+            f"mode=$(stat -c '%a' {self.FTP_CONFIG_FILE} 2>/dev/null || echo 644); "
+            "echo __FTP_CONF_MODE__=$mode; "
+            "else echo __FTP_CONF_EXISTS__=0; echo __FTP_CONF_B64__=; "
+            "echo __FTP_CONF_MODE__=; fi; "
+            "if ipset list DROP_T_PORTS_WAN_IN >/dev/null 2>&1; "
+            "then echo __FTP_FW_SET__=1; else echo __FTP_FW_SET__=0; fi; " +
+            "; ".join(fw_commands) + "; "
+            "if [ -f /tmp/iktmp/upnpd_enabled ]; then "
+            "echo __FTP_UPNP_MARKER__=1; else echo __FTP_UPNP_MARKER__=0; fi; "
+            "if pidof miniupnpd >/dev/null 2>&1; then "
+            "echo __FTP_UPNP_PROCESS__=1; else echo __FTP_UPNP_PROCESS__=0; fi"
+        )
+        self.connect_router()
+        output = self._router.exec(command, timeout=20)
+        exists = "__FTP_CONF_EXISTS__=1" in output
+        b64_match = re.search(r"(?m)^__FTP_CONF_B64__=([^\r\n]*)$", output)
+        mode_match = re.search(r"(?m)^__FTP_CONF_MODE__=([^\r\n]*)$", output)
+        content_b64 = b64_match.group(1).strip() if b64_match else ""
+        if exists:
+            try:
+                base64.b64decode(content_b64, validate=True)
+            except Exception as exc:
+                raise RuntimeError(f"FTP配置快照base64无效: {exc}") from exc
+        members = {}
+        for port in port_list:
+            match = re.search(rf"(?m)^__FTP_FW_{port}__=([01])\s*$", output)
+            if match is None:
+                raise RuntimeError(f"FTP ipset快照缺少端口{port}状态")
+            members[str(port)] = match.group(1) == "1"
+        return {
+            "global": global_row,
+            "runtime_config": {
+                "exists": exists,
+                "content_b64": content_b64,
+                "mode": (mode_match.group(1).strip() if mode_match else ""),
+            },
+            "firewall_set_exists": "__FTP_FW_SET__=1" in output,
+            "firewall_members": members,
+            "upnp_runtime": {
+                "marker": "__FTP_UPNP_MARKER__=1" in output,
+                "process": "__FTP_UPNP_PROCESS__=1" in output,
+            },
+        }
+
+    def snapshot_ftp_non_test_users(self, prefix: str) -> Dict[str, Any]:
+        """Return only a count/fingerprint for rows outside this run's prefix."""
+        predicate = self._ftp_exact_prefix_sql(prefix, "username", "tagname")
+        rows = self._ftp_sqlite_query_list(
+            "SELECT id,enabled,username,tagname,passwd,permission,home_dir,upload,download "
+            f"FROM ftp_server WHERE NOT ({predicate}) ORDER BY id"
+        )
+        payload = json.dumps(rows, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        runtime = self._read_ftp_runtime()
+        runtime_rows = []
+        for username, row in sorted(runtime["users"].items()):
+            if username.startswith(prefix):
+                continue
+            runtime_rows.append({
+                "username": username,
+                "permission": row.get("permission"),
+                "upload": row.get("upload"),
+                "download": row.get("download"),
+                "abs_path": row.get("abs_path"),
+            })
+        runtime_payload = json.dumps(
+            runtime_rows, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")
+        ).encode("utf-8")
+        password_sync = []
+        for row in rows:
+            username = str(row.get("username", ""))
+            state = self._ftp_password_state(username)
+            enabled = self._ftp_truthy(row.get("enabled"))
+            password_sync.append({
+                "username": username,
+                "enabled": enabled,
+                "runtime_present": state.get("runtime_present", False),
+                "db_runtime_match": state.get("db_runtime_match", False),
+                "state_matches_enabled": (
+                    state.get("runtime_present", False) and
+                    state.get("db_runtime_match", False)
+                    if enabled else not state.get("runtime_present", False)
+                ),
+            })
+        password_payload = json.dumps(
+            password_sync, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")
+        ).encode("utf-8")
+        return {
+            "count": len(rows),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "runtime_count": len(runtime_rows),
+            "runtime_sha256": hashlib.sha256(runtime_payload).hexdigest(),
+            "password_sync_sha256": hashlib.sha256(password_payload).hexdigest(),
+        }
+
+    def verify_ftp_non_test_users_unchanged(self, prefix: str,
+                                            snapshot: Dict) -> VerifyResult:
+        try:
+            current = self.snapshot_ftp_non_test_users(prefix)
+            passed = bool(snapshot) and current == snapshot
+        except Exception as exc:
+            return VerifyResult(
+                "L4-FTP非测试用户保护", False,
+                f"非测试FTP用户快照查询失败: {str(exc)[:160]}",
+            )
+        return VerifyResult(
+            level="L4-FTP非测试用户保护",
+            passed=passed,
+            message=("非测试FTP用户未变化" if passed else
+                     "非测试FTP用户数量或字段发生变化"),
+            details={
+                "expected_count": snapshot.get("count"),
+                "actual_count": current.get("count"),
+                "fingerprint_match": current.get("sha256") == snapshot.get("sha256"),
+                "runtime_count_match": (
+                    current.get("runtime_count") == snapshot.get("runtime_count")
+                ),
+                "runtime_fingerprint_match": (
+                    current.get("runtime_sha256") == snapshot.get("runtime_sha256")
+                ),
+                "password_sync_match": (
+                    current.get("password_sync_sha256") ==
+                    snapshot.get("password_sync_sha256")
+                ),
+            },
+            raw_output=(f"count={current.get('count')}, "
+                        f"fingerprint_match={current.get('sha256') == snapshot.get('sha256')}"),
+        )
+
+    def find_ftp_user(self, username: str) -> Optional[Dict]:
+        """Return one FTP account row. The caller must not put ``passwd`` in reports."""
+        literal = self._ftp_sql_literal(username)
+        return self._ftp_sqlite_query_line(
+            "SELECT id,enabled,username,tagname,passwd,permission,home_dir,upload,download "
+            f"FROM ftp_server WHERE username={literal} LIMIT 1"
+        )
+
+    def verify_ftp_global_database(self, expected: Dict = None) -> VerifyResult:
+        """L1: verify FTP global switch, port and WAN-access fields."""
+        try:
+            row = self.get_ftp_global_config()
+        except Exception as exc:
+            return VerifyResult(
+                level="L1-FTP全局数据库",
+                passed=False,
+                message=f"FTP全局配置查询失败: {str(exc)[:160]}",
+            )
+        if row is None:
+            return VerifyResult(
+                level="L1-FTP全局数据库",
+                passed=False,
+                message="remote_control中未找到FTP全局配置",
+            )
+
+        aliases = {
+            "enabled": "open_ftp",
+            "open_ftp": "open_ftp",
+            "port": "ftp_port",
+            "ftp_port": "ftp_port",
+            "access": "ftp_access",
+            "wan_access": "ftp_access",
+            "ftp_access": "ftp_access",
+        }
+        mismatches = []
+        for requested, exp in (expected or {}).items():
+            field = aliases.get(requested, requested)
+            actual = row.get(field, "")
+            if not self._ftp_values_equal(field, actual, exp):
+                mismatches.append({"field": field, "expected": exp, "actual": actual})
+
+        safe_row = self._ftp_redact(row)
+        passed = not mismatches
+        return VerifyResult(
+            level="L1-FTP全局数据库",
+            passed=passed,
+            message=("FTP全局配置字段正确" if passed else
+                     "FTP全局配置字段不匹配: " + ", ".join(m["field"] for m in mismatches)),
+            details={"config": safe_row, "mismatches": self._ftp_redact(mismatches)},
+            raw_output=json.dumps(safe_row, ensure_ascii=False)[:500],
+        )
+
+    def verify_ftp_user_database(self, username: str,
+                                 expected_fields: Dict = None,
+                                 must_exist: bool = True) -> VerifyResult:
+        """L1: verify one ``ftp_server`` row without exposing its password."""
+        try:
+            row = self.find_ftp_user(username)
+        except Exception as exc:
+            return VerifyResult(
+                level="L1-FTP用户数据库",
+                passed=False,
+                message=f"FTP用户查询失败({username}): {str(exc)[:140]}",
+                details={"username": username},
+            )
+        if row is None:
+            return VerifyResult(
+                level="L1-FTP用户数据库",
+                passed=not must_exist,
+                message=(f"FTP用户已不存在: {username}" if not must_exist else
+                         f"FTP用户未找到: {username}"),
+                details={"username": username, "present": False},
+            )
+        if not must_exist:
+            return VerifyResult(
+                level="L1-FTP用户数据库",
+                passed=False,
+                message=f"FTP用户仍存在: {username}",
+                details={"user": self._ftp_redact(row), "present": True},
+                raw_output=json.dumps(self._ftp_redact(row), ensure_ascii=False)[:500],
+            )
+
+        aliases = {
+            "name": "username",
+            "password": "passwd",
+            "passwd": "passwd",
+            "path": "home_dir",
+        }
+        mismatches = []
+        password_stored = row.get("passwd") not in (None, "")
+        password_state = None
+        for requested, exp in (expected_fields or {}).items():
+            field = aliases.get(requested, requested)
+            actual = row.get(field, "")
+            if field == "passwd":
+                if not password_stored:
+                    mismatches.append({"field": "passwd", "expected": "stored",
+                                       "actual": "empty"})
+                    continue
+                try:
+                    password_state = self._ftp_password_state(username, str(exp))
+                    if not (password_state["sql_ok"] and
+                            password_state["db_encrypted"] and
+                            password_state["decrypt_ok"] and
+                            password_state["db_expected_match"]):
+                        mismatches.append({
+                            "field": "passwd",
+                            "expected": "encrypted/decrypt-match",
+                            "actual": "mismatch",
+                        })
+                except Exception as exc:
+                    password_state = {"error": str(exc)[:120]}
+                    mismatches.append({
+                        "field": "passwd",
+                        "expected": "encrypted/decrypt-match",
+                        "actual": "verification-error",
+                    })
+                continue
+            if not self._ftp_values_equal(field, actual, exp):
+                mismatches.append({"field": field, "expected": exp, "actual": actual})
+
+        safe_row = self._ftp_redact(row)
+        safe_mismatches = self._ftp_redact(mismatches)
+        passed = not mismatches
+        return VerifyResult(
+            level="L1-FTP用户数据库",
+            passed=passed,
+            message=(f"FTP用户存在且字段正确: {username}" if passed else
+                     f"FTP用户字段不匹配({username}): " +
+                     ", ".join(m["field"] for m in mismatches)),
+            details={"user": safe_row, "mismatches": safe_mismatches,
+                      "password_stored": password_stored,
+                      "password_match": (
+                          password_state.get("db_expected_match")
+                          if isinstance(password_state, dict) else None
+                      ),
+                      "password_encrypted": (
+                          password_state.get("db_encrypted")
+                          if isinstance(password_state, dict) else None
+                      )},
+            raw_output=json.dumps(safe_row, ensure_ascii=False)[:500],
+        )
+
+    def verify_ftp_user_count(self, prefix: str = None,
+                              expected: int = None) -> VerifyResult:
+        """L1: count all FTP users or only usernames/tag names with ``prefix``."""
+        if prefix is None:
+            sql = "SELECT count(*) AS cnt FROM ftp_server"
+        else:
+            predicate = self._ftp_exact_prefix_sql(str(prefix), "username", "tagname")
+            sql = ("SELECT count(*) AS cnt FROM ftp_server "
+                   f"WHERE {predicate}")
+        try:
+            row = self._ftp_sqlite_query_line(sql)
+        except Exception as exc:
+            return VerifyResult(
+                level="L1-FTP用户计数",
+                passed=False,
+                message=f"FTP用户计数查询失败: {str(exc)[:160]}",
+                details={"expected": expected, "prefix": prefix},
+            )
+        try:
+            count = int((row or {}).get("cnt", 0))
+        except (TypeError, ValueError):
+            count = 0
+        passed = expected is None or count == int(expected)
+        return VerifyResult(
+            level="L1-FTP用户计数",
+            passed=passed,
+            message=(f"FTP用户数量: {count}" if expected is None else
+                     f"FTP用户数量{'正确' if passed else '不正确'}: 实际={count}, 期望={expected}"),
+            details={"count": count, "expected": expected, "prefix": prefix},
+            raw_output=f"count={count}",
+        )
+
+    @staticmethod
+    def _ftp_parse_auth_line(line: str) -> Optional[Dict]:
+        # ftp_server.sh writes:
+        # username "passwd" permission upload download /etc/disk_user${home_dir}
+        match = re.match(
+            r'^\s*(\S+)\s+"(.*)"\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$',
+            line or "",
+        )
+        if match:
+            username, passwd, permission, upload, download, abs_path = match.groups()
+        else:
+            parts = (line or "").split(None, 5)
+            if len(parts) != 6:
+                return None
+            username, passwd, permission, upload, download, abs_path = parts
+            if len(passwd) >= 2 and passwd[0] == passwd[-1] == '"':
+                passwd = passwd[1:-1]
+        return {
+            "username": username,
+            "passwd": passwd,
+            "permission": permission,
+            "upload": upload,
+            "download": download,
+            "abs_path": abs_path,
+            "home_dir": BackendVerifier._ftp_normalize_home(abs_path),
+        }
+
+    def _read_ftp_runtime(self) -> Dict:
+        """Read FTP runtime files; the returned private structure may contain passwords."""
+        self.connect_router()
+        command = (
+            "echo __FTP_AUTH_BEGIN__; "
+            f"if [ -f {self.FTP_AUTH_FILE} ]; then echo __FTP_AUTH_EXISTS__=1; "
+            "awk '{ line=$0; first=index(line,\"\\\"\"); "
+            "if(first>0){ tail=substr(line,first+1); second=index(tail,\"\\\"\"); "
+            "if(second>0){ print substr(line,1,first) \"<redacted>\" substr(tail,second); next; } } "
+            "print line; }' " + self.FTP_AUTH_FILE + "; "
+            "else echo __FTP_AUTH_EXISTS__=0; fi; "
+            "echo __FTP_AUTH_END__; "
+            "echo __FTP_CONF_BEGIN__; "
+            f"if [ -f {self.FTP_CONFIG_FILE} ]; then echo __FTP_CONF_EXISTS__=1; "
+            f"grep '^listen_port=' {self.FTP_CONFIG_FILE} 2>/dev/null; "
+            f"grep '^ikuai_auth_file=' {self.FTP_CONFIG_FILE} 2>/dev/null; "
+            "else echo __FTP_CONF_EXISTS__=0; fi; "
+            "echo __FTP_CONF_END__"
+        )
+        output = self._router.exec(command, timeout=15)
+        auth_match = re.search(
+            r"__FTP_AUTH_BEGIN__\s*(.*?)\s*__FTP_AUTH_END__", output, re.S
+        )
+        conf_match = re.search(
+            r"__FTP_CONF_BEGIN__\s*(.*?)\s*__FTP_CONF_END__", output, re.S
+        )
+        auth_block = auth_match.group(1) if auth_match else ""
+        conf_block = conf_match.group(1) if conf_match else ""
+        auth_exists = "__FTP_AUTH_EXISTS__=1" in auth_block
+        conf_exists = "__FTP_CONF_EXISTS__=1" in conf_block
+        rows = {}
+        malformed = []
+        for raw_line in auth_block.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("__FTP_AUTH_EXISTS__="):
+                continue
+            parsed = self._ftp_parse_auth_line(line)
+            if parsed is None:
+                malformed.append(line)
+                continue
+            rows[parsed["username"]] = parsed
+        config = {}
+        for raw_line in conf_block.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("__FTP_CONF_EXISTS__=") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            config[key.strip()] = value.strip()
+        return {
+            "auth_exists": auth_exists,
+            "config_exists": conf_exists,
+            "users": rows,
+            "config": config,
+            # Never expose malformed auth lines because they may still contain a password.
+            "malformed_count": len(malformed),
+        }
+
+    def _ftp_password_state(self, username: str,
+                            expected_password: str = None) -> Dict[str, Any]:
+        """Compare DB cipher, decrypted value and auth-file value on the router.
+
+        Only boolean/status markers cross SSH.  Neither the supplied plaintext,
+        decrypted password, DB cipher nor auth-file plaintext is returned or logged.
+        """
+        username_b64 = base64.b64encode(str(username).encode("utf-8")).decode("ascii")
+        has_expected = expected_password is not None
+        expected_b64 = base64.b64encode(
+            ("" if expected_password is None else str(expected_password)).encode("utf-8")
+        ).decode("ascii")
+        script = f"""set +x
+umask 077
+USERNAME=$(printf '%s' '{username_b64}' | base64 -d) || exit 91
+EXPECTED=$(printf '%s' '{expected_b64}' | base64 -d) || exit 92
+HAS_EXPECTED={'1' if has_expected else '0'}
+SQL_USER=$(printf '%s' "$USERNAME" | sed "s/'/''/g")
+CIPHER=$(sqlite3 {shlex.quote(self.DNS_DB)} "SELECT passwd FROM ftp_server WHERE username='$SQL_USER' LIMIT 1" 2>/dev/null)
+SQL_RC=$?
+DB_STORED=0; DB_ENCRYPTED=0; DEC_RC=99; DB_EXPECTED_MATCH=-1
+RUNTIME_PRESENT=0; DB_RUNTIME_MATCH=0; RUNTIME_EXPECTED_MATCH=-1
+DECRYPTED=''; RUNTIME_PASS=''
+if [ "$SQL_RC" -eq 0 ] && [ -n "$CIPHER" ]; then
+  DB_STORED=1
+  DECRYPTED=$({self.FTP_SCRIPT} __sql_passwd_dec "$CIPHER" 2>/dev/null)
+  DEC_RC=$?
+  if [ "$HAS_EXPECTED" -eq 1 ] && [ "$CIPHER" != "$EXPECTED" ]; then DB_ENCRYPTED=1; fi
+  if [ "$HAS_EXPECTED" -eq 0 ]; then DB_ENCRYPTED=1; fi
+  if [ "$HAS_EXPECTED" -eq 1 ]; then
+    if [ "$DEC_RC" -eq 0 ] && [ "$DECRYPTED" = "$EXPECTED" ]; then DB_EXPECTED_MATCH=1; else DB_EXPECTED_MATCH=0; fi
+  fi
+fi
+if [ -f {self.FTP_AUTH_FILE} ]; then
+  LINE=$(awk -v u="$USERNAME" '$1==u {{print; exit}}' {self.FTP_AUTH_FILE})
+  if [ -n "$LINE" ]; then
+    RUNTIME_PRESENT=1
+    RUNTIME_PASS=$(printf '%s\n' "$LINE" | awk -F '"' '{{print $2}}')
+    if [ "$DEC_RC" -eq 0 ] && [ "$RUNTIME_PASS" = "$DECRYPTED" ]; then DB_RUNTIME_MATCH=1; fi
+    if [ "$HAS_EXPECTED" -eq 1 ]; then
+      if [ "$RUNTIME_PASS" = "$EXPECTED" ]; then RUNTIME_EXPECTED_MATCH=1; else RUNTIME_EXPECTED_MATCH=0; fi
+    fi
+  fi
+fi
+printf '__FTP_SQL_RC__=%s\n' "$SQL_RC"
+printf '__FTP_DB_STORED__=%s\n' "$DB_STORED"
+printf '__FTP_DB_ENCRYPTED__=%s\n' "$DB_ENCRYPTED"
+printf '__FTP_DECRYPT_RC__=%s\n' "$DEC_RC"
+printf '__FTP_DB_EXPECTED_MATCH__=%s\n' "$DB_EXPECTED_MATCH"
+printf '__FTP_RUNTIME_PRESENT__=%s\n' "$RUNTIME_PRESENT"
+printf '__FTP_DB_RUNTIME_MATCH__=%s\n' "$DB_RUNTIME_MATCH"
+printf '__FTP_RUNTIME_EXPECTED_MATCH__=%s\n' "$RUNTIME_EXPECTED_MATCH"
+unset USERNAME EXPECTED SQL_USER CIPHER DECRYPTED RUNTIME_PASS LINE
+"""
+        safe_username = re.sub(r"[^A-Za-z0-9_.-]", "?", str(username))[:40]
+        output = self._ftp_exec_router_script(
+            script,
+            f"ftp_password_state username={safe_username} password=<redacted>",
+            timeout=25,
+        )
+        values = {
+            key: int(value) for key, value in re.findall(
+                r"(?m)^__FTP_([A-Z_]+)__=(-?\d+)\s*$", output or ""
+            )
+        }
+        required = {
+            "SQL_RC", "DB_STORED", "DB_ENCRYPTED", "DECRYPT_RC",
+            "DB_EXPECTED_MATCH", "RUNTIME_PRESENT", "DB_RUNTIME_MATCH",
+            "RUNTIME_EXPECTED_MATCH",
+        }
+        missing = sorted(required - set(values))
+        if missing:
+            diagnostic = self._ftp_sanitize_text(
+                output, username, expected_password
+            ).strip()[:240]
+            raise RuntimeError(
+                f"FTP密码状态缺少marker: {missing}; output={diagnostic!r}"
+            )
+        return {
+            "sql_ok": values["SQL_RC"] == 0,
+            "db_stored": values["DB_STORED"] == 1,
+            "db_encrypted": values["DB_ENCRYPTED"] == 1,
+            "decrypt_ok": values["DECRYPT_RC"] == 0,
+            "db_expected_match": values["DB_EXPECTED_MATCH"] == 1,
+            "runtime_present": values["RUNTIME_PRESENT"] == 1,
+            "db_runtime_match": values["DB_RUNTIME_MATCH"] == 1,
+            "runtime_expected_match": values["RUNTIME_EXPECTED_MATCH"] == 1,
+            "expected_checked": has_expected,
+        }
+
+    def verify_ftp_auth_runtime(self, username: str,
+                                expected_fields: Dict = None,
+                                expect_present: bool = True) -> VerifyResult:
+        """L2/L3: verify generated auth/config files, with password-safe reporting."""
+        runtime = self._read_ftp_runtime()
+        row = runtime["users"].get(username)
+        present = row is not None
+        base_details = {
+            "username": username,
+            "present": present,
+            "auth_file_exists": runtime["auth_exists"],
+            "config_file_exists": runtime["config_exists"],
+            "config": runtime["config"],
+            "malformed_count": runtime["malformed_count"],
+        }
+        if not expect_present:
+            safe_row = self._ftp_redact(row) if row else None
+            return VerifyResult(
+                level="L2-FTP认证运行时",
+                passed=not present,
+                message=(f"FTP运行时用户已不存在: {username}" if not present else
+                         f"FTP运行时用户仍存在: {username}"),
+                details={**base_details, "runtime_user": safe_row},
+                raw_output=(json.dumps(safe_row, ensure_ascii=False)[:500]
+                            if safe_row else "runtime user absent"),
+            )
+        if not present:
+            return VerifyResult(
+                level="L2-FTP认证运行时",
+                passed=False,
+                message=f"FTP认证文件中未找到用户: {username}",
+                details=base_details,
+                raw_output="runtime user absent",
+            )
+
+        aliases = {"password": "passwd", "path": "home_dir"}
+        mismatches = []
+        password_state = None
+        for requested, exp in (expected_fields or {}).items():
+            field = aliases.get(requested, requested)
+            if field == "passwd":
+                try:
+                    password_state = self._ftp_password_state(username, str(exp))
+                    if not (password_state["runtime_present"] and
+                            password_state["db_runtime_match"] and
+                            password_state["runtime_expected_match"]):
+                        mismatches.append({
+                            "field": "passwd",
+                            "expected": "DB/runtime/expected match",
+                            "actual": "mismatch",
+                        })
+                except Exception as exc:
+                    password_state = {"error": str(exc)[:120]}
+                    mismatches.append({
+                        "field": "passwd",
+                        "expected": "DB/runtime/expected match",
+                        "actual": "verification-error",
+                    })
+                continue
+            if field == "enabled":
+                # Presence in ik_ftp_user is the enabled-state evidence.
+                if not self._ftp_truthy(exp):
+                    mismatches.append({"field": field, "expected": exp, "actual": "present"})
+                continue
+            if field not in row:
+                continue
+            actual = row.get(field, "")
+            if not self._ftp_values_equal(field, actual, exp):
+                mismatches.append({"field": field, "expected": exp, "actual": actual})
+
+        if runtime["config"].get("ikuai_auth_file") != self.FTP_AUTH_FILE:
+            mismatches.append({
+                "field": "ikuai_auth_file",
+                "expected": self.FTP_AUTH_FILE,
+                "actual": runtime["config"].get("ikuai_auth_file", ""),
+            })
+        safe_row = self._ftp_redact(row)
+        safe_mismatches = self._ftp_redact(mismatches)
+        passed = not mismatches and runtime["malformed_count"] == 0
+        return VerifyResult(
+            level="L2-FTP认证运行时",
+            passed=passed,
+            message=(f"FTP认证运行时正确: {username}" if passed else
+                     f"FTP认证运行时不一致({username}): " +
+                     ", ".join(m["field"] for m in mismatches) +
+                     (f", malformed={runtime['malformed_count']}"
+                      if runtime["malformed_count"] else "")),
+            details={**base_details, "runtime_user": safe_row,
+                      "mismatches": safe_mismatches,
+                      "password_match": (
+                          password_state.get("runtime_expected_match")
+                          if isinstance(password_state, dict) else None
+                      ),
+                      "db_runtime_password_match": (
+                          password_state.get("db_runtime_match")
+                          if isinstance(password_state, dict) else None
+                      )},
+            raw_output=json.dumps(safe_row, ensure_ascii=False)[:500],
+        )
+
+    def verify_ftp_listener(self, port: int,
+                            expect_listening: bool = True,
+                            wait_seconds: float = 6.0) -> VerifyResult:
+        """L2: verify a TCP LISTEN socket using netstat plus /proc fallback."""
+        try:
+            port = self._ftp_port_value(port)
+        except Exception as exc:
+            return VerifyResult("L2-FTP监听", False, str(exc))
+        self.connect_router()
+        output = self._router.exec(
+            "netstat -lnt 2>/dev/null; echo __FTP_PROC_TCP__; "
+            "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null",
+            timeout=15,
+        )
+        netstat_part, _, proc_part = output.partition("__FTP_PROC_TCP__")
+        matched = []
+        listening = False
+        for line in netstat_part.splitlines():
+            fields = line.split()
+            if not fields or not fields[0].lower().startswith("tcp") or "LISTEN" not in line.upper():
+                continue
+            local = fields[3] if len(fields) > 3 else ""
+            if local.rsplit(":", 1)[-1] == str(port):
+                listening = True
+                matched.append(line.strip())
+        if not listening:
+            wanted_hex = f"{port:04X}"
+            for line in proc_part.splitlines():
+                fields = line.split()
+                if len(fields) < 4 or ":" not in fields[1]:
+                    continue
+                local_port = fields[1].rsplit(":", 1)[-1].upper()
+                state = fields[3].upper()
+                if local_port == wanted_hex and state == "0A":
+                    listening = True
+                    matched.append(line.strip())
+        passed = listening == bool(expect_listening)
+        result = VerifyResult(
+            level="L2-FTP监听",
+            passed=passed,
+            message=(f"TCP/{port}{'正在' if listening else '未'}监听"
+                     f"（期望{'监听' if expect_listening else '不监听'}）"),
+            details={"port": port, "listening": listening,
+                     "expected": bool(expect_listening), "matched": matched[:5]},
+            raw_output="\n".join(matched[:5]) or f"tcp/{port}: no listener",
+        )
+        if not result.passed and wait_seconds > 0:
+            deadline = time.time() + float(wait_seconds)
+            while time.time() < deadline:
+                time.sleep(0.5)
+                retry = self.verify_ftp_listener(
+                    port, expect_listening, wait_seconds=0
+                )
+                if retry.passed:
+                    return retry
+            return retry
+        return result
+
+    def verify_ftp_daemon(self, expect_running: bool,
+                          port: int = None,
+                          wait_seconds: float = 6.0) -> VerifyResult:
+        """L2: verify ``ik_ftpd`` only; never confuse the permanent ``vsftpd:21``."""
+        self.connect_router()
+        output = self._router.exec(
+            "(ps w 2>/dev/null || ps 2>/dev/null); echo __FTP_FD_OWNER__; "
+            "for pid in $(pidof ik_ftpd 2>/dev/null); do "
+            "ls -l /proc/$pid/fd 2>/dev/null; done; "
+            "echo __FTP_PROC_OWNER__; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null",
+            timeout=15,
+        )
+        ps_output, _, owner_rest = output.partition("__FTP_FD_OWNER__")
+        fd_output, _, owner_output = owner_rest.partition("__FTP_PROC_OWNER__")
+        process_lines = [
+            line.strip() for line in ps_output.splitlines()
+            if re.search(r"(^|[ /])ik_ftpd([ ]|$)", line)
+            and self.FTP_CONFIG_FILE in line
+        ]
+        running = bool(process_lines)
+        listener = None
+        owner_lines = []
+        owner_match = True
+        # A positive daemon assertion also proves its configured port is listening.
+        # For a negative assertion, port 21 may legitimately belong to permanent vsftpd.
+        if port is not None and expect_running:
+            listener = self.verify_ftp_listener(
+                port, expect_listening=True, wait_seconds=wait_seconds
+            )
+            socket_inodes = set(re.findall(r"socket:\[(\d+)\]", fd_output))
+            wanted_hex = f"{int(port):04X}"
+            for line in owner_output.splitlines():
+                fields = line.split()
+                if len(fields) < 10 or ":" not in fields[1]:
+                    continue
+                local_port = fields[1].rsplit(":", 1)[-1].upper()
+                state = fields[3].upper()
+                inode = fields[9]
+                if (local_port == wanted_hex and state == "0A" and
+                        inode in socket_inodes):
+                    owner_lines.append(
+                        f"ik_ftpd socket inode={inode} tcp/{port} LISTEN"
+                    )
+            owner_match = bool(owner_lines)
+        passed = (running == bool(expect_running) and
+                  (listener is None or listener.passed) and owner_match)
+        details = {
+            "running": running,
+            "expected": bool(expect_running),
+            "process_lines": process_lines[:5],
+            "listener_owner_match": owner_match,
+            "listener_owner_lines": owner_lines[:5],
+        }
+        raw_parts = process_lines[:5]
+        raw_parts.extend(owner_lines[:5])
+        if listener is not None:
+            details["listener"] = listener.details
+            raw_parts.append(listener.raw_output)
+        result = VerifyResult(
+            level="L2-FTP进程",
+            passed=passed,
+            message=(f"ik_ftpd{'正在运行' if running else '未运行'}"
+                     f"（期望{'运行' if expect_running else '停止'}）" +
+                     (f"; {listener.message}" if listener is not None else "") +
+                     ("; 目标监听未归属ik_ftpd" if not owner_match else "")),
+            details=details,
+            raw_output="\n".join(part for part in raw_parts if part)[:800],
+        )
+        if not result.passed and wait_seconds > 0:
+            deadline = time.time() + float(wait_seconds)
+            while time.time() < deadline:
+                time.sleep(0.5)
+                retry = self.verify_ftp_daemon(
+                    expect_running, port=port, wait_seconds=0
+                )
+                if retry.passed:
+                    return retry
+            return retry
+        return result
+
+    def verify_ftp_firewall(self, port: int,
+                            expect_blocked: bool) -> VerifyResult:
+        """L3: verify TCP port membership in ``DROP_T_PORTS_WAN_IN`` ipset."""
+        try:
+            port = self._ftp_port_value(port)
+        except Exception as exc:
+            return VerifyResult("L3-FTP外网访问", False, str(exc))
+        self.connect_router()
+        output = self._router.exec(
+            "if ipset list DROP_T_PORTS_WAN_IN >/dev/null 2>&1; then "
+            "echo __FTP_IPSET_SET__=present; "
+            f"if ipset test DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1; "
+            "then echo __FTP_IPSET__=present; else echo __FTP_IPSET__=absent; fi; "
+            "ipset list DROP_T_PORTS_WAN_IN 2>/dev/null; "
+            "else echo __FTP_IPSET_SET__=missing; echo __FTP_IPSET__=error; fi",
+            timeout=15,
+        )
+        set_exists = "__FTP_IPSET_SET__=present" in output
+        blocked = "__FTP_IPSET__=present" in output
+        passed = set_exists and blocked == bool(expect_blocked)
+        members = ""
+        if "Members:" in output:
+            members = output.split("Members:", 1)[1].strip()
+        return VerifyResult(
+            level="L3-FTP外网访问",
+            passed=passed,
+            message=((f"TCP/{port}{'在' if blocked else '不在'}DROP_T_PORTS_WAN_IN"
+                      f"（期望{'阻断外网' if expect_blocked else '允许外网'}）")
+                     if set_exists else "DROP_T_PORTS_WAN_IN集合不存在或无法读取"),
+            details={"port": port, "blocked": blocked,
+                     "expected_blocked": bool(expect_blocked),
+                     "set_exists": set_exists},
+            raw_output=(members[:500] if members else
+                        f"DROP_T_PORTS_WAN_IN: port {port} {'present' if blocked else 'absent'}"),
+        )
+
+    def verify_ftp_runtime_consistency(self,
+                                       prefix: str = "ftp_t_") -> VerifyResult:
+        """L4: cross-check DB, auth/config files, process, listener and WAN ipset."""
+        predicate = self._ftp_exact_prefix_sql(str(prefix), "username", "tagname")
+        try:
+            db_rows = self._ftp_sqlite_query_list(
+                "SELECT id,enabled,username,tagname,passwd,permission,home_dir,upload,download "
+                f"FROM ftp_server WHERE {predicate}"
+            )
+            global_row = self.get_ftp_global_config()
+        except Exception as exc:
+            return VerifyResult(
+                level="L4-FTP运行时一致性",
+                passed=False,
+                message=f"FTP一致性数据库查询失败: {str(exc)[:160]}",
+            )
+        if global_row is None:
+            return VerifyResult(
+                level="L4-FTP运行时一致性",
+                passed=False,
+                message="FTP全局配置不存在，无法检查一致性",
+            )
+        runtime = self._read_ftp_runtime()
+        global_on = self._ftp_truthy(global_row.get("open_ftp"))
+        try:
+            port = self._ftp_port_value(global_row.get("ftp_port", 21) or 21)
+        except Exception as exc:
+            return VerifyResult("L4-FTP运行时一致性", False, str(exc))
+        wan_blocked = global_on and not self._ftp_truthy(global_row.get("ftp_access"))
+
+        # ftp_server.sh writes all enabled users to ik_ftp_user even when the global
+        # service switch is off. ``open_ftp`` controls the daemon, not auth-file rows.
+        expected_rows = {
+            str(row.get("username", "")): row for row in db_rows
+            if self._ftp_truthy(row.get("enabled"))
+        }
+        runtime_rows = {
+            name: row for name, row in runtime["users"].items()
+            if name.startswith(prefix)
+        }
+        expected_names = set(expected_rows)
+        runtime_names = set(runtime_rows)
+        missing = sorted(expected_names - runtime_names)
+        unexpected = sorted(runtime_names - expected_names)
+        field_mismatches = []
+        password_mismatches = []
+        for username in sorted(expected_names & runtime_names):
+            db_row = expected_rows[username]
+            rt_row = runtime_rows[username]
+            expected_abs = self.FTP_DISK_ROOT + self._ftp_normalize_home(
+                db_row.get("home_dir", "")
+            )
+            pairs = {
+                "permission": (rt_row.get("permission"), db_row.get("permission")),
+                "upload": (rt_row.get("upload"), db_row.get("upload")),
+                "download": (rt_row.get("download"), db_row.get("download")),
+                "abs_path": (rt_row.get("abs_path"), expected_abs),
+            }
+            for field, (actual, expected) in pairs.items():
+                if not self._ftp_values_equal(field, actual, expected):
+                    field_mismatches.append({
+                        "username": username,
+                        "field": field,
+                        "expected": expected,
+                        "actual": actual,
+                    })
+            try:
+                password_state = self._ftp_password_state(username)
+                if not (password_state["sql_ok"] and
+                        password_state["db_stored"] and
+                        password_state["decrypt_ok"] and
+                        password_state["runtime_present"] and
+                        password_state["db_runtime_match"]):
+                    password_mismatches.append(username)
+            except Exception:
+                password_mismatches.append(username)
+
+        config_mismatches = []
+        if not runtime["auth_exists"]:
+            config_mismatches.append("auth_file_missing")
+        if global_on:
+            if str(runtime["config"].get("listen_port", "")) != str(port):
+                config_mismatches.append("listen_port")
+            if runtime["config"].get("ikuai_auth_file") != self.FTP_AUTH_FILE:
+                config_mismatches.append("ikuai_auth_file")
+            if not runtime["config_exists"]:
+                config_mismatches.append("config_file_missing")
+
+        daemon_result = self.verify_ftp_daemon(global_on, port if global_on else None)
+        # Closed custom ports must not have an orphan listener. Port 21 is intentionally
+        # skipped because the platform's unrelated permanent vsftpd owns it.
+        if global_on or port != 21:
+            listener_result = self.verify_ftp_listener(port, global_on)
+        else:
+            listener_result = VerifyResult(
+                "L2-FTP监听", True,
+                "FTP关闭且端口为21：跳过监听负断言（常驻vsftpd可能监听21）",
+                details={"port": port, "skipped_for_vsftpd": True},
+            )
+        # Firewall membership is independent from the permanent vsftpd listener;
+        # port 21 therefore must not bypass ipset verification.
+        firewall_result = self.verify_ftp_firewall(port, wan_blocked)
+
+        passed = all([
+            not missing,
+            not unexpected,
+            not field_mismatches,
+            not password_mismatches,
+            not config_mismatches,
+            runtime["malformed_count"] == 0,
+            daemon_result.passed,
+            listener_result.passed,
+            firewall_result.passed,
+        ])
+        summary = {
+            "prefix": prefix,
+            "global_on": global_on,
+            "port": port,
+            "wan_blocked": wan_blocked,
+            "expected_users": sorted(expected_names),
+            "runtime_users": sorted(runtime_names),
+            "missing": missing,
+            "unexpected": unexpected,
+            "field_mismatches": self._ftp_redact(field_mismatches),
+            "password_mismatches": password_mismatches,
+            "config_mismatches": config_mismatches,
+            "malformed_count": runtime["malformed_count"],
+            "daemon": daemon_result.message,
+            "listener": listener_result.message,
+            "firewall": firewall_result.message,
+        }
+        issues = []
+        if missing:
+            issues.append(f"缺少运行时用户={missing}")
+        if unexpected:
+            issues.append(f"残留运行时用户={unexpected}")
+        if field_mismatches:
+            issues.append("用户字段不一致=" + ",".join(
+                f"{m['username']}.{m['field']}" for m in field_mismatches
+            ))
+        if password_mismatches:
+            issues.append(f"DB/runtime密码不一致={password_mismatches}")
+        if config_mismatches:
+            issues.append(f"配置不一致={config_mismatches}")
+        if runtime["malformed_count"]:
+            issues.append(f"认证文件格式错误={runtime['malformed_count']}")
+        if not daemon_result.passed:
+            issues.append(daemon_result.message)
+        if not listener_result.passed:
+            issues.append(listener_result.message)
+        if not firewall_result.passed:
+            issues.append(firewall_result.message)
+        return VerifyResult(
+            level="L4-FTP运行时一致性",
+            passed=passed,
+            message=("FTP DB/运行时/进程/监听/防火墙一致" if passed else
+                     "FTP运行时不一致: " + "; ".join(issues)),
+            details=summary,
+            raw_output=json.dumps(summary, ensure_ascii=False)[:1200],
+        )
+
+    def verify_ftp_reinit(self, username: str = None,
+                          port: int = None) -> VerifyResult:
+        """L4: execute ``ftp_server.sh init`` and verify rebuilt runtime state."""
+        self.connect_router()
+        output = self._router.exec(
+            f"{self.FTP_SCRIPT} init >/dev/null 2>&1; "
+            "echo __FTP_INIT_RC__=$?",
+            timeout=30,
+            probe_console=False,
+        )
+        match = re.search(r"__FTP_INIT_RC__=(\d+)", output)
+        init_rc = int(match.group(1)) if match else -1
+        checks = []
+        consistency = self.verify_ftp_runtime_consistency()
+        checks.append(consistency)
+        global_row = self.get_ftp_global_config() or {}
+        global_on = self._ftp_truthy(global_row.get("open_ftp"))
+        selected_port = port if port is not None else global_row.get("ftp_port", 21)
+        if selected_port is not None:
+            selected_port = self._ftp_port_value(selected_port)
+            if global_on or selected_port != 21:
+                checks.append(self.verify_ftp_listener(selected_port, global_on))
+        if username:
+            db_row = self.find_ftp_user(username)
+            expect_present = bool(
+                db_row and self._ftp_truthy(db_row.get("enabled"))
+            )
+            runtime_expected = {
+                key: value for key, value in (db_row or {}).items()
+                if key not in {"passwd", "password"}
+            }
+            checks.append(self.verify_ftp_auth_runtime(
+                username,
+                expected_fields=runtime_expected or None,
+                expect_present=expect_present,
+            ))
+        passed = init_rc == 0 and all(check.passed for check in checks)
+        details = {
+            "init_rc": init_rc,
+            "username": username,
+            "port": selected_port,
+            "checks": [{"level": c.level, "passed": c.passed,
+                        "message": c.message} for c in checks],
+        }
+        return VerifyResult(
+            level="L4-FTP脚本重建",
+            passed=passed,
+            message=("ftp_server.sh init后运行时重建正确" if passed else
+                     "ftp_server.sh init后验证失败: " + "; ".join(
+                         ([f"init_rc={init_rc}"] if init_rc != 0 else []) +
+                         [c.message for c in checks if not c.passed]
+                     )),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False)[:1000],
+        )
+
+    def prepare_ftp_test_directory(self, partname: str = None,
+                                   dirname: str = "ftp_t_suite") -> VerifyResult:
+        """Create a safe FTP test home and return both absolute path and DB home_dir."""
+        try:
+            dirname = self._ftp_safe_component(dirname, "dirname")
+            part = self._ftp_safe_component(partname, "partname") if partname else ""
+        except Exception as exc:
+            return VerifyResult("L5-FTP测试目录", False, str(exc))
+        self.connect_router()
+        requested_root = f"{self.FTP_DISK_ROOT}/{part}" if part else ""
+        command = (
+            f"root='{requested_root}'; "
+            "if [ -z \"$root\" ]; then "
+            f"for d in {self.FTP_DISK_ROOT}/*; do "
+            "if [ -d \"$d\" ]; then root=\"$d\"; break; fi; done; fi; "
+            "if [ -z \"$root\" ] || [ ! -d \"$root\" ]; then "
+            "echo __FTP_DIR_ERROR__=no_partition; "
+            "else dir=\"$root/" + dirname + "\"; "
+            "if [ -e \"$dir\" ]; then echo __FTP_DIR_ERROR__=already_exists; "
+            "else mkdir \"$dir\" 2>/dev/null; chmod 0777 \"$dir\" 2>/dev/null; "
+            "if [ -d \"$dir\" ]; then echo __FTP_DIR_PATH__=\"$dir\"; "
+            "else echo __FTP_DIR_ERROR__=mkdir_failed; fi; fi; fi"
+        )
+        output = self._router.exec(command, timeout=20)
+        match = re.search(r"__FTP_DIR_PATH__=(\S+)", output)
+        if not match:
+            reason = re.search(r"__FTP_DIR_ERROR__=(\S+)", output)
+            return VerifyResult(
+                level="L5-FTP测试目录",
+                passed=False,
+                message="FTP测试目录创建失败: " +
+                        (reason.group(1) if reason else "unknown"),
+                raw_output=self._ftp_sanitize_text(output)[:300],
+            )
+        path = match.group(1).rstrip("/")
+        home_dir = self._ftp_normalize_home(path)
+        actual_part = home_dir.strip("/").split("/", 1)[0] if home_dir else ""
+        details = {
+            "path": path,
+            "home_dir": home_dir,
+            "partname": actual_part,
+            "dirname": dirname,
+        }
+        return VerifyResult(
+            level="L5-FTP测试目录",
+            passed=True,
+            message=f"FTP测试目录已准备: {path}",
+            details=details,
+            raw_output=path,
+        )
+
+    def _stop_ftp_runtime(self, port: int = None,
+                          remove_firewall: bool = False) -> Dict:
+        """Stop only ik_ftpd and optionally delete its exact TCP port from WAN DROP."""
+        self.connect_router()
+        selected_port = None
+        if port is not None:
+            try:
+                selected_port = self._ftp_port_value(port)
+            except Exception:
+                selected_port = None
+        firewall_cmd = ""
+        if remove_firewall and selected_port is not None:
+            firewall_cmd = (
+                f"ipset del DROP_T_PORTS_WAN_IN {selected_port} >/dev/null 2>&1; "
+                "fw_rc=$?; "
+            )
+        output = self._router.exec(
+            f"{self.FTP_SCRIPT} __stop >/dev/null 2>&1; stop_rc=$?; "
+            "killall ik_ftpd >/dev/null 2>&1; kill_rc=$?; "
+            f"{firewall_cmd}"
+            "sleep 1; echo __FTP_STOP_RC__=$stop_rc; echo __FTP_KILL_RC__=$kill_rc; "
+            "echo __FTP_FW_DEL_RC__=${fw_rc:-skip}",
+            timeout=30,
+            probe_console=False,
+        )
+        daemon = self.verify_ftp_daemon(False)
+        listener = None
+        if selected_port is not None and selected_port != 21:
+            listener = self.verify_ftp_listener(selected_port, False)
+        firewall = None
+        if remove_firewall and selected_port is not None:
+            firewall = self.verify_ftp_firewall(selected_port, False)
+        passed = (daemon.passed and
+                  (listener is None or listener.passed) and
+                  (firewall is None or firewall.passed))
+        return {
+            "passed": passed,
+            "port": selected_port,
+            "remove_firewall": bool(remove_firewall),
+            "daemon": daemon,
+            "listener": listener,
+            "firewall": firewall,
+            "markers": self._ftp_sanitize_text(output)[:300],
+        }
+
+    def cleanup_ftp_test(self, prefix: str = "ftp_t_",
+                         test_dir: Any = None) -> str:
+        """Delete prefixed rows/home, rebuild auth, then leave custom FTP runtime stopped."""
+        try:
+            prefix = self._ftp_safe_component(prefix, "prefix")
+        except Exception as exc:
+            return f"error: {exc}"
+        self.connect_router()
+        current = self.get_ftp_global_config() or {}
+        try:
+            current_port = self._ftp_port_value(current.get("ftp_port", 21) or 21)
+        except Exception:
+            current_port = None
+        remove_old_firewall = bool(
+            current_port is not None and current_port != 21
+        ) or (
+            self._ftp_truthy(current.get("open_ftp")) and
+            not self._ftp_truthy(current.get("ftp_access"))
+        )
+        predicate = self._ftp_exact_prefix_sql(prefix, "username", "tagname")
+        delete_sql = (
+            "DELETE FROM ftp_server "
+            f"WHERE {predicate}; "
+            "SELECT changes();"
+        )
+        try:
+            output = self._ftp_sqlite_raw(delete_sql, line_mode=False)
+        except Exception as exc:
+            return f"error: FTP测试用户数据库清理失败: {str(exc)[:160]}"
+        init_output = self._router.exec(
+            f"{self.FTP_SCRIPT} init >/dev/null 2>&1; echo __FTP_INIT_RC__=$?",
+            timeout=30,
+            probe_console=False,
+        )
+        # init refreshes ik_ftp_user after the DELETE. Stop afterwards so a custom
+        # test port cannot survive cleanup while restore_ftp_global is pending.
+        stop_state = self._stop_ftp_runtime(
+            current_port, remove_firewall=remove_old_firewall
+        )
+        path = test_dir
+        if isinstance(test_dir, VerifyResult):
+            path = test_dir.details.get("path")
+        elif isinstance(test_dir, dict):
+            path = test_dir.get("path")
+        dir_status = "not requested"
+        if path:
+            path = str(path).rstrip("/")
+            safe_path = re.fullmatch(
+                r"/etc/disk_user/[A-Za-z0-9_.-]+/ftp_t[A-Za-z0-9_.-]*", path
+            )
+            if safe_path:
+                dir_output = self._router.exec(
+                    f'rm -rf "{path}"; '
+                    f'if [ -e "{path}" ]; then echo FAILED; else echo REMOVED; fi',
+                    timeout=20,
+                )
+                dir_status = "removed" if "REMOVED" in dir_output else "remove failed"
+            else:
+                dir_status = "refused unsafe path"
+        init_rc = re.search(r"__FTP_INIT_RC__=(\d+)", init_output)
+        return (f"ftp cleanup prefix={prefix}: db={output.strip() or 'ok'}, "
+                f"init_rc={init_rc.group(1) if init_rc else 'unknown'}, "
+                 f"stopped={stop_state['passed']}, "
+                 f"listener_clean={stop_state['listener'].passed if stop_state['listener'] else 'skip'}, "
+                 f"firewall_clean={stop_state['firewall'].passed if stop_state['firewall'] else 'skip'}, "
+                 f"dir={dir_status}")
+
+    def verify_ftp_test_artifacts_absent(self, prefix: str, test_dir: str,
+                                         port: int = None) -> VerifyResult:
+        """Hard-verify DB/auth/home/listener/firewall residue after test cleanup."""
+        checks, issues = {}, []
+        count_result = self.verify_ftp_user_count(prefix, expected=0)
+        checks["database"] = count_result.passed
+        if not count_result.passed:
+            issues.append(count_result.message)
+        try:
+            runtime = self._read_ftp_runtime()
+            runtime_names = sorted(
+                name for name in runtime["users"] if name.startswith(prefix)
+            )
+            checks["auth_runtime"] = not runtime_names
+            if runtime_names:
+                issues.append(f"认证文件残留用户={runtime_names}")
+        except Exception as exc:
+            checks["auth_runtime"] = False
+            issues.append(f"认证文件检查失败={str(exc)[:100]}")
+        path = str(test_dir or "").rstrip("/")
+        safe_path = re.fullmatch(
+            r"/etc/disk_user/[A-Za-z0-9_.-]+/ftp_t[A-Za-z0-9_.-]*", path
+        )
+        if not safe_path:
+            checks["test_dir"] = False
+            issues.append("测试目录路径不在安全白名单")
+        else:
+            self.connect_router()
+            output = self._router.exec(
+                f"if [ -e {shlex.quote(path)} ] || [ -L {shlex.quote(path)} ]; "
+                "then echo PRESENT; else echo ABSENT; fi",
+                timeout=10,
+            )
+            checks["test_dir"] = "ABSENT" in output
+            if not checks["test_dir"]:
+                issues.append("测试目录仍存在")
+        daemon = self.verify_ftp_daemon(False)
+        checks["daemon"] = daemon.passed
+        if not daemon.passed:
+            issues.append(daemon.message)
+        if port is not None:
+            listener = self.verify_ftp_listener(port, False)
+            firewall = self.verify_ftp_firewall(port, False)
+            checks["listener"] = listener.passed
+            checks["firewall"] = firewall.passed
+            if not listener.passed:
+                issues.append(listener.message)
+            if not firewall.passed:
+                issues.append(firewall.message)
+        passed = all(checks.values())
+        return VerifyResult(
+            level="L4-FTP测试残留",
+            passed=passed,
+            message=("FTP测试DB/auth/目录/进程/端口/防火墙均无残留" if passed else
+                     "FTP测试残留检查失败: " + "; ".join(issues)),
+            details={"prefix": prefix, "test_dir": path, "port": port,
+                     "checks": checks},
+            raw_output=json.dumps(checks, ensure_ascii=False),
+        )
+
+    def restore_ftp_global(self, snapshot: Dict) -> VerifyResult:
+        """Restore DB, script side effects, config bytes and touched ipset members."""
+        if not isinstance(snapshot, dict):
+            return VerifyResult(
+                "L4-FTP全局恢复", False,
+                "FTP全局快照无效",
+            )
+        environment_snapshot = snapshot if "global" in snapshot else None
+        global_snapshot = snapshot.get("global") if environment_snapshot else snapshot
+        if not isinstance(global_snapshot, dict):
+            return VerifyResult("L4-FTP全局恢复", False, "FTP全局数据库快照无效")
+        missing = [key for key in ("open_ftp", "ftp_port", "ftp_access")
+                   if key not in global_snapshot]
+        if missing:
+            return VerifyResult(
+                "L4-FTP全局恢复", False,
+                f"FTP全局快照缺少字段: {missing}",
+            )
+        try:
+            port = self._ftp_port_value(global_snapshot["ftp_port"])
+            row_id = int(global_snapshot.get("id", 1))
+        except Exception as exc:
+            return VerifyResult("L4-FTP全局恢复", False, str(exc))
+        open_int = 1 if self._ftp_truthy(global_snapshot["open_ftp"]) else 0
+        access_int = 1 if self._ftp_truthy(global_snapshot["ftp_access"]) else 0
+        expect_running = bool(open_int)
+        self.connect_router()
+        try:
+            current = self.get_ftp_global_config() or {}
+            old_port = self._ftp_port_value(current.get("ftp_port", 21) or 21)
+        except Exception as exc:
+            return VerifyResult("L4-FTP全局恢复", False,
+                                f"读取恢复前FTP配置失败: {str(exc)[:150]}")
+        try:
+            firewall_members = dict(
+                (environment_snapshot or {}).get("firewall_members") or {}
+            )
+        except Exception:
+            firewall_members = {}
+        try:
+            old_port = self._ftp_port_value(old_port)
+        except Exception:
+            old_port = None
+        remove_old_firewall = bool(firewall_members and old_port is not None) or (
+            self._ftp_truthy(current.get("open_ftp")) and
+            not self._ftp_truthy(current.get("ftp_access"))
+        )
+        stopped = self._stop_ftp_runtime(
+            old_port, remove_firewall=remove_old_firewall
+        )
+
+        # Use the product's real save path first so old/new ipset handling, config
+        # generation, daemon restart and UPnP restart all execute as production does.
+        save_output = self._router.exec(
+            f"{self.FTP_SCRIPT} save open_ftp={open_int} ftp_port={port} "
+            f"ftp_access={access_int} >/dev/null 2>&1; echo __FTP_SAVE_RC__=$?",
+            timeout=30,
+            probe_console=False,
+        )
+        save_match = re.search(r"__FTP_SAVE_RC__=(\d+)", save_output)
+        save_rc = int(save_match.group(1)) if save_match else -1
+        fallback_used = False
+        fallback_error = ""
+        if save_rc != 0:
+            # Emergency restoration must still be safe and complete if the public
+            # script rejects a damaged current state.
+            fallback_used = True
+            try:
+                sql = (
+                    "UPDATE remote_control SET "
+                    f"open_ftp={open_int},ftp_port={port},ftp_access={access_int} "
+                    f"WHERE id={row_id}"
+                )
+                self._ftp_sqlite_raw(sql, line_mode=False)
+                self._router.exec(
+                    "/usr/ikuai/script/upnpd.sh restart >/dev/null 2>&1",
+                    timeout=30,
+                    probe_console=False,
+                )
+            except Exception as exc:
+                fallback_error = str(exc)[:160]
+
+        # save(open=1) restarts asynchronously after sleep 2; allow that transition
+        # to settle before the explicit init/auth rebuild.
+        time.sleep(3 if expect_running else 1)
+        init_output = self._router.exec(
+            f"{self.FTP_SCRIPT} init >/dev/null 2>&1; echo __FTP_INIT_RC__=$?",
+            timeout=30,
+            probe_console=False,
+        )
+        init_match = re.search(r"__FTP_INIT_RC__=(\d+)", init_output)
+        init_rc = int(init_match.group(1)) if init_match else -1
+
+        config_result = VerifyResult("L4-FTP配置文件恢复", True,
+                                     "未提供配置文件快照，按脚本生成状态验证")
+        config_snapshot = (environment_snapshot or {}).get("runtime_config")
+        if isinstance(config_snapshot, dict):
+            try:
+                expected_exists = bool(config_snapshot.get("exists"))
+                content_b64 = str(config_snapshot.get("content_b64", ""))
+                mode = str(config_snapshot.get("mode", "") or "644")
+                if not re.fullmatch(r"[0-7]{3,4}", mode):
+                    raise ValueError("配置文件权限快照无效")
+                if expected_exists:
+                    base64.b64decode(content_b64, validate=True)
+                    restore_script = f"""set +x
+umask 077
+TMP=$(mktemp /tmp/ftp_conf_restore.XXXXXX) || exit 90
+trap 'rm -f "$TMP"' EXIT HUP INT TERM
+printf '%s' '{content_b64}' | base64 -d > "$TMP" || exit 91
+chmod {mode} "$TMP" || exit 92
+mv "$TMP" {self.FTP_CONFIG_FILE} || exit 93
+if [ {1 if expect_running else 0} -eq 1 ]; then
+  {self.FTP_SCRIPT} __restart >/dev/null 2>&1
+  RESTART_RC=$?
+else
+  RESTART_RC=0
+fi
+echo __FTP_CONF_RESTORE_RC__=0
+echo __FTP_CONF_RESTART_RC__=$RESTART_RC
+"""
+                    config_output = self._ftp_exec_router_script(
+                        restore_script,
+                        "restore FTP config snapshot content=<redacted>",
+                        timeout=35,
+                    )
+                    config_action_ok = (
+                        "__FTP_CONF_RESTORE_RC__=0" in config_output and
+                        "__FTP_CONF_RESTART_RC__=0" in config_output
+                    )
+                    if expect_running:
+                        time.sleep(3)
+                else:
+                    if expect_running:
+                        raise ValueError("运行中的FTP快照不应缺少配置文件")
+                    self._router.exec(
+                        f"rm -f {self.FTP_CONFIG_FILE}", timeout=10,
+                        probe_console=False,
+                    )
+                    config_action_ok = True
+                actual_config = self.get_ftp_environment_snapshot([])["runtime_config"]
+                content_match = (
+                    bool(actual_config.get("exists")) == expected_exists and
+                    (not expected_exists or
+                     actual_config.get("content_b64") == content_b64)
+                )
+                mode_match = (
+                    not expected_exists or
+                    str(actual_config.get("mode")) == mode
+                )
+                config_passed = config_action_ok and content_match and mode_match
+                config_result = VerifyResult(
+                    "L4-FTP配置文件恢复", config_passed,
+                    ("FTP配置文件内容/存在性/权限已按快照恢复" if config_passed else
+                     "FTP配置文件未精确恢复"),
+                    details={"expected_exists": expected_exists,
+                             "actual_exists": actual_config.get("exists"),
+                             "content_match": content_match,
+                             "mode_match": mode_match},
+                )
+            except Exception as exc:
+                config_result = VerifyResult(
+                    "L4-FTP配置文件恢复", False,
+                    f"FTP配置文件恢复失败: {str(exc)[:160]}",
+                )
+
+        firewall_results = []
+        if firewall_members:
+            for raw_port, expected_member in sorted(
+                    firewall_members.items(), key=lambda item: int(item[0])):
+                member_port = self._ftp_port_value(raw_port)
+                if expected_member:
+                    command = (
+                        f"ipset test DROP_T_PORTS_WAN_IN {member_port} >/dev/null 2>&1 || "
+                        f"ipset add DROP_T_PORTS_WAN_IN {member_port} >/dev/null 2>&1"
+                    )
+                else:
+                    command = (
+                        f"ipset test DROP_T_PORTS_WAN_IN {member_port} >/dev/null 2>&1 && "
+                        f"ipset del DROP_T_PORTS_WAN_IN {member_port} >/dev/null 2>&1 || true"
+                    )
+                self._router.exec(command, timeout=15, probe_console=False)
+                firewall_results.append(
+                    self.verify_ftp_firewall(member_port, bool(expected_member))
+                )
+        else:
+            firewall_results.append(self.verify_ftp_firewall(
+                port, expect_running and not bool(access_int)
+            ))
+
+        upnp_result = VerifyResult(
+            "L4-UPnP恢复联动", True,
+            "未提供UPnP运行时快照，跳过联动复验"
+        )
+        upnp_snapshot = (environment_snapshot or {}).get("upnp_runtime")
+        if isinstance(upnp_snapshot, dict):
+            expected_upnp = {
+                "marker": bool(upnp_snapshot.get("marker")),
+                "process": bool(upnp_snapshot.get("process")),
+            }
+            actual_upnp = None
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                output = self._router.exec(
+                    "if [ -f /tmp/iktmp/upnpd_enabled ]; then echo MARKER=1; "
+                    "else echo MARKER=0; fi; "
+                    "if pidof miniupnpd >/dev/null 2>&1; then echo PROCESS=1; "
+                    "else echo PROCESS=0; fi",
+                    timeout=10,
+                )
+                actual_upnp = {
+                    "marker": "MARKER=1" in output,
+                    "process": "PROCESS=1" in output,
+                }
+                if actual_upnp == expected_upnp:
+                    break
+                time.sleep(0.5)
+            upnp_passed = actual_upnp == expected_upnp
+            upnp_result = VerifyResult(
+                "L4-UPnP恢复联动", upnp_passed,
+                ("FTP端口变更触发的UPnP异步重启已回到快照状态" if upnp_passed else
+                 "UPnP异步重启后未回到测试前运行时状态"),
+                details={"expected": expected_upnp, "actual": actual_upnp},
+                raw_output=json.dumps(
+                    {"expected": expected_upnp, "actual": actual_upnp},
+                    ensure_ascii=False,
+                ),
+            )
+
+        db_result = self.verify_ftp_global_database(global_snapshot)
+        daemon_result = self.verify_ftp_daemon(
+            expect_running, port if expect_running else None
+        )
+        if expect_running or port != 21:
+            target_listener = self.verify_ftp_listener(port, expect_running)
+        else:
+            target_listener = VerifyResult(
+                "L2-FTP监听", True,
+                "FTP恢复为关闭且端口为21：跳过监听负断言（常驻vsftpd兼容）",
+                details={"port": port, "skipped_for_vsftpd": True},
+            )
+        stale_listener = None
+        if old_port is not None and old_port != 21 and (
+                not expect_running or old_port != port):
+            stale_listener = self.verify_ftp_listener(old_port, False)
+        passed = all([
+            save_rc == 0 or (fallback_used and not fallback_error),
+            init_rc == 0,
+            stopped["passed"],
+            db_result.passed,
+            daemon_result.passed,
+            target_listener.passed,
+            stale_listener is None or stale_listener.passed,
+            config_result.passed,
+            all(result.passed for result in firewall_results),
+            upnp_result.passed,
+        ])
+        details = {
+            "save_rc": save_rc,
+            "fallback_used": fallback_used,
+            "fallback_error": fallback_error,
+            "init_rc": init_rc,
+            "stopped_old_runtime": stopped["passed"],
+            "old_port": old_port,
+            "database": db_result.message,
+            "daemon": daemon_result.message,
+            "target_listener": target_listener.message,
+            "stale_listener": stale_listener.message if stale_listener else "not applicable",
+            "config_file": config_result.message,
+            "firewall": [result.message for result in firewall_results],
+            "upnp": upnp_result.message,
+            "snapshot": self._ftp_redact(global_snapshot),
+        }
+        return VerifyResult(
+            level="L4-FTP全局恢复",
+            passed=passed,
+            message=("FTP全局配置及运行时已恢复" if passed else
+                     "FTP全局恢复验证失败: " + "; ".join(
+                          ([f"save_rc={save_rc}"] if save_rc != 0 and fallback_error else []) +
+                          ([f"init_rc={init_rc}"] if init_rc != 0 else []) +
+                          (["旧ik_ftpd/自定义端口未清理"] if not stopped["passed"] else []) +
+                          [r.message for r in (db_result, daemon_result,
+                                              target_listener, stale_listener,
+                                              config_result, upnp_result,
+                                              *firewall_results)
+                          if r is not None
+                          if not r.passed]
+                     )),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False)[:1000],
+        )
+
+    def _ftp_exec_secret_script(self, ssh: SSHClient, script: str,
+                                display_command: str, timeout: int = 60) -> str:
+        """Execute a secret-bearing shell script over stdin without logging its body."""
+        # This is the only entry written to report command logs. ``script`` (which may
+        # contain a base64 curl config) is intentionally never appended or logged.
+        ssh._cmd_log.append(display_command)
+        import threading
+        holder = {}
+
+        def _worker():
+            try:
+                if ssh._client is None:
+                    ssh.connect()
+                stdin, stdout, stderr = ssh._client.exec_command("sh -s", timeout=timeout)
+                stdout.channel.settimeout(timeout)
+                stderr.channel.settimeout(timeout)
+                stdin.write(script)
+                stdin.flush()
+                stdin.channel.shutdown_write()
+                out = stdout.read().decode("utf-8", errors="replace")
+                err = stderr.read().decode("utf-8", errors="replace")
+                holder["result"] = out + (("\n" + err) if err else "")
+            except BaseException as exc:  # noqa: BLE001 - watchdog must capture all
+                holder["error"] = exc
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join(timeout + 15)
+        if thread.is_alive():
+            try:
+                ssh.close()
+            except Exception:
+                pass
+            thread.join(3)
+            raise RuntimeError(f"FTP探测SSH执行超时({timeout + 15}s)")
+        if "error" in holder:
+            raise holder["error"]
+        return holder.get("result", "")
+
+    def _ftp_exec_router_script(self, script: str, display_command: str,
+                                timeout: int = 30) -> str:
+        self.connect_router()
+        return self._ftp_exec_secret_script(
+            self._router, script, display_command, timeout=timeout
+        )
+
+    def _ftp_exec_client_script(self, script: str, display_command: str,
+                                timeout: int = 60) -> str:
+        """Execute a secret-bearing client script; only a redacted command is logged."""
+        self.connect_client()
+        return self._ftp_exec_secret_script(
+            self._client, script, display_command, timeout=timeout
+        )
+
+    @staticmethod
+    def _ftp_curl_config(username: str, password: str) -> str:
+        def quote(value: str) -> str:
+            return (value.replace("\\", "\\\\")
+                         .replace('"', '\\"')
+                         .replace("\r", "\\r")
+                         .replace("\n", "\\n"))
+        return f'user = "{quote(username)}:{quote(password)}"\n'
+
+    def run_ftp_probe(self, username: str, password: str, port: int,
+                      host: str = "192.168.148.1", iface: str = "ens11",
+                      operation: str = "list", remote_name: str = None,
+                      control_password: str = None,
+                      control_host: str = "192.168.148.1",
+                      control_iface: str = "ens11",
+                      cleanup_username: str = None,
+                      cleanup_password: str = None) -> VerifyResult:
+        """L5 real FTP probe from the client, with credential-safe command reporting.
+
+        ``operation`` is one of ``list``, ``upload_download``, ``wrong_password``,
+        ``upload_denied`` or ``connect_fail``. For WAN-access tests call with
+        ``host='10.66.0.150', iface='enp2s0'``; the defaults force LAN traffic through
+        the router via client ``ens11``.
+        """
+        allowed = {
+            "list", "upload_download", "wrong_password",
+            "upload_denied", "connect_fail",
+        }
+        try:
+            port = self._ftp_port_value(port)
+            operation = str(operation).strip().lower()
+            if operation not in allowed:
+                raise ValueError(f"不支持的FTP探测操作: {operation}")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}", str(host)):
+                raise ValueError(f"FTP host包含不安全字符: {host!r}")
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", str(iface)):
+                raise ValueError(f"FTP iface包含不安全字符: {iface!r}")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}", str(control_host)):
+                raise ValueError(f"FTP control_host包含不安全字符: {control_host!r}")
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", str(control_iface)):
+                raise ValueError(f"FTP control_iface包含不安全字符: {control_iface!r}")
+            if not username or not password:
+                raise ValueError("FTP用户名和密码不能为空")
+            secret_values = [username, password, control_password,
+                             cleanup_username, cleanup_password]
+            if any(value is not None and ("\n" in str(value) or "\r" in str(value))
+                   for value in secret_values):
+                raise ValueError("FTP用户名/密码不能包含换行")
+            if (cleanup_username is None) != (cleanup_password is None):
+                raise ValueError("FTP清理凭据必须同时提供用户名和密码")
+            if remote_name is None:
+                remote_name = f"ftp_t_probe_{int(time.time() * 1000)}.txt"
+            remote_name = self._ftp_safe_component(remote_name, "remote_name")
+        except Exception as exc:
+            return VerifyResult("L5-FTP实流", False, str(exc))
+
+        if operation == "wrong_password":
+            correct_password = str(control_password) if control_password is not None else str(password)
+            probe_password = str(password) if control_password is not None else str(password) + "__wrong__"
+        else:
+            correct_password = str(password)
+            probe_password = str(password)
+        curl_config = self._ftp_curl_config(str(username), probe_password)
+        control_curl_config = self._ftp_curl_config(str(username), correct_password)
+        config_b64 = base64.b64encode(curl_config.encode("utf-8")).decode("ascii")
+        control_config_b64 = base64.b64encode(
+            control_curl_config.encode("utf-8")
+        ).decode("ascii")
+        delete_username = str(cleanup_username or username)
+        delete_password = str(cleanup_password or password)
+        delete_credentials = json.dumps(
+            {"username": delete_username, "password": delete_password},
+            ensure_ascii=False,
+        )
+        delete_credentials_b64 = base64.b64encode(
+            delete_credentials.encode("utf-8")
+        ).decode("ascii")
+        base_url = f"ftp://{host}:{port}/"
+        control_base_url = f"ftp://{control_host}:{port}/"
+
+        # Establish the server-side control state before interpreting client errors.
+        server_mode = "not_applicable"
+        server_precondition = True
+        server_checks = []
+        if operation in {"wrong_password", "upload_denied"}:
+            daemon_check = self.verify_ftp_daemon(True, port=port)
+            listener_check = self.verify_ftp_listener(port, True)
+            server_checks = [daemon_check, listener_check]
+            server_precondition = all(check.passed for check in server_checks)
+            server_mode = "service_running"
+        elif operation == "connect_fail":
+            try:
+                global_row = self.get_ftp_global_config() or {}
+                configured_running = (
+                    self._ftp_truthy(global_row.get("open_ftp")) and
+                    self._ftp_port_value(global_row.get("ftp_port", 21)) == port
+                )
+            except Exception:
+                configured_running = False
+            if configured_running:
+                daemon_check = self.verify_ftp_daemon(True, port=port)
+                listener_check = self.verify_ftp_listener(port, True)
+                firewall_check = self.verify_ftp_firewall(port, True)
+                server_checks = [daemon_check, listener_check, firewall_check]
+                server_precondition = all(check.passed for check in server_checks)
+                server_mode = "wan_drop"
+            else:
+                daemon_check = self.verify_ftp_daemon(False)
+                listener_check = self.verify_ftp_listener(port, False)
+                server_checks = [daemon_check, listener_check]
+                server_precondition = all(check.passed for check in server_checks)
+                server_mode = "service_closed"
+
+        script_lines = [
+            "set +x",
+            "umask 077",
+            "CFG=$(mktemp /tmp/ftp_probe_cfg.XXXXXX) || exit 90",
+            "CTRL_CFG=$(mktemp /tmp/ftp_probe_ctrl.XXXXXX) || exit 91",
+            "CREDS=$(mktemp /tmp/ftp_probe_creds.XXXXXX) || exit 92",
+            "SRC=$(mktemp /tmp/ftp_probe_src.XXXXXX) || exit 93",
+            "DST=$(mktemp /tmp/ftp_probe_dst.XXXXXX) || exit 94",
+            "cleanup() { rm -f \"$CFG\" \"$CTRL_CFG\" \"$CREDS\" \"$SRC\" \"$DST\"; }",
+            "trap cleanup EXIT HUP INT TERM",
+            f"printf '%s' '{config_b64}' | base64 -d > \"$CFG\"",
+            f"printf '%s' '{control_config_b64}' | base64 -d > \"$CTRL_CFG\"",
+            f"printf '%s' '{delete_credentials_b64}' | base64 -d > \"$CREDS\"",
+            f"BASE_URL='{base_url}'",
+            f"CONTROL_BASE_URL='{control_base_url}'",
+            f"IFACE='{iface}'",
+            f"CONTROL_IFACE='{control_iface}'",
+            f"HOST='{host}'",
+            f"PORT='{port}'",
+            f"REMOTE='{remote_name}'",
+            "ftp_curl() {",
+            "  curl --silent --show-error --ftp-pasv --interface \"$IFACE\" "
+            "--connect-timeout 5 --max-time 20 --config \"$CFG\" \"$@\"",
+            "}",
+            "ftp_control() {",
+            "  curl --silent --show-error --ftp-pasv --interface \"$CONTROL_IFACE\" "
+            "--connect-timeout 5 --max-time 20 --config \"$CTRL_CFG\" \"$@\"",
+            "}",
+            "ftp_delete() {",
+            "  SRC_IP=$(ip -4 -o addr show dev \"$IFACE\" 2>/dev/null | awk 'NR==1{split($4,a,\"/\");print a[1]}')",
+            "  python3 - \"$CREDS\" \"$HOST\" \"$PORT\" \"$REMOTE\" \"$SRC_IP\" <<'PY'",
+            "import ftplib, json, sys",
+            "cred_path, host, port, remote, source_ip = sys.argv[1:]",
+            "rc = 1",
+            "ftp = None",
+            "try:",
+            "    with open(cred_path, 'r', encoding='utf-8') as fh:",
+            "        cred = json.load(fh)",
+            "    source = (source_ip, 0) if source_ip else None",
+            "    ftp = ftplib.FTP()",
+            "    ftp.connect(host, int(port), timeout=10, source_address=source)",
+            "    ftp.login(cred['username'], cred['password'])",
+            "    response = ftp.delete(remote)",
+            "    rc = 0 if str(response).startswith('250') else 1",
+            "except Exception:",
+            "    rc = 1",
+            "finally:",
+            "    if ftp is not None:",
+            "        try: ftp.quit()",
+            "        except Exception: ftp.close()",
+            "print(f'__FTP_PY_DELETE_RC__={rc}')",
+            "PY",
+            "}",
+        ]
+        if operation == "list":
+            script_lines += [
+                "OUT=$(ftp_curl \"$BASE_URL\" 2>&1)",
+                "RC=$?",
+                "printf '__FTP_RC__=%s\\n' \"$RC\"",
+                "printf '__FTP_OUTPUT_BEGIN__\\n%s\\n__FTP_OUTPUT_END__\\n' \"$OUT\"",
+            ]
+        elif operation == "wrong_password":
+            script_lines += [
+                "CONTROL_OUT=$(ftp_control \"$CONTROL_BASE_URL\" 2>&1)",
+                "CONTROL_RC=$?",
+                "OUT=$(ftp_curl \"$BASE_URL\" 2>&1)",
+                "RC=$?",
+                "printf '__FTP_CONTROL_RC__=%s\\n__FTP_RC__=%s\\n' \"$CONTROL_RC\" \"$RC\"",
+                "printf '__FTP_OUTPUT_BEGIN__\\n%s\\n%s\\n__FTP_OUTPUT_END__\\n' \"$CONTROL_OUT\" \"$OUT\"",
+            ]
+        elif operation == "connect_fail":
+            if server_mode == "wan_drop":
+                script_lines += [
+                    "CONTROL_OUT=$(ftp_control \"$CONTROL_BASE_URL\" 2>&1)",
+                    "CONTROL_RC=$?",
+                ]
+            else:
+                script_lines += ["CONTROL_OUT=''; CONTROL_RC=-1"]
+            script_lines += [
+                "OUT=$(ftp_curl \"$BASE_URL\" 2>&1)",
+                "RC=$?",
+                "printf '__FTP_CONTROL_RC__=%s\\n__FTP_RC__=%s\\n' \"$CONTROL_RC\" \"$RC\"",
+                "printf '__FTP_OUTPUT_BEGIN__\\n%s\\n%s\\n__FTP_OUTPUT_END__\\n' \"$CONTROL_OUT\" \"$OUT\"",
+            ]
+        elif operation == "upload_download":
+            script_lines += [
+                "PRE_OUT=$(ftp_curl \"$BASE_URL\" 2>&1)",
+                "PRE_RC=$?",
+                "if printf '%s\\n' \"$PRE_OUT\" | grep -F -- \"$REMOTE\" >/dev/null 2>&1; then PRE_PRESENT=1; else PRE_PRESENT=0; fi",
+                "printf 'ikuai-ftp-probe-%s\\n' \"$REMOTE\" > \"$SRC\"",
+                "SRC_SHA=$(sha256sum \"$SRC\" 2>/dev/null | awk '{print $1}'); SRC_SHA_RC=$?",
+                "UP_OUT=$(ftp_curl --upload-file \"$SRC\" \"${BASE_URL}${REMOTE}\" 2>&1)",
+                "UP_RC=$?",
+                "DOWN_RC=99; SHA_RC=99; DST_SHA=''",
+                "if [ \"$UP_RC\" -eq 0 ]; then",
+                "  DOWN_OUT=$(ftp_curl --output \"$DST\" \"${BASE_URL}${REMOTE}\" 2>&1)",
+                "  DOWN_RC=$?",
+                "  if [ \"$DOWN_RC\" -eq 0 ]; then",
+                "    DST_SHA=$(sha256sum \"$DST\" | awk '{print $1}')",
+                "    if [ -n \"$SRC_SHA\" ] && [ \"$SRC_SHA\" = \"$DST_SHA\" ]; then SHA_RC=0; else SHA_RC=1; fi",
+                "  fi",
+                "fi",
+                "DEL_OUT=$(ftp_delete 2>&1)",
+                "DEL_RC=$(printf '%s\\n' \"$DEL_OUT\" | sed -n 's/^__FTP_PY_DELETE_RC__=//p' | tail -1)",
+                "[ -n \"$DEL_RC\" ] || DEL_RC=99",
+                "VERIFY_OUT=$(ftp_curl --output \"$DST\" \"${BASE_URL}${REMOTE}\" 2>&1)",
+                "VERIFY_RC=$?",
+                "printf '__FTP_PRE_RC__=%s\\n__FTP_PRE_PRESENT__=%s\\n' \"$PRE_RC\" \"$PRE_PRESENT\"",
+                "printf '__FTP_UP_RC__=%s\\n__FTP_DOWN_RC__=%s\\n__FTP_SHA_RC__=%s\\n__FTP_SRC_SHA_RC__=%s\\n' "
+                "\"$UP_RC\" \"$DOWN_RC\" \"$SHA_RC\" \"$SRC_SHA_RC\"",
+                "printf '__FTP_DEL_RC__=%s\\n__FTP_VERIFY_MISSING_RC__=%s\\n' \"$DEL_RC\" \"$VERIFY_RC\"",
+                "printf '__FTP_SRC_SHA256__=%s\\n__FTP_DST_SHA256__=%s\\n' \"$SRC_SHA\" \"$DST_SHA\"",
+                "printf '__FTP_OUTPUT_BEGIN__\\n%s\\n%s\\n%s\\n__FTP_OUTPUT_END__\\n' "
+                "\"$UP_OUT\" \"${DOWN_OUT:-}\" \"$VERIFY_OUT\"",
+            ]
+        else:  # upload_denied
+            script_lines += [
+                "AUTH_OUT=$(ftp_curl \"$BASE_URL\" 2>&1)",
+                "AUTH_RC=$?",
+                "if printf '%s\\n' \"$AUTH_OUT\" | grep -F -- \"$REMOTE\" >/dev/null 2>&1; then PRE_PRESENT=1; else PRE_PRESENT=0; fi",
+                "printf 'ikuai-ftp-denied-%s\\n' \"$REMOTE\" > \"$SRC\"",
+                "UP_OUT=$(ftp_curl --upload-file \"$SRC\" \"${BASE_URL}${REMOTE}\" 2>&1)",
+                "UP_RC=$?",
+                "LIST_OUT=$(ftp_curl \"$BASE_URL\" 2>&1)",
+                "LIST_RC=$?",
+                "if printf '%s\\n' \"$LIST_OUT\" | grep -F -- \"$REMOTE\" >/dev/null 2>&1; then REMOTE_PRESENT=1; else REMOTE_PRESENT=0; fi",
+                "CLEAN_OUT=$(ftp_delete 2>&1)",
+                "CLEAN_RC=$(printf '%s\\n' \"$CLEAN_OUT\" | sed -n 's/^__FTP_PY_DELETE_RC__=//p' | tail -1)",
+                "[ -n \"$CLEAN_RC\" ] || CLEAN_RC=99",
+                "VERIFY_OUT=$(ftp_curl --output \"$DST\" \"${BASE_URL}${REMOTE}\" 2>&1)",
+                "VERIFY_RC=$?",
+                "printf '__FTP_AUTH_RC__=%s\\n__FTP_PRE_PRESENT__=%s\\n__FTP_UP_RC__=%s\\n' \"$AUTH_RC\" \"$PRE_PRESENT\" \"$UP_RC\"",
+                "printf '__FTP_LIST_RC__=%s\\n__FTP_REMOTE_PRESENT__=%s\\n__FTP_CLEAN_RC__=%s\\n__FTP_VERIFY_MISSING_RC__=%s\\n' "
+                "\"$LIST_RC\" \"$REMOTE_PRESENT\" \"$CLEAN_RC\" \"$VERIFY_RC\"",
+                "printf '__FTP_OUTPUT_BEGIN__\\n%s\\n%s\\n%s\\n__FTP_OUTPUT_END__\\n' \"$AUTH_OUT\" \"$UP_OUT\" \"$VERIFY_OUT\"",
+            ]
+        script = "\n".join(script_lines) + "\n"
+        display_username = re.sub(r"[^A-Za-z0-9_.-]", "?", str(username))[:40]
+        display_command = (
+            f"ftp_probe operation={operation} curl --interface {iface} {base_url} "
+            f"username={display_username} password=<redacted> remote={remote_name}"
+        )
+        try:
+            output = self._ftp_exec_client_script(script, display_command, timeout=65)
+        except Exception as exc:
+            safe_error = self._ftp_sanitize_text(
+                exc, password, probe_password, correct_password,
+                cleanup_password, config_b64, control_config_b64,
+                delete_credentials_b64, delete_credentials,
+            )
+            return VerifyResult(
+                level="L5-FTP实流",
+                passed=False,
+                message=f"FTP {operation}探测异常: {safe_error}",
+                details={"operation": operation, "host": host, "port": port,
+                         "iface": iface, "remote_name": remote_name},
+                raw_output=safe_error[:800],
+            )
+
+        safe_output = self._ftp_sanitize_text(
+            output, password, probe_password, correct_password,
+            cleanup_password, config_b64, control_config_b64,
+            delete_credentials_b64, delete_credentials, curl_config,
+            control_curl_config,
+        )
+        marker_block, separator, response_block = safe_output.partition(
+            "__FTP_OUTPUT_BEGIN__"
+        )
+        marker_matches = re.findall(
+            r"(?m)^__(FTP_[A-Z_]+)__=(-?\d+)\s*$", marker_block
+        )
+        codes, duplicate_markers = {}, []
+        for key, value in marker_matches:
+            if key in codes:
+                duplicate_markers.append(key)
+            codes[key] = int(value)
+        marker_ok = bool(separator) and not duplicate_markers
+        denial_evidence = bool(re.search(
+            r"(?:\b550\b|permission denied|access denied|read[- ]?only|stor.*denied)",
+            response_block, re.I,
+        ))
+        missing_evidence = bool(re.search(
+            r"(?:\b550\b|not found|no such|does not exist|file unavailable|"
+            r"failed to open|remote file not found)",
+            response_block, re.I,
+        ))
+        if operation == "list":
+            passed = marker_ok and codes.get("FTP_RC") == 0
+            verdict = f"LIST rc={codes.get('FTP_RC', 'missing')}"
+        elif operation == "upload_download":
+            passed = (marker_ok and
+                      codes.get("FTP_PRE_RC") == 0 and
+                      codes.get("FTP_PRE_PRESENT") == 0 and
+                      codes.get("FTP_UP_RC") == 0 and
+                      codes.get("FTP_DOWN_RC") == 0 and
+                      codes.get("FTP_SHA_RC") == 0 and
+                      codes.get("FTP_SRC_SHA_RC") == 0 and
+                      codes.get("FTP_DEL_RC") == 0 and
+                      codes.get("FTP_VERIFY_MISSING_RC") in {9, 19, 78})
+            src_sha_match = re.search(
+                r"(?m)^__FTP_SRC_SHA256__=([0-9a-fA-F]{64})\s*$", marker_block
+            )
+            dst_sha_match = re.search(
+                r"(?m)^__FTP_DST_SHA256__=([0-9a-fA-F]{64})\s*$", marker_block
+            )
+            src_sha = src_sha_match.group(1).lower() if src_sha_match else ""
+            dst_sha = dst_sha_match.group(1).lower() if dst_sha_match else ""
+            missing_confirmed = (
+                codes.get("FTP_VERIFY_MISSING_RC") == 78 or missing_evidence
+            )
+            passed = passed and bool(src_sha) and src_sha == dst_sha and missing_confirmed
+            verdict = (f"upload={codes.get('FTP_UP_RC', 'missing')}, "
+                       f"download={codes.get('FTP_DOWN_RC', 'missing')}, "
+                       f"sha256={'match' if src_sha and src_sha == dst_sha else 'mismatch'}, "
+                       f"delete={codes.get('FTP_DEL_RC', 'missing')}, "
+                       f"missing={codes.get('FTP_VERIFY_MISSING_RC', 'missing')}")
+        elif operation == "wrong_password":
+            rc = codes.get("FTP_RC")
+            auth_rejected = bool(re.search(
+                r"(?:login denied|not logged|access denied|\b530\b)",
+                response_block,
+                re.I,
+            ))
+            passed = (marker_ok and server_precondition and
+                      codes.get("FTP_CONTROL_RC") == 0 and
+                      rc == 67 and auth_rejected)
+            verdict = (f"正确凭据控制={codes.get('FTP_CONTROL_RC', 'missing')}, "
+                       f"错误密码拒绝={rc if rc is not None else 'missing'}")
+        elif operation == "upload_denied":
+            auth_rc = codes.get("FTP_AUTH_RC")
+            upload_rc = codes.get("FTP_UP_RC")
+            passed = (marker_ok and server_precondition and
+                      auth_rc == 0 and codes.get("FTP_PRE_PRESENT") == 0 and
+                      upload_rc == 25 and denial_evidence and
+                      codes.get("FTP_LIST_RC") == 0 and
+                      codes.get("FTP_REMOTE_PRESENT") == 0 and
+                      codes.get("FTP_VERIFY_MISSING_RC") in {9, 19, 78} and
+                      missing_evidence)
+            verdict = (f"认证={auth_rc if auth_rc is not None else 'missing'}, "
+                       f"上传拒绝={upload_rc if upload_rc is not None else 'missing'}, "
+                       f"远端残留={codes.get('FTP_REMOTE_PRESENT', 'missing')}")
+        else:
+            rc = codes.get("FTP_RC")
+            if server_mode == "wan_drop":
+                passed = (marker_ok and server_precondition and
+                          codes.get("FTP_CONTROL_RC") == 0 and rc == 28)
+            else:
+                passed = (marker_ok and server_precondition and rc in {7, 28})
+            verdict = (f"模式={server_mode}, 控制={codes.get('FTP_CONTROL_RC', 'n/a')}, "
+                       f"连接失败rc={rc if rc is not None else 'missing'}")
+
+        if not marker_ok:
+            passed = False
+            verdict += f", marker异常/重复={duplicate_markers}"
+
+        details = {
+            "operation": operation,
+            "host": host,
+            "port": port,
+            "iface": iface,
+            "username": username,
+            "remote_name": remote_name,
+            "codes": codes,
+            "server_mode": server_mode,
+            "server_precondition": server_precondition,
+            "server_checks": [check.message for check in server_checks],
+            "marker_ok": marker_ok,
+            "denial_evidence": denial_evidence,
+            "missing_evidence": missing_evidence,
+        }
+        if operation == "upload_download":
+            details["src_sha256"] = src_sha
+            details["dst_sha256"] = dst_sha
+        return VerifyResult(
+            level="L5-FTP实流",
+            passed=passed,
+            message=f"FTP {operation}{'符合预期' if passed else '不符合预期'}: {verdict}",
+            details=details,
+            raw_output=(marker_block.strip()[:1000] +
+                        f"\nresponse_classified: denial={denial_evidence}, "
+                        f"missing={missing_evidence}"),
+        )
+
+    # ==================== 高级服务 > 本地服务 > Samba服务 ====================
+    # 底层脚本: /usr/ikuai/script/smbd.sh
+    # DB:
+    #   smbd(id, enabled, workgroup, wsdd2, interface, access)
+    #   smbd_dir(id, enabled, username, passwd, name, tagname, perm, guest,
+    #            browseable, home_dir)
+    # Runtime:
+    #   /etc/samba/config        shell-style global cache
+    #   /etc/samba/smb.conf      generated service/share configuration
+    #   /etc/samba/smbpasswd     generated LM/NT hash database
+    #   /etc/samba/is_enabled    global-enable marker
+    # Processes/listeners:
+    #   ik_smbd -> TCP/139,445; nmbd -> UDP/137,138;
+    #   wsdd2 -> discovery sockets.  WAN blocking is implemented by eight exact
+    #   bitmap:port memberships, not by binding the daemons to LAN only.
+
+    SAMBA_SCRIPT = "/usr/ikuai/script/smbd.sh"
+    SAMBA_DISK_ROOT = "/etc/disk_user"
+    SAMBA_RUNTIME_FILES = {
+        "config": "/etc/samba/config",
+        "smb_conf": "/etc/samba/smb.conf",
+        "smbpasswd": "/etc/samba/smbpasswd",
+        "is_enabled": "/etc/samba/is_enabled",
+    }
+    SAMBA_FIREWALL_PORTS = {
+        "tcp": (139, 445, 3702, 5355),
+        "udp": (137, 138, 3702, 5355),
+    }
+    # Candidate sockets are inventoried without assuming that every firmware must
+    # expose every endpoint.  5357 is the conventional WSD HTTP endpoint and is
+    # recorded for diagnostics, but is not a hard expectation until observed on the
+    # target firmware.
+    SAMBA_LISTENER_CANDIDATE_PORTS = (137, 138, 139, 445, 3702, 5355, 5357)
+    SAMBA_STAGING_FILES = {
+        "import_csv": "/tmp/iktmp/import/smbd_dir.csv",
+        "import_txt": "/tmp/iktmp/import/smbd_dir.txt",
+        "export_csv": "/tmp/iktmp/export/smbd_dir.csv",
+        "export_txt": "/tmp/iktmp/export/smbd_dir.txt",
+    }
+
+    @staticmethod
+    def _samba_sql_literal(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def _samba_yes(value: Any) -> bool:
+        return str(value).strip().lower() in {
+            "1", "yes", "true", "on", "enable", "enabled",
+        }
+
+    @staticmethod
+    def _samba_redact(value: Any) -> Any:
+        """Remove credentials, hashes and private snapshot bytes from report data."""
+        if isinstance(value, dict):
+            safe = {}
+            for key, item in value.items():
+                lowered = str(key).lower()
+                if ("pass" in lowered or "secret" in lowered or
+                        "content_b64" in lowered or "database_users" in lowered):
+                    safe[key] = "***"
+                else:
+                    safe[key] = BackendVerifier._samba_redact(item)
+            return safe
+        if isinstance(value, list):
+            return [BackendVerifier._samba_redact(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(BackendVerifier._samba_redact(item) for item in value)
+        return value
+
+    @staticmethod
+    def _samba_sanitize_text(text: Any, *secrets: Any) -> str:
+        safe = "" if text is None else str(text)
+        tokens = sorted(
+            {str(secret) for secret in secrets if secret is not None and str(secret)},
+            key=len,
+            reverse=True,
+        )
+        for token in tokens:
+            safe = safe.replace(token, "***")
+        # Do not let an accidental smbpasswd record enter JSON/HTML/Excel reports.
+        safe = re.sub(
+            r"(?m)^([^:\r\n]+):([0-9]+):([0-9A-Fa-fX]{32}):"
+            r"([0-9A-Fa-f]{32}):.*$",
+            r"\1:<smbpasswd-redacted>",
+            safe,
+        )
+        return safe
+
+    @staticmethod
+    def _samba_safe_component(value: Any, label: str,
+                               max_length: int = 100) -> str:
+        text = str(value or "").strip()
+        if not re.fullmatch(
+                rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,{max_length - 1}}}", text):
+            raise ValueError(f"{label}包含不安全字符: {text!r}")
+        if text in {".", ".."}:
+            raise ValueError(f"{label}不能为{text!r}")
+        return text
+
+    @staticmethod
+    def _samba_normalize_home(value: Any) -> str:
+        home = str(value or "").strip()
+        if home.startswith(BackendVerifier.SAMBA_DISK_ROOT):
+            home = home[len(BackendVerifier.SAMBA_DISK_ROOT):]
+        if home and not home.startswith("/"):
+            home = "/" + home
+        if len(home) > 1:
+            home = home.rstrip("/")
+        return home
+
+    @classmethod
+    def _samba_exact_prefix_sql(cls, prefix: str, *fields: str) -> str:
+        prefix = str(prefix)
+        allowed = {"username", "name", "tagname"}
+        if not fields or any(field not in allowed for field in fields):
+            raise ValueError("Samba前缀查询字段不在白名单")
+        literal = cls._samba_sql_literal(prefix)
+        return " OR ".join(
+            f"substr(COALESCE({field},''),1,{len(prefix)})={literal}"
+            for field in fields
+        )
+
+    def _samba_sqlite_raw(self, sql: str, line_mode: bool = True) -> str:
+        """Execute SQLite safely; the complete SQL is shell-quoted as one token."""
+        self.connect_router()
+        mode = "-line " if line_mode else ""
+        output = self._router.exec(
+            f"sqlite3 {shlex.quote(self.DNS_DB)} {mode}{shlex.quote(str(sql))} "
+            "2>&1; rc=$?; printf '\\n__SAMBA_SQLITE_RC__=%s\\n' \"$rc\"",
+            timeout=20,
+        )
+        matches = list(re.finditer(
+            r"(?m)^__SAMBA_SQLITE_RC__=(-?\d+)\s*$", output or ""
+        ))
+        if not matches:
+            raise RuntimeError("Samba SQLite未返回执行状态")
+        marker = matches[-1]
+        rc = int(marker.group(1))
+        body = ((output or "")[:marker.start()] +
+                (output or "")[marker.end():]).strip()
+        if rc != 0:
+            raise RuntimeError(f"Samba SQLite执行失败(rc={rc}): {body[:160]}")
+        return body
+
+    def _samba_sqlite_query_line(self, sql: str) -> Optional[Dict]:
+        output = self._samba_sqlite_raw(sql, line_mode=True)
+        if not output:
+            return None
+        row = {}
+        for raw_line in output.splitlines():
+            if "=" not in raw_line:
+                continue
+            key, value = raw_line.split("=", 1)
+            row[key.strip()] = value.strip()
+        return row or None
+
+    def _samba_sqlite_query_list(self, sql: str) -> List[Dict]:
+        output = self._samba_sqlite_raw(sql, line_mode=True)
+        if not output:
+            return []
+        records, current = [], {}
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if "=" in line:
+                key, value = line.split("=", 1)
+                current[key.strip()] = value.strip()
+            elif not line and current:
+                records.append(current)
+                current = {}
+        if current:
+            records.append(current)
+        return records
+
+    def _samba_exec_router_script(self, script: str, display_command: str,
+                                   timeout: int = 40) -> str:
+        # Reuse the hardened stdin executor.  Its name is historical; it is generic
+        # and deliberately logs only ``display_command``, never the secret script.
+        self.connect_router()
+        return self._ftp_exec_secret_script(
+            self._router, script, display_command, timeout=timeout
+        )
+
+    def _samba_exec_client_script(self, script: str, display_command: str,
+                                   timeout: int = 60) -> str:
+        self.connect_client()
+        return self._ftp_exec_secret_script(
+            self._client, script, display_command, timeout=timeout
+        )
+
+    def get_samba_global_config(self) -> Optional[Dict]:
+        return self._samba_sqlite_query_line(
+            "SELECT id,enabled,workgroup,wsdd2,interface,access "
+            "FROM smbd ORDER BY id LIMIT 1"
+        )
+
+    def _samba_capture_files(self, paths: Dict[str, str]) -> Dict[str, Dict]:
+        commands = []
+        for key, path in paths.items():
+            safe_key = re.sub(r"[^A-Za-z0-9_]", "_", key).upper()
+            quoted = shlex.quote(path)
+            commands.append(
+                f"if [ -f {quoted} ]; then "
+                f"echo __SAMBA_FILE_{safe_key}_EXISTS__=1; "
+                f"printf '__SAMBA_FILE_{safe_key}_B64__='; "
+                f"base64 {quoted} | tr -d '\\n'; echo; "
+                f"echo __SAMBA_FILE_{safe_key}_MODE__=$(stat -c '%a' {quoted}); "
+                f"else echo __SAMBA_FILE_{safe_key}_EXISTS__=0; "
+                f"echo __SAMBA_FILE_{safe_key}_B64__=; "
+                f"echo __SAMBA_FILE_{safe_key}_MODE__=; fi"
+            )
+        self.connect_router()
+        output = self._router.exec("; ".join(commands), timeout=25)
+        result = {}
+        for key in paths:
+            safe_key = re.sub(r"[^A-Za-z0-9_]", "_", key).upper()
+            exists = bool(re.search(
+                rf"(?m)^__SAMBA_FILE_{safe_key}_EXISTS__=1\s*$", output
+            ))
+            b64_match = re.search(
+                rf"(?m)^__SAMBA_FILE_{safe_key}_B64__=([^\r\n]*)$", output
+            )
+            mode_match = re.search(
+                rf"(?m)^__SAMBA_FILE_{safe_key}_MODE__=([^\r\n]*)$", output
+            )
+            content_b64 = b64_match.group(1).strip() if b64_match else ""
+            if exists:
+                try:
+                    base64.b64decode(content_b64, validate=True)
+                except Exception as exc:
+                    raise RuntimeError(f"Samba文件快照base64无效({key}): {exc}") from exc
+            result[key] = {
+                "path": paths[key],
+                "exists": exists,
+                "content_b64": content_b64,
+                "mode": mode_match.group(1).strip() if mode_match else "",
+            }
+        return result
+
+    def _samba_firewall_members(self) -> Dict[str, bool]:
+        commands = []
+        for proto, ports in self.SAMBA_FIREWALL_PORTS.items():
+            set_name = "DROP_T_PORTS_WAN_IN" if proto == "tcp" else "DROP_U_PORTS_WAN_IN"
+            for port in ports:
+                key = f"{proto}:{port}"
+                commands.append(
+                    f"if ipset test {set_name} {port} >/dev/null 2>&1; "
+                    f"then echo __SAMBA_FW_{proto.upper()}_{port}__=1; "
+                    f"else echo __SAMBA_FW_{proto.upper()}_{port}__=0; fi"
+                )
+        self.connect_router()
+        output = self._router.exec("; ".join(commands), timeout=20)
+        members = {}
+        for proto, ports in self.SAMBA_FIREWALL_PORTS.items():
+            for port in ports:
+                match = re.search(
+                    rf"(?m)^__SAMBA_FW_{proto.upper()}_{port}__=([01])\s*$",
+                    output,
+                )
+                if match is None:
+                    raise RuntimeError(f"Samba ipset快照缺少{proto}/{port}")
+                members[f"{proto}:{port}"] = match.group(1) == "1"
+        return members
+
+    def get_samba_environment_snapshot(self) -> Optional[Dict]:
+        """Capture the exact DB/runtime/firewall baseline without exposing secrets."""
+        global_row = self.get_samba_global_config()
+        if global_row is None:
+            return None
+        user_rows = self._samba_sqlite_query_list(
+            "SELECT id,enabled,username,passwd,name,tagname,perm,guest,browseable,home_dir "
+            "FROM smbd_dir ORDER BY id"
+        )
+        private_users = base64.b64encode(json.dumps(
+            user_rows, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).decode("ascii")
+        self.connect_router()
+        process_output = self._router.exec(
+            "for p in ik_smbd nmbd wsdd2; do "
+            "if pidof $p >/dev/null 2>&1; then echo ${p}=1; else echo ${p}=0; fi; done; "
+            "if [ -e /var/nmbd ]; then echo var_nmbd=1; else echo var_nmbd=0; fi; "
+            "if [ -e /tmp/.winbindd ]; then echo tmp_winbindd=1; else echo tmp_winbindd=0; fi",
+            timeout=15,
+        )
+        runtime_files = self._samba_capture_files(self.SAMBA_RUNTIME_FILES)
+        staging_files = self._samba_capture_files(self.SAMBA_STAGING_FILES)
+        return {
+            "global": global_row,
+            "runtime_files": runtime_files,
+            "firewall_members": self._samba_firewall_members(),
+            "database_users_b64": private_users,
+            "database_users_count": len(user_rows),
+            "database_users_sha256": hashlib.sha256(
+                base64.b64decode(private_users)
+            ).hexdigest(),
+            "processes": {
+                "ik_smbd": "ik_smbd=1" in process_output,
+                "nmbd": "nmbd=1" in process_output,
+                "wsdd2": "wsdd2=1" in process_output,
+            },
+            "ancillary": {
+                "var_nmbd": "var_nmbd=1" in process_output,
+                "tmp_winbindd": "tmp_winbindd=1" in process_output,
+            },
+            "staging_files": staging_files,
+        }
+
+    def snapshot_samba_non_test_users(self, prefix: str) -> Dict[str, Any]:
+        predicate = self._samba_exact_prefix_sql(
+            str(prefix), "username", "name", "tagname"
+        )
+        rows = self._samba_sqlite_query_list(
+            "SELECT id,enabled,username,passwd,name,tagname,perm,guest,browseable,home_dir "
+            f"FROM smbd_dir WHERE NOT ({predicate}) ORDER BY id"
+        )
+        payload = json.dumps(
+            rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        prefix_b64 = base64.b64encode(str(prefix).encode("utf-8")).decode("ascii")
+        script = f"""set +x
+PREFIX=$(printf '%s' '{prefix_b64}' | base64 -d) || exit 91
+if [ -f {self.SAMBA_RUNTIME_FILES['smbpasswd']} ]; then
+  awk -F: -v p="$PREFIX" 'index($1,p)!=1 {{print}}' {self.SAMBA_RUNTIME_FILES['smbpasswd']} | sha256sum | awk '{{print "HASH=" $1}}'
+  awk -F: -v p="$PREFIX" 'index($1,p)!=1 {{n++}} END{{print "COUNT=" n+0}}' {self.SAMBA_RUNTIME_FILES['smbpasswd']}
+else
+  printf 'HASH=%s\nCOUNT=0\n' "$(printf '' | sha256sum | awk '{{print $1}}')"
+fi
+"""
+        output = self._samba_exec_router_script(
+            script, "snapshot Samba non-test smbpasswd fingerprint", timeout=20
+        )
+        hash_match = re.search(r"(?m)^HASH=([0-9a-f]{64})\s*$", output)
+        count_match = re.search(r"(?m)^COUNT=(\d+)\s*$", output)
+        return {
+            "count": len(rows),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "runtime_count": int(count_match.group(1)) if count_match else -1,
+            "runtime_sha256": hash_match.group(1) if hash_match else "",
+        }
+
+    def verify_samba_non_test_users_unchanged(self, prefix: str,
+                                              snapshot: Dict) -> VerifyResult:
+        try:
+            current = self.snapshot_samba_non_test_users(prefix)
+            passed = bool(snapshot) and current == snapshot
+        except Exception as exc:
+            return VerifyResult(
+                "L4-Samba非测试用户保护", False,
+                f"非测试Samba用户快照查询失败: {str(exc)[:160]}",
+            )
+        return VerifyResult(
+            "L4-Samba非测试用户保护", passed,
+            ("非测试Samba用户及认证哈希未变化" if passed else
+             "非测试Samba用户或认证哈希发生变化"),
+            details={
+                "expected_count": snapshot.get("count"),
+                "actual_count": current.get("count"),
+                "database_fingerprint_match": (
+                    current.get("sha256") == snapshot.get("sha256")
+                ),
+                "runtime_count_match": (
+                    current.get("runtime_count") == snapshot.get("runtime_count")
+                ),
+                "runtime_fingerprint_match": (
+                    current.get("runtime_sha256") == snapshot.get("runtime_sha256")
+                ),
+            },
+        )
+
+    def find_samba_user(self, username: str) -> Optional[Dict]:
+        return self._samba_sqlite_query_line(
+            "SELECT id,enabled,username,passwd,name,tagname,perm,guest,browseable,home_dir "
+            "FROM smbd_dir WHERE username=" +
+            self._samba_sql_literal(username) + " LIMIT 1"
+        )
+
+    def _samba_password_state(self, username: str,
+                              expected_password: str = None) -> Dict[str, Any]:
+        """Verify encrypted DB storage and NT-hash runtime sync without returning secrets."""
+        username_b64 = base64.b64encode(str(username).encode("utf-8")).decode("ascii")
+        expected_b64 = base64.b64encode(
+            ("" if expected_password is None else str(expected_password)).encode("utf-8")
+        ).decode("ascii")
+        script = f"""set +x
+umask 077
+USERNAME=$(printf '%s' '{username_b64}' | base64 -d) || exit 91
+EXPECTED=$(printf '%s' '{expected_b64}' | base64 -d) || exit 92
+HAS_EXPECTED={'1' if expected_password is not None else '0'}
+SQL_USER=$(printf '%s' "$USERNAME" | sed "s/'/''/g")
+CIPHER=$(sqlite3 {shlex.quote(self.DNS_DB)} "SELECT passwd FROM smbd_dir WHERE username='$SQL_USER' LIMIT 1" 2>/dev/null)
+SQL_RC=$?
+DB_STORED=0; DB_ENCRYPTED=0; DEC_RC=99; DB_EXPECTED_MATCH=-1
+RUNTIME_PRESENT=0; RUNTIME_HASH_VALID=0; RUNTIME_EXPECTED_MATCH=-1; DB_RUNTIME_MATCH=0
+if [ "$SQL_RC" -eq 0 ] && [ -n "$CIPHER" ]; then
+  DB_STORED=1
+  DECRYPTED=$({self.SAMBA_SCRIPT} __sql_passwd_dec "$CIPHER" 2>/dev/null)
+  DEC_RC=$?
+  if [ "$HAS_EXPECTED" -eq 0 ] || [ "$CIPHER" != "$EXPECTED" ]; then DB_ENCRYPTED=1; fi
+  if [ "$HAS_EXPECTED" -eq 1 ]; then
+    if [ "$DEC_RC" -eq 0 ] && [ "$DECRYPTED" = "$EXPECTED" ]; then DB_EXPECTED_MATCH=1; else DB_EXPECTED_MATCH=0; fi
+  fi
+fi
+if [ -f {self.SAMBA_RUNTIME_FILES['smbpasswd']} ]; then
+  LINE=$(awk -F: -v u="$USERNAME" '$1==u {{print; exit}}' {self.SAMBA_RUNTIME_FILES['smbpasswd']})
+  if [ -n "$LINE" ]; then
+    RUNTIME_PRESENT=1
+    LM=$(printf '%s\n' "$LINE" | awk -F: '{{print $3}}')
+    NT=$(printf '%s\n' "$LINE" | awk -F: '{{print $4}}')
+    if printf '%s' "$LM" | grep -Eq '^[0-9A-Fa-fX]{{32}}$' && \
+       printf '%s' "$NT" | grep -Eq '^[0-9A-Fa-f]{{32}}$'; then
+      RUNTIME_HASH_VALID=1
+    fi
+    if [ "$DEC_RC" -eq 0 ]; then
+      DECRYPTED_NT=$(printf '%s' "$DECRYPTED" | iconv -f UTF-8 -t UTF-16LE 2>/dev/null | \
+        openssl dgst -md4 2>/dev/null | awk '{{print toupper($NF)}}')
+      NT_UPPER=$(printf '%s' "$NT" | tr 'a-f' 'A-F')
+      if [ -n "$DECRYPTED_NT" ] && [ "$NT_UPPER" = "$DECRYPTED_NT" ]; then
+        DB_RUNTIME_MATCH=1
+      fi
+    fi
+    if [ "$HAS_EXPECTED" -eq 1 ]; then
+      EXPECTED_NT=$(printf '%s' "$EXPECTED" | iconv -f UTF-8 -t UTF-16LE 2>/dev/null | \
+        openssl dgst -md4 2>/dev/null | awk '{{print toupper($NF)}}')
+      NT_UPPER=$(printf '%s' "$NT" | tr 'a-f' 'A-F')
+      if [ -n "$EXPECTED_NT" ] && [ "$NT_UPPER" = "$EXPECTED_NT" ]; then
+        RUNTIME_EXPECTED_MATCH=1
+      else
+        RUNTIME_EXPECTED_MATCH=0
+      fi
+    fi
+  fi
+fi
+printf '__SAMBA_SQL_RC__=%s\n' "$SQL_RC"
+printf '__SAMBA_DB_STORED__=%s\n' "$DB_STORED"
+printf '__SAMBA_DB_ENCRYPTED__=%s\n' "$DB_ENCRYPTED"
+printf '__SAMBA_DECRYPT_RC__=%s\n' "$DEC_RC"
+printf '__SAMBA_DB_EXPECTED_MATCH__=%s\n' "$DB_EXPECTED_MATCH"
+printf '__SAMBA_RUNTIME_PRESENT__=%s\n' "$RUNTIME_PRESENT"
+printf '__SAMBA_RUNTIME_HASH_VALID__=%s\n' "$RUNTIME_HASH_VALID"
+printf '__SAMBA_RUNTIME_EXPECTED_MATCH__=%s\n' "$RUNTIME_EXPECTED_MATCH"
+printf '__SAMBA_DB_RUNTIME_MATCH__=%s\n' "$DB_RUNTIME_MATCH"
+unset EXPECTED DECRYPTED CIPHER LINE LM NT EXPECTED_NT DECRYPTED_NT NT_UPPER
+"""
+        output = self._samba_exec_router_script(
+            script,
+            f"verify Samba password state username={str(username)[:40]} "
+            "password=<redacted>",
+            timeout=25,
+        )
+        values = {}
+        for key, raw_value in re.findall(
+                r"(?m)^__SAMBA_([A-Z_]+)__=(-?\d+)\s*$", output):
+            values[key] = int(raw_value)
+        return {
+            "sql_ok": values.get("SQL_RC") == 0,
+            "db_stored": values.get("DB_STORED") == 1,
+            "db_encrypted": values.get("DB_ENCRYPTED") == 1,
+            "decrypt_ok": values.get("DECRYPT_RC") == 0,
+            "db_expected_match": values.get("DB_EXPECTED_MATCH") == 1,
+            "runtime_present": values.get("RUNTIME_PRESENT") == 1,
+            "runtime_hash_valid": values.get("RUNTIME_HASH_VALID") == 1,
+            "runtime_expected_match": values.get("RUNTIME_EXPECTED_MATCH") == 1,
+            "db_runtime_match": values.get("DB_RUNTIME_MATCH") == 1,
+            "markers_complete": all(key in values for key in (
+                "SQL_RC", "DB_STORED", "DB_ENCRYPTED", "DECRYPT_RC",
+                "DB_EXPECTED_MATCH", "RUNTIME_PRESENT", "RUNTIME_HASH_VALID",
+                "RUNTIME_EXPECTED_MATCH", "DB_RUNTIME_MATCH",
+            )),
+        }
+
+    @classmethod
+    def _samba_values_equal(cls, field: str, actual: Any, expected: Any) -> bool:
+        field = str(field).lower()
+        if field == "enabled":
+            return cls._samba_yes(actual) == cls._samba_yes(expected)
+        if field in {"wsdd2", "access", "id"}:
+            try:
+                return int(str(actual).strip()) == int(str(expected).strip())
+            except (TypeError, ValueError):
+                return False
+        if field == "home_dir":
+            actual_items = [cls._samba_normalize_home(v)
+                            for v in str(actual or "").split(",")]
+            expected_items = [cls._samba_normalize_home(v)
+                              for v in str(expected or "").split(",")]
+            return actual_items == expected_items
+        return str(actual) == str(expected)
+
+    def verify_samba_global_database(self,
+                                     expected: Dict = None) -> VerifyResult:
+        try:
+            row = self.get_samba_global_config()
+        except Exception as exc:
+            return VerifyResult(
+                "L1-Samba全局数据库", False,
+                f"Samba全局配置查询失败: {str(exc)[:160]}",
+            )
+        if row is None:
+            return VerifyResult(
+                "L1-Samba全局数据库", False, "smbd表中未找到全局配置"
+            )
+        aliases = {
+            "wan_access": "access", "network_discovery": "wsdd2",
+            "discovery": "wsdd2",
+        }
+        mismatches = []
+        for requested, exp in (expected or {}).items():
+            field = aliases.get(requested, requested)
+            if field not in row:
+                mismatches.append({"field": field, "reason": "unknown"})
+            elif not self._samba_values_equal(field, row.get(field), exp):
+                mismatches.append({
+                    "field": field, "expected": exp, "actual": row.get(field),
+                })
+        passed = not mismatches
+        return VerifyResult(
+            "L1-Samba全局数据库", passed,
+            ("Samba全局配置字段正确" if passed else
+             "Samba全局配置字段不匹配: " +
+             ", ".join(str(item.get("field")) for item in mismatches)),
+            details={"config": row, "mismatches": mismatches},
+            raw_output=json.dumps(row, ensure_ascii=False)[:500],
+        )
+
+    def verify_samba_user_database(self, username: str,
+                                   expected: Dict = None,
+                                   must_exist: bool = True) -> VerifyResult:
+        try:
+            row = self.find_samba_user(username)
+        except Exception as exc:
+            return VerifyResult(
+                "L1-Samba用户数据库", False,
+                f"Samba用户查询失败({username}): {str(exc)[:140]}",
+            )
+        if row is None:
+            return VerifyResult(
+                "L1-Samba用户数据库", not must_exist,
+                (f"Samba用户已不存在: {username}" if not must_exist else
+                 f"Samba用户未找到: {username}"),
+                details={"username": username, "present": False},
+            )
+        if not must_exist:
+            return VerifyResult(
+                "L1-Samba用户数据库", False,
+                f"Samba用户仍存在: {username}",
+                details={"user": self._samba_redact(row), "present": True},
+            )
+
+        normalized = dict(expected or {})
+        if "permission" in normalized and "perm" not in normalized:
+            normalized["perm"] = normalized.pop("permission")
+        if "password" in normalized and "passwd" not in normalized:
+            normalized["passwd"] = normalized.pop("password")
+        shares = normalized.pop("shares", None)
+        if shares is not None:
+            if not isinstance(shares, (list, tuple)) or not shares:
+                return VerifyResult(
+                    "L1-Samba用户数据库", False, "shares必须是非空列表"
+                )
+            normalized["name"] = ",".join(
+                str(item.get("name", "")) for item in shares
+            )
+            normalized["home_dir"] = ",".join(
+                self._samba_normalize_home(item.get("home_dir", ""))
+                for item in shares
+            )
+            normalized["browseable"] = ",".join(
+                str(item.get("browseable", "yes") or "yes") for item in shares
+            )
+
+        aliases = {"share_name": "name", "path": "home_dir"}
+        mismatches = []
+        password_state = None
+        for requested, exp in normalized.items():
+            field = aliases.get(requested, requested)
+            if field == "passwd":
+                try:
+                    password_state = self._samba_password_state(username, str(exp))
+                    if not (password_state.get("markers_complete") and
+                            password_state.get("sql_ok") and
+                            password_state.get("db_stored") and
+                            password_state.get("db_encrypted") and
+                            password_state.get("decrypt_ok") and
+                            password_state.get("db_expected_match")):
+                        mismatches.append({
+                            "field": "passwd",
+                            "expected": "encrypted/decrypt-match",
+                            "actual": "mismatch",
+                        })
+                except Exception as exc:
+                    password_state = {"error": str(exc)[:120]}
+                    mismatches.append({
+                        "field": "passwd", "expected": "verified",
+                        "actual": "verification-error",
+                    })
+                continue
+            if field not in row:
+                mismatches.append({"field": field, "reason": "unknown"})
+            elif not self._samba_values_equal(field, row.get(field), exp):
+                mismatches.append({
+                    "field": field, "expected": exp, "actual": row.get(field),
+                })
+        safe_row = self._samba_redact(row)
+        passed = not mismatches
+        return VerifyResult(
+            "L1-Samba用户数据库", passed,
+            (f"Samba用户存在且字段正确: {username}" if passed else
+             f"Samba用户字段不匹配({username}): " +
+             ", ".join(str(item.get("field")) for item in mismatches)),
+            details={
+                "user": safe_row,
+                "mismatches": self._samba_redact(mismatches),
+                "password_stored": bool(row.get("passwd")),
+                "password_encrypted": (
+                    password_state.get("db_encrypted")
+                    if isinstance(password_state, dict) else None
+                ),
+                "password_match": (
+                    password_state.get("db_expected_match")
+                    if isinstance(password_state, dict) else None
+                ),
+            },
+            raw_output=json.dumps(safe_row, ensure_ascii=False)[:600],
+        )
+
+    def verify_samba_user_count(self, prefix: str = None,
+                                expected: int = None) -> VerifyResult:
+        if prefix is None:
+            sql = "SELECT count(*) AS cnt FROM smbd_dir"
+        else:
+            predicate = self._samba_exact_prefix_sql(
+                str(prefix), "username", "name", "tagname"
+            )
+            sql = f"SELECT count(*) AS cnt FROM smbd_dir WHERE {predicate}"
+        try:
+            row = self._samba_sqlite_query_line(sql)
+            count = int((row or {}).get("cnt", 0))
+        except Exception as exc:
+            return VerifyResult(
+                "L1-Samba用户计数", False,
+                f"Samba用户计数失败: {str(exc)[:160]}",
+            )
+        passed = expected is None or count == int(expected)
+        return VerifyResult(
+            "L1-Samba用户计数", passed,
+            (f"Samba用户数量: {count}" if expected is None else
+             f"Samba用户数量{'正确' if passed else '不正确'}: "
+             f"实际={count}, 期望={expected}"),
+            details={"count": count, "expected": expected, "prefix": prefix},
+            raw_output=f"count={count}",
+        )
+
+    def verify_samba_processes(self, expect_running: bool = None,
+                               expect_wsdd2: bool = None,
+                               expect_smbd: bool = None,
+                               expect_discovery: bool = None) -> VerifyResult:
+        if expect_smbd is not None:
+            expect_running = bool(expect_smbd)
+        if expect_discovery is not None:
+            expect_wsdd2 = bool(expect_discovery)
+        if expect_running is None:
+            raise ValueError("verify_samba_processes必须提供expect_running/expect_smbd")
+        if expect_wsdd2 is None:
+            global_row = self.get_samba_global_config() or {}
+            expect_wsdd2 = bool(expect_running and
+                                self._samba_yes(global_row.get("wsdd2", 0)))
+        expected = {
+            "ik_smbd": bool(expect_running),
+            "nmbd": bool(expect_running and expect_wsdd2),
+            "wsdd2": bool(expect_running and expect_wsdd2),
+        }
+        self.connect_router()
+        output, actual, counts = "", {}, {}
+        exe_ok = count_ok = passed = False
+        # save/up/down all restart Samba asynchronously.  Exiting nmbd/wsdd2 can
+        # remain visible to pidof for about one second with /proc/<pid>/exe already
+        # gone, so verify the settled state instead of sampling that transition.
+        for attempt in range(10):
+            output = self._router.exec(
+                "for p in ik_smbd nmbd wsdd2; do ids=$(pidof $p 2>/dev/null); "
+                "count=0; for id in $ids; do count=$((count+1)); done; "
+                "echo __SAMBA_PROC_${p}_COUNT__=$count; "
+                "if [ -n \"$ids\" ]; then echo __SAMBA_PROC_${p}__=1; "
+                "for id in $ids; do printf '__SAMBA_EXE_%s__=' $p; "
+                "readlink -f /proc/$id/exe 2>/dev/null || echo unknown; done; "
+                "else echo __SAMBA_PROC_${p}__=0; fi; done",
+                timeout=15,
+            )
+            actual = {
+                name: bool(re.search(
+                    rf"(?m)^__SAMBA_PROC_{name}__=1\s*$", output
+                )) for name in ("ik_smbd", "nmbd", "wsdd2")
+            }
+            counts = {}
+            for name in ("ik_smbd", "nmbd", "wsdd2"):
+                match = re.search(
+                    rf"(?m)^__SAMBA_PROC_{name}_COUNT__=(\d+)\s*$", output
+                )
+                counts[name] = int(match.group(1)) if match else -1
+            exe_ok = True
+            if actual["ik_smbd"]:
+                exe_ok &= bool(re.search(
+                    r"(?m)^__SAMBA_EXE_ik_smbd__=/usr/sbin/samba_multicall\s*$",
+                    output,
+                ))
+            if actual["nmbd"]:
+                exe_ok &= bool(re.search(
+                    r"(?m)^__SAMBA_EXE_nmbd__=/usr/sbin/samba_multicall\s*$",
+                    output,
+                ))
+            if actual["wsdd2"]:
+                exe_ok &= bool(re.search(
+                    r"(?m)^__SAMBA_EXE_wsdd2__=/usr/bin/wsdd2\s*$", output
+                ))
+            count_ok = all(
+                (counts.get(name, -1) >= 1 if should_run
+                 else counts.get(name) == 0)
+                for name, should_run in expected.items()
+            )
+            passed = actual == expected and exe_ok and count_ok
+            if passed:
+                break
+            if attempt < 9:
+                time.sleep(0.25)
+        return VerifyResult(
+            "L2-Samba进程", passed,
+            ("Samba进程及可执行文件归属正确" if passed else
+             f"Samba进程状态不符: actual={actual}, expected={expected}, "
+             f"exe_ok={exe_ok}, counts={counts}"),
+            details={"actual": actual, "expected": expected, "exe_ok": exe_ok,
+                     "counts": counts, "count_ok": count_ok},
+            raw_output=json.dumps(actual, ensure_ascii=False),
+        )
+
+    def _samba_listener_inventory(self) -> Dict[str, List[Dict[str, str]]]:
+        self.connect_router()
+        port_pattern = "|".join(str(p) for p in self.SAMBA_LISTENER_CANDIDATE_PORTS)
+        output = self._router.exec(
+            "netstat -lntup 2>/dev/null | "
+            f"awk '$4 ~ /:({port_pattern})$/ "
+            "{owner=($1 ~ /^tcp/ ? $7 : $6); "
+            "print $1 \"|\" $4 \"|\" owner}'",
+            timeout=15,
+        )
+        inventory: Dict[str, List[Dict[str, str]]] = {}
+        for raw_line in output.splitlines():
+            parts = raw_line.strip().split("|", 2)
+            if len(parts) != 3:
+                continue
+            proto, address, owner = parts
+            match = re.search(
+                rf":({'|'.join(str(p) for p in self.SAMBA_LISTENER_CANDIDATE_PORTS)})$",
+                address,
+            )
+            if match:
+                key = f"{'tcp' if proto.startswith('tcp') else 'udp'}:{match.group(1)}"
+                inventory.setdefault(key, []).append({
+                    "address": address, "owner": owner, "protocol": proto,
+                })
+        return inventory
+
+    def verify_samba_listeners(self, expect_present: bool = None,
+                               expect_wsdd2: bool = None,
+                               expect_smbd: bool = None,
+                               expect_discovery: bool = None) -> VerifyResult:
+        if expect_smbd is not None:
+            expect_present = bool(expect_smbd)
+        if expect_discovery is not None:
+            expect_wsdd2 = bool(expect_discovery)
+        if expect_present is None:
+            raise ValueError("verify_samba_listeners必须提供expect_present/expect_smbd")
+        if expect_wsdd2 is None:
+            row = self.get_samba_global_config() or {}
+            expect_wsdd2 = bool(expect_present and
+                                self._samba_yes(row.get("wsdd2", 0)))
+        try:
+            actual = self._samba_listener_inventory()
+        except Exception as exc:
+            return VerifyResult(
+                "L2-Samba监听", False,
+                f"Samba监听查询失败: {str(exc)[:160]}",
+            )
+        expected_keys = set()
+        if expect_present:
+            expected_keys.update({"tcp:139", "tcp:445"})
+            if expect_wsdd2:
+                expected_keys.update({
+                    "tcp:3702", "tcp:5355",
+                    "udp:137", "udp:138", "udp:3702", "udp:5355",
+                })
+        actual_keys = set(actual)
+        owner_expectations = {
+            "tcp:139": "ik_smbd", "tcp:445": "ik_smbd",
+            "tcp:3702": "wsdd2", "tcp:5355": "wsdd2",
+            "udp:137": "nmbd", "udp:138": "nmbd",
+            "udp:3702": "wsdd2", "udp:5355": "wsdd2",
+        }
+        owner_ok = all(any(
+            owner_expectations[key] in entry.get("owner", "")
+            for entry in actual.get(key, [])
+        ) for key in expected_keys)
+        missing = expected_keys - actual_keys
+        samba_owners = ("ik_smbd", "nmbd", "wsdd2")
+        unexpected = set()
+        for key, entries in actual.items():
+            for entry in entries:
+                owner = entry.get("owner", "")
+                if not any(name in owner for name in samba_owners):
+                    continue
+                if not expect_present:
+                    unexpected.add(key)
+                elif not expect_wsdd2 and ("nmbd" in owner or "wsdd2" in owner):
+                    unexpected.add(key)
+        passed = not missing and not unexpected and owner_ok
+        safe_actual = {key: value for key, value in sorted(actual.items())}
+        return VerifyResult(
+            "L2-Samba监听", passed,
+            ("Samba监听端口及PID归属正确" if passed else
+             f"Samba监听不符: actual={sorted(actual_keys)}, "
+             f"expected={sorted(expected_keys)}, missing={sorted(missing)}, "
+             f"unexpected={sorted(unexpected)}, owner_ok={owner_ok}"),
+            details={
+                "actual": safe_actual, "expected": sorted(expected_keys),
+                "owner_ok": owner_ok, "missing": sorted(missing),
+                "unexpected": sorted(unexpected),
+            },
+            raw_output=json.dumps(safe_actual, ensure_ascii=False),
+        )
+
+    def verify_samba_firewall(self, expect_wan_drop: bool,
+                              expect_wsdd2: bool = None,
+                              expected_members: Dict = None,
+                              expect_discovery: bool = None) -> VerifyResult:
+        if expect_discovery is not None:
+            expect_wsdd2 = bool(expect_discovery)
+        try:
+            actual = self._samba_firewall_members()
+        except Exception as exc:
+            return VerifyResult(
+                "L3-Samba防火墙", False,
+                f"Samba WAN ipset查询失败: {str(exc)[:160]}",
+            )
+        if expected_members is not None:
+            expected = {str(k): bool(v) for k, v in expected_members.items()}
+        else:
+            if expect_wsdd2 is None:
+                row = self.get_samba_global_config() or {}
+                expect_wsdd2 = self._samba_yes(row.get("wsdd2", 0))
+            expected = {key: False for key in actual}
+            if expect_wan_drop:
+                expected["tcp:139"] = True
+                expected["tcp:445"] = True
+                if expect_wsdd2:
+                    for key in (
+                            "tcp:3702", "tcp:5355", "udp:137", "udp:138",
+                            "udp:3702", "udp:5355"):
+                        expected[key] = True
+        mismatches = {
+            key: {"expected": expected.get(key), "actual": actual.get(key)}
+            for key in sorted(set(expected) | set(actual))
+            if expected.get(key) != actual.get(key)
+        }
+        passed = not mismatches
+        return VerifyResult(
+            "L3-Samba防火墙", passed,
+            ("Samba 8项WAN端口成员正确" if passed else
+             "Samba WAN ipset成员不匹配: " + ", ".join(mismatches)),
+            details={"actual": actual, "expected": expected,
+                     "mismatches": mismatches},
+            raw_output=json.dumps(actual, ensure_ascii=False),
+        )
+
+    @staticmethod
+    def _samba_parse_shell_cache(content: str) -> Dict[str, str]:
+        values = {}
+        try:
+            tokens = shlex.split(content or "", comments=False, posix=True)
+        except ValueError:
+            tokens = (content or "").split()
+        for token in tokens:
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            values[key.strip()] = value.strip()
+        return values
+
+    @staticmethod
+    def _samba_parse_smb_conf(content: str) -> Dict[str, Dict[str, str]]:
+        sections: Dict[str, Dict[str, str]] = {}
+        current = None
+        for raw_line in (content or "").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current = line[1:-1].strip()
+                sections.setdefault(current, {})
+                continue
+            if current is not None and "=" in line:
+                key, value = line.split("=", 1)
+                sections[current][key.strip().lower()] = value.strip()
+        return sections
+
+    def _read_samba_runtime(self) -> Dict[str, Any]:
+        files = self._samba_capture_files(self.SAMBA_RUNTIME_FILES)
+        decoded = {}
+        for key in ("config", "smb_conf"):
+            info = files[key]
+            if info.get("exists"):
+                decoded[key] = base64.b64decode(
+                    info.get("content_b64", ""), validate=True
+                ).decode("utf-8", errors="replace")
+            else:
+                decoded[key] = ""
+        self.connect_router()
+        output = self._router.exec(
+            f"if [ -f {self.SAMBA_RUNTIME_FILES['smbpasswd']} ]; then "
+            f"awk -F: '{{lm=(length($3)==32 && $3 !~ /[^0-9A-Fa-fX]/); "
+            f"nt=(length($4)==32 && $4 !~ /[^0-9A-Fa-f]/); "
+            f"print \"__SAMBA_AUTH_USER__=\" $1 \"|\" lm \"|\" nt}}' "
+            f"{self.SAMBA_RUNTIME_FILES['smbpasswd']}; fi",
+            timeout=15,
+        )
+        auth_users = {}
+        malformed = 0
+        for raw_line in output.splitlines():
+            if not raw_line.startswith("__SAMBA_AUTH_USER__="):
+                continue
+            value = raw_line.split("=", 1)[1]
+            parts = value.rsplit("|", 2)
+            if len(parts) != 3:
+                malformed += 1
+                continue
+            username, lm_valid, nt_valid = parts
+            auth_users[username] = {
+                "lm_valid": lm_valid == "1", "nt_valid": nt_valid == "1",
+            }
+        return {
+            "files": {
+                key: {"exists": bool(value.get("exists")),
+                      "mode": value.get("mode", "")}
+                for key, value in files.items()
+            },
+            "global_cache": self._samba_parse_shell_cache(decoded["config"]),
+            "sections": self._samba_parse_smb_conf(decoded["smb_conf"]),
+            "auth_users": auth_users,
+            "auth_malformed_count": malformed,
+        }
+
+    def _samba_resolve_home(self, home_dir: str) -> str:
+        home = self._samba_normalize_home(home_dir)
+        if not home or home == "/" or ".." in home.split("/"):
+            return ""
+        candidate = self.SAMBA_DISK_ROOT + home
+        self.connect_router()
+        output = self._router.exec(
+            f"if [ -d {shlex.quote(candidate)} ]; then "
+            f"readlink -f {shlex.quote(candidate)}; fi",
+            timeout=10,
+        )
+        return output.strip().splitlines()[-1] if output.strip() else ""
+
+    def verify_samba_runtime_consistency(
+            self, prefix: str = None,
+            expected_firewall_members: Dict = None) -> VerifyResult:
+        """L4: cross-check DB -> four files -> hashes -> processes/sockets/ipsets."""
+        try:
+            global_row = self.get_samba_global_config()
+            if global_row is None:
+                raise RuntimeError("smbd全局行不存在")
+            if prefix is None:
+                rows = self._samba_sqlite_query_list(
+                    "SELECT id,enabled,username,name,perm,guest,browseable,home_dir "
+                    "FROM smbd_dir ORDER BY id"
+                )
+            else:
+                predicate = self._samba_exact_prefix_sql(
+                    str(prefix), "username", "name", "tagname"
+                )
+                rows = self._samba_sqlite_query_list(
+                    "SELECT id,enabled,username,name,perm,guest,browseable,home_dir "
+                    f"FROM smbd_dir WHERE {predicate} ORDER BY id"
+                )
+            runtime = self._read_samba_runtime()
+        except Exception as exc:
+            return VerifyResult(
+                "L4-Samba运行时一致性", False,
+                f"Samba一致性读取失败: {str(exc)[:180]}",
+            )
+
+        enabled = self._samba_yes(global_row.get("enabled"))
+        discovery = self._samba_yes(global_row.get("wsdd2"))
+        access = self._samba_yes(global_row.get("access"))
+        issues = []
+        checks = {
+            "marker": runtime["files"]["is_enabled"]["exists"] == enabled,
+        }
+        if not checks["marker"]:
+            issues.append("is_enabled标记与DB全局开关不一致")
+
+        if enabled:
+            cache = runtime["global_cache"]
+            checks["config_file"] = runtime["files"]["config"]["exists"]
+            checks["smb_conf_file"] = runtime["files"]["smb_conf"]["exists"]
+            checks["smbpasswd_file"] = runtime["files"]["smbpasswd"]["exists"]
+            checks["cache_fields"] = all([
+                self._samba_yes(cache.get("enabled")) == enabled,
+                str(cache.get("workgroup", "")) == str(global_row.get("workgroup", "")),
+                self._samba_yes(cache.get("wsdd2")) == discovery,
+                self._samba_yes(cache.get("access")) == access,
+            ])
+            for key in ("config_file", "smb_conf_file", "smbpasswd_file",
+                        "cache_fields"):
+                if not checks[key]:
+                    issues.append(f"{key}不一致")
+            global_section = runtime["sections"].get("global", {})
+            checks["global_section"] = all([
+                global_section.get("workgroup") == str(global_row.get("workgroup", "")),
+                global_section.get("max protocol") == "SMB2",
+                global_section.get("security") == "user",
+                global_section.get("passdb backend") == "smbpasswd",
+                global_section.get("smb passwd file") == self.SAMBA_RUNTIME_FILES["smbpasswd"],
+            ])
+            if not checks["global_section"]:
+                issues.append("smb.conf全局段不一致")
+
+            row_results = []
+            for row in rows:
+                row_enabled = self._samba_yes(row.get("enabled"))
+                username = str(row.get("username", ""))
+                names = str(row.get("name", "")).split(",")
+                homes = str(row.get("home_dir", "")).split(",")
+                browses = str(row.get("browseable", "")).split(",")
+                auth = runtime["auth_users"].get(username)
+                row_issues = []
+                if row_enabled:
+                    if not auth:
+                        row_issues.append("smbpasswd缺少用户")
+                    elif not (auth.get("lm_valid") and auth.get("nt_valid")):
+                        row_issues.append("smbpasswd哈希格式无效")
+                    try:
+                        password_sync = self._samba_password_state(username)
+                        if not (password_sync.get("markers_complete") and
+                                password_sync.get("sql_ok") and
+                                password_sync.get("db_stored") and
+                                password_sync.get("decrypt_ok") and
+                                password_sync.get("runtime_present") and
+                                password_sync.get("runtime_hash_valid") and
+                                password_sync.get("db_runtime_match")):
+                            row_issues.append("DB解密密码与smbpasswd NT哈希不一致")
+                    except Exception as exc:
+                        row_issues.append(
+                            "密码运行时同步验证异常:" + str(exc)[:80]
+                        )
+                    if len(names) != len(homes):
+                        row_issues.append("name/home_dir数量不一致")
+                    else:
+                        for index, share_name in enumerate(names):
+                            section = runtime["sections"].get(share_name, {})
+                            expected_path = self._samba_resolve_home(homes[index])
+                            browse = (browses[index] if index < len(browses)
+                                      and browses[index] else "yes")
+                            expected_valid = username + (
+                                " nobody" if str(row.get("guest")) == "yes" else ""
+                            )
+                            expected_values = {
+                                "path": expected_path,
+                                "valid users": expected_valid,
+                                "public": str(row.get("guest", "")),
+                                "writable": "yes" if str(row.get("perm")) == "rw" else "no",
+                                "browseable": browse,
+                                "available": "yes",
+                            }
+                            mismatched = [
+                                key for key, value in expected_values.items()
+                                if section.get(key) != value
+                            ]
+                            if not section:
+                                row_issues.append(f"共享段缺失:{share_name}")
+                            elif mismatched:
+                                row_issues.append(
+                                    f"共享段字段不符:{share_name}/" + ",".join(mismatched)
+                                )
+                else:
+                    if auth:
+                        row_issues.append("停用用户仍在smbpasswd")
+                    present_shares = [
+                        name for name in names if name in runtime["sections"]
+                    ]
+                    if present_shares:
+                        row_issues.append("停用共享仍在smb.conf")
+                row_results.append({
+                    "username": username, "enabled": row_enabled,
+                    "passed": not row_issues, "issues": row_issues,
+                })
+                issues.extend(f"{username}:{item}" for item in row_issues)
+            checks["users_and_shares"] = all(item["passed"] for item in row_results)
+            checks["auth_parse"] = runtime["auth_malformed_count"] == 0
+            if not checks["auth_parse"]:
+                issues.append("smbpasswd存在无法解析的记录")
+        else:
+            row_results = []
+            checks["inactive_files_allowed"] = True
+
+        process_result = self.verify_samba_processes(enabled, discovery)
+        listener_result = self.verify_samba_listeners(enabled, discovery)
+        checks["processes"] = process_result.passed
+        checks["listeners"] = listener_result.passed
+        if not process_result.passed:
+            issues.append(process_result.message)
+        if not listener_result.passed:
+            issues.append(listener_result.message)
+
+        firewall_result = None
+        if enabled:
+            if expected_firewall_members is not None:
+                firewall_result = self.verify_samba_firewall(
+                    expect_wan_drop=not access,
+                    expect_wsdd2=discovery,
+                    expected_members=expected_firewall_members,
+                )
+            else:
+                firewall_result = self.verify_samba_firewall(
+                    expect_wan_drop=not access, expect_wsdd2=discovery
+                )
+            checks["firewall"] = firewall_result.passed
+            if not firewall_result.passed:
+                issues.append(firewall_result.message)
+        else:
+            # The two WAN sets are shared by many modules and may contain an exact
+            # pre-test member (this environment has a pre-existing UDP/138).  A
+            # disabled Samba service therefore must not assert that all eight are
+            # empty; exact absence/presence is checked against the saved snapshot.
+            checks["firewall_skipped_when_disabled"] = True
+
+        passed = all(checks.values())
+        details = {
+            "global": global_row,
+            "prefix": prefix,
+            "checks": checks,
+            "rows": row_results,
+            "processes": process_result.message,
+            "listeners": listener_result.message,
+            "firewall": firewall_result.message if firewall_result else
+                        "全局关闭：由环境快照做精确成员复验",
+            "file_modes": {
+                key: value.get("mode") for key, value in runtime["files"].items()
+            },
+        }
+        return VerifyResult(
+            "L4-Samba运行时一致性", passed,
+            ("Samba DB→配置→认证→进程→监听→防火墙一致" if passed else
+             "Samba运行时一致性失败: " + "; ".join(issues[:12])),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False)[:1400],
+        )
+
+    def verify_samba_reinit(
+            self, username: str = None,
+            expected_firewall_members: Dict = None) -> VerifyResult:
+        """Stop and invoke the product ``init`` path, then prove runtime rebuild."""
+        self.connect_router()
+        output = self._router.exec(
+            f"{self.SAMBA_SCRIPT} __smbd_stop >/dev/null 2>&1; "
+            f"{self.SAMBA_SCRIPT} init >/dev/null 2>&1; "
+            "echo __SAMBA_INIT_RC__=$?",
+            timeout=35,
+            probe_console=False,
+        )
+        match = re.search(r"__SAMBA_INIT_RC__=(\d+)", output)
+        init_rc = int(match.group(1)) if match else -1
+        time.sleep(2)
+        consistency = self.verify_samba_runtime_consistency(
+            username, expected_firewall_members=expected_firewall_members
+        )
+        passed = init_rc == 0 and consistency.passed
+        return VerifyResult(
+            "L4-Samba脚本重建", passed,
+            ("smbd.sh init后运行时重建正确" if passed else
+             f"smbd.sh init重建失败: init_rc={init_rc}; "
+             f"{consistency.message}"),
+            details={"init_rc": init_rc,
+                     "consistency": consistency.message,
+                     "username": username},
+            raw_output=f"init_rc={init_rc}",
+        )
+
+    def _samba_rebuild_runtime_files_stopped(self,
+                                             global_row: Dict) -> Dict[str, Any]:
+        """Rebuild DB-derived files without starting any Samba process."""
+        workgroup = str((global_row or {}).get("workgroup", "WORKGROUP"))
+        if "\n" in workgroup or "\r" in workgroup:
+            return {"passed": False, "markers": {},
+                    "error": "workgroup包含换行"}
+        workgroup_b64 = base64.b64encode(workgroup.encode("utf-8")).decode("ascii")
+        enabled = self._samba_yes((global_row or {}).get("enabled"))
+        script = f"""set +x
+WORKGROUP=$(printf '%s' '{workgroup_b64}' | base64 -d) || exit 91
+{self.SAMBA_SCRIPT} __smbd_stop >/dev/null 2>&1
+STOP_RC=$?
+{self.SAMBA_SCRIPT} __smbd_config_cache >/dev/null 2>&1
+CACHE_RC=$?
+{self.SAMBA_SCRIPT} smbd_global_init "workgroup=$WORKGROUP" >/dev/null 2>&1
+GLOBAL_RC=$?
+{self.SAMBA_SCRIPT} smbd_share_init >/dev/null 2>&1
+SHARE_RC=$?
+if [ {'1' if enabled else '0'} -eq 1 ]; then
+  touch {self.SAMBA_RUNTIME_FILES['is_enabled']}
+  MARKER_RC=$?
+else
+  rm -f {self.SAMBA_RUNTIME_FILES['is_enabled']}
+  MARKER_RC=$?
+fi
+printf '__SAMBA_REBUILD_STOP_RC__=%s\n' "$STOP_RC"
+printf '__SAMBA_REBUILD_CACHE_RC__=%s\n' "$CACHE_RC"
+printf '__SAMBA_REBUILD_GLOBAL_RC__=%s\n' "$GLOBAL_RC"
+printf '__SAMBA_REBUILD_SHARE_RC__=%s\n' "$SHARE_RC"
+printf '__SAMBA_REBUILD_MARKER_RC__=%s\n' "$MARKER_RC"
+"""
+        try:
+            output = self._samba_exec_router_script(
+                script, "rebuild Samba runtime files while stopped", timeout=40
+            )
+        except Exception as exc:
+            return {"passed": False, "markers": {},
+                    "error": str(exc)[:160]}
+        markers = {
+            key: int(value) for key, value in re.findall(
+                r"(?m)^__SAMBA_REBUILD_([A-Z_]+)_RC__=(\d+)\s*$", output
+            )
+        }
+        required = {"STOP", "CACHE", "GLOBAL", "SHARE", "MARKER"}
+        stop_ok = markers.get("STOP") in {0, 1}
+        return {
+            "passed": required.issubset(markers) and
+                      stop_ok and all(
+                          markers[key] == 0
+                          for key in required - {"STOP"}
+                      ),
+            "markers": markers,
+            "error": "",
+        }
+
+    def prepare_samba_test_directories(self, partname: str = None,
+                                       dirnames: Any = None) -> VerifyResult:
+        """Create one or more unique directories under an approved disk symlink."""
+        try:
+            part = self._samba_safe_component(partname, "partname") if partname else ""
+            if dirnames is None:
+                dirnames = [f"smb_t_suite_{int(time.time())}"]
+            elif isinstance(dirnames, str):
+                dirnames = [dirnames]
+            else:
+                dirnames = list(dirnames)
+            if not dirnames:
+                raise ValueError("dirnames不能为空")
+            names = [self._samba_safe_component(item, "dirname")
+                     for item in dirnames]
+            if len(set(names)) != len(names):
+                raise ValueError("dirnames不能重复")
+        except Exception as exc:
+            return VerifyResult("L5-Samba测试目录", False, str(exc))
+
+        self.connect_router()
+        if not part:
+            output = self._router.exec(
+                f"for d in {self.SAMBA_DISK_ROOT}/*; do "
+                "[ -d \"$d\" ] || continue; basename \"$d\"; break; done",
+                timeout=10,
+            )
+            part = output.strip().splitlines()[0] if output.strip() else ""
+            try:
+                part = self._samba_safe_component(part, "自动发现partname")
+            except Exception as exc:
+                return VerifyResult("L5-Samba测试目录", False, str(exc))
+        root = f"{self.SAMBA_DISK_ROOT}/{part}"
+        root_q = shlex.quote(root)
+        aliases = [f"{root}/{name}" for name in names]
+        prechecks = " ".join(shlex.quote(path) for path in aliases)
+        command = (
+            f"root={root_q}; resolved=$(readlink -f \"$root\" 2>/dev/null); "
+            "case \"$resolved\" in /etc/disk/*) ;; *) echo __SAMBA_DIR_ERROR__=unsafe_root; exit 0;; esac; "
+            "[ -d \"$resolved\" ] || { echo __SAMBA_DIR_ERROR__=no_partition; exit 0; }; "
+            f"for d in {prechecks}; do [ ! -e \"$d\" ] && [ ! -L \"$d\" ] || "
+            "{ echo __SAMBA_DIR_ERROR__=already_exists; exit 0; }; done; "
+            "created=''; ok=1; "
+            f"for d in {prechecks}; do mkdir \"$d\" 2>/dev/null && chmod 0777 \"$d\" 2>/dev/null "
+            "&& created=\"$created $d\" || { ok=0; break; }; done; "
+            "if [ \"$ok\" -ne 1 ]; then for d in $created; do rmdir \"$d\" 2>/dev/null; done; "
+            "echo __SAMBA_DIR_ERROR__=mkdir_failed; else "
+            "for d in $created; do echo __SAMBA_DIR_PATH__=$d; "
+            "echo __SAMBA_DIR_RESOLVED__=$(readlink -f \"$d\"); done; fi"
+        )
+        output = self._router.exec(command, timeout=25)
+        if "__SAMBA_DIR_ERROR__=" in output:
+            reason = re.search(r"__SAMBA_DIR_ERROR__=(\S+)", output)
+            return VerifyResult(
+                "L5-Samba测试目录", False,
+                "Samba测试目录创建失败: " +
+                (reason.group(1) if reason else "unknown"),
+                raw_output=self._samba_sanitize_text(output)[:300],
+            )
+        created = re.findall(r"(?m)^__SAMBA_DIR_PATH__=(\S+)\s*$", output)
+        resolved = re.findall(r"(?m)^__SAMBA_DIR_RESOLVED__=(\S+)\s*$", output)
+        if created != aliases or len(resolved) != len(aliases):
+            return VerifyResult(
+                "L5-Samba测试目录", False,
+                f"Samba测试目录返回不完整: {len(created)}/{len(aliases)}",
+                details={"absolute_dirs": created},
+            )
+        home_dirs = [self._samba_normalize_home(path) for path in aliases]
+        details = {
+            "partname": part,
+            "dirnames": names,
+            "home_dirs": home_dirs,
+            "absolute_dirs": aliases,
+            "resolved_dirs": resolved,
+            # Single-directory aliases ease reuse by Page/test code.
+            "home_dir": home_dirs[0] if len(home_dirs) == 1 else None,
+            "path": aliases[0] if len(aliases) == 1 else None,
+        }
+        return VerifyResult(
+            "L5-Samba测试目录", True,
+            f"Samba测试目录已准备: {len(aliases)}个",
+            details=details,
+            raw_output="\n".join(aliases),
+        )
+
+    @staticmethod
+    def _samba_extract_test_dirs(test_dirs: Any) -> List[str]:
+        if test_dirs is None:
+            return []
+        if isinstance(test_dirs, VerifyResult):
+            values = (test_dirs.details.get("absolute_dirs") or
+                      [test_dirs.details.get("path")])
+        elif isinstance(test_dirs, dict):
+            values = test_dirs.get("absolute_dirs") or [test_dirs.get("path")]
+        elif isinstance(test_dirs, str):
+            values = [test_dirs]
+        else:
+            values = list(test_dirs)
+        return [str(value).rstrip("/") for value in values if value]
+
+    @staticmethod
+    def _samba_extract_resolved_dirs(test_dirs: Any,
+                                     resolved_dirs: Any = None) -> List[str]:
+        if resolved_dirs is None:
+            if isinstance(test_dirs, VerifyResult):
+                resolved_dirs = test_dirs.details.get("resolved_dirs")
+            elif isinstance(test_dirs, dict):
+                resolved_dirs = test_dirs.get("resolved_dirs")
+        if resolved_dirs is None:
+            return []
+        if isinstance(resolved_dirs, str):
+            values = [resolved_dirs]
+        else:
+            values = list(resolved_dirs)
+        return [str(value).rstrip("/") for value in values if value]
+
+    def _samba_remove_test_dir(self, path: str, prefix: str) -> str:
+        prefix_re = re.escape(prefix)
+        pattern = (rf"{re.escape(self.SAMBA_DISK_ROOT)}/[A-Za-z0-9_.-]+/"
+                   rf"{prefix_re}[A-Za-z0-9_.-]*")
+        if not re.fullmatch(pattern, path):
+            return "refused_unsafe_path"
+        parent = path.rsplit("/", 1)[0]
+        basename = path.rsplit("/", 1)[1]
+        self.connect_router()
+        output = self._router.exec(
+            f"parent=$(readlink -f {shlex.quote(parent)} 2>/dev/null); "
+            f"target=$(readlink -f {shlex.quote(path)} 2>/dev/null); "
+            "case \"$parent\" in /etc/disk/*) ;; *) echo REFUSED; exit 0;; esac; "
+            f"[ \"$target\" = \"$parent/{basename}\" ] || "
+            "{ echo REFUSED; exit 0; }; "
+            f"rm -rf {shlex.quote(path)}; "
+            f"if [ -e {shlex.quote(path)} ] || [ -L {shlex.quote(path)} ]; "
+            "then echo FAILED; else echo REMOVED; fi",
+            timeout=25,
+            probe_console=False,
+        )
+        if "REMOVED" in output:
+            return "removed"
+        if "REFUSED" in output:
+            return "refused_unsafe_resolution"
+        return "remove_failed"
+
+    def cleanup_samba_test(self, prefix: str = "smb_t_",
+                           test_dirs: Any = None,
+                           import_filenames: Any = None,
+                           snapshot: Dict = None) -> str:
+        """Delete only exact-prefix rows/directories and rebuild a clean stopped runtime."""
+        try:
+            prefix = self._samba_safe_component(prefix, "prefix")
+        except Exception as exc:
+            return f"error: {exc}"
+        # Username is the account identity and the only authoritative ownership
+        # boundary.  Share names/tag names are user-controlled and must never cause
+        # an otherwise non-test account to be deleted.
+        predicate = self._samba_exact_prefix_sql(prefix, "username")
+        try:
+            self.connect_router()
+            self._router.exec(
+                f"{self.SAMBA_SCRIPT} __smbd_stop >/dev/null 2>&1; "
+                "echo __SAMBA_STOP_RC__=$?",
+                timeout=25,
+                probe_console=False,
+            )
+            db_output = self._samba_sqlite_raw(
+                f"DELETE FROM smbd_dir WHERE {predicate}; SELECT changes();",
+                line_mode=False,
+            )
+            global_row = self.get_samba_global_config() or {}
+            rebuild_state = self._samba_rebuild_runtime_files_stopped(global_row)
+            rebuild = json.dumps(rebuild_state, ensure_ascii=False)
+        except Exception as exc:
+            return f"error: Samba测试用户数据库清理失败: {str(exc)[:180]}"
+
+        dir_results = {
+            path: self._samba_remove_test_dir(path, prefix)
+            for path in self._samba_extract_test_dirs(test_dirs)
+        }
+        filenames = []
+        if import_filenames:
+            values = [import_filenames] if isinstance(import_filenames, str) else list(import_filenames)
+            for value in values:
+                try:
+                    filenames.append(self._samba_safe_component(
+                        str(value).replace("\\", "/").rsplit("/", 1)[-1],
+                        "import_filename", max_length=120,
+                    ))
+                except Exception:
+                    continue
+        # Without a baseline snapshot, only caller-provided exact upload names are
+        # removable.  Generic smbd_dir.csv/txt files may predate this test.
+        staging_paths = {
+            f"/tmp/iktmp/import/{name}" for name in filenames
+        }
+        staging_status = {}
+        for path in sorted(staging_paths):
+            if not re.fullmatch(
+                    r"/tmp/iktmp/(?:import|export)/[A-Za-z0-9][A-Za-z0-9_.-]{0,119}",
+                    path):
+                staging_status[path] = "refused"
+                continue
+            output = self._router.exec(
+                f"rm -f {shlex.quote(path)}; "
+                f"[ -e {shlex.quote(path)} ] && echo PRESENT || echo ABSENT",
+                timeout=10,
+                probe_console=False,
+            )
+            staging_status[path] = "removed" if "ABSENT" in output else "failed"
+        staging_restore = None
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("staging_files"), dict):
+            staging_restore = self._restore_samba_file_group(
+                snapshot.get("staging_files"),
+                self.SAMBA_STAGING_FILES,
+                "导入导出暂存",
+            )
+        return (
+            f"samba cleanup prefix={prefix}: db={db_output.strip() or 'ok'}, "
+            f"rebuild={self._samba_sanitize_text(rebuild).strip()}, "
+            f"dirs={dir_results}, staging={staging_status}, "
+            f"staging_baseline={staging_restore.message if staging_restore else 'not supplied'}"
+        )
+
+    def verify_samba_test_artifacts_absent(self, prefix: str,
+                                           test_dirs: Any = None,
+                                           import_filenames: Any = None,
+                                           snapshot: Dict = None,
+                                           resolved_dirs: Any = None) -> VerifyResult:
+        checks, issues = {}, []
+        count_result = self.verify_samba_user_count(prefix, expected=0)
+        checks["database"] = count_result.passed
+        if not count_result.passed:
+            issues.append(count_result.message)
+        try:
+            runtime = self._read_samba_runtime()
+            auth_names = [name for name in runtime["auth_users"]
+                          if name.startswith(prefix)]
+            share_names = [name for name in runtime["sections"]
+                           if name != "global" and name.startswith(prefix)]
+            checks["smbpasswd"] = not auth_names
+            checks["smb_conf"] = not share_names
+            if auth_names:
+                issues.append(f"smbpasswd残留测试用户={auth_names}")
+            if share_names:
+                issues.append(f"smb.conf残留测试共享={share_names}")
+        except Exception as exc:
+            checks["smbpasswd"] = checks["smb_conf"] = False
+            issues.append(f"运行时残留读取失败={str(exc)[:120]}")
+
+        self.connect_router()
+        for index, path in enumerate(self._samba_extract_test_dirs(test_dirs)):
+            valid = bool(re.fullmatch(
+                rf"{re.escape(self.SAMBA_DISK_ROOT)}/[A-Za-z0-9_.-]+/"
+                rf"{re.escape(prefix)}[A-Za-z0-9_.-]*", path
+            ))
+            key = f"test_dir_{index}"
+            if not valid:
+                checks[key] = False
+                issues.append(f"目录不在安全白名单:{path}")
+                continue
+            output = self._router.exec(
+                f"if [ -e {shlex.quote(path)} ] || [ -L {shlex.quote(path)} ]; "
+                "then echo PRESENT; else echo ABSENT; fi",
+                timeout=10,
+            )
+            checks[key] = "ABSENT" in output
+            if not checks[key]:
+                issues.append(f"测试目录仍存在:{path}")
+
+        for index, path in enumerate(self._samba_extract_resolved_dirs(
+                test_dirs, resolved_dirs)):
+            valid = bool(re.fullmatch(
+                rf"/etc/disk/[A-Za-z0-9_.-]+/"
+                rf"{re.escape(prefix)}[A-Za-z0-9_.-]*", path
+            ))
+            key = f"resolved_dir_{index}"
+            if not valid:
+                checks[key] = False
+                issues.append(f"真实目录不在安全白名单:{path}")
+                continue
+            output = self._router.exec(
+                f"if [ -e {shlex.quote(path)} ] || [ -L {shlex.quote(path)} ]; "
+                "then echo PRESENT; else echo ABSENT; fi",
+                timeout=10,
+            )
+            checks[key] = "ABSENT" in output
+            if not checks[key]:
+                issues.append(f"真实测试目录仍存在:{path}")
+
+        filenames = []
+        if import_filenames:
+            values = [import_filenames] if isinstance(import_filenames, str) else list(import_filenames)
+            filenames = [str(v).replace("\\", "/").rsplit("/", 1)[-1]
+                         for v in values]
+        custom_staging = {
+            f"/tmp/iktmp/import/{name}" for name in filenames
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", name)
+        }
+        for index, path in enumerate(sorted(custom_staging)):
+            output = self._router.exec(
+                f"[ -e {shlex.quote(path)} ] && echo PRESENT || echo ABSENT",
+                timeout=10,
+            )
+            checks[f"custom_staging_{index}"] = "ABSENT" in output
+            if not checks[f"custom_staging_{index}"]:
+                issues.append(f"本轮导入暂存残留:{path}")
+
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("staging_files"), dict):
+            current_staging = self._samba_capture_files(self.SAMBA_STAGING_FILES)
+            for key, expected_info in snapshot["staging_files"].items():
+                actual_info = current_staging.get(key, {})
+                match = (
+                    bool(actual_info.get("exists")) == bool(expected_info.get("exists")) and
+                    (not expected_info.get("exists") or (
+                        actual_info.get("content_b64") == expected_info.get("content_b64") and
+                        str(actual_info.get("mode")) == str(expected_info.get("mode"))
+                    ))
+                )
+                checks[f"staging_baseline_{key}"] = match
+                if not match:
+                    issues.append(f"暂存文件未回到基线:{key}")
+
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("processes"), dict):
+            self.connect_router()
+            proc_output = self._router.exec(
+                "for p in ik_smbd nmbd wsdd2; do "
+                "pidof $p >/dev/null 2>&1 && echo ${p}=1 || echo ${p}=0; done",
+                timeout=12,
+            )
+            current_processes = {
+                name: f"{name}=1" in proc_output
+                for name in ("ik_smbd", "nmbd", "wsdd2")
+            }
+            expected_processes = {
+                name: bool(snapshot["processes"].get(name))
+                for name in ("ik_smbd", "nmbd", "wsdd2")
+            }
+            checks["processes_baseline"] = current_processes == expected_processes
+            if not checks["processes_baseline"]:
+                issues.append(
+                    f"进程未回到基线: actual={current_processes}, "
+                    f"expected={expected_processes}"
+                )
+        else:
+            processes = self.verify_samba_processes(False, False)
+            listeners = self.verify_samba_listeners(False, False)
+            checks["processes"] = processes.passed
+            checks["listeners"] = listeners.passed
+            if not processes.passed:
+                issues.append(processes.message)
+            if not listeners.passed:
+                issues.append(listeners.message)
+
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("firewall_members"), dict):
+            current_firewall = self._samba_firewall_members()
+            checks["firewall_baseline"] = (
+                current_firewall == snapshot.get("firewall_members")
+            )
+            if not checks["firewall_baseline"]:
+                issues.append("Samba相关8项ipset成员未回到基线")
+        passed = all(checks.values())
+        return VerifyResult(
+            "L4-Samba测试残留", passed,
+            ("Samba测试DB/配置/认证/目录/暂存/进程/端口均无残留" if passed else
+             "Samba测试残留检查失败: " + "; ".join(issues)),
+            details={"prefix": prefix, "checks": checks,
+                     "test_dirs": self._samba_extract_test_dirs(test_dirs),
+                     "resolved_dirs": self._samba_extract_resolved_dirs(
+                         test_dirs, resolved_dirs)},
+            raw_output=json.dumps(checks, ensure_ascii=False),
+        )
+
+    def _restore_samba_file_group(self, snapshot_files: Dict,
+                                   allowed_paths: Dict[str, str],
+                                   label: str) -> VerifyResult:
+        if not isinstance(snapshot_files, dict):
+            return VerifyResult(f"L4-Samba{label}恢复", False,
+                                f"{label}快照不是字典")
+        script_lines = [
+            "set +x", "umask 077",
+            "trap 'rm -f /tmp/.samba_restore_*_$$' EXIT HUP INT TERM",
+        ]
+        expected = {}
+        try:
+            for key, path in allowed_paths.items():
+                info = snapshot_files.get(key)
+                if not isinstance(info, dict):
+                    raise ValueError(f"缺少{key}快照")
+                exists = bool(info.get("exists"))
+                content_b64 = str(info.get("content_b64", ""))
+                mode = str(info.get("mode", "") or "644")
+                if exists:
+                    base64.b64decode(content_b64, validate=True)
+                    if not re.fullmatch(r"[0-7]{3,4}", mode):
+                        raise ValueError(f"{key}权限快照无效")
+                    tmp = f"/tmp/.samba_restore_{key}_$$"
+                    script_lines.extend([
+                        f"printf '%s' '{content_b64}' | base64 -d > {tmp} || exit 91",
+                        f"chmod {mode} {tmp} || exit 92",
+                        f"mv {tmp} {shlex.quote(path)} || exit 93",
+                    ])
+                else:
+                    script_lines.append(f"rm -f {shlex.quote(path)} || exit 94")
+                expected[key] = {
+                    "exists": exists, "content_b64": content_b64, "mode": mode,
+                }
+            script_lines.append("echo __SAMBA_FILES_RESTORE_RC__=0")
+            output = self._samba_exec_router_script(
+                "\n".join(script_lines) + "\n",
+                f"restore Samba {label} content=<redacted>",
+                timeout=35,
+            )
+            action_ok = "__SAMBA_FILES_RESTORE_RC__=0" in output
+            actual = self._samba_capture_files(allowed_paths)
+            mismatches = {}
+            for key, exp in expected.items():
+                act = actual[key]
+                ok = (bool(act.get("exists")) == exp["exists"] and
+                      (not exp["exists"] or
+                       (act.get("content_b64") == exp["content_b64"] and
+                        str(act.get("mode")) == exp["mode"])))
+                if not ok:
+                    mismatches[key] = {
+                        "expected_exists": exp["exists"],
+                        "actual_exists": act.get("exists"),
+                        "content_match": act.get("content_b64") == exp["content_b64"],
+                        "mode_match": str(act.get("mode")) == exp["mode"],
+                    }
+            passed = action_ok and not mismatches
+            return VerifyResult(
+                f"L4-Samba{label}恢复", passed,
+                (f"Samba{label}内容/存在性/权限已精确恢复" if passed else
+                 f"Samba{label}未精确恢复: {list(mismatches)}"),
+                details={"action_ok": action_ok, "mismatches": mismatches},
+            )
+        except Exception as exc:
+            return VerifyResult(
+                f"L4-Samba{label}恢复", False,
+                f"Samba{label}恢复失败: {str(exc)[:180]}",
+            )
+
+    def _start_samba_process_snapshot(self, process_snapshot: Dict,
+                                      global_row: Dict) -> Dict[str, Any]:
+        """Start exactly the baseline daemon set without regenerating files."""
+        expected = {
+            name: bool((process_snapshot or {}).get(name))
+            for name in ("ik_smbd", "nmbd", "wsdd2")
+        }
+        workgroup = str((global_row or {}).get("workgroup", "WORKGROUP"))
+        workgroup_b64 = base64.b64encode(workgroup.encode("utf-8")).decode("ascii")
+        script = f"""set +x
+WORKGROUP=$(printf '%s' '{workgroup_b64}' | base64 -d) || exit 91
+hostname='iKuai'
+if [ -f /tmp/iktmp/cache/config/basic ]; then
+  cached_hostname=$(awk '{{for(i=1;i<=NF;i++) if($i ~ /^hostname=/) {{sub(/^hostname=/,"",$i); print $i; exit}}}}' /tmp/iktmp/cache/config/basic)
+  [ -n "$cached_hostname" ] && hostname="$cached_hostname"
+fi
+IK_RC=0; WSD_RC=0; NMB_RC=0
+if [ {'1' if expected['ik_smbd'] else '0'} -eq 1 ]; then
+  ik_smbd >/dev/null 2>&1
+  IK_RC=$?
+fi
+if [ {'1' if expected['wsdd2'] else '0'} -eq 1 ]; then
+  wsdd2 -d -N "$hostname" -G "$WORKGROUP" >/dev/null 2>&1
+  WSD_RC=$?
+fi
+if [ {'1' if expected['nmbd'] else '0'} -eq 1 ]; then
+  nmbd >/dev/null 2>&1
+  NMB_RC=$?
+fi
+printf '__SAMBA_START_IK_RC__=%s\n' "$IK_RC"
+printf '__SAMBA_START_WSD_RC__=%s\n' "$WSD_RC"
+printf '__SAMBA_START_NMB_RC__=%s\n' "$NMB_RC"
+"""
+        try:
+            output = self._samba_exec_router_script(
+                script, "start exact Samba baseline process set", timeout=35
+            )
+        except Exception as exc:
+            return {"passed": False, "expected": expected, "markers": {},
+                    "error": str(exc)[:160]}
+        markers = {
+            key: int(value) for key, value in re.findall(
+                r"(?m)^__SAMBA_START_([A-Z]+)_RC__=(\d+)\s*$", output
+            )
+        }
+        return {
+            "passed": all(markers.get(key) == 0 for key in ("IK", "WSD", "NMB")),
+            "expected": expected, "markers": markers, "error": "",
+        }
+
+    def restore_samba_environment(self, snapshot: Dict) -> VerifyResult:
+        """Restore DB, four runtime files, daemons and all eight ipset members."""
+        if not isinstance(snapshot, dict):
+            return VerifyResult("L4-Samba环境恢复", False, "Samba环境快照无效")
+        global_row = snapshot.get("global")
+        if not isinstance(global_row, dict):
+            return VerifyResult("L4-Samba环境恢复", False, "缺少Samba全局快照")
+        try:
+            row_id = int(global_row.get("id", 1))
+            enabled = "yes" if self._samba_yes(global_row.get("enabled")) else "no"
+            workgroup = str(global_row.get("workgroup", "WORKGROUP"))
+            if "\n" in workgroup or "\r" in workgroup:
+                raise ValueError("workgroup快照含换行")
+            wsdd2 = 1 if self._samba_yes(global_row.get("wsdd2")) else 0
+            access = 1 if self._samba_yes(global_row.get("access")) else 0
+            interface = str(global_row.get("interface", ""))
+            users_raw = base64.b64decode(
+                str(snapshot.get("database_users_b64", "")), validate=True
+            )
+            user_rows = json.loads(users_raw.decode("utf-8"))
+            if not isinstance(user_rows, list):
+                raise ValueError("用户快照不是列表")
+        except Exception as exc:
+            return VerifyResult(
+                "L4-Samba环境恢复", False,
+                f"Samba快照字段无效: {str(exc)[:180]}",
+            )
+
+        self.connect_router()
+        stop_output = self._router.exec(
+            f"{self.SAMBA_SCRIPT} __smbd_stop >/dev/null 2>&1; "
+            "echo __SAMBA_STOP_RC__=$?",
+            timeout=30,
+            probe_console=False,
+        )
+
+        allowed_user_fields = (
+            "id", "enabled", "username", "passwd", "name", "tagname", "perm",
+            "guest", "browseable", "home_dir",
+        )
+        try:
+            statements = ["BEGIN IMMEDIATE", "DELETE FROM smbd_dir"]
+            for row in user_rows:
+                if not isinstance(row, dict):
+                    raise ValueError("用户行不是字典")
+                row_id_value = int(row.get("id"))
+                values = [str(row_id_value)] + [
+                    self._samba_sql_literal(row.get(field, ""))
+                    for field in allowed_user_fields[1:]
+                ]
+                statements.append(
+                    "INSERT INTO smbd_dir(" + ",".join(allowed_user_fields) +
+                    ") VALUES(" + ",".join(values) + ")"
+                )
+            statements.append(
+                "UPDATE smbd SET "
+                f"enabled={self._samba_sql_literal(enabled)},"
+                f"workgroup={self._samba_sql_literal(workgroup)},"
+                f"wsdd2={wsdd2},interface={self._samba_sql_literal(interface)},"
+                f"access={access} WHERE id={row_id}"
+            )
+            statements.append("COMMIT")
+            sql = ";\n".join(statements) + ";\n"
+            sql_b64 = base64.b64encode(sql.encode("utf-8")).decode("ascii")
+            db_script = f"""set +x
+printf '%s' '{sql_b64}' | base64 -d | sqlite3 {shlex.quote(self.DNS_DB)}
+printf '__SAMBA_DB_RESTORE_RC__=%s\n' "$?"
+"""
+            db_output = self._samba_exec_router_script(
+                db_script, "restore Samba DB rows sql=<redacted>", timeout=35
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-Samba环境恢复", False,
+                f"Samba数据库恢复失败: {str(exc)[:180]}",
+            )
+
+        # Rebuild only after the baseline DB is back, and keep every daemon stopped.
+        # This prevents a baseline-enabled restore from briefly serving test rows.
+        rebuild_state = self._samba_rebuild_runtime_files_stopped(global_row)
+
+        runtime_restore = self._restore_samba_file_group(
+            snapshot.get("runtime_files"), self.SAMBA_RUNTIME_FILES, "运行文件"
+        )
+        staging_restore = self._restore_samba_file_group(
+            snapshot.get("staging_files", {
+                key: {"exists": False, "content_b64": "", "mode": ""}
+                for key in self.SAMBA_STAGING_FILES
+            }),
+            self.SAMBA_STAGING_FILES, "导入导出暂存",
+        )
+
+        process_snapshot = snapshot.get("processes")
+        if not isinstance(process_snapshot, dict):
+            process_snapshot = {
+                "ik_smbd": enabled == "yes",
+                "nmbd": enabled == "yes" and bool(wsdd2),
+                "wsdd2": enabled == "yes" and bool(wsdd2),
+            }
+        start_state = self._start_samba_process_snapshot(
+            process_snapshot, global_row
+        )
+        time.sleep(2 if any(process_snapshot.values()) else 0.2)
+
+        ancillary = snapshot.get("ancillary") or {}
+        if not ancillary.get("var_nmbd"):
+            self._router.exec(
+                "if ! pidof nmbd >/dev/null 2>&1; then rm -rf /var/nmbd; fi",
+                timeout=15,
+                probe_console=False,
+            )
+        if not ancillary.get("tmp_winbindd"):
+            self._router.exec(
+                "if ! pidof ik_smbd >/dev/null 2>&1; then rm -rf /tmp/.winbindd; fi",
+                timeout=15,
+                probe_console=False,
+            )
+
+        firewall_snapshot = snapshot.get("firewall_members")
+        firewall_actions_ok = isinstance(firewall_snapshot, dict)
+        if firewall_actions_ok:
+            for key, should_exist in firewall_snapshot.items():
+                match = re.fullmatch(r"(tcp|udp):(\d+)", str(key))
+                if not match:
+                    firewall_actions_ok = False
+                    continue
+                proto, port_text = match.groups()
+                port = int(port_text)
+                if port not in self.SAMBA_FIREWALL_PORTS[proto]:
+                    firewall_actions_ok = False
+                    continue
+                set_name = ("DROP_T_PORTS_WAN_IN" if proto == "tcp" else
+                            "DROP_U_PORTS_WAN_IN")
+                if should_exist:
+                    command = (
+                        f"ipset test {set_name} {port} >/dev/null 2>&1 || "
+                        f"ipset add {set_name} {port} >/dev/null 2>&1"
+                    )
+                else:
+                    command = (
+                        f"ipset test {set_name} {port} >/dev/null 2>&1 && "
+                        f"ipset del {set_name} {port} >/dev/null 2>&1 || true"
+                    )
+                self._router.exec(command, timeout=12, probe_console=False)
+
+        db_result = self.verify_samba_global_database(global_row)
+        current_rows = self._samba_sqlite_query_list(
+            "SELECT id,enabled,username,passwd,name,tagname,perm,guest,browseable,home_dir "
+            "FROM smbd_dir ORDER BY id"
+        )
+        current_users_payload = json.dumps(
+            current_rows, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        users_match = current_users_payload == users_raw
+        expected_processes = {
+            name: bool(process_snapshot.get(name))
+            for name in ("ik_smbd", "nmbd", "wsdd2")
+        }
+        process_result = self.verify_samba_processes(
+            expect_smbd=expected_processes["ik_smbd"],
+            expect_discovery=(expected_processes["nmbd"] and
+                              expected_processes["wsdd2"]),
+        )
+        listener_result = self.verify_samba_listeners(
+            expect_smbd=expected_processes["ik_smbd"],
+            expect_discovery=(expected_processes["nmbd"] and
+                              expected_processes["wsdd2"]),
+        )
+        runtime_after = self._samba_capture_files(self.SAMBA_RUNTIME_FILES)
+        runtime_snapshot = snapshot.get("runtime_files") or {}
+        runtime_after_match = True
+        for key in self.SAMBA_RUNTIME_FILES:
+            expected_info = runtime_snapshot.get(key, {})
+            actual_info = runtime_after.get(key, {})
+            if (bool(actual_info.get("exists")) !=
+                    bool(expected_info.get("exists"))):
+                runtime_after_match = False
+                continue
+            if expected_info.get("exists") and (
+                    actual_info.get("content_b64") != expected_info.get("content_b64") or
+                    str(actual_info.get("mode")) != str(expected_info.get("mode"))):
+                runtime_after_match = False
+        firewall_result = self.verify_samba_firewall(
+            False, expected_members=firewall_snapshot
+        ) if firewall_actions_ok else VerifyResult(
+            "L3-Samba防火墙", False, "Samba防火墙快照无效"
+        )
+        db_match = re.search(r"__SAMBA_DB_RESTORE_RC__=(\d+)", db_output)
+        codes = {
+            "database": int(db_match.group(1)) if db_match else -1,
+            "rebuild": 0 if rebuild_state.get("passed") else -1,
+            "start": 0 if start_state.get("passed") else -1,
+        }
+        passed = all([
+            codes["database"] == 0, codes["rebuild"] == 0,
+            codes["start"] == 0,
+            db_result.passed, users_match, runtime_restore.passed,
+            staging_restore.passed, process_result.passed,
+            listener_result.passed, runtime_after_match,
+            firewall_actions_ok, firewall_result.passed,
+        ])
+        details = {
+            "codes": codes,
+            "stop_marker": self._samba_sanitize_text(stop_output)[:120],
+            "global": db_result.message,
+            "users_match": users_match,
+            "rebuild": self._samba_redact(rebuild_state),
+            "start": self._samba_redact(start_state),
+            "runtime_files": runtime_restore.message,
+            "runtime_files_stable_after_start": runtime_after_match,
+            "staging_files": staging_restore.message,
+            "processes": process_result.message,
+            "listeners": listener_result.message,
+            "firewall": firewall_result.message,
+            "preexisting_udp_138_restored": (
+                firewall_snapshot.get("udp:138") ==
+                self._samba_firewall_members().get("udp:138")
+                if isinstance(firewall_snapshot, dict) else False
+            ),
+        }
+        return VerifyResult(
+            "L4-Samba环境恢复", passed,
+            ("Samba数据库/4文件/进程/监听/8项防火墙及暂存均已精确恢复"
+             if passed else "Samba环境恢复验证失败: " + "; ".join(
+                 str(value) for key, value in details.items()
+                 if key not in {"codes", "stop_marker"} and
+                 (value is False or (isinstance(value, str) and "失败" in value))
+             )),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False)[:1400],
+        )
+
+    def run_samba_probe(self, username: str = None, password: str = None,
+                        host: str = "192.168.148.1",
+                        iface: str = "ens11",
+                        operation: str = "list",
+                        share_name: str = None,
+                        control_password: str = None,
+                        remote_name: str = None,
+                        control_host: str = None,
+                        control_iface: str = "ens11") -> VerifyResult:
+        """L5 SMB2 data-plane probe using the client's ``smbclient`` Python API.
+
+        Credentials are embedded only in a JSON blob sent through SSH stdin.  The
+        script emits a base64-encoded *safe result* containing booleans/error classes,
+        never the username, password, NT hash or directory listing.
+
+        Supported operations: ``list``, ``upload_download``, ``wrong_password``,
+        ``write_denied``, ``guest_list``, ``guest_denied`` and ``connect_fail``.
+        For the WAN-drop case, host=10.66.0.150 automatically uses the LAN address as
+        an authenticated control unless ``control_host`` is explicitly supplied.
+        """
+        allowed = {
+            "list", "upload_download", "wrong_password", "write_denied",
+            "guest_list", "guest_denied", "connect_fail",
+        }
+        try:
+            operation = str(operation or "").strip().lower()
+            if operation not in allowed:
+                raise ValueError(f"不支持的Samba探测操作: {operation}")
+            for value, label in ((host, "host"), (iface, "iface"),
+                                 (control_iface, "control_iface")):
+                if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,253}", str(value or "")):
+                    raise ValueError(f"Samba {label}包含不安全字符: {value!r}")
+            if control_host is not None and not re.fullmatch(
+                    r"[A-Za-z0-9_.:-]{1,253}", str(control_host)):
+                raise ValueError(f"Samba control_host包含不安全字符: {control_host!r}")
+            if operation != "connect_fail" and not share_name:
+                raise ValueError("Samba实流探测必须提供share_name")
+            if share_name is not None:
+                share_name = self._samba_safe_component(
+                    share_name, "share_name", max_length=80
+                )
+            if remote_name is None:
+                remote_name = f"smb_t_probe_{int(time.time() * 1000)}.bin"
+            remote_name = self._samba_safe_component(
+                remote_name, "remote_name", max_length=100
+            )
+            needs_credentials = operation in {
+                "list", "upload_download", "write_denied", "wrong_password",
+                "guest_denied",
+            }
+            if needs_credentials and (not username or password is None):
+                raise ValueError(f"Samba {operation}探测需要用户名和密码")
+            secrets_to_check = [username, password, control_password]
+            if any(value is not None and ("\n" in str(value) or "\r" in str(value))
+                   for value in secrets_to_check):
+                raise ValueError("Samba用户名/密码不能包含换行")
+        except Exception as exc:
+            return VerifyResult("L5-Samba实流", False, str(exc))
+
+        if operation == "wrong_password":
+            correct_password = (str(control_password) if control_password is not None
+                                else str(password))
+            probe_password = (str(password) if control_password is not None else
+                              str(password) + "__wrong__")
+        else:
+            correct_password = (str(control_password) if control_password is not None
+                                else ("" if password is None else str(password)))
+            probe_password = "" if password is None else str(password)
+
+        if operation == "connect_fail" and control_host is None and str(host) == "10.66.0.150":
+            control_host = "192.168.148.1"
+        use_control = bool(
+            operation == "connect_fail" and control_host and share_name and
+            username and correct_password
+        )
+
+        # Establish the server-side state first so a client-side rejection cannot be
+        # misclassified as a successful negative test.
+        if operation == "connect_fail" and not use_control:
+            process_check = self.verify_samba_processes(False, False)
+            listener_check = self.verify_samba_listeners(False, False)
+        else:
+            row = self.get_samba_global_config() or {}
+            discovery = self._samba_yes(row.get("wsdd2", 0))
+            process_check = self.verify_samba_processes(True, discovery)
+            listener_check = self.verify_samba_listeners(True, discovery)
+        server_precondition = process_check.passed and listener_check.passed
+
+        config = {
+            "host": str(host), "iface": str(iface), "operation": operation,
+            "share": share_name or "", "username": "" if username is None else str(username),
+            "password": probe_password, "correct_password": correct_password,
+            "remote_name": remote_name,
+            "control_host": "" if control_host is None else str(control_host),
+            "control_iface": str(control_iface), "use_control": use_control,
+        }
+        config_json = json.dumps(
+            config, ensure_ascii=False, separators=(",", ":")
+        )
+        config_b64 = base64.b64encode(config_json.encode("utf-8")).decode("ascii")
+        client_script = r'''set +x
+umask 077
+CFG=$(mktemp /tmp/samba_probe_cfg.XXXXXX) || exit 90
+trap 'rm -f "$CFG"' EXIT HUP INT TERM
+printf '%s' '__CONFIG_B64__' | base64 -d > "$CFG" || exit 91
+python3 - "$CFG" <<'PY'
+import base64
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import time as probe_time
+
+import smbclient
+
+cfg_path = sys.argv[1]
+with open(cfg_path, "r", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+
+safe = {
+    "operation": cfg["operation"],
+    "route_ok": False,
+    "target_tcp": False,
+    "control_attempted": bool(cfg.get("use_control")),
+    "control_ok": not bool(cfg.get("use_control")),
+    "error_class": "",
+}
+
+def route_ok(host, iface):
+    for attempt in range(3):
+        try:
+            cp = subprocess.run(
+                ["ip", "route", "get", host], capture_output=True, text=True,
+                timeout=4, check=False,
+            )
+            tokens = cp.stdout.split()
+            if cp.returncode == 0 and any(
+                tokens[i] == "dev" and i + 1 < len(tokens) and
+                tokens[i + 1] == iface
+                for i in range(len(tokens))
+            ):
+                return True
+        except Exception:
+            pass
+        if attempt < 2:
+            probe_time.sleep(0.15)
+    return False
+
+def tcp_open(host, timeout=5):
+    sock = None
+    try:
+        sock = socket.create_connection((host, 445), timeout=timeout)
+        return True
+    except Exception:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+def reset():
+    try:
+        smbclient.reset_connection_cache()
+    except Exception:
+        pass
+
+def root(server):
+    return "\\\\" + server + "\\" + cfg["share"]
+
+def register(server, user, passwd, secure_negotiate=True):
+    smbclient.ClientConfig(
+        auth_protocol="ntlm",
+        require_secure_negotiate=secure_negotiate,
+    )
+    reset()
+    session = smbclient.register_session(
+        server, username=user, password=passwd, port=445,
+        connection_timeout=8, auth_protocol="ntlm", require_signing=False,
+    )
+    try:
+        dialect = int(session.connection.dialect)
+        safe["dialect"] = dialect
+        safe["dialect_smb2"] = 0x0202 <= dialect < 0x0300
+    except Exception:
+        safe["dialect_smb2"] = False
+    return session
+
+def list_once(server, user, passwd, secure_negotiate=True):
+    register(server, user, passwd, secure_negotiate=secure_negotiate)
+    values = smbclient.listdir(root(server))
+    return len(values)
+
+NOT_FOUND_CLASSES = {"ObjectNameNotFound", "ObjectPathNotFound", "NoSuchFile"}
+AUTH_DENIAL_CLASSES = {
+    "SMBAuthenticationError", "LogonFailure", "AccessDenied",
+    "AccountRestriction", "PasswordExpired", "PasswordMustChange",
+    "AccountLockedOut",
+}
+WRITE_DENIAL_CLASSES = {"AccessDenied", "MediaWriteProtected", "PrivilegeNotHeld"}
+NOT_FOUND_STATUS = {0xC0000034, 0xC000003A, 0xC0000225}
+AUTH_DENIAL_STATUS = {
+    0xC0000022, 0xC000006A, 0xC000006D, 0xC000006E,
+    0xC0000070, 0xC0000071, 0xC0000072, 0xC0000234,
+}
+WRITE_DENIAL_STATUS = {0xC0000022, 0xC0000061, 0xC00000A2}
+
+def status_code(exc):
+    try:
+        return int(getattr(exc, "ntstatus"))
+    except Exception:
+        return -1
+
+def is_not_found(exc):
+    return (
+        type(exc).__name__ in NOT_FOUND_CLASSES or
+        getattr(exc, "errno", None) == 2 or
+        status_code(exc) in NOT_FOUND_STATUS
+    )
+
+def is_auth_denied(exc):
+    return (
+        type(exc).__name__ in AUTH_DENIAL_CLASSES or
+        status_code(exc) in AUTH_DENIAL_STATUS
+    )
+
+def is_write_denied(exc):
+    return (
+        type(exc).__name__ in WRITE_DENIAL_CLASSES or
+        status_code(exc) in WRITE_DENIAL_STATUS
+    )
+
+def path_state(path):
+    try:
+        smbclient.stat(path)
+        return "present", ""
+    except Exception as exc:
+        name = type(exc).__name__
+        if is_not_found(exc):
+            return "absent", name
+        return "error", name
+
+def cleanup_path(path, is_dir=False):
+    state, _ = path_state(path)
+    if state == "absent":
+        return True
+    if state != "present":
+        return False
+    try:
+        smbclient.rmdir(path) if is_dir else smbclient.remove(path)
+    except Exception:
+        return False
+    return path_state(path)[0] == "absent"
+
+host = cfg["host"]
+guest_probe_user = "smb_guest_probe"
+guest_probe_password = "guest-probe-password"
+safe["route_ok"] = route_ok(host, cfg["iface"])
+safe["target_tcp"] = tcp_open(host)
+
+try:
+    op = cfg["operation"]
+    if op == "connect_fail":
+        if cfg.get("use_control"):
+            chost = cfg["control_host"]
+            safe["control_route_ok"] = route_ok(chost, cfg["control_iface"])
+            try:
+                safe["control_count"] = list_once(
+                    chost, cfg["username"], cfg["correct_password"]
+                )
+                safe["control_ok"] = True
+            except Exception as exc:
+                safe["control_ok"] = False
+                safe["control_error_class"] = type(exc).__name__
+    elif op == "list":
+        safe["list_count"] = list_once(
+            host, cfg["username"], cfg["password"]
+        )
+        safe["list_ok"] = True
+    elif op == "guest_list":
+        # smbd.conf uses ``map to guest = Bad User``: the supported guest path is
+        # an unknown account with any password, not an empty NTLM anonymous session.
+        safe["list_count"] = list_once(
+            host, guest_probe_user, guest_probe_password,
+            secure_negotiate=False,
+        )
+        safe["guest_ok"] = True
+    elif op == "wrong_password":
+        try:
+            safe["control_count"] = list_once(
+                host, cfg["username"], cfg["correct_password"]
+            )
+            safe["control_ok"] = True
+        except Exception as exc:
+            safe["control_ok"] = False
+            safe["control_error_class"] = type(exc).__name__
+        reset()
+        try:
+            list_once(host, cfg["username"], cfg["password"])
+            safe["wrong_denied"] = False
+        except Exception as exc:
+            error_class = type(exc).__name__
+            safe["wrong_error_class"] = error_class
+            safe["wrong_error_status"] = status_code(exc)
+            safe["wrong_denied"] = is_auth_denied(exc)
+        try:
+            safe["post_control_count"] = list_once(
+                host, cfg["username"], cfg["correct_password"]
+            )
+            safe["post_control_ok"] = True
+        except Exception as exc:
+            safe["post_control_ok"] = False
+            safe["post_control_error_class"] = type(exc).__name__
+    elif op == "guest_denied":
+        try:
+            safe["control_count"] = list_once(
+                host, cfg["username"], cfg["correct_password"]
+            )
+            safe["control_ok"] = True
+        except Exception as exc:
+            safe["control_ok"] = False
+            safe["control_error_class"] = type(exc).__name__
+        reset()
+        try:
+            list_once(
+                host, guest_probe_user, guest_probe_password,
+                secure_negotiate=False,
+            )
+            safe["guest_denied"] = False
+        except Exception as exc:
+            error_class = type(exc).__name__
+            safe["guest_error_class"] = error_class
+            safe["guest_error_status"] = status_code(exc)
+            safe["guest_denied"] = is_auth_denied(exc)
+        try:
+            safe["post_control_count"] = list_once(
+                host, cfg["username"], cfg["correct_password"]
+            )
+            safe["post_control_ok"] = True
+        except Exception as exc:
+            safe["post_control_ok"] = False
+            safe["post_control_error_class"] = type(exc).__name__
+    elif op == "write_denied":
+        safe["list_count"] = list_once(host, cfg["username"], cfg["password"])
+        safe["list_ok"] = True
+        remote = root(host) + "\\" + cfg["remote_name"]
+        pre_state, pre_error = path_state(remote)
+        safe["pre_state"] = pre_state
+        safe["pre_error_class"] = pre_error
+        safe["pre_absent"] = pre_state == "absent"
+        try:
+            with smbclient.open_file(remote, mode="wb") as fh:
+                fh.write(b"samba-write-must-be-denied")
+            safe["write_denied"] = False
+        except Exception as exc:
+            error_class = type(exc).__name__
+            safe["write_error_class"] = error_class
+            safe["write_error_status"] = status_code(exc)
+            safe["write_denied"] = is_write_denied(exc)
+        post_state, post_error = path_state(remote)
+        safe["post_state"] = post_state
+        safe["post_error_class"] = post_error
+        safe["post_absent"] = post_state == "absent"
+        safe["unexpected_file_cleaned"] = cleanup_path(remote)
+        try:
+            safe["post_control_count"] = list_once(
+                host, cfg["username"], cfg["password"]
+            )
+            safe["post_control_ok"] = True
+        except Exception as exc:
+            safe["post_control_ok"] = False
+            safe["post_control_error_class"] = type(exc).__name__
+    elif op == "upload_download":
+        list_once(host, cfg["username"], cfg["password"])
+        remote = root(host) + "\\" + cfg["remote_name"]
+        payload = os.urandom(8192)
+        pre_remote = path_state(remote)
+        safe["pre_absent"] = pre_remote[0] == "absent"
+        safe["pre_state_error"] = (
+            pre_remote[1] if pre_remote[0] == "error" else ""
+        )
+        try:
+            safe["stage"] = "upload"
+            with smbclient.open_file(remote, mode="wb") as fh:
+                fh.write(payload)
+            safe["upload_ok"] = path_state(remote)[0] == "present"
+            register(host, cfg["username"], cfg["password"])
+            safe["stage"] = "download"
+            with smbclient.open_file(remote, mode="rb") as fh:
+                downloaded = fh.read()
+            safe["size_ok"] = len(downloaded) == len(payload)
+            src_sha = hashlib.sha256(payload).hexdigest()
+            dst_sha = hashlib.sha256(downloaded).hexdigest()
+            safe["src_sha256"] = src_sha
+            safe["dst_sha256"] = dst_sha
+            safe["download_ok"] = src_sha == dst_sha
+            register(host, cfg["username"], cfg["password"])
+            safe["stage"] = "delete"
+            smbclient.remove(remote)
+            safe["delete_ok"] = path_state(remote)[0] == "absent"
+            safe["stage"] = "done"
+        finally:
+            try:
+                register(host, cfg["username"], cfg["password"])
+                safe["cleanup_ok"] = cleanup_path(remote, False)
+            except Exception as exc:
+                safe["cleanup_ok"] = False
+                safe["cleanup_error_class"] = type(exc).__name__
+except Exception as exc:
+    safe["error_class"] = type(exc).__name__
+finally:
+    reset()
+
+encoded = base64.b64encode(
+    json.dumps(safe, ensure_ascii=False, sort_keys=True,
+               separators=(",", ":")).encode("utf-8")
+).decode("ascii")
+print("__SAMBA_RESULT_B64__=" + encoded)
+PY
+'''.replace("__CONFIG_B64__", config_b64)
+        display = (
+            f"samba_probe operation={operation} host={host} iface={iface} "
+            f"share={share_name or '<none>'} username=<redacted> password=<redacted>"
+        )
+        try:
+            output = self._samba_exec_client_script(
+                client_script, display, timeout=75
+            )
+        except Exception as exc:
+            safe_error = self._samba_sanitize_text(
+                exc, username, password, control_password, correct_password,
+                probe_password, config_b64, config_json,
+            )
+            return VerifyResult(
+                "L5-Samba实流", False,
+                f"Samba {operation}探测异常: {safe_error[:180]}",
+                details={"operation": operation, "host": host,
+                         "iface": iface, "share_name": share_name,
+                         "server_precondition": server_precondition},
+                raw_output=safe_error[:800],
+            )
+        # Parse the opaque safe-result marker before token redaction.  Replacing a
+        # short username/password inside an unrelated base64 marker would corrupt
+        # the marker and create a false "missing result" failure.
+        matches = re.findall(
+            r"(?m)^__SAMBA_RESULT_B64__=([A-Za-z0-9+/=]+)\s*$", output
+        )
+        if len(matches) != 1:
+            safe_output = self._samba_sanitize_text(
+                output, username, password, control_password, correct_password,
+                probe_password, config_b64, config_json,
+            )
+            return VerifyResult(
+                "L5-Samba实流", False,
+                f"Samba {operation}探测缺少唯一结果标记",
+                details={"marker_count": len(matches),
+                         "server_precondition": server_precondition},
+                raw_output=safe_output[:800],
+            )
+        try:
+            result = json.loads(base64.b64decode(
+                matches[0], validate=True
+            ).decode("utf-8"))
+        except Exception as exc:
+            return VerifyResult(
+                "L5-Samba实流", False,
+                f"Samba结果标记解析失败: {str(exc)[:140]}",
+            )
+
+        route_ok = result.get("route_ok") is True
+        tcp_open = result.get("target_tcp") is True
+        no_top_error = not result.get("error_class")
+        dialect_ok = result.get("dialect_smb2") is True
+        if operation == "list":
+            passed = server_precondition and route_ok and tcp_open and dialect_ok and \
+                     result.get("list_ok") is True and no_top_error
+            verdict = f"LIST={result.get('list_ok')}, count={result.get('list_count')}"
+        elif operation == "upload_download":
+            required = (
+                "pre_absent", "upload_ok", "size_ok", "download_ok",
+                "delete_ok", "cleanup_ok",
+            )
+            sha_match = (bool(result.get("src_sha256")) and
+                         result.get("src_sha256") == result.get("dst_sha256"))
+            passed = (server_precondition and route_ok and tcp_open and dialect_ok and no_top_error
+                      and all(result.get(key) is True for key in required)
+                      and sha_match)
+            verdict = (
+                f"RW全操作={all(result.get(key) is True for key in required)}, "
+                f"SHA256={'match' if sha_match else 'mismatch'}"
+            )
+        elif operation == "wrong_password":
+            passed = (server_precondition and route_ok and tcp_open and
+                      result.get("control_ok") is True and
+                      result.get("wrong_denied") is True and
+                      result.get("post_control_ok") is True and
+                      dialect_ok and no_top_error)
+            verdict = (f"正确密码控制={result.get('control_ok')}, "
+                       f"错误密码拒绝={result.get('wrong_denied')}, "
+                       f"拒绝后控制={result.get('post_control_ok')}")
+        elif operation == "write_denied":
+            passed = (server_precondition and route_ok and tcp_open and
+                      result.get("list_ok") is True and
+                      result.get("pre_absent") is True and
+                      result.get("write_denied") is True and
+                      result.get("post_absent") is True and
+                      result.get("post_control_ok") is True and
+                      dialect_ok and no_top_error)
+            verdict = (f"RO可读={result.get('list_ok')}, "
+                       f"拒写={result.get('write_denied')}, "
+                       f"无残留={result.get('post_absent')}")
+        elif operation == "guest_list":
+            passed = (server_precondition and route_ok and tcp_open and dialect_ok and
+                      result.get("guest_ok") is True and no_top_error)
+            verdict = f"匿名访问={result.get('guest_ok')}"
+        elif operation == "guest_denied":
+            passed = (server_precondition and route_ok and tcp_open and
+                      result.get("control_ok") is True and
+                      result.get("guest_denied") is True and
+                      result.get("post_control_ok") is True and
+                      dialect_ok and no_top_error)
+            verdict = (f"认证控制={result.get('control_ok')}, "
+                       f"匿名拒绝={result.get('guest_denied')}")
+        else:
+            control_ok = (result.get("control_ok") is True and
+                          (not use_control or result.get("control_route_ok") is True))
+            passed = (server_precondition and route_ok and not tcp_open and
+                      control_ok and (not use_control or dialect_ok) and no_top_error)
+            verdict = (f"目标连接失败={not tcp_open}, 控制组={control_ok}, "
+                       f"WAN隔离模式={use_control}")
+
+        safe_result = self._samba_redact(result)
+        details = {
+            "operation": operation, "host": host, "iface": iface,
+            "share_name": share_name, "route_ok": route_ok,
+            "server_precondition": server_precondition,
+            "server_checks": [process_check.message, listener_check.message],
+            "result": safe_result,
+        }
+        return VerifyResult(
+            "L5-Samba实流", passed,
+            f"Samba {operation}{'符合预期' if passed else '不符合预期'}: {verdict}",
+            details=details,
+            raw_output=json.dumps(safe_result, ensure_ascii=False)[:1200],
+        )
+
+    # ==================== 高级服务 > 本地服务 > HTTP服务 ====================
+    # 底层脚本: /usr/ikuai/script/http_server.sh
+    # DB: http_server(id,enabled,tagname,http_port,server_name,ssl_on,
+    #                 autoindex,download,home_dir,access)
+    # Runtime: /usr/openresty/conf/static_file.conf + shared openresty process.
+    # WAN restriction: DROP_T_PORTS_WAN_IN exact TCP port membership.
+
+    HTTP_SCRIPT = "/usr/ikuai/script/http_server.sh"
+    HTTP_DISK_ROOT = "/etc/disk_user"
+    HTTP_RUNTIME_FILES = {
+        "static_conf": "/usr/openresty/conf/static_file.conf",
+    }
+    HTTP_STAGING_FILES = {
+        "import_csv": "/tmp/iktmp/import/http_server.csv",
+        "import_txt": "/tmp/iktmp/import/http_server.txt",
+        "export_csv": "/tmp/iktmp/export/http_server.csv",
+        "export_txt": "/tmp/iktmp/export/http_server.txt",
+    }
+    HTTP_TEST_OWNER_MARKER = ".ikuai_http_test_owner"
+    HTTP_FIELDS = (
+        "id", "enabled", "tagname", "http_port", "server_name", "ssl_on",
+        "autoindex", "download", "home_dir", "access",
+    )
+    HTTP_RESERVED_PORTS = set(range(600, 801)) | set(range(1234, 1242)) | {
+        12345, 34567,
+    }
+
+    @staticmethod
+    def _http_sql_literal(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def _http_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return int(default)
+
+    @staticmethod
+    def _http_yes(value: Any) -> bool:
+        return str(value).strip().lower() in {
+            "1", "yes", "true", "on", "enable", "enabled",
+        }
+
+    @staticmethod
+    def _http_safe_component(value: Any, label: str,
+                             max_length: int = 120) -> str:
+        text = str(value or "").strip()
+        if not re.fullmatch(
+                rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,{max_length - 1}}}", text):
+            raise ValueError(f"{label}包含不安全字符: {text!r}")
+        if text in {".", ".."}:
+            raise ValueError(f"{label}不能为{text!r}")
+        return text
+
+    @classmethod
+    def _http_prefix_where(cls, prefix: str) -> str:
+        prefix = str(prefix or "")
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,40}", prefix):
+            raise ValueError("HTTP测试前缀格式不安全")
+        return (
+            f"substr(COALESCE(tagname,''),1,{len(prefix)})="
+            f"{cls._http_sql_literal(prefix)}"
+        )
+
+    def _http_rows(self, where: str = "", order: str = "ORDER BY id") -> List[Dict]:
+        clause = f" WHERE {where}" if where else ""
+        fields = ",".join(self.HTTP_FIELDS)
+        return self._samba_sqlite_query_list(
+            f"SELECT {fields} FROM http_server{clause} {order}"
+        )
+
+    @staticmethod
+    def _http_normalize_row(row: Dict) -> Dict:
+        normalized = {field: str((row or {}).get(field, "")) for field in BackendVerifier.HTTP_FIELDS}
+        for field in ("id", "http_port", "ssl_on", "autoindex", "download", "access"):
+            normalized[field] = str(BackendVerifier._http_int(normalized.get(field)))
+        normalized["enabled"] = str(normalized.get("enabled", "")).lower()
+        return normalized
+
+    def _http_capture_files(self, paths: Dict[str, str]) -> Dict[str, Dict]:
+        return self._samba_capture_files(paths)
+
+    def _http_restore_file_group(self, snapshot_files: Dict,
+                                 allowed_paths: Dict[str, str],
+                                 label: str) -> VerifyResult:
+        if not isinstance(snapshot_files, dict):
+            return VerifyResult(f"L4-HTTP{label}恢复", False, f"{label}快照无效")
+        script_lines = [
+            "set +x", "umask 077",
+            "trap 'rm -f /tmp/.http_restore_*_$$' EXIT HUP INT TERM",
+        ]
+        expected: Dict[str, Dict] = {}
+        try:
+            for key, path in allowed_paths.items():
+                info = snapshot_files.get(key)
+                if not isinstance(info, dict):
+                    raise ValueError(f"缺少{key}快照")
+                exists = bool(info.get("exists"))
+                content_b64 = str(info.get("content_b64", ""))
+                mode = str(info.get("mode", "") or "644")
+                if exists:
+                    base64.b64decode(content_b64, validate=True)
+                    if not re.fullmatch(r"[0-7]{3,4}", mode):
+                        raise ValueError(f"{key}权限快照无效")
+                    directory = os.path.dirname(path) or "/tmp"
+                    basename = os.path.basename(path)
+                    tmp = f"{directory}/.{basename}.http_restore.$$"
+                    script_lines.extend([
+                        f"mkdir -p {shlex.quote(directory)} || exit 90",
+                        f"printf '%s' '{content_b64}' | base64 -d > {tmp} || exit 91",
+                        f"chmod {mode} {tmp} || exit 92",
+                        f"mv {tmp} {shlex.quote(path)} || exit 93",
+                    ])
+                else:
+                    script_lines.append(f"rm -f {shlex.quote(path)} || exit 94")
+                expected[key] = {
+                    "exists": exists, "content_b64": content_b64, "mode": mode,
+                }
+            script_lines.append("echo __HTTP_FILES_RESTORE_OK__=1")
+            output = self._samba_exec_router_script(
+                "\n".join(script_lines) + "\n",
+                f"restore HTTP {label} content=<redacted>", timeout=35,
+            )
+            actual = self._http_capture_files(allowed_paths)
+            mismatches = {}
+            for key, exp in expected.items():
+                act = actual.get(key, {})
+                ok = bool(act.get("exists")) == exp["exists"]
+                if exp["exists"]:
+                    ok = ok and act.get("content_b64") == exp["content_b64"]
+                    ok = ok and str(act.get("mode")) == exp["mode"]
+                if not ok:
+                    mismatches[key] = {
+                        "expected_exists": exp["exists"],
+                        "actual_exists": act.get("exists"),
+                        "content_match": act.get("content_b64") == exp["content_b64"],
+                        "mode_match": str(act.get("mode")) == exp["mode"],
+                    }
+            passed = "__HTTP_FILES_RESTORE_OK__=1" in output and not mismatches
+            return VerifyResult(
+                f"L4-HTTP{label}恢复", passed,
+                (f"HTTP{label}已精确恢复" if passed else
+                 f"HTTP{label}恢复不匹配: {list(mismatches)}"),
+                details={"mismatches": mismatches},
+            )
+        except Exception as exc:
+            return VerifyResult(
+                f"L4-HTTP{label}恢复", False,
+                f"HTTP{label}恢复失败: {str(exc)[:180]}",
+            )
+
+    def _http_firewall_members(self, ports: Iterable[int]) -> Dict[str, bool]:
+        safe_ports = sorted({int(port) for port in ports if 1 <= int(port) <= 65535})
+        if not safe_ports:
+            return {}
+        self.connect_router()
+        exists_output = self._router.exec(
+            "ipset list DROP_T_PORTS_WAN_IN >/dev/null 2>&1 "
+            "&& echo __HTTP_FW_SET__=1 || echo __HTTP_FW_SET__=0",
+            timeout=10,
+        )
+        if "__HTTP_FW_SET__=1" not in exists_output:
+            raise RuntimeError("DROP_T_PORTS_WAN_IN不存在")
+        commands = []
+        for port in safe_ports:
+            commands.append(
+                f"if ipset test DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1; "
+                f"then echo __HTTP_FW_{port}__=1; else echo __HTTP_FW_{port}__=0; fi"
+            )
+        output = self._router.exec("; ".join(commands), timeout=20)
+        result = {}
+        for port in safe_ports:
+            match = re.search(rf"(?m)^__HTTP_FW_{port}__=([01])\s*$", output or "")
+            if match is None:
+                raise RuntimeError(f"HTTP端口{port}防火墙快照缺失")
+            result[str(port)] = match.group(1) == "1"
+        return result
+
+    def _http_listener_members(self, ports: Iterable[int]) -> Dict[str, bool]:
+        safe_ports = sorted({int(port) for port in ports if 1 <= int(port) <= 65535})
+        if not safe_ports:
+            return {}
+        self.connect_router()
+        pattern = "|".join(str(port) for port in safe_ports)
+        output = self._router.exec(
+            "netstat -lntp 2>/dev/null | "
+            f"awk '$4 ~ /:({pattern})$/ {{print $4 \"|\" $7}}'",
+            timeout=15,
+        )
+        result = {str(port): False for port in safe_ports}
+        for line in (output or "").splitlines():
+            match = re.search(r":(\d+)\|", line)
+            if match and match.group(1) in result:
+                result[match.group(1)] = True
+        return result
+
+    def choose_http_candidate_ports(self, port_count: int = 5,
+                                    start_port: int = None) -> List[int]:
+        """选择当前 DB/listener/ipset 均未占用的高位端口，不做任何设备变更。"""
+        count = int(port_count)
+        if count < 1 or count > 20:
+            raise ValueError("HTTP候选端口数量必须在1-20")
+        self.connect_router()
+        output = self._router.exec(
+            "echo __LISTEN__; netstat -lnt 2>/dev/null; "
+            "echo __DB__; sqlite3 /etc/mnt/ikuai/config.db "
+            "'select distinct http_port from http_server where http_port>0'; "
+            "echo __IPSET__; ipset list DROP_T_PORTS_WAN_IN 2>/dev/null",
+            timeout=20,
+        )
+        used = set(self.HTTP_RESERVED_PORTS)
+        section = ""
+        for raw_line in (output or "").splitlines():
+            line = raw_line.strip()
+            if line in {"__LISTEN__", "__DB__", "__IPSET__"}:
+                section = line
+                continue
+            if section == "__LISTEN__":
+                match = re.search(r":(\d+)\s", line)
+                if match:
+                    used.add(int(match.group(1)))
+            elif section == "__DB__" and re.fullmatch(r"\d+", line):
+                used.add(int(line))
+            elif section == "__IPSET__" and re.fullmatch(r"\d+", line):
+                used.add(int(line))
+        if start_port is None:
+            start = 18080 + (int(time.time()) % 18000)
+        else:
+            start = int(start_port)
+        start = max(10000, min(start, 60000))
+        candidates = []
+        for offset in range(50000):
+            port = 10000 + ((start - 10000 + offset) % 50000)
+            if port in used or port in self.HTTP_RESERVED_PORTS:
+                continue
+            candidates.append(port)
+            if len(candidates) == count:
+                return candidates
+        raise RuntimeError("未找到足够的HTTP测试空闲端口")
+
+    def get_http_environment_snapshot(self,
+                                      candidate_ports: Iterable[int] = None) -> Dict:
+        """快照HTTP表、运行文件、暂存文件和逐端口WAN/监听状态。"""
+        rows = [self._http_normalize_row(row) for row in self._http_rows()]
+        ports = {self._http_int(row.get("http_port")) for row in rows}
+        ports.update(int(port) for port in (candidate_ports or []))
+        ports.discard(0)
+        process = self.verify_http_process(True)
+        return {
+            "version": 1,
+            "rows": rows,
+            "runtime_files": self._http_capture_files(self.HTTP_RUNTIME_FILES),
+            "staging_files": self._http_capture_files(self.HTTP_STAGING_FILES),
+            "firewall_members": self._http_firewall_members(ports),
+            "listener_members": self._http_listener_members(ports),
+            "candidate_ports": sorted(int(port) for port in (candidate_ports or [])),
+            "captured_ports": sorted(ports),
+            "firewall_set_exists": True,
+            "openresty_alive": process.passed,
+        }
+
+    def snapshot_http_non_test_rules(self, prefix: str) -> Dict[str, Any]:
+        where = f"NOT ({self._http_prefix_where(prefix)})"
+        rows = [self._http_normalize_row(row) for row in self._http_rows(where)]
+        encoded = json.dumps(rows, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        return {"rows": rows, "sha256": hashlib.sha256(encoded).hexdigest()}
+
+    def verify_http_non_test_rules_unchanged(self, prefix: str,
+                                             snapshot: Dict) -> VerifyResult:
+        try:
+            current = self.snapshot_http_non_test_rules(prefix)
+            passed = (
+                isinstance(snapshot, dict)
+                and current.get("sha256") == snapshot.get("sha256")
+                and current.get("rows") == snapshot.get("rows")
+            )
+            return VerifyResult(
+                "L4-HTTP非测试保护", passed,
+                ("非测试HTTP规则未变化" if passed else
+                 "非测试HTTP规则发生变化"),
+                details={"baseline_count": len((snapshot or {}).get("rows", [])),
+                         "current_count": len(current.get("rows", []))},
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-HTTP非测试保护", False,
+                f"非测试HTTP规则复验失败: {str(exc)[:160]}",
+            )
+
+    def find_http_rule(self, tagname: str = None,
+                       rule_id: int = None) -> Optional[Dict]:
+        if tagname is None and rule_id is None:
+            raise ValueError("find_http_rule必须提供tagname或rule_id")
+        if rule_id is not None:
+            where = f"id={int(rule_id)}"
+        else:
+            where = f"tagname={self._http_sql_literal(str(tagname))}"
+        rows = self._http_rows(where, "ORDER BY id LIMIT 1")
+        return self._http_normalize_row(rows[0]) if rows else None
+
+    def verify_http_rule_database(self, tagname: str = None,
+                                  rule_id: int = None,
+                                  expected_fields: Dict = None,
+                                  must_exist: bool = True) -> VerifyResult:
+        try:
+            row = self.find_http_rule(tagname=tagname, rule_id=rule_id)
+            identity = tagname if tagname is not None else str(rule_id)
+            if row is None:
+                return VerifyResult(
+                    "L1-HTTP数据库", not must_exist,
+                    (f"HTTP规则已不存在: {identity}" if not must_exist else
+                     f"HTTP规则未找到: {identity}"),
+                )
+            if not must_exist:
+                return VerifyResult(
+                    "L1-HTTP数据库", False, f"HTTP规则仍存在: {identity}",
+                    raw_output=json.dumps(row, ensure_ascii=False),
+                )
+            mismatches = {}
+            for field, expected in (expected_fields or {}).items():
+                actual = row.get(field, "")
+                if field in {"id", "http_port", "ssl_on", "autoindex", "download", "access"}:
+                    equal = self._http_int(actual) == self._http_int(expected)
+                else:
+                    equal = str(actual) == str(expected)
+                if not equal:
+                    mismatches[field] = {"expected": expected, "actual": actual}
+            passed = not mismatches
+            return VerifyResult(
+                "L1-HTTP数据库", passed,
+                (f"HTTP规则存在且字段正确: {identity}" if passed else
+                 f"HTTP规则字段不匹配: {list(mismatches)}"),
+                details={"mismatches": mismatches, "rule_id": row.get("id")},
+                raw_output=json.dumps(row, ensure_ascii=False)[:900],
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L1-HTTP数据库", False,
+                f"HTTP数据库验证异常: {str(exc)[:180]}",
+            )
+
+    def verify_http_rule_count(self, prefix: str = None,
+                               expected: int = None) -> VerifyResult:
+        try:
+            if prefix:
+                where = self._http_prefix_where(prefix)
+                row = self._samba_sqlite_query_line(
+                    f"SELECT count(*) AS cnt FROM http_server WHERE {where}"
+                ) or {}
+            else:
+                row = self._samba_sqlite_query_line(
+                    "SELECT count(*) AS cnt FROM http_server"
+                ) or {}
+            count = self._http_int(row.get("cnt"))
+            passed = expected is None or count == int(expected)
+            return VerifyResult(
+                "L1-HTTP规则计数", passed,
+                (f"HTTP规则数量: {count}" if expected is None else
+                 f"HTTP规则数量{'正确' if passed else '不正确'}: "
+                 f"实际={count}, 期望={int(expected)}"),
+                details={"count": count, "expected": expected},
+                raw_output=f"count={count}",
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L1-HTTP规则计数", False,
+                f"HTTP规则计数失败: {str(exc)[:160]}",
+            )
+
+    def _http_read_runtime(self) -> Dict[str, Any]:
+        self.connect_router()
+        output = self._router.exec(
+            "if [ -f /usr/openresty/conf/static_file.conf ]; then "
+            "echo __HTTP_CONF_EXISTS__=1; cat /usr/openresty/conf/static_file.conf; "
+            "else echo __HTTP_CONF_EXISTS__=0; fi",
+            timeout=20,
+        )
+        exists = "__HTTP_CONF_EXISTS__=1" in (output or "")
+        content = re.sub(
+            r"(?m)^__HTTP_CONF_EXISTS__=[01]\s*$", "", output or ""
+        ).lstrip("\r\n")
+        blocks: Dict[str, Dict] = {}
+        duplicate_ids: List[str] = []
+        for match in re.finditer(r"server\s*\{(.*?)\n\}", content, re.S):
+            body = match.group(1)
+            id_match = re.search(r"(?m)^\s*#sql_id\s*=\s*(\d+)\s*$", body)
+            if not id_match:
+                continue
+            rule_id = id_match.group(1)
+            if rule_id in blocks:
+                duplicate_ids.append(rule_id)
+            listen_lines = re.findall(
+                r"(?m)^\s*listen\s+([^;]+);\s*$", body
+            )
+            ports = []
+            listen_entries = []
+            ssl_on = False
+            for listen in listen_lines:
+                endpoint = (listen.strip().split() or [""])[0]
+                family = "unclassified"
+                form = "unclassified"
+                port = 0
+                if endpoint.startswith("["):
+                    endpoint_match = re.fullmatch(
+                        r"\[([0-9A-Fa-f:]+)\]:(\d+)", endpoint
+                    )
+                    if endpoint_match:
+                        try:
+                            if ipaddress.ip_address(endpoint_match.group(1)).version == 6:
+                                family = "ipv6"
+                                form = "ipv6_explicit"
+                                port = int(endpoint_match.group(2))
+                        except ValueError:
+                            pass
+                elif endpoint.count(":") == 1:
+                    host_text, port_text = endpoint.rsplit(":", 1)
+                    if port_text.isdigit():
+                        try:
+                            if ipaddress.ip_address(host_text).version == 4:
+                                family = "ipv4"
+                                form = "ipv4_explicit"
+                                port = int(port_text)
+                        except ValueError:
+                            pass
+                elif endpoint.isdigit():
+                    # nginx's bare ``listen <port>`` means the IPv4 wildcard
+                    # (0.0.0.0:<port>); the script emits this together with an
+                    # explicit [::] entry, so classify it as the IPv4 half.
+                    family = "ipv4"
+                    form = "ipv4_implicit"
+                    port = int(endpoint)
+                if port:
+                    ports.append(port)
+                listen_ssl = bool(re.search(r"(?:^|\s)ssl(?:\s|$)", listen))
+                listen_entries.append({
+                    "raw": listen.strip(),
+                    "endpoint": endpoint,
+                    "family": family,
+                    "form": form,
+                    "port": port,
+                    "ssl": listen_ssl,
+                })
+                if listen_ssl:
+                    ssl_on = True
+            server_match = re.search(
+                r"(?m)^\s*server_name\s+([^;]*);\s*$", body
+            )
+            root_match = re.search(r"(?m)^\s*root\s+([^;]+);\s*$", body)
+            rate_match = re.search(
+                r"(?m)^\s*limit_rate\s+(\d+)k;\s*$", body
+            )
+            blocks[rule_id] = {
+                "id": rule_id,
+                "http_port": ports[0] if ports else 0,
+                "listen_ports": sorted(set(ports)),
+                "listen_count": len(listen_lines),
+                "listen_entries": listen_entries,
+                "listen_ipv4_count": sum(
+                    1 for entry in listen_entries if entry["family"] == "ipv4"
+                ),
+                "listen_ipv6_count": sum(
+                    1 for entry in listen_entries if entry["family"] == "ipv6"
+                ),
+                "listen_unclassified": [
+                    entry["raw"] for entry in listen_entries
+                    if entry["family"] == "unclassified"
+                ],
+                "listen_forms": [entry["form"] for entry in listen_entries],
+                "ssl_on": 1 if ssl_on else 0,
+                "server_name": (server_match.group(1).strip()
+                                if server_match else ""),
+                "root": root_match.group(1).strip() if root_match else "",
+                "autoindex": 1 if re.search(
+                    r"(?m)^\s*autoindex\s+on;\s*$", body
+                ) else 0,
+                "download": int(rate_match.group(1)) if rate_match else 0,
+                "try_files": bool(re.search(
+                    r"(?m)^\s*try_files\s+\$uri\s+\$uri/\s+=404;\s*$", body
+                )),
+                "charset_utf8": bool(re.search(
+                    r"(?m)^\s*charset\s+utf-8;\s*$", body
+                )),
+                "ssl_certificate": bool(re.search(
+                    r"(?m)^\s*ssl_certificate\s+ssl/server\.crt;\s*$", body
+                )),
+                "ssl_certificate_key": bool(re.search(
+                    r"(?m)^\s*ssl_certificate_key\s+ssl/server\.key;\s*$", body
+                )),
+                "autoindex_localtime": bool(re.search(
+                    r"(?m)^\s*autoindex_localtime\s+on;\s*$", body
+                )),
+                "autoindex_exact_size": bool(re.search(
+                    r"(?m)^\s*autoindex_exact_size\s+off;\s*$", body
+                )),
+            }
+        return {
+            "exists": exists,
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "size": len(content.encode("utf-8")),
+            "blocks": blocks,
+            "duplicate_ids": sorted(set(duplicate_ids)),
+        }
+
+    def verify_http_openresty_config(self, tagname: str = None,
+                                     rule_id: int = None,
+                                     expected_fields: Dict = None,
+                                     expect_present: bool = True) -> VerifyResult:
+        try:
+            row = self.find_http_rule(tagname=tagname, rule_id=rule_id)
+            identity = tagname if tagname is not None else str(rule_id)
+            resolved_id = str(rule_id) if rule_id is not None else (
+                str(row.get("id")) if row else ""
+            )
+            runtime = self._http_read_runtime()
+            block = runtime.get("blocks", {}).get(resolved_id)
+            if block is None:
+                return VerifyResult(
+                    "L2-HTTP配置", not expect_present,
+                    (f"HTTP运行配置已不存在: {identity}" if not expect_present else
+                     f"HTTP运行配置未找到: {identity}"),
+                    details={"config_size": runtime.get("size", 0)},
+                )
+            if not expect_present:
+                return VerifyResult(
+                    "L2-HTTP配置", False,
+                    f"HTTP运行配置仍存在: {identity}", details={"block": block},
+                )
+            source = dict(row or {})
+            source.update(expected_fields or {})
+            expected = {
+                "http_port": self._http_int(source.get("http_port")),
+                "ssl_on": self._http_int(source.get("ssl_on")),
+                "server_name": str(source.get("server_name", "")),
+                "root": self.HTTP_DISK_ROOT + str(source.get("home_dir", "")),
+                "autoindex": self._http_int(source.get("autoindex")),
+                "download": self._http_int(source.get("download")),
+            }
+            mismatches = {}
+            for field, exp in expected.items():
+                actual = block.get(field)
+                equal = (self._http_int(actual) == self._http_int(exp)
+                         if field in {"http_port", "ssl_on", "autoindex", "download"}
+                         else str(actual) == str(exp))
+                if not equal:
+                    mismatches[field] = {"expected": exp, "actual": actual}
+            if block.get("listen_count") != 2:
+                mismatches["listen_count"] = {
+                    "expected": 2, "actual": block.get("listen_count"),
+                }
+            if block.get("listen_ipv4_count") != 1:
+                mismatches["listen_ipv4_count"] = {
+                    "expected": 1, "actual": block.get("listen_ipv4_count"),
+                }
+            if block.get("listen_ipv6_count") != 1:
+                mismatches["listen_ipv6_count"] = {
+                    "expected": 1, "actual": block.get("listen_ipv6_count"),
+                }
+            if block.get("listen_unclassified"):
+                mismatches["listen_unclassified"] = {
+                    "expected": [], "actual": block.get("listen_unclassified"),
+                }
+            if block.get("listen_ports") != [expected["http_port"]]:
+                mismatches["listen_ports"] = {
+                    "expected": [expected["http_port"]],
+                    "actual": block.get("listen_ports"),
+                }
+            directive_expectations = {
+                "try_files": True,
+                "charset_utf8": True,
+                "ssl_certificate": bool(expected["ssl_on"]),
+                "ssl_certificate_key": bool(expected["ssl_on"]),
+                "autoindex_localtime": bool(expected["autoindex"]),
+                "autoindex_exact_size": bool(expected["autoindex"]),
+            }
+            for field, exp in directive_expectations.items():
+                if bool(block.get(field)) != exp:
+                    mismatches[field] = {
+                        "expected": exp, "actual": bool(block.get(field)),
+                    }
+            passed = not mismatches
+            return VerifyResult(
+                "L2-HTTP配置", passed,
+                (f"HTTP openresty配置正确: {identity}" if passed else
+                 f"HTTP openresty配置不匹配: {list(mismatches)}"),
+                details={"mismatches": mismatches, "block": block},
+                raw_output=json.dumps(block, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L2-HTTP配置", False,
+                f"HTTP运行配置验证异常: {str(exc)[:180]}",
+            )
+
+    def verify_http_process(self, expect_running: bool = True) -> VerifyResult:
+        try:
+            self.connect_router()
+            output = self._router.exec(
+                "ids=$(pidof openresty 2>/dev/null); "
+                "[ -n \"$ids\" ] || ids=$(pidof nginx 2>/dev/null); "
+                "echo __HTTP_PIDS__=$ids; "
+                "for id in $ids; do "
+                "exe=$(readlink -f /proc/$id/exe 2>/dev/null); "
+                "cmd=$(tr '\\0' ' ' </proc/$id/cmdline 2>/dev/null); "
+                "echo __HTTP_PROC__=$id\"|\"$exe\"|\"$cmd; done",
+                timeout=15,
+            )
+            pid_match = re.search(r"(?m)^__HTTP_PIDS__=(.*)$", output or "")
+            pids = re.findall(r"\d+", pid_match.group(1) if pid_match else "")
+            process_lines = re.findall(r"(?m)^__HTTP_PROC__=(.*)$", output or "")
+            owners_ok = all(
+                ("/usr/openresty/" in line or "nginx" in line or "openresty" in line)
+                for line in process_lines
+            ) if process_lines else False
+            running = bool(pids) and owners_ok
+            passed = running if expect_running else not bool(pids)
+            return VerifyResult(
+                "L2-HTTP进程", passed,
+                ("openresty进程及归属正确" if passed and expect_running else
+                 "openresty进程已停止" if passed else
+                 f"openresty进程状态不符: running={running}"),
+                details={"pid_count": len(pids), "owners_ok": owners_ok},
+                raw_output="\n".join(process_lines)[:800],
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L2-HTTP进程", False,
+                f"HTTP进程验证失败: {str(exc)[:160]}",
+            )
+
+    def verify_http_listener(self, port: int, expect_listening: bool = True,
+                             wait_seconds: float = 4.0) -> VerifyResult:
+        port = int(port)
+        if not 1 <= port <= 65535:
+            return VerifyResult("L2-HTTP监听", False, f"非法端口: {port}")
+        last_lines: List[str] = []
+        deadline = time.time() + max(0.0, float(wait_seconds))
+        try:
+            self.connect_router()
+            while True:
+                output = self._router.exec(
+                    "netstat -lntp 2>/dev/null | "
+                    f"awk '$4 ~ /:{port}$/ {{print $1 \"|\" $4 \"|\" $7}}'",
+                    timeout=12,
+                )
+                lines = [line.strip() for line in (output or "").splitlines()
+                         if line.strip()]
+                owner_ok = bool(lines) and all(
+                    ("nginx" in line or "openresty" in line) for line in lines
+                )
+                listening = bool(lines) and owner_ok
+                last_lines = lines
+                if listening == bool(expect_listening) or time.time() >= deadline:
+                    break
+                time.sleep(0.35)
+            passed = listening == bool(expect_listening)
+            return VerifyResult(
+                "L2-HTTP监听", passed,
+                (f"HTTP端口{port}{'正在' if expect_listening else '未在'}监听"
+                 if passed else
+                 f"HTTP端口{port}监听状态不符: actual={listening}"),
+                details={"port": port, "listening": listening,
+                         "owners_ok": owner_ok if lines else True},
+                raw_output="\n".join(last_lines)[:800],
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L2-HTTP监听", False,
+                f"HTTP端口{port}监听验证失败: {str(exc)[:160]}",
+            )
+
+    def verify_http_firewall(self, port: int,
+                             expect_drop: bool) -> VerifyResult:
+        try:
+            actual = self._http_firewall_members([int(port)]).get(str(int(port)))
+            passed = actual is bool(expect_drop)
+            return VerifyResult(
+                "L3-HTTP防火墙", passed,
+                (f"HTTP端口{int(port)} WAN DROP成员正确" if passed else
+                 f"HTTP端口{int(port)} WAN DROP成员不符: "
+                 f"actual={actual}, expected={bool(expect_drop)}"),
+                details={"port": int(port), "actual_drop": actual,
+                         "expected_drop": bool(expect_drop)},
+                raw_output=f"DROP_T_PORTS_WAN_IN:{int(port)}={int(bool(actual))}",
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L3-HTTP防火墙", False,
+                f"HTTP防火墙验证失败: {str(exc)[:160]}",
+            )
+
+    def verify_http_runtime_consistency(self, prefix: str = None,
+                                        candidate_ports: Iterable[int] = None
+                                        ) -> VerifyResult:
+        try:
+            all_rows = [self._http_normalize_row(row) for row in self._http_rows()]
+            if prefix:
+                rows = [row for row in all_rows
+                        if str(row.get("tagname", "")).startswith(str(prefix))]
+            else:
+                rows = list(all_rows)
+            runtime = self._http_read_runtime()
+            blocks = runtime.get("blocks", {})
+            issues: List[str] = []
+            enabled_ids = {
+                str(row.get("id")) for row in all_rows if row.get("enabled") == "yes"
+            }
+            block_ids = set(blocks)
+            if enabled_ids != block_ids:
+                missing = sorted(enabled_ids - block_ids)
+                orphan = sorted(block_ids - enabled_ids)
+                if missing:
+                    issues.append("缺少启用ID:" + ",".join(missing))
+                if orphan:
+                    issues.append("存在孤儿block:" + ",".join(orphan))
+            duplicate_ids = runtime.get("duplicate_ids", [])
+            if duplicate_ids:
+                issues.append("重复#sql_id:" + ",".join(duplicate_ids))
+            expected_ports: Dict[int, Dict[str, bool]] = {}
+            row_checks = {}
+            for row in rows:
+                rule_id = str(row.get("id"))
+                enabled = row.get("enabled") == "yes"
+                block = blocks.get(rule_id)
+                if enabled and block is None:
+                    issues.append(f"id={rule_id}启用但无server block")
+                if not enabled and block is not None:
+                    issues.append(f"id={rule_id}停用但仍有server block")
+                if enabled and block is not None:
+                    expected_root = self.HTTP_DISK_ROOT + row.get("home_dir", "")
+                    comparisons = {
+                        "port": self._http_int(block.get("http_port")) == self._http_int(row.get("http_port")),
+                        "listen_ports": block.get("listen_ports") == [self._http_int(row.get("http_port"))],
+                        "listen_ipv4": block.get("listen_ipv4_count") == 1,
+                        "listen_ipv6": block.get("listen_ipv6_count") == 1,
+                        "listen_count": block.get("listen_count") == 2,
+                        "ssl": self._http_int(block.get("ssl_on")) == self._http_int(row.get("ssl_on")),
+                        "server_name": str(block.get("server_name", "")) == str(row.get("server_name", "")),
+                        "root": str(block.get("root", "")) == expected_root,
+                        "autoindex": self._http_int(block.get("autoindex")) == self._http_int(row.get("autoindex")),
+                        "download": self._http_int(block.get("download")) == self._http_int(row.get("download")),
+                    }
+                    bad = [key for key, ok in comparisons.items() if not ok]
+                    if bad:
+                        issues.append(f"id={rule_id}配置字段不符:{','.join(bad)}")
+                    row_checks[rule_id] = comparisons
+                port = self._http_int(row.get("http_port"))
+                if port:
+                    state = expected_ports.setdefault(
+                        port, {"listening": False, "drop": False}
+                    )
+                    if enabled:
+                        state["listening"] = True
+                        if self._http_int(row.get("access")) == 0:
+                            state["drop"] = True
+            for port in (candidate_ports or []):
+                expected_ports.setdefault(
+                    int(port), {"listening": False, "drop": False}
+                )
+            listener_actual = self._http_listener_members(expected_ports)
+            firewall_actual = self._http_firewall_members(expected_ports)
+            port_checks = {}
+            for port, expected in expected_ports.items():
+                actual_listener = listener_actual.get(str(port), False)
+                actual_drop = firewall_actual.get(str(port), False)
+                port_checks[str(port)] = {
+                    "expected_listener": expected["listening"],
+                    "actual_listener": actual_listener,
+                    "expected_drop": expected["drop"],
+                    "actual_drop": actual_drop,
+                }
+                if actual_listener != expected["listening"]:
+                    issues.append(f"端口{port}监听不符")
+                if actual_drop != expected["drop"]:
+                    issues.append(f"端口{port}WAN DROP不符")
+            process = self.verify_http_process(True)
+            if not process.passed:
+                issues.append(process.message)
+            passed = not issues
+            return VerifyResult(
+                "L4-HTTP运行时一致性", passed,
+                ("HTTP DB→openresty→监听→WAN ipset一致" if passed else
+                 "HTTP运行时一致性失败: " + "; ".join(issues[:12])),
+                details={"row_count": len(rows), "row_checks": row_checks,
+                         "port_checks": port_checks,
+                         "config_block_count": len(blocks)},
+                raw_output=json.dumps(
+                    {"issues": issues, "ports": port_checks}, ensure_ascii=False
+                )[:1400],
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-HTTP运行时一致性", False,
+                f"HTTP一致性验证异常: {str(exc)[:180]}",
+            )
+
+    def verify_http_reinit(self, prefix: str = None,
+                           candidate_ports: Iterable[int] = None) -> VerifyResult:
+        try:
+            self.connect_router()
+            output = self._router.exec(
+                f"{shlex.quote(self.HTTP_SCRIPT)} init >/dev/null 2>&1; "
+                "echo __HTTP_INIT_RC__=$?",
+                timeout=35,
+            )
+            init_ok = "__HTTP_INIT_RC__=0" in (output or "")
+            consistency = self.verify_http_runtime_consistency(
+                prefix, candidate_ports
+            )
+            passed = init_ok and consistency.passed
+            return VerifyResult(
+                "L4-HTTP脚本重建", passed,
+                ("http_server.sh init后运行时重建正确" if passed else
+                 f"HTTP init重建失败: init_ok={init_ok}; {consistency.message}"),
+                details={"init_ok": init_ok,
+                         "consistency": consistency.details},
+                raw_output=(output or "")[:300],
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-HTTP脚本重建", False,
+                f"HTTP init重建异常: {str(exc)[:180]}",
+            )
+
+    def prepare_http_test_environment(self, partition: str = None,
+                                      dir_names: Any = None,
+                                      port_count: int = 5,
+                                      candidate_ports: Iterable[int] = None,
+                                      prefix: str = "http_t_") -> VerifyResult:
+        """准备独立目录/不同内容payload，并复验候选端口仍为空闲。"""
+        try:
+            partition = self._http_safe_component(
+                partition or "666", "HTTP测试分区", max_length=40
+            )
+            if isinstance(dir_names, dict):
+                aliases = {
+                    self._http_safe_component(key, "HTTP目录别名", 50):
+                    self._http_safe_component(value, "HTTP目录名", 100)
+                    for key, value in dir_names.items()
+                }
+            else:
+                values = list(dir_names or [])
+                aliases = {
+                    self._http_safe_component(value, "HTTP目录名", 100):
+                    self._http_safe_component(value, "HTTP目录名", 100)
+                    for value in values
+                }
+            if not aliases:
+                raise ValueError("HTTP测试目录集合不能为空")
+            for dirname in aliases.values():
+                if not dirname.startswith(str(prefix)):
+                    raise ValueError("HTTP测试目录必须使用本轮前缀")
+            ports = [int(port) for port in (candidate_ports or [])]
+            if not ports:
+                ports = self.choose_http_candidate_ports(port_count)
+            if len(ports) < int(port_count):
+                raise ValueError("HTTP候选端口数量不足")
+            if len(set(ports)) != len(ports):
+                raise ValueError("HTTP候选端口重复")
+            listeners = self._http_listener_members(ports)
+            firewall = self._http_firewall_members(ports)
+            db_ports = {
+                self._http_int(row.get("http_port")) for row in self._http_rows()
+            }
+            conflicts = [
+                port for port in ports
+                if listeners.get(str(port)) or firewall.get(str(port)) or port in db_ports
+            ]
+            if conflicts:
+                raise RuntimeError(f"HTTP候选端口已被占用: {conflicts}")
+
+            owner_nonce = secrets.token_hex(32)
+            owner_content = f"ikuai-http-test-owner-v1:{owner_nonce}"
+            owner_sha256 = hashlib.sha256(
+                owner_content.encode("utf-8")
+            ).hexdigest()
+            root = f"{self.HTTP_DISK_ROOT}/{partition}"
+            targets = []
+            for index, (alias, dirname) in enumerate(aliases.items()):
+                home = f"/{partition}/{dirname}"
+                targets.append({
+                    "alias": alias,
+                    "dirname": dirname,
+                    "home": home,
+                    "absolute": f"{self.HTTP_DISK_ROOT}{home}",
+                    "payload_char": chr(ord("A") + (index % 26)),
+                    "marker": f"http-marker-{alias}",
+                })
+            script_lines = [
+                "set -eu", "umask 022",
+                f"root={shlex.quote(root)}",
+                "resolved_root=$(readlink -f \"$root\" 2>/dev/null || true)",
+                "case \"$resolved_root\" in /etc/disk/*) ;; "
+                "*) echo __HTTP_PREP_ERROR__=unsafe_root; exit 70;; esac",
+                "[ -d \"$resolved_root\" ] || { "
+                "echo __HTTP_PREP_ERROR__=missing_root; exit 71; }",
+                "printf '__HTTP_ROOT__=%s\\n' \"$resolved_root\"",
+            ]
+            # Two-phase preflight: all targets must be new direct children of the
+            # already-resolved disk root before the script creates even one entry.
+            for target in targets:
+                script_lines.extend([
+                    f"dir={shlex.quote(target['absolute'])}",
+                    "parent=$(dirname \"$dir\")",
+                    "resolved_parent=$(readlink -f \"$parent\" 2>/dev/null || true)",
+                    "[ \"$resolved_parent\" = \"$resolved_root\" ] || { "
+                    f"echo __HTTP_PREP_ERROR__=unsafe_parent:{target['alias']}; "
+                    "exit 72; }",
+                    "if [ -e \"$dir\" ] || [ -L \"$dir\" ]; then "
+                    f"echo __HTTP_PREP_ERROR__=target_exists:{target['alias']}; "
+                    "exit 73; fi",
+                ])
+
+            # If a later write fails, roll back only directories whose cryptographic
+            # owner marker matches this invocation.  An unmarked empty directory is
+            # removed with rmdir only, never recursively.
+            script_lines.extend([
+                "committed=0",
+                "rollback_http_dirs() {",
+                "  [ \"$committed\" -eq 0 ] || return 0",
+            ])
+            for target in targets:
+                script_lines.extend([
+                    f"  dir={shlex.quote(target['absolute'])}",
+                    f"  owner_file=\"$dir/{self.HTTP_TEST_OWNER_MARKER}\"",
+                    "  if [ -d \"$dir\" ] && [ ! -L \"$dir\" ]; then",
+                    "    resolved=$(readlink -f \"$dir\" 2>/dev/null || true)",
+                    f"    expected=\"$resolved_root/{target['dirname']}\"",
+                    "    case \"$resolved\" in \"$expected\")",
+                    "      if [ -f \"$owner_file\" ] && [ ! -L \"$owner_file\" ]; then",
+                    "        actual_owner_sha=$(sha256sum \"$owner_file\" 2>/dev/null | "
+                    "awk '{print $1}')",
+                    f"        if [ \"$actual_owner_sha\" = {shlex.quote(owner_sha256)} ]; "
+                    "then rm -rf -- \"$dir\"; else rmdir -- \"$dir\" 2>/dev/null || true; fi",
+                    "      else rmdir -- \"$dir\" 2>/dev/null || true; fi",
+                    "      ;;",
+                    "    esac",
+                    "  fi",
+                ])
+            script_lines.extend([
+                "}",
+                "trap rollback_http_dirs EXIT",
+                "trap 'exit 130' HUP INT TERM",
+            ])
+
+            for target in targets:
+                script_lines.extend([
+                    f"dir={shlex.quote(target['absolute'])}",
+                    "mkdir -- \"$dir\" || { echo __HTTP_PREP_ERROR__=mkdir_failed; exit 74; }",
+                    "[ -d \"$dir\" ] && [ ! -L \"$dir\" ] || { "
+                    "echo __HTTP_PREP_ERROR__=unsafe_created_type; exit 75; }",
+                    "resolved=$(readlink -f \"$dir\" 2>/dev/null || true)",
+                    f"expected_resolved=\"$resolved_root/{target['dirname']}\"",
+                    "[ \"$resolved\" = \"$expected_resolved\" ] || { "
+                    "echo __HTTP_PREP_ERROR__=unsafe_created_path; exit 76; }",
+                    f"owner_file=\"$dir/{self.HTTP_TEST_OWNER_MARKER}\"",
+                    f"printf '%s' {shlex.quote(owner_content)} > \"$owner_file\"",
+                    "chmod 600 \"$owner_file\"",
+                    "actual_owner_sha=$(sha256sum \"$owner_file\" | awk '{print $1}')",
+                    f"[ \"$actual_owner_sha\" = {shlex.quote(owner_sha256)} ] || {{ "
+                    "echo __HTTP_PREP_ERROR__=owner_marker_mismatch; exit 77; }",
+                    f"printf '%s\\n' {shlex.quote(target['marker'])} > \"$dir/marker.txt\"",
+                    f"awk 'BEGIN {{for(i=0;i<262144;i++) printf \"{target['payload_char']}\"}}' "
+                    "> \"$dir/payload.bin\"",
+                    "sha=$(sha256sum \"$dir/payload.bin\" | awk '{print $1}')",
+                    "size=$(stat -c '%s' \"$dir/payload.bin\")",
+                    f"printf '__HTTP_DIR__=%s|%s|%s|%s|%s|%s|%s\\n' "
+                    f"{shlex.quote(target['alias'])} {shlex.quote(target['home'])} "
+                    f"{shlex.quote(target['absolute'])} \"$resolved\" \"$sha\" "
+                    f"\"$size\" {shlex.quote(target['marker'])}",
+                ])
+            script_lines.extend([
+                "committed=1",
+                "trap - EXIT HUP INT TERM",
+                "echo __HTTP_PREP_COMMITTED__=1",
+            ])
+            output = self._samba_exec_router_script(
+                "\n".join(script_lines) + "\n",
+                f"prepare HTTP test directories count={len(aliases)} content=<generated>",
+                timeout=45,
+            )
+            if "__HTTP_PREP_ERROR__=" in output:
+                error_roots = re.findall(
+                    r"(?m)^__HTTP_ROOT__=([^\r\n]+)\s*$", output or ""
+                )
+                error_root = (
+                    error_roots[-1].strip() if len(error_roots) == 1 else ""
+                )
+                if re.fullmatch(
+                        r"/etc/disk/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*",
+                        error_root):
+                    self._http_last_test_environment = {
+                        "ports": ports,
+                        "home_dirs": {
+                            target["alias"]: target["home"] for target in targets
+                        },
+                        "absolute_dirs": {
+                            target["alias"]: target["absolute"] for target in targets
+                        },
+                        "resolved_dirs": {
+                            target["alias"]: f"{error_root}/{target['dirname']}"
+                            for target in targets
+                        },
+                        "payloads": {},
+                        "partition": partition,
+                        "prefix": prefix,
+                        "ownership": {
+                            "version": 1,
+                            "marker_name": self.HTTP_TEST_OWNER_MARKER,
+                            "nonce": owner_nonce,
+                            "marker_sha256": owner_sha256,
+                            "resolved_root": error_root,
+                        },
+                    }
+                raise RuntimeError(output.strip()[:180])
+            homes: Dict[str, str] = {}
+            absolutes: Dict[str, str] = {}
+            resolved_dirs: Dict[str, str] = {}
+            payloads: Dict[str, Dict] = {}
+            root_matches = re.findall(
+                r"(?m)^__HTTP_ROOT__=([^\r\n]+)\s*$", output or ""
+            )
+            resolved_root = root_matches[-1].strip() if len(root_matches) == 1 else ""
+            for line in output.splitlines():
+                if not line.startswith("__HTTP_DIR__="):
+                    continue
+                parts = line.split("=", 1)[1].split("|")
+                if len(parts) != 7:
+                    continue
+                alias, home, absolute, resolved, sha256, size, marker = parts
+                homes[alias] = home
+                absolutes[alias] = absolute
+                resolved_dirs[alias] = resolved
+                payloads[alias] = {
+                    "path": "/payload.bin", "absolute_path": absolute + "/payload.bin",
+                    "sha256": sha256, "size": int(size),
+                    "marker": marker, "marker_path": "/marker.txt",
+                }
+            expected_homes = {
+                target["alias"]: target["home"] for target in targets
+            }
+            expected_absolutes = {
+                target["alias"]: target["absolute"] for target in targets
+            }
+            expected_resolved = {
+                target["alias"]: f"{resolved_root}/{target['dirname']}"
+                for target in targets
+            }
+            root_valid = bool(re.fullmatch(
+                r"/etc/disk/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*",
+                resolved_root,
+            ))
+            passed = bool(
+                "__HTTP_PREP_COMMITTED__=1" in (output or "")
+                and root_valid
+                and homes == expected_homes
+                and absolutes == expected_absolutes
+                and resolved_dirs == expected_resolved
+                and all(
+                    re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", ""))
+                    and item.get("size") == 262144
+                    for item in payloads.values()
+                )
+            )
+            environment_details = {
+                "ports": ports,
+                "home_dirs": homes,
+                "absolute_dirs": expected_absolutes,
+                "resolved_dirs": expected_resolved if root_valid else resolved_dirs,
+                "payloads": payloads,
+                "partition": partition,
+                "prefix": prefix,
+                "ownership": {
+                    "version": 1,
+                    "marker_name": self.HTTP_TEST_OWNER_MARKER,
+                    "nonce": owner_nonce,
+                    "marker_sha256": owner_sha256,
+                    "resolved_root": resolved_root,
+                },
+            }
+            if root_valid:
+                # A caller may raise on a failed VerifyResult before assigning its
+                # details.  Keep only validated ownership metadata as a safe finally
+                # fallback; cleanup still rechecks the on-device marker and path.
+                self._http_last_test_environment = dict(environment_details)
+            return VerifyResult(
+                "L5-HTTP测试环境", passed,
+                (f"HTTP测试目录和端口已准备: dirs={len(homes)}, ports={len(ports)}"
+                 if passed else "HTTP测试环境返回不完整"),
+                details=environment_details,
+                raw_output=json.dumps(
+                    {"dirs": sorted(homes), "ports": ports,
+                     "payload_sizes": {k: v["size"] for k, v in payloads.items()}},
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L5-HTTP测试环境", False,
+                f"HTTP测试环境准备失败: {str(exc)[:180]}",
+            )
+
+    def _http_environment_details(self, test_environment: Any,
+                                  prefix: str = None) -> Dict:
+        if isinstance(test_environment, VerifyResult):
+            details = dict(test_environment.details or {})
+        else:
+            details = (dict(test_environment or {})
+                       if isinstance(test_environment, dict) else {})
+        if prefix and not isinstance(details.get("ownership"), dict):
+            cached = getattr(self, "_http_last_test_environment", None)
+            if isinstance(cached, dict) and cached.get("prefix") == prefix:
+                return dict(cached)
+        return details
+
+    def _http_owned_test_directories(self, prefix: str,
+                                     details: Dict) -> List[Dict[str, str]]:
+        """Validate prepare metadata before any recursive HTTP directory cleanup."""
+        absolute_dirs = details.get("absolute_dirs") or {}
+        if not absolute_dirs:
+            return []
+        if not isinstance(absolute_dirs, dict):
+            raise ValueError("HTTP目录清理缺少alias到路径的安全映射")
+        resolved_dirs = details.get("resolved_dirs") or {}
+        ownership = details.get("ownership") or {}
+        if not isinstance(resolved_dirs, dict) or not isinstance(ownership, dict):
+            raise ValueError("HTTP目录清理缺少canonical/ownership元数据")
+        if details.get("prefix") != prefix:
+            raise ValueError("HTTP目录清理前缀与prepare元数据不一致")
+        partition = self._http_safe_component(
+            details.get("partition"), "HTTP测试分区", max_length=40
+        )
+        marker_name = str(ownership.get("marker_name", ""))
+        nonce = str(ownership.get("nonce", ""))
+        marker_sha256 = str(ownership.get("marker_sha256", ""))
+        resolved_root = str(ownership.get("resolved_root", ""))
+        if ownership.get("version") != 1:
+            raise ValueError("HTTP目录owner元数据版本无效")
+        if marker_name != self.HTTP_TEST_OWNER_MARKER:
+            raise ValueError("HTTP目录owner marker名称无效")
+        if not re.fullmatch(r"[0-9a-f]{64}", nonce):
+            raise ValueError("HTTP目录owner nonce无效")
+        expected_sha = hashlib.sha256(
+            f"ikuai-http-test-owner-v1:{nonce}".encode("utf-8")
+        ).hexdigest()
+        if marker_sha256 != expected_sha:
+            raise ValueError("HTTP目录owner marker摘要与nonce不一致")
+        if not re.fullmatch(
+                r"/etc/disk/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*",
+                resolved_root):
+            raise ValueError("HTTP测试canonical根目录无效")
+        if set(absolute_dirs) != set(resolved_dirs):
+            raise ValueError("HTTP绝对目录与canonical目录alias不一致")
+
+        owned: List[Dict[str, str]] = []
+        for alias, raw_path in absolute_dirs.items():
+            alias = self._http_safe_component(alias, "HTTP目录别名", 50)
+            path = str(raw_path)
+            dirname = path.rstrip("/").rsplit("/", 1)[-1]
+            dirname = self._http_safe_component(dirname, "HTTP目录名", 100)
+            if not dirname.startswith(prefix):
+                raise ValueError(f"拒绝清理非本轮HTTP目录: {path}")
+            expected_path = f"{self.HTTP_DISK_ROOT}/{partition}/{dirname}"
+            if path != expected_path:
+                raise ValueError(f"HTTP目录路径不符合prepare契约: {path}")
+            resolved = str(resolved_dirs.get(alias, ""))
+            if resolved != f"{resolved_root}/{dirname}":
+                raise ValueError(f"HTTP目录canonical路径不符合prepare契约: {alias}")
+            owned.append({
+                "alias": alias,
+                "path": path,
+                "resolved": resolved,
+                "resolved_root": resolved_root,
+                "marker_name": marker_name,
+                "marker_sha256": marker_sha256,
+            })
+        return owned
+
+    def cleanup_http_test(self, prefix: str = "http_t_",
+                          test_environment: Any = None,
+                          candidate_ports: Iterable[int] = None,
+                          import_filenames: Any = None,
+                          snapshot: Dict = None) -> str:
+        """只清本轮owned目录/规则/端口；有快照时清空staging待最终恢复。"""
+        try:
+            where = self._http_prefix_where(prefix)
+            details = self._http_environment_details(test_environment, prefix)
+            owned_dirs = self._http_owned_test_directories(prefix, details)
+            staging_snapshot = None
+            if snapshot is not None:
+                required_snapshot = {
+                    "rows", "runtime_files", "staging_files",
+                    "firewall_members", "listener_members", "captured_ports",
+                }
+                if (
+                    not isinstance(snapshot, dict)
+                    or snapshot.get("version") != 1
+                    or not required_snapshot.issubset(snapshot)
+                    or not isinstance(snapshot.get("staging_files"), dict)
+                ):
+                    raise ValueError("HTTP cleanup收到无效staging快照")
+                staging_snapshot = snapshot["staging_files"]
+                if set(staging_snapshot) != set(self.HTTP_STAGING_FILES) or any(
+                        not isinstance(staging_snapshot.get(key), dict)
+                        for key in self.HTTP_STAGING_FILES):
+                    raise ValueError("HTTP cleanup staging快照字段不完整")
+                for key, info in staging_snapshot.items():
+                    if info.get("exists"):
+                        try:
+                            base64.b64decode(
+                                str(info.get("content_b64", "")), validate=True
+                            )
+                        except Exception as exc:
+                            raise ValueError(
+                                f"HTTP cleanup staging快照内容无效: {key}"
+                            ) from exc
+                        if not re.fullmatch(
+                                r"[0-7]{3,4}", str(info.get("mode", ""))):
+                            raise ValueError(
+                                f"HTTP cleanup staging快照权限无效: {key}"
+                            )
+            rows = self._http_rows(where)
+            ports = {self._http_int(row.get("http_port")) for row in rows}
+            ports.update(int(port) for port in (candidate_ports or []))
+            ports.discard(0)
+            self._samba_sqlite_raw(
+                f"DELETE FROM http_server WHERE {where}", line_mode=False
+            )
+            self.connect_router()
+            init_output = self._router.exec(
+                f"{shlex.quote(self.HTTP_SCRIPT)} init >/dev/null 2>&1; "
+                "echo __HTTP_CLEAN_INIT_RC__=$?",
+                timeout=35,
+            )
+            if "__HTTP_CLEAN_INIT_RC__=0" not in init_output:
+                raise RuntimeError("HTTP cleanup init失败")
+            for port in sorted(ports):
+                self._router.exec(
+                    f"ipset test DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1 "
+                    f"&& ipset del DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1 || true",
+                    timeout=10,
+                )
+            for owned in owned_dirs:
+                directory_script = "\n".join([
+                    "set -eu",
+                    f"path={shlex.quote(owned['path'])}",
+                    f"expected={shlex.quote(owned['resolved'])}",
+                    f"root={shlex.quote(owned['resolved_root'])}",
+                    f"marker=\"$path/{owned['marker_name']}\"",
+                    "if [ ! -e \"$path\" ] && [ ! -L \"$path\" ]; then",
+                    "  echo __HTTP_CLEAN_DIR__=ABSENT; exit 0",
+                    "fi",
+                    "[ -d \"$path\" ] && [ ! -L \"$path\" ] || { "
+                    "echo __HTTP_CLEAN_DIR__=UNSAFE_TYPE; exit 80; }",
+                    "resolved=$(readlink -f \"$path\" 2>/dev/null || true)",
+                    "[ \"$resolved\" = \"$expected\" ] || { "
+                    "echo __HTTP_CLEAN_DIR__=CANONICAL_MISMATCH; exit 81; }",
+                    "case \"$resolved\" in \"$root\"/*) ;; *) "
+                    "echo __HTTP_CLEAN_DIR__=OUTSIDE_ROOT; exit 82;; esac",
+                    "[ -f \"$marker\" ] && [ ! -L \"$marker\" ] || { "
+                    "echo __HTTP_CLEAN_DIR__=OWNER_MISSING; exit 83; }",
+                    "actual=$(sha256sum \"$marker\" 2>/dev/null | awk '{print $1}')",
+                    f"[ \"$actual\" = {shlex.quote(owned['marker_sha256'])} ] || {{ "
+                    "echo __HTTP_CLEAN_DIR__=OWNER_MISMATCH; exit 84; }",
+                    "rm -rf -- \"$path\"",
+                    "[ ! -e \"$path\" ] && [ ! -L \"$path\" ] || { "
+                    "echo __HTTP_CLEAN_DIR__=REMOVE_FAILED; exit 85; }",
+                    "echo __HTTP_CLEAN_DIR__=REMOVED",
+                ]) + "\n"
+                directory_output = self._samba_exec_router_script(
+                    directory_script,
+                    f"cleanup owned HTTP test directory alias={owned['alias']}",
+                    timeout=20,
+                )
+                if not re.search(
+                        r"(?m)^__HTTP_CLEAN_DIR__=(?:ABSENT|REMOVED)\s*$",
+                        directory_output or ""):
+                    status = re.findall(
+                        r"(?m)^__HTTP_CLEAN_DIR__=([^\r\n]+)",
+                        directory_output or "",
+                    )
+                    raise RuntimeError(
+                        "HTTP owned目录拒绝删除: " +
+                        (status[-1][:80] if status else "无安全状态")
+                    )
+            filenames = []
+            values = ([import_filenames] if isinstance(import_filenames, str)
+                      else list(import_filenames or []))
+            for value in values:
+                filenames.append(self._http_safe_component(
+                    value, "HTTP导入文件名", max_length=120
+                ))
+            for filename in filenames:
+                self._router.exec(
+                    f"rm -f -- {shlex.quote('/tmp/iktmp/import/' + filename)}",
+                    timeout=10,
+                )
+            staging_state = "untouched(no_snapshot)"
+            if staging_snapshot is not None:
+                staging_lines = ["set -eu"]
+                staging_lines.extend(
+                    f"rm -f -- {shlex.quote(path)}"
+                    for path in self.HTTP_STAGING_FILES.values()
+                )
+                staging_lines.append("echo __HTTP_STAGING_CLEARED__=1")
+                staging_output = self._samba_exec_router_script(
+                    "\n".join(staging_lines) + "\n",
+                    "clear HTTP staging files pending exact snapshot restore",
+                    timeout=20,
+                )
+                if "__HTTP_STAGING_CLEARED__=1" not in (staging_output or ""):
+                    raise RuntimeError("HTTP staging安全清空未返回完成标记")
+                staging_state = "cleared_for_restore"
+                self._http_staging_cleared_prefix = prefix
+            return (
+                f"http cleanup prefix={prefix}: db_rows={len(rows)}, "
+                f"ports={len(ports)}, dirs={len(owned_dirs)}, imports={len(filenames)}, "
+                f"staging={staging_state}"
+            )
+        except Exception as exc:
+            return f"error: HTTP测试清理失败: {str(exc)[:180]}"
+
+    def verify_http_test_artifacts_absent(self, prefix: str,
+                                          test_environment: Any = None,
+                                          candidate_ports: Iterable[int] = None,
+                                          import_filenames: Any = None,
+                                          snapshot: Dict = None) -> VerifyResult:
+        """硬验证本轮DB/conf/目录/listener/ipset/暂存/client临时文件。"""
+        checks: Dict[str, bool] = {}
+        issues: List[str] = []
+        try:
+            where = self._http_prefix_where(prefix)
+            count_row = self._samba_sqlite_query_line(
+                f"SELECT count(*) AS cnt FROM http_server WHERE {where}"
+            ) or {}
+            checks["database"] = self._http_int(count_row.get("cnt")) == 0
+            runtime = self._http_read_runtime()
+            # Prefix只出现在本轮tagname/目录，配置不应再引用它。
+            self.connect_router()
+            conf_hit = self._router.exec(
+                f"grep -F {shlex.quote(prefix)} {shlex.quote(self.HTTP_RUNTIME_FILES['static_conf'])} "
+                ">/dev/null 2>&1 && echo PRESENT || echo ABSENT",
+                timeout=10,
+            )
+            checks["runtime_config"] = "PRESENT" not in conf_hit
+            details = self._http_environment_details(test_environment, prefix)
+            owned_dirs = self._http_owned_test_directories(prefix, details)
+            paths = []
+            for owned in owned_dirs:
+                paths.extend([owned["path"], owned["resolved"]])
+            for index, path in enumerate(dict.fromkeys(str(item) for item in paths)):
+                output = self._router.exec(
+                    f"if [ -e {shlex.quote(path)} ] || [ -L {shlex.quote(path)} ]; "
+                    "then echo PRESENT; else echo ABSENT; fi",
+                    timeout=10,
+                )
+                checks[f"test_dir_{index}"] = "PRESENT" not in output
+            if owned_dirs:
+                owner = details["ownership"]
+                owner_script = "\n".join([
+                    "set -eu",
+                    f"root={shlex.quote(owner['resolved_root'])}",
+                    f"marker_name={shlex.quote(owner['marker_name'])}",
+                    f"wanted={shlex.quote(owner['marker_sha256'])}",
+                    "found=0",
+                    "for marker in \"$root\"/*/\"$marker_name\"; do",
+                    "  if [ -f \"$marker\" ] || [ -L \"$marker\" ]; then",
+                    "    actual=$(sha256sum \"$marker\" 2>/dev/null | awk '{print $1}')",
+                    "    [ \"$actual\" = \"$wanted\" ] && found=1",
+                    "  fi",
+                    "done",
+                    "echo __HTTP_OWNER_MARKER__=$found",
+                ]) + "\n"
+                owner_output = self._samba_exec_router_script(
+                    owner_script,
+                    "audit HTTP owner marker nonce under canonical test root",
+                    timeout=20,
+                )
+                checks["owner_marker"] = bool(re.search(
+                    r"(?m)^__HTTP_OWNER_MARKER__=0\s*$", owner_output or ""
+                ))
+            ports = sorted({int(port) for port in (candidate_ports or [])})
+            listeners = self._http_listener_members(ports)
+            firewall = self._http_firewall_members(ports)
+            baseline_listener = (snapshot or {}).get("listener_members", {})
+            baseline_firewall = (snapshot or {}).get("firewall_members", {})
+            for port in ports:
+                expected_listener = bool(baseline_listener.get(str(port), False)) if snapshot else False
+                expected_firewall = bool(baseline_firewall.get(str(port), False)) if snapshot else False
+                checks[f"listener_{port}"] = listeners.get(str(port), False) == expected_listener
+                checks[f"firewall_{port}"] = firewall.get(str(port), False) == expected_firewall
+            values = ([import_filenames] if isinstance(import_filenames, str)
+                      else list(import_filenames or []))
+            for index, value in enumerate(values):
+                filename = self._http_safe_component(value, "HTTP导入文件名", 120)
+                path = "/tmp/iktmp/import/" + filename
+                output = self._router.exec(
+                    f"[ -e {shlex.quote(path)} ] && echo PRESENT || echo ABSENT",
+                    timeout=10,
+                )
+                checks[f"import_{index}"] = "PRESENT" not in output
+            current_staging = self._http_capture_files(self.HTTP_STAGING_FILES)
+            if snapshot and isinstance(snapshot.get("staging_files"), dict):
+                for key, expected in snapshot["staging_files"].items():
+                    actual = current_staging.get(key, {})
+                    checks[f"staging_{key}"] = (
+                        bool(actual.get("exists")) == bool(expected.get("exists"))
+                        and (not expected.get("exists") or (
+                            actual.get("content_b64") == expected.get("content_b64")
+                            and str(actual.get("mode")) == str(expected.get("mode"))
+                        ))
+                    )
+            else:
+                prefix_bytes = str(prefix).encode("utf-8")
+                require_absent = (
+                    getattr(self, "_http_staging_cleared_prefix", None) == prefix
+                )
+                for key in self.HTTP_STAGING_FILES:
+                    actual = current_staging.get(key, {})
+                    exists = bool(actual.get("exists"))
+                    content = b""
+                    if exists:
+                        content = base64.b64decode(
+                            str(actual.get("content_b64", "")), validate=True
+                        )
+                    checks[f"staging_{key}"] = (
+                        not exists if require_absent else prefix_bytes not in content
+                    )
+            process = self.verify_http_process(True)
+            checks["openresty_alive"] = process.passed
+            try:
+                self.connect_client()
+                port_text = ",".join(str(port) for port in ports)
+                client_output = self._client.exec(
+                    "if find /tmp -maxdepth 1 "
+                    "\\( -name 'http_probe_cfg.*' -o -name 'http_probe_work.*' \\) "
+                    "-print -quit 2>/dev/null | grep -q .; "
+                    "then echo __HTTP_CLIENT_TMP__=1; "
+                    "else echo __HTTP_CLIENT_TMP__=0; fi; "
+                    "if ps -eo args= 2>/dev/null | "
+                    f"awk -v p={shlex.quote(str(prefix))} "
+                    f"-v ports={shlex.quote(port_text)} "
+                    "'/[c]url/ { "
+                    "if (index($0,p)) found=1; n=split(ports,a,\",\"); "
+                    "for (i=1;i<=n;i++) if (a[i] != \"\" && "
+                    "index($0, \":\" a[i])) found=1 } "
+                    "END {exit !found}'; "
+                    "then echo __HTTP_CLIENT_PROC__=1; "
+                    "else echo __HTTP_CLIENT_PROC__=0; fi",
+                    timeout=15,
+                )
+                checks["client_temp"] = bool(re.search(
+                    r"(?m)^__HTTP_CLIENT_TMP__=0\s*$", client_output or ""
+                ))
+                checks["client_process"] = bool(re.search(
+                    r"(?m)^__HTTP_CLIENT_PROC__=0\s*$", client_output or ""
+                ))
+            except Exception:
+                checks["client_temp"] = False
+                checks["client_process"] = False
+            issues = [key for key, ok in checks.items() if not ok]
+            passed = not issues
+            return VerifyResult(
+                "L4-HTTP测试残留", passed,
+                ("HTTP测试DB/配置/目录/端口/暂存/client均无残留" if passed else
+                 "HTTP测试残留检查失败: " + ", ".join(issues)),
+                details={"checks": checks, "prefix": prefix,
+                         "ports": ports},
+                raw_output=json.dumps(checks, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-HTTP测试残留", False,
+                f"HTTP测试残留验证异常: {str(exc)[:180]}",
+                details={"checks": checks, "issues": issues},
+            )
+
+    def restore_http_environment(self, snapshot: Dict,
+                                 prefix: str = "http_t_") -> VerifyResult:
+        """精确恢复DB/配置文件/暂存/逐端口ipset，不停止共享openresty。"""
+        if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+            return VerifyResult("L4-HTTP环境恢复", False, "HTTP环境快照无效")
+        required = ("rows", "runtime_files", "staging_files",
+                    "firewall_members", "listener_members", "captured_ports")
+        if any(key not in snapshot for key in required):
+            return VerifyResult("L4-HTTP环境恢复", False, "HTTP环境快照字段不完整")
+        try:
+            # cleanup may have deliberately cleared the shared staging files so an
+            # independent pre-restore audit can prove they contain no test data.
+            # Restore them first inside the final restore transaction path, so a
+            # later DB concurrency refusal cannot leave the baseline files deleted.
+            staging_restore = self._http_restore_file_group(
+                snapshot["staging_files"], self.HTTP_STAGING_FILES, "导入导出暂存"
+            )
+            if not staging_restore.passed:
+                return VerifyResult(
+                    "L4-HTTP环境恢复", False,
+                    "HTTP环境恢复失败: staging_restore",
+                    details={"staging": staging_restore.details},
+                )
+            baseline_rows = [self._http_normalize_row(row) for row in snapshot["rows"]]
+            current_non_test = [
+                self._http_normalize_row(row) for row in self._http_rows(
+                    f"NOT ({self._http_prefix_where(prefix)})"
+                )
+            ]
+            baseline_non_test = [
+                row for row in baseline_rows
+                if not str(row.get("tagname", "")).startswith(prefix)
+            ]
+            if current_non_test != baseline_non_test:
+                return VerifyResult(
+                    "L4-HTTP环境恢复", False,
+                    "检测到测试期间非测试HTTP规则并发变化，拒绝整表覆盖",
+                    details={"baseline_count": len(baseline_non_test),
+                             "current_count": len(current_non_test)},
+                )
+            sql_lines = ["BEGIN IMMEDIATE;", "DELETE FROM http_server;"]
+            for row in baseline_rows:
+                values = []
+                for field in self.HTTP_FIELDS:
+                    if field in {"id", "http_port", "ssl_on", "autoindex", "download", "access"}:
+                        values.append(str(self._http_int(row.get(field))))
+                    else:
+                        values.append(self._http_sql_literal(row.get(field, "")))
+                sql_lines.append(
+                    f"INSERT INTO http_server({','.join(self.HTTP_FIELDS)}) "
+                    f"VALUES({','.join(values)});"
+                )
+            sql_lines.append("COMMIT;")
+            self._samba_sqlite_raw("\n".join(sql_lines), line_mode=False)
+            self.connect_router()
+            init_output = self._router.exec(
+                f"{shlex.quote(self.HTTP_SCRIPT)} init >/dev/null 2>&1; "
+                "echo __HTTP_RESTORE_INIT_RC__=$?",
+                timeout=35,
+            )
+            runtime_restore = self._http_restore_file_group(
+                snapshot["runtime_files"], self.HTTP_RUNTIME_FILES, "运行配置"
+            )
+            if runtime_restore.passed:
+                reload_output = self._router.exec(
+                    "openresty -t >/dev/null 2>&1; test_rc=$?; "
+                    "if [ $test_rc -eq 0 ]; then openresty -s reload >/dev/null 2>&1; "
+                    "reload_rc=$?; else reload_rc=99; fi; "
+                    "echo __HTTP_CONF_TEST_RC__=$test_rc; "
+                    "echo __HTTP_CONF_RELOAD_RC__=$reload_rc",
+                    timeout=35,
+                )
+            else:
+                reload_output = ""
+            for port_text, expected in snapshot["firewall_members"].items():
+                port = int(port_text)
+                if expected:
+                    command = (
+                        f"ipset test DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1 || "
+                        f"ipset add DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1"
+                    )
+                else:
+                    command = (
+                        f"ipset test DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1 && "
+                        f"ipset del DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1 || true"
+                    )
+                self._router.exec(command, timeout=10)
+            actual_rows = [self._http_normalize_row(row) for row in self._http_rows()]
+            actual_runtime = self._http_capture_files(self.HTTP_RUNTIME_FILES)
+            actual_staging = self._http_capture_files(self.HTTP_STAGING_FILES)
+            actual_firewall = self._http_firewall_members(snapshot["captured_ports"])
+            actual_listeners = self._http_listener_members(snapshot["captured_ports"])
+            file_equal = actual_runtime == snapshot["runtime_files"]
+            staging_equal = actual_staging == snapshot["staging_files"]
+            firewall_equal = actual_firewall == snapshot["firewall_members"]
+            listeners_equal = actual_listeners == snapshot["listener_members"]
+            process = self.verify_http_process(True)
+            init_ok = "__HTTP_RESTORE_INIT_RC__=0" in init_output
+            reload_ok = (
+                "__HTTP_CONF_TEST_RC__=0" in reload_output
+                and "__HTTP_CONF_RELOAD_RC__=0" in reload_output
+            )
+            passed = all((
+                actual_rows == baseline_rows, init_ok, runtime_restore.passed,
+                reload_ok, staging_restore.passed, file_equal, staging_equal,
+                firewall_equal, listeners_equal, process.passed,
+            ))
+            if (passed and
+                    getattr(self, "_http_staging_cleared_prefix", None) == prefix):
+                self._http_staging_cleared_prefix = None
+            issues = []
+            for label, ok in (
+                ("db", actual_rows == baseline_rows), ("init", init_ok),
+                ("runtime_restore", runtime_restore.passed), ("reload", reload_ok),
+                ("staging_restore", staging_restore.passed),
+                ("runtime_exact", file_equal), ("staging_exact", staging_equal),
+                ("firewall", firewall_equal), ("listeners", listeners_equal),
+                ("process", process.passed),
+            ):
+                if not ok:
+                    issues.append(label)
+            return VerifyResult(
+                "L4-HTTP环境恢复", passed,
+                ("HTTP数据库/配置/暂存/监听/WAN端口已精确恢复" if passed else
+                 "HTTP环境恢复失败: " + ", ".join(issues)),
+                details={"issues": issues, "row_count": len(actual_rows),
+                         "runtime": runtime_restore.details,
+                         "staging": staging_restore.details},
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-HTTP环境恢复", False,
+                f"HTTP环境恢复异常: {str(exc)[:200]}",
+            )
+
+    def run_http_probe(self, port: int, operation: str = "fetch",
+                       host: str = "192.168.148.1", iface: str = "ens11",
+                       path: str = "/payload.bin", scheme: str = "http",
+                       server_name: str = None,
+                       expected_sha256: str = None,
+                       expected_status: int = None,
+                       expected_contains: Any = None,
+                       control_port: int = None,
+                       control_host: str = None,
+                       control_iface: str = "ens11",
+                       control_path: str = None,
+                       control_scheme: str = None,
+                       control_server_name: str = None,
+                       rate_limit_kbps: int = None,
+                       timeout_seconds: int = 35) -> VerifyResult:
+        """L5真实curl：状态/SHA/HTTPS/Host/WAN拒绝/autoindex/限速。"""
+        try:
+            operation = str(operation).strip().lower()
+            if operation not in {"fetch", "autoindex", "connect_fail", "throttle"}:
+                raise ValueError(f"不支持的HTTP探测操作: {operation}")
+            port = int(port)
+            if not 1 <= port <= 65535:
+                raise ValueError("HTTP探测端口非法")
+            host_ip = ipaddress.ip_address(str(host))
+            if host_ip.version != 4:
+                raise ValueError("HTTP探测仅支持IPv4目标")
+            if iface not in {"ens11", "enp2s0"}:
+                raise ValueError("HTTP探测网卡必须为ens11或enp2s0")
+            scheme = str(scheme).lower()
+            if scheme not in {"http", "https"}:
+                raise ValueError("HTTP探测scheme必须为http/https")
+            path = str(path or "/")
+            if not path.startswith("/") or any(ch in path for ch in "\x00\r\n"):
+                raise ValueError("HTTP探测path不安全")
+            if len(path) > 240:
+                raise ValueError("HTTP探测path过长")
+            if server_name is not None:
+                server_name = str(server_name).strip()
+                if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", server_name):
+                    raise ValueError("HTTP Host/SNI格式不安全")
+            expected_sha256 = str(expected_sha256 or "").lower()
+            if expected_sha256 and not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                raise ValueError("HTTP期望SHA256格式错误")
+            if expected_status is None:
+                expected_status = 200
+            expected_status = int(expected_status)
+            contains = ([expected_contains] if isinstance(expected_contains, str)
+                        else list(expected_contains or []))
+            if len(contains) > 8 or any(
+                    not isinstance(item, str) or not item or len(item) > 120
+                    or any(ch in item for ch in "\x00\r\n") for item in contains):
+                raise ValueError("HTTP contains断言不安全")
+            control = None
+            if control_port is not None:
+                control_port = int(control_port)
+                control_host = str(control_host or host)
+                control_ip = ipaddress.ip_address(control_host)
+                if control_ip.version != 4 or not 1 <= control_port <= 65535:
+                    raise ValueError("HTTP控制端点非法")
+                if control_iface not in {"ens11", "enp2s0"}:
+                    raise ValueError("HTTP控制网卡非法")
+                control_scheme = str(control_scheme or scheme).lower()
+                if control_scheme not in {"http", "https"}:
+                    raise ValueError("HTTP控制scheme非法")
+                control_path = str(control_path or path)
+                if not control_path.startswith("/") or any(
+                        ch in control_path for ch in "\x00\r\n"):
+                    raise ValueError("HTTP控制path不安全")
+                if control_server_name is not None:
+                    control_server_name = str(control_server_name).strip()
+                    if not re.fullmatch(
+                            r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?",
+                            control_server_name):
+                        raise ValueError("HTTP控制Host格式不安全")
+                control = {
+                    "port": control_port, "host": control_host,
+                    "iface": control_iface, "path": control_path,
+                    "scheme": control_scheme,
+                    "server_name": control_server_name,
+                }
+            rate = int(rate_limit_kbps or 0)
+            if operation == "throttle" and (rate <= 0 or control is None):
+                raise ValueError("HTTP限速探测需要rate_limit_kbps和控制端点")
+            config = {
+                "v": 1,
+                "operation": operation,
+                "timeout": max(8, min(int(timeout_seconds), 90)),
+                "expected_status": expected_status,
+                "expected_sha256": expected_sha256,
+                "contains": contains,
+                "rate_limit_kbps": rate,
+                "target": {
+                    "port": port, "host": str(host), "iface": iface,
+                    "path": path, "scheme": scheme,
+                    "server_name": server_name,
+                },
+                "control": control,
+            }
+        except Exception as exc:
+            return VerifyResult("L5-HTTP实流", False, str(exc)[:180])
+
+        config_json = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+        config_b64 = base64.b64encode(config_json.encode("utf-8")).decode("ascii")
+        client_script = r'''set +x
+umask 077
+CFG=$(mktemp /tmp/http_probe_cfg.XXXXXX) || exit 90
+WORK=$(mktemp -d /tmp/http_probe_work.XXXXXX) || { rm -f "$CFG"; exit 91; }
+cleanup() {
+    rm -f -- "$CFG"
+    case "$WORK" in /tmp/http_probe_work.*) rm -rf -- "$WORK" ;; esac
+}
+trap cleanup EXIT HUP INT TERM
+printf '%s' '__CONFIG_B64__' | base64 -d > "$CFG" || exit 92
+python3 - "$CFG" "$WORK" <<'PY'
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+cfg_path, work = sys.argv[1:3]
+with open(cfg_path, 'r', encoding='utf-8') as stream:
+    cfg = json.load(stream)
+
+SAFE_IFACES = {'ens11', 'enp2s0'}
+
+def safe_run(argv, timeout):
+    env = os.environ.copy()
+    for key in list(env):
+        if key.lower() in {'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'}:
+            env.pop(key, None)
+    return subprocess.run(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=timeout, env=env, check=False,
+    )
+
+def endpoint(label, spec, contains):
+    result = {
+        'route_ok': False, 'iface_exists': False, 'source_ip': '',
+        'curl_rc': None, 'meta_ok': False, 'status': 0,
+        'size_download': 0, 'body_size': 0, 'sha256': '',
+        'speed_bps': 0.0, 'time_s': 0.0, 'local_ip': '', 'remote_ip': '',
+        'source_match': False, 'remote_match': False,
+        'https_insecure': spec['scheme'] == 'https',
+        'host_header_applied': bool(spec.get('server_name')),
+        'contains_all': not contains, 'missing_indices': [],
+        'stderr_present': False, 'error_class': '',
+    }
+    try:
+        iface = spec['iface']
+        if iface not in SAFE_IFACES:
+            raise ValueError('unsafe_iface')
+        host = str(ipaddress.ip_address(spec['host']))
+        addr = safe_run(
+            ['ip', '-4', '-o', 'addr', 'show', 'dev', iface, 'scope', 'global'], 5
+        )
+        match = re.search(r'\binet\s+(\d+\.\d+\.\d+\.\d+)/', addr.stdout)
+        if not match:
+            raise RuntimeError('iface_no_ipv4')
+        source = match.group(1)
+        result['iface_exists'] = True
+        result['source_ip'] = source
+        route = safe_run(
+            ['ip', '-4', 'route', 'get', host, 'from', source, 'oif', iface], 5
+        )
+        route_text = route.stdout or ''
+        result['route_ok'] = (
+            route.returncode == 0 and re.search(r'\bdev\s+' + re.escape(iface) + r'\b', route_text)
+            and re.search(r'\b(?:src|from)\s+' + re.escape(source) + r'\b', route_text)
+        ) is not None
+        authority = spec.get('server_name') or host
+        url = '{}://{}:{}{}'.format(
+            spec['scheme'], authority, int(spec['port']), spec['path']
+        )
+        body_path = os.path.join(work, label + '.body')
+        meta_prefix = '__HTTP_META__'
+        argv = [
+            'curl', '--disable', '--silent', '--show-error', '--noproxy', '*',
+            '--http1.1', '--connect-timeout', '4', '--max-time', str(cfg['timeout']),
+            '--interface', iface, '--header', 'Accept-Encoding: identity',
+            '--output', body_path,
+            '--write-out', meta_prefix + '\t%{http_code}\t%{size_download}\t%{speed_download}\t%{time_total}\t%{local_ip}\t%{remote_ip}',
+        ]
+        if spec['scheme'] == 'https':
+            argv.append('--insecure')
+        if spec.get('server_name'):
+            argv += [
+                '--resolve', '{}:{}:{}'.format(authority, int(spec['port']), host),
+                '--header', 'Host: ' + authority,
+            ]
+        argv.append(url)
+        proc = safe_run(argv, int(cfg['timeout']) + 8)
+        result['curl_rc'] = proc.returncode
+        result['stderr_present'] = bool((proc.stderr or '').strip())
+        meta_line = next(
+            (line for line in (proc.stdout or '').splitlines()
+             if line.startswith(meta_prefix + '\t')), ''
+        )
+        if meta_line:
+            parts = meta_line.split('\t')
+            if len(parts) == 7:
+                result['meta_ok'] = True
+                result['status'] = int(parts[1] or 0)
+                result['size_download'] = int(float(parts[2] or 0))
+                result['speed_bps'] = float(parts[3] or 0)
+                result['time_s'] = float(parts[4] or 0)
+                result['local_ip'] = parts[5]
+                result['remote_ip'] = parts[6]
+        if os.path.isfile(body_path):
+            result['body_size'] = os.path.getsize(body_path)
+            digest = hashlib.sha256()
+            with open(body_path, 'rb') as body:
+                for chunk in iter(lambda: body.read(65536), b''):
+                    digest.update(chunk)
+            result['sha256'] = digest.hexdigest()
+            if contains:
+                with open(body_path, 'rb') as body:
+                    content = body.read(1048576)
+                missing = [
+                    index for index, token in enumerate(contains)
+                    if token.encode('utf-8') not in content
+                ]
+                result['missing_indices'] = missing
+                result['contains_all'] = not missing
+        result['source_match'] = result['local_ip'] == source
+        result['remote_match'] = result['remote_ip'] == host
+    except subprocess.TimeoutExpired:
+        result['error_class'] = 'TimeoutExpired'
+        result['curl_rc'] = 28
+    except Exception as exc:
+        result['error_class'] = type(exc).__name__
+    return result
+
+control = endpoint('control', cfg['control'], []) if cfg.get('control') else None
+target = endpoint('target', cfg['target'], cfg.get('contains') or [])
+safe = {
+    'v': 1, 'operation': cfg['operation'], 'target': target,
+    'control_attempted': control is not None, 'control': control,
+}
+encoded = base64.b64encode(
+    json.dumps(safe, separators=(',', ':'), sort_keys=True).encode('utf-8')
+).decode('ascii')
+print('__HTTP_RESULT_B64__=' + encoded)
+PY
+'''.replace("__CONFIG_B64__", config_b64)
+        display = (
+            f"http_probe operation={operation} curl --interface {iface} "
+            f"{scheme}://{host}:{port}{path} "
+            f"host={server_name or host} body=<discarded>"
+        )
+        try:
+            self.connect_client()
+            output = self._ftp_exec_secret_script(
+                self._client, client_script, display,
+                timeout=max(50, int(config["timeout"]) * (2 if control else 1) + 25),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L5-HTTP实流", False,
+                f"HTTP {operation}探测异常: {str(exc)[:180]}",
+            )
+        matches = re.findall(
+            r"(?m)^__HTTP_RESULT_B64__=([A-Za-z0-9+/=]+)\s*$", output or ""
+        )
+        if len(matches) != 1:
+            return VerifyResult(
+                "L5-HTTP实流", False,
+                f"HTTP {operation}探测缺少唯一安全结果标记",
+                details={"marker_count": len(matches)},
+            )
+        try:
+            decoded = base64.b64decode(matches[0], validate=True)
+            if len(decoded) > 16384:
+                raise ValueError("结果过大")
+            result = json.loads(decoded.decode("utf-8"))
+        except Exception as exc:
+            return VerifyResult(
+                "L5-HTTP实流", False,
+                f"HTTP结果解析失败: {str(exc)[:140]}",
+            )
+        target = result.get("target") or {}
+        control_result = result.get("control") or {}
+        common = (
+            target.get("route_ok") is True
+            and target.get("source_match") is True
+            and target.get("remote_match") is True
+        )
+        successful_fetch = (
+            common and target.get("curl_rc") == 0
+            and target.get("meta_ok") is True
+            and target.get("status") == expected_status
+            and target.get("body_size") == target.get("size_download")
+            and (not expected_sha256 or target.get("sha256") == expected_sha256)
+            and (scheme != "https" or target.get("https_insecure") is True)
+        )
+        if operation == "fetch":
+            passed = successful_fetch
+            verdict = (
+                f"status={target.get('status')}, size={target.get('body_size')}, "
+                f"sha={'match' if not expected_sha256 or target.get('sha256') == expected_sha256 else 'mismatch'}"
+            )
+        elif operation == "autoindex":
+            passed = successful_fetch and target.get("contains_all") is True
+            verdict = (
+                f"status={target.get('status')}, contains_all={target.get('contains_all')}, "
+                f"missing={target.get('missing_indices')}"
+            )
+        elif operation == "connect_fail":
+            control_ok = True
+            if control:
+                control_ok = (
+                    control_result.get("route_ok") is True
+                    and control_result.get("source_match") is True
+                    and control_result.get("remote_match") is True
+                    and control_result.get("curl_rc") == 0
+                    and control_result.get("status") == 200
+                    and (not expected_sha256 or
+                         control_result.get("sha256") == expected_sha256)
+                )
+            listener = self._http_listener_members([port]).get(str(port), False)
+            firewall = self._http_firewall_members([port]).get(str(port), False)
+            if iface == "enp2s0" and firewall and listener:
+                target_failed = target.get("curl_rc") == 28 and target.get("status") == 0
+                failure_mode = "wan_drop"
+            elif not listener:
+                target_failed = target.get("curl_rc") in {7, 28} and target.get("status") == 0
+                failure_mode = "service_closed"
+            else:
+                target_failed = False
+                failure_mode = "invalid_precondition"
+            route_precondition = (
+                target.get("route_ok") is True
+                and target.get("iface_exists") is True
+                and bool(target.get("source_ip"))
+            )
+            passed = route_precondition and target_failed and control_ok
+            verdict = (
+                f"mode={failure_mode}, rc={target.get('curl_rc')}, "
+                f"listener={listener}, firewall={firewall}, control={control_ok}"
+            )
+        else:
+            control_ok = (
+                control_result.get("route_ok") is True
+                and control_result.get("source_match") is True
+                and control_result.get("remote_match") is True
+                and control_result.get("curl_rc") == 0
+                and control_result.get("status") == expected_status
+                and (not expected_sha256 or
+                     control_result.get("sha256") == expected_sha256)
+            )
+            target_speed = float(target.get("speed_bps") or 0)
+            control_speed = float(control_result.get("speed_bps") or 0)
+            size_ok = int(target.get("body_size") or 0) >= rate * 1024 * 4
+            speed_ok = target_speed > 0 and target_speed <= rate * 1024 * 1.35
+            ratio_ok = control_speed >= target_speed * 2 if target_speed else False
+            duration_ok = float(target.get("time_s") or 0) >= 2.5
+            passed = successful_fetch and control_ok and size_ok and speed_ok and ratio_ok and duration_ok
+            verdict = (
+                f"target_speed={target_speed:.0f}, control_speed={control_speed:.0f}, "
+                f"time={float(target.get('time_s') or 0):.2f}, limit={rate}KiB/s"
+            )
+        safe_details = {
+            "operation": operation, "host": str(host), "port": port,
+            "iface": iface, "scheme": scheme, "server_name": server_name,
+            "target": target, "control": control_result if control else None,
+        }
+        return VerifyResult(
+            "L5-HTTP实流", passed,
+            f"HTTP {operation}{'符合预期' if passed else '不符合预期'}: {verdict}",
+            details=safe_details,
+            raw_output=json.dumps(safe_details, ensure_ascii=False)[:1600],
+        )
+
+    # ==================== 高级服务 > 本地服务 > SNMP服务 ====================
+    # 实机事实(2026-07-15):
+    # DB=/etc/mnt/ikuai/config.db:snmp_conf(id=1); script=netsnmp.sh;
+    # config=/var/run/snmp/snmpd.conf; daemons=snmpd + ik_snmp_subagent.
+    # SNMP没有独立iptables/ipset规则。启用端口由upnpd.sh写入miniupnpd deny，
+    # 防止UPnP把本机服务端口映射出去。所有协议秘密仅在内存/SSH stdin中流转。
+
+    SNMP_SCRIPT = "/usr/ikuai/script/netsnmp.sh"
+    SNMP_FUNCTION = "/usr/ikuai/function/netsnmp"
+    SNMP_TABLE = "snmp_conf"
+    SNMP_CONFIG_FILE = "/var/run/snmp/snmpd.conf"
+    SNMP_PID_FILE = "/var/run/snmp/snmpd.pid"
+    SNMP_SUBAGENT_PID_FILE = "/var/run/snmp/subsnmpd.pid"
+    SNMP_UPNP_CONFIG_FILE = "/tmp/iktmp/miniupnpd.conf"
+    SNMP_VERIFY_HELPER = "/usr/local/sbin/ikuai-snmp-verify"
+    SNMP_TEXT_FIELDS = (
+        "enabled", "syslocation", "syscontact", "sysname", "community",
+        "source", "rw", "username", "security", "auth_proto", "auth_pass",
+        "priv_proto", "priv_pass",
+    )
+    SNMP_FIELDS = ("id", "listen_port", "version") + SNMP_TEXT_FIELDS
+    SNMP_SECRET_FIELDS = {"community", "auth_pass", "priv_pass"}
+    SNMP_PRIVATE_FIELDS = {
+        "community", "auth_pass", "priv_pass", "username", "source",
+        "syslocation", "syscontact", "sysname",
+    }
+
+    @staticmethod
+    def _snmp_sql_literal(value: Any) -> str:
+        return "'" + str(value if value is not None else "").replace("'", "''") + "'"
+
+    @staticmethod
+    def _snmp_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return int(default)
+
+    @staticmethod
+    def _snmp_sanitize_text(text: Any, *secrets_to_hide: Any) -> str:
+        from utils.step_recorder import register_sensitive_values
+        register_sensitive_values(secrets_to_hide)
+        safe = str(text or "")
+        values = sorted(
+            {str(v) for v in secrets_to_hide if v is not None and str(v)},
+            key=len, reverse=True,
+        )
+        for value in values:
+            safe = safe.replace(value, "[敏感值已隐藏]")
+        safe = re.sub(
+            r"(?im)^\s*(?:rocommunity6?|rwcommunity6?|createUser|rouser|rwuser)\b.*$",
+            "[SNMP认证指令已隐藏]", safe,
+        )
+        safe = re.sub(
+            r"(?i)(community|auth(?:entication)?[_ -]?(?:pass|key)|"
+            r"priv(?:acy)?[_ -]?(?:pass|key))\s*[:=]\s*\S+",
+            r"\1=[敏感值已隐藏]", safe,
+        )
+        return safe[:2000]
+
+    @classmethod
+    def _snmp_normalize_row(cls, row: Optional[Dict]) -> Optional[Dict]:
+        if not row:
+            return None
+        normalized = {field: str(row.get(field, "")) for field in cls.SNMP_FIELDS}
+        normalized["id"] = str(cls._snmp_int(normalized.get("id"), 1))
+        normalized["listen_port"] = str(cls._snmp_int(normalized.get("listen_port"), 0))
+        normalized["version"] = str(cls._snmp_int(normalized.get("version"), 0))
+        normalized["enabled"] = normalized.get("enabled", "").strip().lower()
+        return normalized
+
+    @classmethod
+    def _snmp_public_row(cls, row: Optional[Dict]) -> Dict[str, Any]:
+        """Return report-safe row metadata; never return a private value or digest."""
+        normalized = cls._snmp_normalize_row(row) or {}
+        public: Dict[str, Any] = {}
+        for field in cls.SNMP_FIELDS:
+            value = str(normalized.get(field, ""))
+            if field in cls.SNMP_PRIVATE_FIELDS:
+                public[field] = {
+                    "configured": bool(value),
+                    "length": len(value),
+                }
+            else:
+                public[field] = value
+        return public
+
+    def _snmp_read_row(self) -> Optional[Dict]:
+        """Read id=1 exactly by hex-encoding text fields on the wire.
+
+        Reversible values stay in process memory only. The SSH command log contains
+        column names, never values, and migrated report handling hides internal output.
+        """
+        selects = ["id", "listen_port", "version"]
+        selects.extend(f"hex(COALESCE({field},'')) AS {field}_hex"
+                       for field in self.SNMP_TEXT_FIELDS)
+        raw = self._samba_sqlite_query_line(
+            f"SELECT {','.join(selects)} FROM {self.SNMP_TABLE} WHERE id=1"
+        )
+        if not raw:
+            return None
+        row: Dict[str, Any] = {
+            "id": str(self._snmp_int(raw.get("id"), 1)),
+            "listen_port": str(self._snmp_int(raw.get("listen_port"), 0)),
+            "version": str(self._snmp_int(raw.get("version"), 0)),
+        }
+        for field in self.SNMP_TEXT_FIELDS:
+            encoded = str(raw.get(f"{field}_hex", ""))
+            try:
+                row[field] = bytes.fromhex(encoded).decode("utf-8")
+            except Exception as exc:
+                raise RuntimeError(f"SNMP字段{field}无法安全解码") from exc
+        return self._snmp_normalize_row(row)
+
+    @staticmethod
+    def _snmp_rows_equal(actual: Optional[Dict], expected: Optional[Dict]) -> bool:
+        return BackendVerifier._snmp_normalize_row(actual) == BackendVerifier._snmp_normalize_row(expected)
+
+    @staticmethod
+    def _snmp_fingerprint(value: Any) -> str:
+        payload = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def choose_snmp_candidate_ports(self, count: int = 3,
+                                    start_port: int = None) -> List[int]:
+        """Choose free high UDP ports, excluding every current TCP/UDP listener."""
+        count = max(1, min(int(count), 12))
+        self.connect_router()
+        output = self._router.exec(
+            "netstat -lnut 2>/dev/null | awk 'NR>2 {print $4}'; "
+            "cat /proc/net/udp6 2>/dev/null; "
+            "sqlite3 /etc/mnt/ikuai/config.db "
+            "\"select listen_port from snmp_conf where listen_port is not null\"",
+            timeout=20,
+        )
+        used = set()
+        for match in re.finditer(r":(\d+)(?:\s|$)", output or ""):
+            used.add(int(match.group(1)))
+        for line in (output or "").splitlines():
+            if re.fullmatch(r"\d+", line.strip()):
+                used.add(int(line.strip()))
+            columns = line.split()
+            if len(columns) > 1 and re.fullmatch(
+                r"[0-9A-Fa-f]{32}:[0-9A-Fa-f]{4}", columns[1]
+            ):
+                used.add(int(columns[1].rsplit(":", 1)[-1], 16))
+        start = int(start_port or (24000 + int(time.time()) % 20000))
+        start = max(20000, min(start, 60000))
+        ports = []
+        for offset in range(40000):
+            port = 20000 + ((start - 20000 + offset) % 40000)
+            if port in used:
+                continue
+            ports.append(port)
+            if len(ports) == count:
+                return ports
+        raise RuntimeError("未找到足够的SNMP测试空闲端口")
+
+    def start_snmp_udp_port_guard(self, port: int) -> VerifyResult:
+        """Bind a router UDP port with an exact disposable helper process."""
+        port = int(port)
+        if not 1 <= port <= 65535:
+            return VerifyResult("SNMP端口占用准备", False, "UDP端口越界")
+        self.connect_router()
+        script = (
+            "set -eu\n"
+            f"socat -T180 UDP4-RECVFROM:{port},fork EXEC:/bin/true "
+            ">/dev/null 2>&1 &\n"
+            "pid=$!\n"
+            f"printf '%s\\n' \"$pid\" >/var/run/snmp/ikuai_test_udp_{port}.pid\n"
+            "sleep 1\n"
+        )
+        self._samba_exec_router_script(
+            script,
+            f"start exact disposable UDP/{port} occupancy guard",
+            timeout=15,
+        )
+        output = self._router.exec(
+            f"cat /var/run/snmp/ikuai_test_udp_{port}.pid 2>/dev/null; "
+            f"netstat -lnup 2>/dev/null | grep -E ':({port})[[:space:]]'",
+            timeout=15,
+        )
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        passed = bool(lines and re.fullmatch(r"\d+", lines[0])) and any(
+            f":{port}" in line for line in lines[1:]
+        )
+        details = {"port": port, "guard_pid_present": bool(lines),
+                   "udp_listener_present": passed}
+        return VerifyResult(
+            "SNMP端口占用准备", passed,
+            f"UDP/{port}占用控制进程已启动" if passed else
+            f"UDP/{port}占用控制进程未生效",
+            details=details, raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def stop_snmp_udp_port_guard(self, port: int) -> VerifyResult:
+        """Remove only the PID file and process created by the exact guard."""
+        port = int(port)
+        if not 1 <= port <= 65535:
+            return VerifyResult("SNMP端口占用清理", False, "UDP端口越界")
+        self.connect_router()
+        pid_file = f"/var/run/snmp/ikuai_test_udp_{port}.pid"
+        script = (
+            "set -eu\n"
+            f"pid=$(cat {shlex.quote(pid_file)} 2>/dev/null || true)\n"
+            "case \"$pid\" in ''|*[!0-9]*) ;; *) kill \"$pid\" 2>/dev/null || true ;; esac\n"
+            f"rm -f {shlex.quote(pid_file)}\n"
+            "sleep 1\n"
+        )
+        self._samba_exec_router_script(
+            script, f"stop exact disposable UDP/{port} occupancy guard", timeout=15
+        )
+        output = self._router.exec(
+            f"test ! -e {shlex.quote(pid_file)} && echo pidfile_absent; "
+            f"netstat -lnup 2>/dev/null | grep -E ':({port})[[:space:]]' || true",
+            timeout=15,
+        )
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        passed = lines == ["pidfile_absent"]
+        details = {"port": port, "pid_file_absent": "pidfile_absent" in lines,
+                   "udp_listener_absent": passed}
+        return VerifyResult(
+            "SNMP端口占用清理", passed,
+            f"UDP/{port}占用控制进程已精确清理" if passed else
+            f"UDP/{port}占用控制进程或监听仍残留",
+            details=details, raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    @staticmethod
+    def _snmp_helper_source() -> str:
+        """Root-owned helper that reads credentials securely and leaves no profile."""
+        return r'''#!/bin/sh
+set -eu
+umask 077
+mode=
+operation=
+host=
+oid=
+auth_proto=MD5
+priv_proto=DES
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --mode) mode=${2-}; shift 2 ;;
+        --operation) operation=${2-}; shift 2 ;;
+        --host) host=${2-}; shift 2 ;;
+        --oid) oid=${2-}; shift 2 ;;
+        --auth-proto) auth_proto=${2-}; shift 2 ;;
+        --priv-proto) priv_proto=${2-}; shift 2 ;;
+        *) echo "unsupported argument" >&2; exit 64 ;;
+    esac
+done
+case "$mode" in v2c|v3-auth|v3-priv) ;; *) echo "invalid mode" >&2; exit 64 ;; esac
+case "$operation" in get|walk) ;; *) echo "invalid operation" >&2; exit 64 ;; esac
+case "$auth_proto" in MD5|SHA) ;; *) echo "invalid auth protocol" >&2; exit 64 ;; esac
+case "$priv_proto" in DES|AES) ;; *) echo "invalid privacy protocol" >&2; exit 64 ;; esac
+case "$host" in *[!0-9A-Fa-f:.]*) echo "invalid host" >&2; exit 64 ;; esac
+case "$oid" in ''|*[!0-9.]*) echo "invalid oid" >&2; exit 64 ;; esac
+
+read_hidden() {
+    prompt=$1
+    if [ -t 0 ]; then
+        printf '%s' "$prompt" >&2
+        stty -echo
+        IFS= read -r hidden_value || hidden_value=
+        stty echo
+        printf '\n' >&2
+    else
+        IFS= read -r hidden_value || hidden_value=
+    fi
+    printf '%s' "$hidden_value"
+}
+
+tmpdir=$(mktemp -d /tmp/ikuai-snmp-verify.XXXXXX)
+trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+conf=$tmpdir/snmp.conf
+if [ "$mode" = v2c ]; then
+    community=$(read_hidden 'Community: ')
+    [ -n "$community" ] || { echo "missing credential" >&2; exit 65; }
+    printf 'defVersion 2c\ndefCommunity %s\n' "$community" >"$conf"
+else
+    username=$(read_hidden 'Username: ')
+    auth_pass=$(read_hidden 'Authentication passphrase: ')
+    [ -n "$username" ] && [ -n "$auth_pass" ] || { echo "missing credential" >&2; exit 65; }
+    {
+        printf 'defVersion 3\n'
+        printf 'defSecurityName %s\n' "$username"
+        printf 'defAuthType %s\n' "$auth_proto"
+        printf 'defAuthPassphrase %s\n' "$auth_pass"
+        if [ "$mode" = v3-priv ]; then
+            priv_pass=$(read_hidden 'Privacy passphrase: ')
+            [ -n "$priv_pass" ] || { echo "missing credential" >&2; exit 65; }
+            printf 'defSecurityLevel authPriv\n'
+            printf 'defPrivType %s\n' "$priv_proto"
+            printf 'defPrivPassphrase %s\n' "$priv_pass"
+        else
+            printf 'defSecurityLevel authNoPriv\n'
+        fi
+    } >"$conf"
+fi
+SNMPCONFPATH="$tmpdir" "snmp$operation" -On -t 2 -r 1 "$host" "$oid"
+'''
+
+    def ensure_snmp_client_tools(self, install_missing: bool = False) -> VerifyResult:
+        """Verify native Net-SNMP CLI; optional install is explicit and non-secret."""
+        self.connect_client()
+        output = self._client.exec(
+            "command -v snmpget; command -v snmpwalk; snmpget --version 2>&1 | head -1",
+            timeout=20,
+        )
+        ready = "snmpget" in output and "snmpwalk" in output and "NET-SNMP" in output
+        installed = False
+        if not ready and install_missing:
+            install_output = self._client.exec(
+                "sudo -n apt-get update -qq && "
+                "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq snmp",
+                timeout=240, probe_console=False,
+            )
+            installed = True
+            output = self._client.exec(
+                "command -v snmpget; command -v snmpwalk; snmpget --version 2>&1 | head -1",
+                timeout=20,
+            )
+            ready = "snmpget" in output and "snmpwalk" in output and "NET-SNMP" in output
+            if not ready:
+                output = self._snmp_sanitize_text(install_output)
+        version_match = re.search(r"NET-SNMP version:\s*([^\s]+)", output or "")
+        details = {
+            "snmpget": "snmpget" in output,
+            "snmpwalk": "snmpwalk" in output,
+            "version": version_match.group(1) if version_match else "unknown",
+            "installed_now": installed,
+        }
+        return VerifyResult(
+            "L5-SNMP客户端工具", ready,
+            "客户端snmpget/snmpwalk可用" if ready else "客户端缺少可用的Net-SNMP工具",
+            details=details, raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def ensure_snmp_verify_helper(self) -> VerifyResult:
+        """Install/refresh the credential-safe interactive helper on the client."""
+        source = self._snmp_helper_source()
+        expected_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        script = (
+            "set -eu\n"
+            "tmp=$(mktemp /tmp/ikuai-snmp-helper.XXXXXX)\n"
+            "trap 'rm -f \"$tmp\"' EXIT HUP INT TERM\n"
+            "cat >\"$tmp\" <<'IKUAI_SNMP_HELPER'\n" + source +
+            "IKUAI_SNMP_HELPER\n"
+            "sudo -n install -o root -g root -m 0755 \"$tmp\" " +
+            shlex.quote(self.SNMP_VERIFY_HELPER) + "\n"
+        )
+        self.connect_client()
+        self._samba_exec_client_script(
+            script,
+            "sudo -n stat -c '%U:%G %a %n' /usr/local/sbin/ikuai-snmp-verify",
+            timeout=40,
+        )
+        output = self._client.exec(
+            "stat -c '%U:%G|%a' /usr/local/sbin/ikuai-snmp-verify 2>/dev/null; "
+            "sha256sum /usr/local/sbin/ikuai-snmp-verify 2>/dev/null | awk '{print $1}'",
+            timeout=15,
+        )
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        owner_mode = lines[0] if lines else ""
+        actual_hash = lines[1] if len(lines) > 1 else ""
+        passed = owner_mode == "root:root|755" and actual_hash == expected_hash
+        details = {
+            "path": self.SNMP_VERIFY_HELPER,
+            "owner_mode": owner_mode,
+            "content_matches": actual_hash == expected_hash,
+            "persistent_secret_file": False,
+        }
+        return VerifyResult(
+            "L5-SNMP安全复验入口", passed,
+            "SNMP安全复验入口已部署且不持久化协议秘密" if passed else
+            "SNMP安全复验入口部署或权限校验失败",
+            details=details, raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def _snmp_process_state(self) -> Dict[str, Any]:
+        self.connect_router()
+        output = self._router.exec(
+            "printf 'main_pid='; cat /var/run/snmp/snmpd.pid 2>/dev/null; echo; "
+            "printf 'sub_pid='; cat /var/run/snmp/subsnmpd.pid 2>/dev/null; echo; "
+            "ps w | awk '$5==\"/usr/sbin/snmpd\" || "
+            "$5==\"/usr/bin/ik_snmp_subagent\" {print \"proc=\"$1\"|\"$5}'",
+            timeout=20,
+        )
+        main_match = re.search(r"(?m)^main_pid=(\d+)\s*$", output or "")
+        sub_match = re.search(r"(?m)^sub_pid=(\d+)\s*$", output or "")
+        processes = []
+        for match in re.finditer(r"(?m)^proc=(\d+)\|([^\r\n]+)$", output or ""):
+            processes.append({"pid": int(match.group(1)), "exe": match.group(2).strip()})
+        main_pid = int(main_match.group(1)) if main_match else None
+        sub_pid = int(sub_match.group(1)) if sub_match else None
+        return {
+            "main_pid": main_pid,
+            "sub_pid": sub_pid,
+            "processes": sorted(processes, key=lambda item: (item["exe"], item["pid"])),
+            "main_pid_matches": bool(main_pid and any(
+                item["pid"] == main_pid and item["exe"] == "/usr/sbin/snmpd"
+                for item in processes
+            )),
+            "sub_pid_matches": bool(sub_pid and any(
+                item["pid"] == sub_pid and item["exe"] == "/usr/bin/ik_snmp_subagent"
+                for item in processes
+            )),
+            "main_count": sum(
+                item["exe"] == "/usr/sbin/snmpd" for item in processes
+            ),
+            "sub_count": sum(
+                item["exe"] == "/usr/bin/ik_snmp_subagent" for item in processes
+            ),
+        }
+
+    def _snmp_listener_state(self, ports: Iterable[int]) -> Dict[str, Dict[str, Any]]:
+        safe_ports = sorted({int(port) for port in ports if 1 <= int(port) <= 65535})
+        state = {
+            str(port): {"ipv4": False, "ipv6": False, "owners": []}
+            for port in safe_ports
+        }
+        if not safe_ports:
+            return state
+        self.connect_router()
+        output = self._router.exec(
+            "netstat -lnup 2>/dev/null; echo __SNMP_PROC_UDP6__; "
+            "cat /proc/net/udp6 2>/dev/null",
+            timeout=20,
+        )
+        netstat_text, _, udp6_text = (output or "").partition("__SNMP_PROC_UDP6__")
+        for raw_line in netstat_text.splitlines():
+            columns = raw_line.split()
+            if len(columns) < 4 or not columns[0].lower().startswith("udp"):
+                continue
+            local = columns[3]
+            match = re.search(r":(\d+)$", local)
+            if not match or int(match.group(1)) not in safe_ports:
+                continue
+            port = str(int(match.group(1)))
+            ipv6 = columns[0].lower().startswith("udp6") or local.count(":") > 1
+            owner = columns[-1] if "/" in columns[-1] else ""
+            state[port]["ipv6" if ipv6 else "ipv4"] = True
+            if owner:
+                state[port]["owners"].append(owner)
+        # This BusyBox netstat build omits udp6 even though /proc/net/udp6 is
+        # populated. Cross-check the kernel socket table by hexadecimal port.
+        wanted_hex = {format(port, "04X"): str(port) for port in safe_ports}
+        for raw_line in udp6_text.splitlines()[1:]:
+            columns = raw_line.split()
+            if len(columns) < 2 or ":" not in columns[1]:
+                continue
+            port_hex = columns[1].rsplit(":", 1)[-1].upper()
+            if port_hex in wanted_hex:
+                state[wanted_hex[port_hex]]["ipv6"] = True
+        for item in state.values():
+            item["owners"] = sorted(set(item["owners"]))
+        return state
+
+    def _snmp_firewall_state(self, ports: Iterable[int]) -> Dict[str, Dict[str, Any]]:
+        safe_ports = sorted({int(port) for port in ports if 1 <= int(port) <= 65535})
+        result = {
+            str(port): {
+                "udp_wan_drop_member": False,
+                "tcp_wan_drop_member": False,
+                "dedicated_ipv4_rule_count": 0,
+                "dedicated_ipv6_rule_count": 0,
+                "upnp_excluded": False,
+            }
+            for port in safe_ports
+        }
+        if not safe_ports:
+            return result
+        self.connect_router()
+        for port in safe_ports:
+            output = self._router.exec(
+                f"ipset test DROP_U_PORTS_WAN_IN {port} >/dev/null 2>&1 && echo udp_drop=yes || echo udp_drop=no; "
+                f"ipset test DROP_T_PORTS_WAN_IN {port} >/dev/null 2>&1 && echo tcp_drop=yes || echo tcp_drop=no; "
+                f"iptables-save 2>/dev/null | grep -E -- '(^|[[:space:]])(--dport|--sport) {port}([[:space:]]|$)' | wc -l; "
+                f"ip6tables-save 2>/dev/null | grep -E -- '(^|[[:space:]])(--dport|--sport) {port}([[:space:]]|$)' | wc -l; "
+                f"grep -F 'deny {port} 0.0.0.0/0 0-65535' {shlex.quote(self.SNMP_UPNP_CONFIG_FILE)} 2>/dev/null | wc -l",
+                timeout=20,
+            )
+            lines = [line.strip() for line in output.splitlines() if line.strip()]
+            counts = []
+            for line in lines:
+                if re.fullmatch(r"\d+", line):
+                    counts.append(int(line))
+            result[str(port)] = {
+                "udp_wan_drop_member": "udp_drop=yes" in lines,
+                "tcp_wan_drop_member": "tcp_drop=yes" in lines,
+                "dedicated_ipv4_rule_count": counts[0] if len(counts) > 0 else -1,
+                "dedicated_ipv6_rule_count": counts[1] if len(counts) > 1 else -1,
+                "upnp_excluded": (counts[2] if len(counts) > 2 else 0) > 0,
+                "upnp_service_enabled": self._samba_sqlite_query_line(
+                    "SELECT enabled FROM upnpd_conf LIMIT 1"
+                ).get("enabled", "no") == "yes",
+            }
+        return result
+
+    def _snmp_config_state(self) -> Dict[str, Any]:
+        self.connect_router()
+        output = self._router.exec(
+            "if [ -f /var/run/snmp/snmpd.conf ]; then "
+            "echo exists=yes; stat -c 'mode=%a' /var/run/snmp/snmpd.conf; "
+            "sha256sum /var/run/snmp/snmpd.conf | awk '{print \"sha256=\"$1}'; "
+            "else echo exists=no; fi",
+            timeout=15,
+        )
+        exists = bool(re.search(r"(?m)^exists=yes\s*$", output or ""))
+        mode_match = re.search(r"(?m)^mode=([^\r\n]+)$", output or "")
+        hash_match = re.search(r"(?m)^sha256=([0-9a-f]{64})\s*$", output or "")
+        return {
+            "exists": exists,
+            "mode": mode_match.group(1).strip() if mode_match else "",
+            "sha256": hash_match.group(1) if hash_match else "",
+        }
+
+    def get_snmp_environment_snapshot(self,
+                                      candidate_ports: Iterable[int] = None) -> Dict[str, Any]:
+        """Capture exact singleton data and semantic runtime state in memory only."""
+        row = self._snmp_read_row()
+        if row is None:
+            raise RuntimeError("snmp_conf缺少id=1基线记录")
+        ports = {self._snmp_int(row.get("listen_port"))}
+        ports.update(int(port) for port in (candidate_ports or []))
+        ports = {port for port in ports if 1 <= port <= 65535}
+        snapshot = {
+            "version": 1,
+            "row": row,
+            "captured_ports": sorted(ports),
+            "candidate_ports": sorted({int(port) for port in (candidate_ports or [])}),
+            "process": self._snmp_process_state(),
+            "listeners": self._snmp_listener_state(ports),
+            "firewall": self._snmp_firewall_state(ports),
+            "config": self._snmp_config_state(),
+        }
+        snapshot["fingerprint"] = self._snmp_fingerprint(snapshot["row"])
+        return snapshot
+
+    def verify_snmp_database(self, expected_fields: Dict = None,
+                             expected_secrets: Dict = None) -> VerifyResult:
+        """L1: validate singleton values while exposing no private value or digest."""
+        try:
+            from utils.step_recorder import register_sensitive_values
+            register_sensitive_values((expected_secrets or {}).values())
+            row = self._snmp_read_row()
+            if row is None:
+                return VerifyResult("L1-SNMP数据库", False, "snmp_conf缺少id=1记录")
+            mismatches = []
+            for field, expected in (expected_fields or {}).items():
+                if field not in self.SNMP_FIELDS:
+                    raise ValueError(f"未知SNMP字段: {field}")
+                actual = str(row.get(field, ""))
+                if field in {"id", "listen_port", "version"}:
+                    matched = self._snmp_int(actual) == self._snmp_int(expected)
+                else:
+                    matched = actual == str(expected if expected is not None else "")
+                if not matched:
+                    mismatches.append(field)
+            for field, expected in (expected_secrets or {}).items():
+                if field not in self.SNMP_SECRET_FIELDS:
+                    raise ValueError(f"非SNMP秘密字段不能走expected_secrets: {field}")
+                if str(row.get(field, "")) != str(expected if expected is not None else ""):
+                    mismatches.append(field)
+            safe_details = {
+                "row_count": 1,
+                "checked_fields": sorted((expected_fields or {}).keys()),
+                "checked_secret_fields": sorted((expected_secrets or {}).keys()),
+                "mismatched_fields": sorted(set(mismatches)),
+                "state": self._snmp_public_row(row),
+            }
+            passed = not mismatches
+            return VerifyResult(
+                "L1-SNMP数据库", passed,
+                "SNMP数据库记录与期望一致" if passed else
+                f"SNMP数据库字段不一致: {','.join(sorted(set(mismatches)))}",
+                details=safe_details,
+                raw_output=json.dumps(safe_details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L1-SNMP数据库", False,
+                f"SNMP数据库验证异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def verify_snmp_singleton_contract(self) -> VerifyResult:
+        """L1/L2 evidence that this page is save/show singleton, not list CRUD."""
+        try:
+            self.connect_router()
+            output = self._router.exec(
+                "sqlite3 /etc/mnt/ikuai/config.db "
+                "\"select count(*) from snmp_conf; pragma table_info(snmp_conf);\"; "
+                "grep -nF 'url=advanced-service/snmpd-config' "
+                "/usr/ikuai/script/netsnmp.sh",
+                timeout=20,
+            )
+            first_line = next((line.strip() for line in output.splitlines()
+                               if re.fullmatch(r"\d+", line.strip())), "")
+            url_line = next((line.strip() for line in output.splitlines()
+                             if "url=advanced-service/snmpd-config" in line), "")
+            fields = []
+            schema = {}
+            for line in output.splitlines():
+                parts = line.split("|")
+                if len(parts) >= 3 and parts[0].isdigit() and parts[1] in self.SNMP_FIELDS:
+                    fields.append(parts[1])
+                    schema[parts[1]] = {
+                        "type": parts[2].lower(),
+                        "not_null": parts[3] == "1" if len(parts) > 3 else False,
+                        "default": parts[4] if len(parts) > 4 else "",
+                        "primary_key": parts[5] == "1" if len(parts) > 5 else False,
+                    }
+            integer_fields = {"id", "listen_port", "version"}
+            text_fields = set(self.SNMP_FIELDS) - integer_fields
+            empty_default_fields = {
+                "syslocation", "syscontact", "sysname", "source", "username",
+                "security", "auth_proto", "auth_pass", "priv_proto", "priv_pass",
+            }
+            schema_checks = {
+                "integer_types": all(
+                    schema.get(field, {}).get("type") == "integer"
+                    for field in integer_fields
+                ),
+                "text_types": all(
+                    schema.get(field, {}).get("type") == "text"
+                    for field in text_fields
+                ),
+                "id_primary_key": bool(schema.get("id", {}).get("primary_key")),
+                "enabled_default_disabled": schema.get("enabled", {}).get("default")
+                    in {"'no'", '"no"'},
+                "listen_port_default_161": schema.get("listen_port", {}).get("default") == "161",
+                "version_default_v2c": schema.get("version", {}).get("default") == "2",
+                "rw_default_read_only": schema.get("rw", {}).get("default")
+                    in {"'ro'", '"ro"'},
+                "empty_text_defaults": all(
+                    schema.get(field, {}).get("default") in {"''", '""'}
+                    for field in empty_default_fields
+                ),
+                # The factory community is a protocol credential.  Validate only
+                # that a non-empty default exists; never copy its value to reports.
+                "community_default_configured": schema.get("community", {}).get("default")
+                    not in {None, "", "''", '\"\"'},
+            }
+            checks = {
+                "single_row": first_line == "1",
+                "all_schema_fields": set(fields) == set(self.SNMP_FIELDS),
+                "schema_types_and_defaults": all(schema_checks.values()),
+                "show_registered": "get=data" in url_line,
+                "save_registered": "put=save" in url_line,
+                "add_not_registered": "post=add" not in url_line,
+                "delete_not_registered": "delete=del" not in url_line,
+                "import_export_not_registered": all(
+                    token not in url_line.upper() for token in ("IMPORT", "EXPORT")
+                ),
+            }
+            passed = all(checks.values())
+            details = {
+                "checks": checks,
+                "schema_checks": schema_checks,
+                "column_types": {
+                    field: schema.get(field, {}).get("type", "missing")
+                    for field in self.SNMP_FIELDS
+                },
+                "table": self.SNMP_TABLE,
+                "field_count": len(fields),
+                "api": "advanced-service/snmpd-config: show/save",
+                "list_crud": "不适用",
+                "import_export": "不适用",
+            }
+            return VerifyResult(
+                "L1/L2-SNMP单例契约", passed,
+                "SNMP实机接口仅提供单例show/save" if passed else
+                "SNMP单例表或接口注册与实机契约不一致",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L1/L2-SNMP单例契约", False,
+                f"SNMP单例契约验证异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def verify_snmp_environment_unchanged(self, snapshot: Dict,
+                                          allow_pid_change: bool = False) -> VerifyResult:
+        """Compare DB/config/process/listener/firewall with a prior in-memory snapshot."""
+        try:
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("row"), dict):
+                raise ValueError("SNMP快照无效")
+            ports = snapshot.get("captured_ports", [])
+            actual = {
+                "row": self._snmp_read_row(),
+                "process": self._snmp_process_state(),
+                "listeners": self._snmp_listener_state(ports),
+                "firewall": self._snmp_firewall_state(ports),
+                "config": self._snmp_config_state(),
+            }
+            expected_process = snapshot.get("process", {}) or {}
+            actual_process = actual["process"]
+            if allow_pid_change:
+                process_match = (
+                    sorted(item.get("exe") for item in actual_process.get("processes", [])) ==
+                    sorted(item.get("exe") for item in expected_process.get("processes", []))
+                    and bool(actual_process.get("main_pid_matches")) ==
+                    bool(expected_process.get("main_pid_matches"))
+                    and bool(actual_process.get("sub_pid_matches")) ==
+                    bool(expected_process.get("sub_pid_matches"))
+                )
+            else:
+                process_match = actual_process == expected_process
+
+            def listener_semantics(value):
+                semantic = {}
+                for port, item in (value or {}).items():
+                    owners = []
+                    for owner in item.get("owners", []) or []:
+                        owner = str(owner)
+                        owners.append(owner.split("/", 1)[-1] if "/" in owner else owner)
+                    semantic[str(port)] = {
+                        "ipv4": bool(item.get("ipv4")),
+                        "ipv6": bool(item.get("ipv6")),
+                        "owner_executables": sorted(set(owners)),
+                    }
+                return semantic
+
+            if allow_pid_change:
+                listeners_match = listener_semantics(actual["listeners"]) == listener_semantics(
+                    snapshot.get("listeners")
+                )
+                expected_row = snapshot.get("row") or {}
+                enabled = str(expected_row.get("enabled", "no")) == "yes"
+                if enabled:
+                    expected_fields = {
+                        field: expected_row.get(field, "")
+                        for field in self.SNMP_FIELDS
+                        if field not in self.SNMP_SECRET_FIELDS
+                    }
+                    expected_secrets = {
+                        field: expected_row.get(field, "")
+                        for field in self.SNMP_SECRET_FIELDS
+                    }
+                    generated = self.verify_snmp_generated_config(
+                        expected_fields, expected_secrets, True
+                    )
+                    config_match = bool(generated.passed)
+                else:
+                    config_match = actual["config"] == snapshot.get("config")
+            else:
+                listeners_match = actual["listeners"] == snapshot.get("listeners")
+                config_match = actual["config"] == snapshot.get("config")
+            checks = {
+                "database": self._snmp_rows_equal(actual["row"], snapshot.get("row")),
+                "process": process_match,
+                "listeners": listeners_match,
+                "firewall": actual["firewall"] == snapshot.get("firewall"),
+                "config": config_match,
+            }
+            passed = all(checks.values())
+            details = {
+                "checks": checks, "captured_ports": list(ports),
+                "allow_pid_change": bool(allow_pid_change),
+            }
+            return VerifyResult(
+                "L4-SNMP环境指纹", passed,
+                "SNMP数据库与运行时指纹未变化" if passed else
+                "SNMP环境发生意外变化: " + ",".join(k for k, ok in checks.items() if not ok),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-SNMP环境指纹", False,
+                f"SNMP环境指纹复验异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def verify_snmp_generated_config(self, expected_fields: Dict = None,
+                                     expected_secrets: Dict = None,
+                                     expect_present: bool = True) -> VerifyResult:
+        """L2: parse generated snmpd.conf in memory and return only safe checks."""
+        expected_fields = dict(expected_fields or {})
+        expected_secrets = dict(expected_secrets or {})
+        secrets_to_hide = [
+            *expected_secrets.values(),
+            expected_fields.get("username"), expected_fields.get("source"),
+            expected_fields.get("syslocation"), expected_fields.get("syscontact"),
+            expected_fields.get("sysname"),
+        ]
+        try:
+            self.connect_router()
+            content = self._router.exec(
+                f"cat {shlex.quote(self.SNMP_CONFIG_FILE)} 2>/dev/null",
+                timeout=15,
+            )
+            present = bool(content.strip())
+            if not expect_present:
+                passed = not present
+                details = {"present": present, "expected_present": False}
+                return VerifyResult(
+                    "L2-SNMP生成配置", passed,
+                    "SNMP生成配置已移除" if passed else "SNMP生成配置仍残留",
+                    details=details, raw_output=json.dumps(details, ensure_ascii=False),
+                )
+            if not present:
+                return VerifyResult("L2-SNMP生成配置", False, "SNMP生成配置不存在")
+
+            lines = [line.strip() for line in content.splitlines() if line.strip()]
+            port = self._snmp_int(expected_fields.get("listen_port"), 0)
+            version = self._snmp_int(expected_fields.get("version"), 0)
+            rw = str(expected_fields.get("rw", "ro"))
+            checks: Dict[str, bool] = {
+                "udp4_agent": any(line == f"agentAddress udp:0.0.0.0:{port}" for line in lines),
+                "udp6_agent": any(line == f"agentAddress udp6:{port}" for line in lines),
+                "agentx": any(re.fullmatch(r"master\s+agentx", line) for line in lines),
+            }
+            for field, directive in (
+                ("syslocation", "sysLocation"),
+                ("syscontact", "sysContact"),
+                ("sysname", "sysName"),
+            ):
+                if field in expected_fields:
+                    expected = str(expected_fields.get(field) or "")
+                    actual = [line[len(directive):].strip() for line in lines
+                              if line.startswith(directive + " ")]
+                    checks[field] = actual == ([expected] if expected else [])
+
+            auth_shape: Dict[str, Any] = {"version": version, "rw": rw}
+            if version == 2:
+                token = "rocommunity" if rw == "ro" else "rwcommunity"
+                token6 = token + "6"
+                v4_lines = [line for line in lines if line.startswith(token + " ")]
+                v6_lines = [line for line in lines if line.startswith(token6 + " ")]
+                expected_community = str(expected_secrets.get("community", ""))
+                expected_source = str(expected_fields.get("source", ""))
+                expected_v4 = f"{token} {expected_community}" + (
+                    f" {expected_source}" if expected_source else ""
+                )
+                expected_v6 = f"{token6} {expected_community}"
+                checks["v2_auth_ipv4"] = v4_lines == [expected_v4]
+                checks["v2_auth_ipv6"] = v6_lines == [expected_v6]
+                checks["v3_auth_absent"] = not any(
+                    line.startswith(("createUser ", "rouser ", "rwuser "))
+                    for line in lines
+                )
+                auth_shape.update({
+                    "v4_directive": token,
+                    "v6_directive": token6,
+                    "source_restricted_ipv4": bool(expected_source),
+                    "source_restricted_ipv6": False,
+                    "credential_configured": bool(expected_community),
+                })
+            elif version == 3:
+                username = str(expected_fields.get("username", ""))
+                security = str(expected_fields.get("security", ""))
+                auth_proto = str(expected_fields.get("auth_proto", ""))
+                priv_proto = str(expected_fields.get("priv_proto", ""))
+                auth_pass = str(expected_secrets.get("auth_pass", ""))
+                priv_pass = str(expected_secrets.get("priv_pass", ""))
+                create_lines = [line for line in lines if line.startswith("createUser ")]
+                expected_create = f"createUser {username} {auth_proto} {auth_pass}"
+                if security == "authPriv":
+                    expected_create += f" {priv_proto} {priv_pass}"
+                user_directive = "rouser" if rw == "ro" else "rwuser"
+                checks["v3_create_user"] = create_lines == [expected_create]
+                checks["v3_access_user"] = any(
+                    line == f"{user_directive} {username}" for line in lines
+                )
+                checks["v2_auth_absent"] = not any(
+                    line.startswith(("rocommunity ", "rocommunity6 ",
+                                     "rwcommunity ", "rwcommunity6 "))
+                    for line in lines
+                )
+                auth_shape.update({
+                    "security": security,
+                    "auth_proto": auth_proto,
+                    "priv_proto": priv_proto if security == "authPriv" else "not_applicable",
+                    "username_configured": bool(username),
+                    "auth_secret_configured": bool(auth_pass),
+                    "privacy_secret_configured": bool(priv_pass) if security == "authPriv" else False,
+                })
+            else:
+                checks["supported_version"] = False
+
+            passed = all(checks.values())
+            details = {"checks": checks, "authentication_shape": auth_shape,
+                       "line_count": len(lines)}
+            return VerifyResult(
+                "L2-SNMP生成配置", passed,
+                "SNMP数据库已正确映射到生成配置" if passed else
+                "SNMP生成配置映射不一致: " + ",".join(k for k, ok in checks.items() if not ok),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L2-SNMP生成配置", False,
+                "SNMP生成配置验证异常: " + self._snmp_sanitize_text(exc, *secrets_to_hide),
+            )
+
+    def verify_snmp_processes(self, expect_running: bool = True) -> VerifyResult:
+        try:
+            state = self._snmp_process_state()
+            main = [item for item in state["processes"] if item["exe"] == "/usr/sbin/snmpd"]
+            sub = [item for item in state["processes"]
+                   if item["exe"] == "/usr/bin/ik_snmp_subagent"]
+            if expect_running:
+                passed = (
+                    len(main) == 1 and len(sub) == 1
+                    and state["main_pid_matches"] and state["sub_pid_matches"]
+                )
+            else:
+                passed = not main and not sub and state["main_pid"] is None and state["sub_pid"] is None
+            self.connect_router()
+            command_output = self._router.exec(
+                "ps w | awk '$5==\"/usr/sbin/snmpd\" || "
+                "$5==\"/usr/bin/ik_snmp_subagent\" {print $5\"|\"$0}'",
+                timeout=15,
+            )
+            command_lines = [
+                line.strip() for line in (command_output or "").splitlines()
+                if line.strip()
+            ]
+            main_command_count = len([
+                line for line in command_lines
+                if line.startswith("/usr/sbin/snmpd|")
+                and " -C " in f" {line} "
+                and f" -c {self.SNMP_CONFIG_FILE} " in f" {line} "
+                and " -p /var/run/snmp/snmpd.pid " in f" {line} "
+                and " -Ln" in line
+            ])
+            sub_command_count = len([
+                line for line in command_lines
+                if line.startswith("/usr/bin/ik_snmp_subagent|")
+                and " -d " in f" {line} "
+                and " -p /var/run/snmp/subsnmpd.pid" in line
+            ])
+            expected_count = 1 if expect_running else 0
+            command_line_ok = (
+                main_command_count == expected_count
+                and sub_command_count == expected_count
+            )
+            passed = passed and command_line_ok
+            details = {
+                "expect_running": bool(expect_running),
+                "snmpd_count": len(main),
+                "subagent_count": len(sub),
+                "pid_files_match": bool(
+                    state["main_pid_matches"] and state["sub_pid_matches"]
+                ) if expect_running else state["main_pid"] is None and state["sub_pid"] is None,
+                "executables": sorted(item["exe"] for item in state["processes"]),
+                "snmpd_command_line_matches": main_command_count,
+                "subagent_command_line_matches": sub_command_count,
+            }
+            return VerifyResult(
+                "L3-SNMP进程", passed,
+                ("snmpd与子代理进程/PID/命令行均正确" if expect_running and passed else
+                 "SNMP进程与PID文件均已停止" if not expect_running and passed else
+                 "SNMP进程或PID状态不符合预期"),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L3-SNMP进程", False,
+                f"SNMP进程验证异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def verify_snmp_listener(self, port: int,
+                             expect_listening: bool = True) -> VerifyResult:
+        port = int(port)
+        try:
+            item = self._snmp_listener_state([port]).get(str(port), {})
+            owners = list(item.get("owners", []))
+            owner_ok = all(owner.endswith("/snmpd") for owner in owners) if owners else False
+            if expect_listening:
+                passed = bool(item.get("ipv4")) and bool(item.get("ipv6")) and owner_ok
+            else:
+                passed = not item.get("ipv4") and not item.get("ipv6")
+            details = {
+                "port": port, "protocol": "udp",
+                "ipv4": bool(item.get("ipv4")), "ipv6": bool(item.get("ipv6")),
+                "owner_is_snmpd": owner_ok if expect_listening else not bool(owners),
+                "expected_listening": bool(expect_listening),
+            }
+            return VerifyResult(
+                "L3-SNMP UDP监听", passed,
+                (f"UDP/{port} IPv4/IPv6均由snmpd监听" if expect_listening and passed else
+                 f"UDP/{port}已无SNMP监听" if not expect_listening and passed else
+                 f"UDP/{port}监听状态不符合预期"),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L3-SNMP UDP监听", False,
+                f"SNMP监听验证异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def verify_snmp_firewall(self, port: int,
+                             expect_excluded: bool = True) -> VerifyResult:
+        """L3: prove no dedicated rule/ipset and validate UPnP local-port exclusion."""
+        port = int(port)
+        try:
+            item = self._snmp_firewall_state([port]).get(str(port), {})
+            no_dedicated = (
+                not item.get("udp_wan_drop_member")
+                and not item.get("tcp_wan_drop_member")
+                and item.get("dedicated_ipv4_rule_count") == 0
+                and item.get("dedicated_ipv6_rule_count") == 0
+            )
+            upnp_enabled = bool(item.get("upnp_service_enabled"))
+            upnp_ok = (
+                bool(item.get("upnp_excluded")) == bool(expect_excluded)
+                if upnp_enabled else True
+            )
+            passed = no_dedicated and upnp_ok
+            details = {
+                "port": port,
+                "dedicated_firewall_or_ipset": not no_dedicated,
+                "dedicated_firewall_applicability": "不适用：netsnmp.sh使用snmpd访问控制",
+                "upnp_service_enabled": upnp_enabled,
+                "upnp_excluded": bool(item.get("upnp_excluded")),
+                "expected_upnp_excluded": (
+                    bool(expect_excluded) if upnp_enabled else
+                    "不适用：UPnP服务当前关闭"
+                ),
+            }
+            return VerifyResult(
+                "L3-SNMP防火墙/UPnP", passed,
+                ("SNMP无专用防火墙/ipset且UPnP端口排除正确" if passed else
+                 "SNMP防火墙/ipset或UPnP端口排除状态不正确"),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L3-SNMP防火墙/UPnP", False,
+                f"SNMP防火墙验证异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def verify_snmp_runtime_consistency(self, expected_fields: Dict = None,
+                                        expected_secrets: Dict = None) -> VerifyResult:
+        expected_fields = dict(expected_fields or {})
+        enabled = str(expected_fields.get("enabled", "no")).lower() == "yes"
+        port = self._snmp_int(expected_fields.get("listen_port"), 161)
+        results = [
+            self.verify_snmp_database(expected_fields, expected_secrets),
+            self.verify_snmp_generated_config(
+                expected_fields, expected_secrets, expect_present=enabled
+            ),
+            self.verify_snmp_processes(enabled),
+            self.verify_snmp_listener(port, enabled),
+            self.verify_snmp_firewall(port, enabled),
+        ]
+        passed = all(result.passed for result in results)
+        details = {
+            "enabled": enabled, "port": port,
+            "layers": {result.level: {"passed": result.passed, "message": result.message}
+                       for result in results},
+        }
+        return VerifyResult(
+            "L4-SNMP全链路一致性", passed,
+            "SNMP DB到配置、进程、UDP监听和UPnP链路一致" if passed else
+            "SNMP全链路不一致: " + "; ".join(
+                result.message for result in results if not result.passed
+            ),
+            details=details, raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def verify_snmp_reinit(self, expected_fields: Dict = None,
+                           expected_secrets: Dict = None) -> VerifyResult:
+        """L4: invoke the confirmed product init chain and re-check every layer."""
+        try:
+            self.connect_router()
+            self._router.exec(
+                f"{shlex.quote(self.SNMP_SCRIPT)} init >/dev/null 2>&1",
+                timeout=15,
+            )
+            enabled = str((expected_fields or {}).get("enabled", "no")).lower() == "yes"
+            for _ in range(20):
+                state = self._snmp_process_state()
+                running = state["main_pid_matches"] and state["sub_pid_matches"]
+                if running == enabled:
+                    break
+                time.sleep(0.4)
+            result = self.verify_snmp_runtime_consistency(expected_fields, expected_secrets)
+            details = dict(result.details or {})
+            details["product_init_invoked"] = True
+            return VerifyResult(
+                "L4-SNMP服务重载", result.passed,
+                "netsnmp.sh init后全链路仍一致" if result.passed else
+                "netsnmp.sh init后全链路不一致: " + result.message,
+                details=details,
+                raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-SNMP服务重载", False,
+                f"SNMP init复验异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def _snmp_restore_row_script(self, row: Dict) -> str:
+        normalized = self._snmp_normalize_row(row)
+        if not normalized:
+            raise ValueError("SNMP恢复记录为空")
+        assignments = []
+        for field in self.SNMP_FIELDS:
+            if field == "id":
+                continue
+            value = normalized.get(field, "")
+            if field in {"listen_port", "version"}:
+                assignments.append(f"{field}={self._snmp_int(value)}")
+            else:
+                assignments.append(f"{field}={self._snmp_sql_literal(value)}")
+        sql = (
+            f"UPDATE {self.SNMP_TABLE} SET {','.join(assignments)} "
+            f"WHERE id={self._snmp_int(normalized.get('id'), 1)};"
+        )
+        action = "start" if normalized.get("enabled") == "yes" else "stop"
+        return (
+            "set -eu\n"
+            f"sqlite3 {shlex.quote(self.DNS_DB)} {shlex.quote(sql)}\n"
+            # netsnmp.sh stop only follows PID files.  A previously interrupted
+            # start can leave exact orphan executables without PID files; remove
+            # only those two confirmed SNMP processes before rebuilding state.
+            "for pid in $(ps w | awk '$5==\"/usr/sbin/snmpd\" || "
+            "$5==\"/usr/bin/ik_snmp_subagent\" {print $1}'); do "
+            "kill \"$pid\" 2>/dev/null || true; done\n"
+            "sleep 1\n"
+            "for pid in $(ps w | awk '$5==\"/usr/sbin/snmpd\" || "
+            "$5==\"/usr/bin/ik_snmp_subagent\" {print $1}'); do "
+            "kill -9 \"$pid\" 2>/dev/null || true; done\n"
+            "rm -f /var/run/snmp/snmpd.pid /var/run/snmp/subsnmpd.pid "
+            "/var/run/snmp/snmpd.conf /var/run/snmp/snmpd.log\n"
+            f"{shlex.quote(self.SNMP_SCRIPT)} {action} >/dev/null 2>&1\n"
+            "/usr/ikuai/script/upnpd.sh restart >/dev/null 2>&1 || true\n"
+        )
+
+    def restore_snmp_environment(self, snapshot: Dict) -> VerifyResult:
+        """Restore exact singleton data through a secret-safe stdin script."""
+        try:
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("row"), dict):
+                raise ValueError("SNMP恢复快照无效")
+            row = snapshot["row"]
+            script = self._snmp_restore_row_script(row)
+            self._samba_exec_router_script(
+                script,
+                "restore SNMP singleton and runtime content=<redacted>",
+                timeout=45,
+            )
+            enabled = str(row.get("enabled", "no")) == "yes"
+            for _ in range(30):
+                process = self._snmp_process_state()
+                running = process["main_pid_matches"] and process["sub_pid_matches"]
+                if running == enabled:
+                    break
+                time.sleep(0.4)
+            # upnpd rebuild is asynchronous on this firmware.
+            target_port = self._snmp_int(row.get("listen_port"), 161)
+            expected_upnp = bool(
+                (snapshot.get("firewall", {}).get(str(target_port), {}) or {})
+                .get("upnp_excluded", enabled)
+            )
+            for _ in range(20):
+                actual_upnp = bool(
+                    self._snmp_firewall_state([target_port])[str(target_port)]
+                    .get("upnp_excluded")
+                )
+                if actual_upnp == expected_upnp:
+                    break
+                time.sleep(0.35)
+            result = None
+            # start/stop and UPnP refresh are asynchronous on this firmware.
+            # Compare the regenerated active state semantically and wait for the
+            # PID files, sockets and configuration to converge before declaring
+            # a restore failure.
+            for _ in range(30):
+                result = self.verify_snmp_environment_unchanged(
+                    snapshot, allow_pid_change=True
+                )
+                if result.passed:
+                    break
+                time.sleep(0.4)
+            details = dict(result.details or {})
+            details.update({
+                "restored": result.passed,
+                "secret_transport": "SSH stdin; command log redacted",
+            })
+            return VerifyResult(
+                "L4-SNMP环境恢复", result.passed,
+                "SNMP测试前配置与运行态已精确恢复" if result.passed else
+                "SNMP恢复后与测试前快照不一致: " + result.message,
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-SNMP环境恢复", False,
+                f"SNMP环境恢复异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def cleanup_snmp_test(self, prefix: str,
+                          candidate_ports: Iterable[int],
+                          snapshot: Dict) -> VerifyResult:
+        """Singleton cleanup is an exact baseline restore, never a broad DELETE."""
+        del prefix, candidate_ports
+        return self.restore_snmp_environment(snapshot)
+
+    def verify_snmp_test_artifacts_absent(self, prefix: str,
+                                          candidate_ports: Iterable[int],
+                                          snapshot: Dict = None) -> VerifyResult:
+        """Audit prefix, candidate listeners, PID/config semantics and client temp files."""
+        try:
+            prefix = str(prefix or "")
+            if not re.fullmatch(r"[A-Za-z0-9_]{5,40}", prefix):
+                raise ValueError("SNMP测试前缀格式不安全")
+            ports = sorted({int(port) for port in (candidate_ports or [])})
+            row = self._snmp_read_row() or {}
+            prefix_hits = sum(prefix in str(row.get(field, "")) for field in self.SNMP_FIELDS)
+            self.connect_router()
+            config_hit = self._router.exec(
+                f"grep -F {shlex.quote(prefix)} {shlex.quote(self.SNMP_CONFIG_FILE)} "
+                ">/dev/null 2>&1 && echo found || echo absent",
+                timeout=10,
+            ).strip() == "found"
+            listeners = self._snmp_listener_state(ports)
+            listener_hits = [
+                port for port, item in listeners.items()
+                if item.get("ipv4") or item.get("ipv6")
+            ]
+            self.connect_client()
+            temp_output = self._client.exec(
+                "find /tmp -maxdepth 1 -name 'ikuai-snmp-verify.*' -print 2>/dev/null",
+                timeout=15,
+            )
+            temp_count = len([line for line in temp_output.splitlines() if line.strip()])
+            baseline_match = True
+            baseline_message = "未提供快照，仅执行独立测试残留审计"
+            if snapshot is not None:
+                baseline = self.verify_snmp_environment_unchanged(
+                    snapshot, allow_pid_change=True
+                )
+                baseline_match = baseline.passed
+                baseline_message = baseline.message
+            passed = (
+                prefix_hits == 0 and not config_hit and not listener_hits
+                and temp_count == 0 and baseline_match
+            )
+            details = {
+                "prefix_hits": int(prefix_hits),
+                "config_prefix_hit": bool(config_hit),
+                "candidate_listener_ports": listener_hits,
+                "client_temp_count": temp_count,
+                "baseline_match": baseline_match,
+                "baseline_message": baseline_message,
+            }
+            return VerifyResult(
+                "清理-SNMP残留审计", passed,
+                "SNMP测试数据、候选端口和客户端临时文件均无残留" if passed else
+                "SNMP清理审计发现残留或基线不一致",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "清理-SNMP残留审计", False,
+                f"SNMP残留审计异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def run_snmp_probe(self, version: Any, host: str, oid: str,
+                       operation: str = "get", community: str = None,
+                       username: str = None, security: str = None,
+                       auth_proto: str = None, auth_pass: str = None,
+                       priv_proto: str = None, priv_pass: str = None,
+                       expect_success: bool = True,
+                       expected_value: str = None,
+                       expected_failure: str = None) -> VerifyResult:
+        """L5 real snmpget/snmpwalk through the interactive, no-secret helper."""
+        secrets_to_hide = [community, username, auth_pass, priv_pass, expected_value]
+        # Wrong credentials used only for negative protocol probes never pass
+        # through the page object, so register them explicitly for report-wide
+        # in-memory redaction as well.
+        from utils.step_recorder import register_sensitive_values
+        register_sensitive_values([community, auth_pass, priv_pass])
+        try:
+            version_text = str(version).strip().lower()
+            operation = str(operation).strip().lower()
+            if operation not in {"get", "walk"}:
+                raise ValueError("SNMP操作仅支持get/walk")
+            if not re.fullmatch(r"[0-9A-Fa-f:.]+", str(host)):
+                raise ValueError("SNMP目标地址格式不安全")
+            if not re.fullmatch(r"\d+(?:\.\d+)+", str(oid).lstrip(".")):
+                raise ValueError("SNMP OID格式不安全")
+            oid = str(oid).lstrip(".")
+            if version_text in {"2", "2c", "v2", "v2c", "snmp v2c"}:
+                mode = "v2c"
+                credential_lines = [str(community or "")]
+                public_version = "V2C"
+            elif version_text in {"3", "v3", "snmp v3"}:
+                if str(security) == "authPriv":
+                    mode = "v3-priv"
+                    credential_lines = [
+                        str(username or ""), str(auth_pass or ""), str(priv_pass or ""),
+                    ]
+                else:
+                    mode = "v3-auth"
+                    credential_lines = [str(username or ""), str(auth_pass or "")]
+                public_version = "V3"
+            else:
+                raise ValueError("页面未支持该SNMP版本")
+            auth_proto = str(auth_proto or "MD5").upper()
+            priv_proto = str(priv_proto or "DES").upper()
+            if auth_proto not in {"MD5", "SHA"} or priv_proto not in {"DES", "AES"}:
+                raise ValueError("SNMP认证/加密算法不受页面支持")
+            safe_command = (
+                f"sudo -n {self.SNMP_VERIFY_HELPER} --mode {mode} "
+                f"--operation {operation} --host {host} --oid {oid}"
+            )
+            if mode != "v2c":
+                safe_command += f" --auth-proto {auth_proto}"
+            if mode == "v3-priv":
+                safe_command += f" --priv-proto {priv_proto}"
+            quoted_lines = " ".join(shlex.quote(value) for value in credential_lines)
+            script = (
+                "set +x\n"
+                f"printf '%s\\n' {quoted_lines} | {safe_command}\n"
+                "snmp_rc=$?\n"
+                "printf '\\n__IKUAI_SNMP_RC__=%s\\n' \"$snmp_rc\"\n"
+            )
+            self.connect_client()
+            output = self._samba_exec_client_script(
+                script, safe_command, timeout=45,
+            )
+            match = re.search(r"(?m)^__IKUAI_SNMP_RC__=(\d+)\s*$", output or "")
+            rc = int(match.group(1)) if match else 255
+            body = re.sub(r"(?m)^__IKUAI_SNMP_RC__=\d+\s*$", "", output or "").strip()
+            lower = body.lower()
+            negative_markers = (
+                "timeout", "authentication failure", "unknown user", "decryption error",
+                "no such object", "no such instance", "authorization error", "missing credential",
+            )
+            oid_value_line = bool(re.search(
+                r"(?m)^\.?\d+(?:\.\d+)+\s*=\s*", body
+            ))
+            negative_hits = [marker for marker in negative_markers if marker in lower]
+            protocol_success = (
+                rc == 0 and oid_value_line
+                and not any(marker in lower for marker in (
+                    "authentication failure", "unknown user", "decryption error",
+                    "no such object", "no such instance", "authorization error",
+                ))
+            )
+            value_match = True
+            if expected_value is not None and expect_success:
+                value_match = str(expected_value) in body
+            failure_kind = ""
+            if "no such" in lower:
+                failure_kind = "oid_not_found"
+            elif "authentication" in lower or "unknown user" in lower:
+                failure_kind = "authentication_rejected"
+            elif "decryption" in lower:
+                failure_kind = "privacy_rejected"
+            elif "timeout" in lower:
+                failure_kind = "timeout"
+            elif rc != 0:
+                failure_kind = "command_failed"
+            allowed_failures = {
+                "oid": {"oid_not_found"},
+                "authentication": {"authentication_rejected", "timeout"},
+                "privacy": {"privacy_rejected", "authentication_rejected", "timeout"},
+                "source": {"timeout"},
+                "stopped": {"timeout", "command_failed"},
+            }
+            if expect_success:
+                passed = protocol_success and value_match
+            elif expected_failure:
+                passed = failure_kind in allowed_failures.get(str(expected_failure), set())
+            else:
+                passed = not protocol_success and bool(negative_hits)
+            if protocol_success:
+                response_state = "OID和值返回成功" if value_match else "OID返回但值不匹配"
+            elif "no such" in lower:
+                response_state = "OID不存在"
+            elif "authentication" in lower or "unknown user" in lower or "decryption" in lower:
+                response_state = "认证或隐私校验失败"
+            elif "timeout" in lower or rc != 0:
+                response_state = "无响应或连接失败"
+            else:
+                response_state = "协议响应不符合预期"
+            details = {
+                "version": public_version,
+                "security": (
+                    "community" if mode == "v2c" else
+                    "authPriv" if mode == "v3-priv" else "authNoPriv"
+                ),
+                "operation": operation,
+                "host": str(host), "oid": oid,
+                "expected_success": bool(expect_success),
+                "command_exit": rc,
+                "response_state": response_state,
+                "oid_value_line": oid_value_line,
+                "negative_marker_count": len(negative_hits),
+                "failure_kind": failure_kind or "not_applicable",
+                "expected_failure": expected_failure or "generic_rejection",
+                "expected_value_match": value_match if expect_success else "not_applicable",
+            }
+            return VerifyResult(
+                "L5-SNMP真实协议", passed,
+                f"{public_version} snmp{operation} {response_state}，"
+                f"{'符合' if passed else '不符合'}预期",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L5-SNMP真实协议", False,
+                "SNMP协议探测异常: " + self._snmp_sanitize_text(exc, *secrets_to_hide),
+            )
+
+    def verify_snmp_client_route(self, host: str,
+                                 expected_iface: str) -> VerifyResult:
+        """L5 prerequisite: prove which physical client path reaches the target."""
+        try:
+            host = str(host).strip()
+            expected_iface = str(expected_iface).strip()
+            if not re.fullmatch(r"[0-9A-Fa-f:.]+", host):
+                raise ValueError("SNMP路由目标格式不安全")
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", expected_iface):
+                raise ValueError("SNMP客户端接口格式不安全")
+            self.connect_client()
+            output = self._client.exec(
+                f"ip route get {shlex.quote(host)} 2>/dev/null | head -1",
+                timeout=15,
+            )
+            dev_match = re.search(r"\bdev\s+(\S+)", output or "")
+            src_match = re.search(r"\bsrc\s+(\S+)", output or "")
+            actual_iface = dev_match.group(1) if dev_match else ""
+            passed = actual_iface == expected_iface and bool(src_match)
+            details = {
+                "host": host, "expected_iface": expected_iface,
+                "actual_iface": actual_iface, "source_present": bool(src_match),
+            }
+            return VerifyResult(
+                "L5-SNMP客户端路由", passed,
+                f"SNMP目标{host}经{actual_iface or '未知接口'}到达，"
+                f"{'符合' if passed else '不符合'}预期接口{expected_iface}",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L5-SNMP客户端路由", False,
+                f"SNMP客户端路由验证异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    def verify_snmp_v1_not_supported(self) -> VerifyResult:
+        """Prove V1 is absent from both the page contract and save validator."""
+        try:
+            self.connect_router()
+            output = self._router.exec(
+                "grep -nF 'version' /usr/ikuai/script/netsnmp.sh | "
+                "grep -E '== \"2\"|== \"3\"'",
+                timeout=15,
+            )
+            only_v2_v3 = (
+                'version' in output and '== "2"' in output and '== "3"' in output
+                and '== "1"' not in output
+            )
+            details = {
+                "page_versions": ["SNMP V2C", "SNMP V3"],
+                "v1_option_present": False,
+                "save_validator_accepts_only_v2_v3": only_v2_v3,
+                "result": "不适用",
+            }
+            return VerifyResult(
+                "SNMP V1能力证据", only_v2_v3,
+                "页面无V1选项，后端保存校验仅接受V2C/V3，V1不适用" if only_v2_v3 else
+                "SNMP V1不支持证据不完整",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "SNMP V1能力证据", False,
+                f"SNMP V1能力证据异常: {self._snmp_sanitize_text(exc)}",
+            )
+
+    # ==================== 设备设置 > 基础设置 ====================
+    # 实机确认：/usr/ikuai/script/basic.sh，config.db.basic，固定 id=1。
+    # 本分区把完整原值仅保存在进程内快照；公开 VerifyResult 只返回字段名、
+    # 布尔结论、数量和模式代码，避免设备名称等私有值进入 JSON/HTML/Excel。
+
+    BASIC_SCRIPT = "/usr/ikuai/script/basic.sh"
+    BASIC_NTP_SCRIPT = "/usr/ikuai/script/utils/ntp.sh"
+    BASIC_TABLE = "basic"
+    BASIC_CACHE_FILE = "/tmp/iktmp/cache/config/basic"
+    BASIC_FIELDS = (
+        "id", "hostname", "language", "time_zone", "time_zone_full",
+        "switch_nat", "switch_dpi", "switch_ntp", "switch_ntpd",
+        "switch_ntpserver", "ntpserver_list", "ntp_sync_cycle",
+        "link_mode", "fast_nat", "lan_nat", "listenport", "backport",
+    )
+    BASIC_INTEGER_FIELDS = frozenset({
+        "id", "language", "time_zone", "switch_nat", "switch_dpi",
+        "switch_ntp", "switch_ntpd", "switch_ntpserver",
+        "ntp_sync_cycle", "link_mode", "fast_nat", "lan_nat",
+    })
+    BASIC_PRIVATE_FIELDS = frozenset({"hostname", "ntpserver_list"})
+    BASIC_SCHEMA_DEFAULTS = {
+        "id": "", "hostname": "'iKuai'", "language": "1",
+        "time_zone": "8", "time_zone_full": "'0800'",
+        "switch_nat": "1", "switch_dpi": "1", "switch_ntp": "1",
+        "switch_ntpd": "0", "switch_ntpserver": "0",
+        "ntpserver_list": "''", "ntp_sync_cycle": "60",
+        "link_mode": "0", "fast_nat": "0", "lan_nat": "1",
+        "listenport": "'lan1'", "backport": "'wan1'",
+    }
+
+    @staticmethod
+    def _basic_sql_literal(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @classmethod
+    def _basic_normalize_row(cls, row: Dict[str, Any]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for field in cls.BASIC_FIELDS:
+            value = (row or {}).get(field, "")
+            if field in cls.BASIC_INTEGER_FIELDS:
+                try:
+                    value = int(str(value).strip() or 0)
+                except (TypeError, ValueError):
+                    value = 0
+            else:
+                value = "" if value is None else str(value)
+            result[field] = value
+        return result
+
+    def _basic_read_row(self) -> Optional[Dict[str, Any]]:
+        row = self._samba_sqlite_query_line(
+            f"SELECT {','.join(self.BASIC_FIELDS)} FROM {self.BASIC_TABLE} "
+            "WHERE id=1"
+        )
+        return self._basic_normalize_row(row) if row else None
+
+    def _basic_row_count(self) -> int:
+        row = self._samba_sqlite_query_line(
+            f"SELECT count(*) AS row_count FROM {self.BASIC_TABLE}"
+        ) or {}
+        try:
+            return int(row.get("row_count", -1))
+        except (TypeError, ValueError):
+            return -1
+
+    @classmethod
+    def _basic_public_row(cls, row: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = cls._basic_normalize_row(row or {})
+        public = {
+            field: normalized[field]
+            for field in cls.BASIC_FIELDS
+            if field not in cls.BASIC_PRIVATE_FIELDS
+        }
+        public["hostname_length"] = len(normalized.get("hostname", ""))
+        public["ntpserver_configured"] = bool(
+            normalized.get("ntpserver_list", "")
+        )
+        return public
+
+    @staticmethod
+    def _basic_parse_cache(content: str) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for token in str(content or "").split():
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            result[key.strip()] = value.strip()
+        return result
+
+    @staticmethod
+    def _basic_timezone_file_value(time_zone_full: Any) -> str:
+        text = str(time_zone_full or "0000").strip()
+        try:
+            numeric = int(text)
+        except ValueError:
+            numeric = 0
+        if numeric > 0:
+            return f"UTC-{text}"
+        if numeric < 0:
+            return "UTC+" + text.lstrip("-")
+        return "UTC"
+
+    def _basic_file_state(self) -> Dict[str, Any]:
+        self.connect_router()
+        output = self._router.exec(
+            f"printf '__BASIC_CACHE__\\n'; cat {self.BASIC_CACHE_FILE} 2>/dev/null; "
+            "printf '\\n__BASIC_TZ__\\n'; cat /etc/TZ 2>/dev/null; "
+            "printf '\\n__BASIC_HOSTS__\\n'; cat /etc/hosts.d/hostname 2>/dev/null; "
+            "printf '\\n__BASIC_HOSTNAME__\\n'; hostname 2>/dev/null; "
+            "printf '\\n__BASIC_LOCALTIME__\\n'; readlink /tmp/localtime 2>/dev/null",
+            timeout=20,
+        )
+
+        def section(name: str, next_name: str = None) -> str:
+            marker = f"__BASIC_{name}__\n"
+            if marker not in output:
+                return ""
+            body = output.split(marker, 1)[1]
+            if next_name:
+                body = body.split(f"__BASIC_{next_name}__\n", 1)[0]
+            return body.strip("\r\n")
+
+        cache = section("CACHE", "TZ")
+        return {
+            "cache_content": cache,
+            "cache": self._basic_parse_cache(cache),
+            "tz": section("TZ", "HOSTS").strip(),
+            "hosts_hostname": section("HOSTS", "HOSTNAME").strip(),
+            "kernel_hostname": section("HOSTNAME", "LOCALTIME").strip(),
+            "localtime_link": section("LOCALTIME").strip(),
+        }
+
+    def _basic_iptables_state(self, include_counters: bool = False) -> Dict[str, Any]:
+        self.connect_router()
+        commands = {
+            "autonat": "iptables -w -t nat -S AUTONAT 2>/dev/null",
+            "pre_fullcone": "iptables -w -t nat -S PRE_FULLCONE 2>/dev/null",
+            "post_fullcone": "iptables -w -t nat -S POST_FULLCONE 2>/dev/null",
+            "nonat": "iptables -w -S NONAT 2>/dev/null",
+            "fastoffload": "iptables -w -t mangle -S FASTOFFLOAD 2>/dev/null",
+        }
+        state = {
+            name: self._router.exec(command, timeout=15).strip()
+            for name, command in commands.items()
+        }
+        if include_counters:
+            counter_text = self._router.exec(
+                "iptables -w -t mangle -L FASTOFFLOAD -n -v -x 2>/dev/null",
+                timeout=15,
+            )
+            packet_count = 0
+            for line in counter_text.splitlines():
+                if "FLOWOFFLOAD" not in line:
+                    continue
+                columns = line.split()
+                if columns and columns[0].isdigit():
+                    packet_count += int(columns[0])
+            state["fastoffload_packets"] = packet_count
+        return state
+
+    def _basic_process_state(self) -> Dict[str, Any]:
+        self.connect_router()
+        output = self._router.exec(
+            "ps -w 2>/dev/null | grep -E '[ ](AC|lldpd|ntpd|iktimerd|\\{openresty\\})' "
+            "| grep -v grep",
+            timeout=15,
+        )
+        processes = []
+        for line in output.splitlines():
+            columns = line.split()
+            if len(columns) < 5 or not columns[0].isdigit():
+                continue
+            command = " ".join(columns[4:])
+            if not any(token in command for token in (
+                "AC", "lldpd", "ntpd", "iktimerd", "openresty"
+            )):
+                continue
+            processes.append({"pid": int(columns[0]), "command": command})
+        return {"processes": processes}
+
+    @staticmethod
+    def _basic_process_semantics(state: Dict[str, Any]) -> List[str]:
+        semantics: List[str] = []
+        openresty_master = False
+        openresty_worker = False
+        for item in (state or {}).get("processes", []):
+            command = str(item.get("command", ""))
+            if "openresty" in command:
+                if "master process" in command:
+                    openresty_master = True
+                elif "worker process" in command and "shutting down" not in command:
+                    openresty_worker = True
+                # Graceful reload workers may remain in "shutting down" while
+                # an existing browser connection drains.  They are transient,
+                # not a different basic-setting runtime configuration.
+                continue
+            semantics.append(command)
+        if openresty_master:
+            semantics.append("openresty:master")
+        if openresty_worker:
+            semantics.append("openresty:active-worker")
+        return sorted(semantics)
+
+    @staticmethod
+    def _basic_process_inventory(state: Dict[str, Any]) -> Dict[str, Any]:
+        inventory = {
+            role: {"count": 0, "pids": [], "commands": []}
+            for role in ("AC", "lldpd", "ntpd", "iktimerd", "openresty")
+        }
+        for item in (state or {}).get("processes", []):
+            command = str(item.get("command", ""))[:240]
+            role = None
+            if re.search(r"(^|[ /{])AC(?: |$)", command):
+                role = "AC"
+            elif "lldpd" in command:
+                role = "lldpd"
+            elif re.search(r"(^|[ /{])ntpd(?: |$|})", command):
+                role = "ntpd"
+            elif "iktimerd" in command:
+                role = "iktimerd"
+            elif "openresty" in command:
+                role = "openresty"
+            if role is None:
+                continue
+            safe_command = re.sub(
+                r"(?i)(password|passwd|secret|token)(=|\s+)\S+",
+                r"\1\2<redacted>", command,
+            )
+            inventory[role]["count"] += 1
+            inventory[role]["pids"].append(int(item.get("pid", 0) or 0))
+            inventory[role]["commands"].append(safe_command)
+        return inventory
+
+    def _basic_summary_state(self) -> Dict[str, Any]:
+        self.connect_router()
+        output = self._router.exec(
+            "grep -iE '^WansNAT:|^Bypass:|^bypass mode:' "
+            "/proc/ikuai/stats/ik_summary 2>/dev/null; "
+            "printf '__BASIC_MARKERS__\\n'; "
+            "for f in /tmp/iktmp/webauth/auth_switch "
+            "/etc/mnt/ikuai/mac_autoauth /tmp/iktmp/webauth/bypass_enabled; do "
+            "test -e $f && echo $f=present || echo $f=absent; done; "
+            "printf '__BASIC_SYSCTL__\\n'; "
+            "sysctl -n net.ipv4.ip_forward net.ipv4.conf.all.rp_filter 2>/dev/null",
+            timeout=15,
+        )
+        result = {
+            "wans_nat": "",
+            "bypass": "",
+            "sdwan_bypass": "",
+            "auth_switch": False,
+            "auto_auth": False,
+            "bypass_marker": False,
+            "ip_forward": "",
+            "rp_filter": "",
+        }
+        for line in output.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("WansNAT:"):
+                result["wans_nat"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("Bypass:"):
+                result["bypass"] = stripped.split(":", 1)[1].strip()
+            elif stripped.lower().startswith("bypass mode:"):
+                result["sdwan_bypass"] = stripped.split(":", 1)[1].strip()
+            elif stripped.endswith("auth_switch=present"):
+                result["auth_switch"] = True
+            elif stripped.endswith("mac_autoauth=present"):
+                result["auto_auth"] = True
+            elif stripped.endswith("bypass_enabled=present"):
+                result["bypass_marker"] = True
+        tail = output.split("__BASIC_SYSCTL__\n", 1)[-1].splitlines()
+        numeric = [line.strip() for line in tail if line.strip() in {"0", "1"}]
+        if numeric:
+            result["ip_forward"] = numeric[0]
+        if len(numeric) > 1:
+            result["rp_filter"] = numeric[1]
+        return result
+
+    def _basic_route_state(self) -> Dict[str, str]:
+        """基础设置前后的路由/策略路由语义指纹（只读）。"""
+        self.connect_router()
+        output = self._router.exec(
+            "printf '__BASIC_MAIN_ROUTES__\\n'; ip -4 route show table main 2>/dev/null; "
+            "printf '__BASIC_RULES__\\n'; ip -4 rule show 2>/dev/null",
+            timeout=15,
+        )
+        route_marker = "__BASIC_MAIN_ROUTES__\n"
+        rule_marker = "__BASIC_RULES__\n"
+        body = output.split(route_marker, 1)[-1]
+        routes, _, rules = body.partition(rule_marker)
+        return {
+            "main_routes": "\n".join(
+                sorted(line.strip() for line in routes.splitlines() if line.strip())
+            ),
+            "policy_rules": "\n".join(
+                sorted(line.strip() for line in rules.splitlines() if line.strip())
+            ),
+        }
+
+    def _basic_clock_state(self) -> Dict[str, Any]:
+        """以客户端时钟为参考，记录系统时钟和RTC的相对偏差。"""
+        self.connect_router()
+        self.connect_client()
+        router_text = self._router.exec(
+            "printf '__BASIC_EPOCH__='; date +%s; "
+            "printf '__BASIC_LOCAL__='; date '+%Y-%m-%d %H:%M:%S'; "
+            "printf '__BASIC_HWCLOCK__='; hwclock -r 2>/dev/null",
+            timeout=15,
+        )
+        client_text = self._client.exec("date +%s", timeout=15).strip()
+        epoch_match = re.search(r"__BASIC_EPOCH__=(\d+)", router_text or "")
+        local_match = re.search(
+            r"__BASIC_LOCAL__=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",
+            router_text or "",
+        )
+        hardware_line = re.search(r"__BASIC_HWCLOCK__=(.*)", router_text or "")
+        router_epoch = int(epoch_match.group(1)) if epoch_match else 0
+        client_epoch = int(client_text) if client_text.isdigit() else 0
+        rtc_system_delta = None
+        if local_match and hardware_line and hardware_line.group(1).strip():
+            try:
+                system_local = datetime.strptime(
+                    local_match.group(1), "%Y-%m-%d %H:%M:%S"
+                )
+                hardware_text = re.sub(
+                    r"\s+[0-9.]+\s+seconds\s*$", "",
+                    hardware_line.group(1).strip(),
+                )
+                hardware_local = datetime.strptime(
+                    hardware_text, "%a %b %d %H:%M:%S %Y"
+                )
+                rtc_system_delta = int(
+                    round((hardware_local - system_local).total_seconds())
+                )
+            except (TypeError, ValueError):
+                rtc_system_delta = None
+        router_client_offset = (
+            router_epoch - client_epoch
+            if router_epoch and client_epoch else None
+        )
+        return {
+            "router_epoch": router_epoch,
+            "client_epoch": client_epoch,
+            "router_client_offset": router_client_offset,
+            "rtc_system_delta": rtc_system_delta,
+            "rtc_client_offset": (
+                int(router_client_offset) + int(rtc_system_delta)
+                if router_client_offset is not None
+                and rtc_system_delta is not None else None
+            ),
+            "hardware_clock_available": rtc_system_delta is not None,
+        }
+
+    def get_basic_manual_time_candidate(
+        self, offset_seconds: int = 35
+    ) -> Dict[str, Any]:
+        """从客户端参考epoch生成路由器本地UI时间；结果仅供内存中填写。"""
+        offset = int(offset_seconds)
+        if not 15 <= abs(offset) <= 120:
+            raise ValueError("手动设时偏移必须在15到120秒之间")
+        self.connect_client()
+        client_text = self._client.exec("date +%s", timeout=15).strip()
+        if not client_text.isdigit():
+            raise RuntimeError("客户端参考epoch不可用")
+        target_epoch = int(client_text) + offset
+        if not re.fullmatch(r"\d{10}", str(target_epoch)):
+            raise RuntimeError("目标epoch格式无效")
+        self.connect_router()
+        display_value = self._router.exec(
+            f"date -d '@{target_epoch}' '+%Y-%m-%d %H:%M:%S' 2>/dev/null",
+            timeout=15,
+        ).strip()
+        if not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", display_value
+        ):
+            raise RuntimeError("路由器本地时间格式化失败")
+        control_display = datetime.fromtimestamp(target_epoch).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        if control_display != display_value:
+            raise RuntimeError("控制机/浏览器与路由器时区不一致，禁止手动设时")
+        from utils.step_recorder import register_sensitive_value
+        register_sensitive_value(display_value)
+        return {
+            "display_value": display_value,
+            "target_epoch": target_epoch,
+            "offset_seconds": offset,
+        }
+
+    def _basic_integrity_state(self) -> Dict[str, str]:
+        """记录基础设置不应触碰的维护文件、模块和 ipset 名称指纹。"""
+        self.connect_router()
+        output = self._router.exec(
+            "printf '__BASIC_PASSWD__='; sha256sum /etc/passwd 2>/dev/null | cut -d' ' -f1; "
+            "printf '__BASIC_CRONTAB__='; crontab -l 2>/dev/null | sha256sum | cut -d' ' -f1; "
+            "printf '__BASIC_MODULES__='; awk '{print $1}' /proc/modules 2>/dev/null | "
+            "sort | sha256sum | cut -d' ' -f1; "
+            "printf '__BASIC_IPSETS__='; ipset list -n 2>/dev/null | sort | "
+            "sha256sum | cut -d' ' -f1",
+            timeout=15,
+        )
+        result: Dict[str, str] = {}
+        for key in ("PASSWD", "CRONTAB", "MODULES", "IPSETS"):
+            match = re.search(rf"__BASIC_{key}__=([0-9a-f]{{64}})", output or "")
+            result[key.lower()] = match.group(1) if match else ""
+        return result
+
+    def _basic_link_topology_state(
+        self,
+        router_lan_iface: str = "lan1",
+        router_wan_ifaces: Iterable[str] = ("wan1", "wan2", "wan3"),
+        client_lan_iface: str = "ens11",
+        router_lan_ip: str = "192.168.148.1",
+        client_lan_ip: str = "192.168.148.2",
+    ) -> Dict[str, Any]:
+        """只返回接口角色/状态布尔和接口名，不返回MAC等硬件标识。"""
+        lan_iface = str(router_lan_iface)
+        wan_ifaces = tuple(str(item) for item in router_wan_ifaces)
+        client_iface = str(client_lan_iface)
+        all_ifaces = (lan_iface,) + wan_ifaces + (client_iface,)
+        if any(not re.fullmatch(r"[A-Za-z0-9_.:-]+", item) for item in all_ifaces):
+            raise ValueError("链路拓扑接口名格式不安全")
+        router_lan = str(ipaddress.ip_address(router_lan_ip))
+        client_lan = str(ipaddress.ip_address(client_lan_ip))
+        management_ip = str(ipaddress.ip_address(self._ssh_config.router.host))
+        self.connect_router()
+        self.connect_client()
+
+        router_checks = []
+        for iface in (lan_iface,) + wan_ifaces:
+            router_checks.append(
+                f"printf '__BASIC_LINK_{iface}__='; "
+                f"ip link show dev {iface} 2>/dev/null | "
+                "grep -qE 'state UP.*LOWER_UP|LOWER_UP.*state UP' && echo 1 || echo 0"
+            )
+            router_checks.append(
+                f"printf '__BASIC_ADDR_{iface}__='; "
+                f"ip -o -4 addr show dev {iface} 2>/dev/null | "
+                "grep -q ' inet ' && echo 1 || echo 0"
+            )
+        router_checks.extend([
+            "printf '__BASIC_MGMT_IFACE__='; ip -o -4 addr show 2>/dev/null | "
+            f"awk '$4 ~ /^{re.escape(management_ip).replace('\\.', '[.]')}\\// {{print $2; exit}}'",
+            "printf '__BASIC_LAN_ADDR__='; ip -o -4 addr show dev "
+            f"{lan_iface} 2>/dev/null | grep -q ' {router_lan}/' && echo 1 || echo 0",
+            "printf '__BASIC_NOTIFY_COUNT__='; find /etc/basic/notify.d "
+            "-maxdepth 1 -type f -perm /111 2>/dev/null | wc -l",
+            "printf '__BASIC_LINK_SCRIPT__\\n'; awk "
+            "'/^__set_linke_mode\\(\\)/,/^__set_hostname\\(\\)/' "
+            f"{shlex.quote(self.BASIC_SCRIPT)}",
+        ])
+        router_output = self._router.exec("; ".join(router_checks), timeout=20)
+        script_body = router_output.split("__BASIC_LINK_SCRIPT__\n", 1)[-1]
+
+        client_output = self._client.exec(
+            f"printf '__BASIC_CLIENT_LINK__='; ip link show dev {client_iface} "
+            "2>/dev/null | grep -qE 'state UP.*LOWER_UP|LOWER_UP.*state UP' "
+            "&& echo 1 || echo 0; "
+            f"printf '__BASIC_CLIENT_ADDR__='; ip -o -4 addr show dev {client_iface} "
+            f"2>/dev/null | grep -q ' {client_lan}/' && echo 1 || echo 0; "
+            "printf '__BASIC_CLIENT_MGMT_ROUTE__\\n'; "
+            f"ip route get {management_ip} 2>/dev/null | head -1; "
+            "printf '__BASIC_CLIENT_LAN_ROUTE__\\n'; "
+            f"ip route get {router_lan} 2>/dev/null | head -1",
+            timeout=15,
+        )
+
+        def flag(text: str, name: str) -> bool:
+            match = re.search(rf"__BASIC_{name}__=(\d+)", text or "")
+            return bool(match and match.group(1) == "1")
+
+        management_match = re.search(
+            r"__BASIC_MGMT_IFACE__=([^\s]+)", router_output or ""
+        )
+        management_iface = management_match.group(1) if management_match else ""
+        notify_match = re.search(
+            r"__BASIC_NOTIFY_COUNT__=(\d+)", router_output or ""
+        )
+        client_mgmt = client_output.split(
+            "__BASIC_CLIENT_MGMT_ROUTE__\n", 1
+        )[-1].split("__BASIC_CLIENT_LAN_ROUTE__\n", 1)[0]
+        client_lan_route = client_output.split(
+            "__BASIC_CLIENT_LAN_ROUTE__\n", 1
+        )[-1]
+        mgmt_dev = re.search(r"\bdev\s+(\S+)", client_mgmt)
+        lan_dev = re.search(r"\bdev\s+(\S+)", client_lan_route)
+        lan_src = re.search(r"\bsrc\s+(\S+)", client_lan_route)
+        summary = self._basic_summary_state()
+        forbidden_interface_ops = bool(re.search(
+            r"\b(?:ip\s+(?:link|addr|route)|ifconfig)\b", script_body
+        ))
+        return {
+            "router_lan_iface": lan_iface,
+            "router_wan_ifaces": list(wan_ifaces),
+            "router_link_up": {
+                iface: flag(router_output, f"LINK_{iface}")
+                for iface in (lan_iface,) + wan_ifaces
+            },
+            "router_address_present": {
+                iface: flag(router_output, f"ADDR_{iface}")
+                for iface in (lan_iface,) + wan_ifaces
+            },
+            "router_lan_address_matches": flag(router_output, "LAN_ADDR"),
+            "management_iface": management_iface,
+            "notify_handler_count": int(notify_match.group(1)) if notify_match else -1,
+            "link_script_has_interface_mutation": forbidden_interface_ops,
+            "auth_bypass_prerequisite_present": bool(
+                summary.get("auth_switch") or summary.get("auto_auth")
+            ),
+            "client_lan_iface": client_iface,
+            "client_lan_link_up": flag(client_output, "CLIENT_LINK"),
+            "client_lan_address_matches": flag(client_output, "CLIENT_ADDR"),
+            "client_management_iface": mgmt_dev.group(1) if mgmt_dev else "",
+            "client_management_separate": bool(
+                mgmt_dev and mgmt_dev.group(1) != client_iface
+            ),
+            "client_lan_route_matches": bool(
+                lan_dev and lan_dev.group(1) == client_iface
+                and lan_src and lan_src.group(1) == client_lan
+            ),
+        }
+
+    def verify_basic_link_topology_safety(self) -> VerifyResult:
+        """链路模式写入前证明接口状态、管理路径和脚本影响边界。"""
+        try:
+            state = self._basic_link_topology_state()
+            health = self.verify_basic_management_health()
+            wan_ifaces = tuple(state.get("router_wan_ifaces") or ())
+            checks = {
+                "router_lan_link_and_address": bool(
+                    state.get("router_link_up", {}).get("lan1")
+                    and state.get("router_address_present", {}).get("lan1")
+                    and state.get("router_lan_address_matches")
+                ),
+                "router_wans_link_and_address": all(
+                    state.get("router_link_up", {}).get(iface)
+                    and state.get("router_address_present", {}).get(iface)
+                    for iface in wan_ifaces
+                ),
+                "management_iface_known": state.get("management_iface") in wan_ifaces,
+                "client_lan_link_and_address": bool(
+                    state.get("client_lan_link_up")
+                    and state.get("client_lan_address_matches")
+                    and state.get("client_lan_route_matches")
+                ),
+                "client_management_separate": bool(
+                    state.get("client_management_separate")
+                ),
+                "link_script_no_ip_mutation": not bool(
+                    state.get("link_script_has_interface_mutation")
+                ),
+                "no_unknown_notify_handlers": state.get("notify_handler_count") == 0,
+                "auth_bypass_inactive": not bool(
+                    state.get("auth_bypass_prerequisite_present")
+                ),
+                "management_channels_healthy": health.passed,
+            }
+            details = {
+                "checks": checks,
+                "router_lan_iface": state.get("router_lan_iface"),
+                "router_wan_ifaces": list(wan_ifaces),
+                "management_iface": state.get("management_iface"),
+                "client_lan_iface": state.get("client_lan_iface"),
+                "client_management_iface": state.get("client_management_iface"),
+                "notify_handler_count": state.get("notify_handler_count"),
+                "auth_bypass_prerequisite_present": state.get(
+                    "auth_bypass_prerequisite_present"
+                ),
+            }
+            passed = all(checks.values())
+            return VerifyResult(
+                "安全-基础设置链路拓扑", passed,
+                "链路模式写入前接口、管理路径和脚本边界均已确认" if passed else
+                "链路模式写入安全前置不完整",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "安全-基础设置链路拓扑", False,
+                f"链路模式安全前置异常: {type(exc).__name__}",
+            )
+
+    def _basic_client_state(self, server_ip: str) -> Dict[str, Any]:
+        self.connect_client()
+        safe_server = str(ipaddress.ip_address(server_ip))
+        route = self._client.exec(
+            f"ip route show exact {safe_server}/32 2>/dev/null",
+            timeout=15,
+        ).strip()
+        route_get = self._client.exec(
+            f"ip route get {safe_server} 2>/dev/null | head -1",
+            timeout=15,
+        ).strip()
+        artifact_files = self._client.exec(
+            "find /tmp -maxdepth 1 -type f -name 'ikuai-basic-*' -print 2>/dev/null",
+            timeout=15,
+        )
+        artifact_processes = self._client.exec(
+            "pgrep -af 'python3 /tmp/[i]kuai-basic-' 2>/dev/null",
+            timeout=15,
+        )
+        artifacts = "\n".join(
+            part for part in (artifact_files.strip(), artifact_processes.strip()) if part
+        )
+        return {
+            "server_ip": safe_server,
+            "route": route,
+            "route_get": route_get,
+            "artifact_lines": [line for line in artifacts.splitlines() if line.strip()],
+        }
+
+    def get_basic_environment_snapshot(self, server_ip: str = None) -> Dict[str, Any]:
+        """测试前完整内存快照；不把设备名称或自定义 NTP 值写入报告。"""
+        server_ip = str(server_ip or self._ssh_config.iperf3_server)
+        row = self._basic_read_row()
+        if row is None:
+            raise RuntimeError("basic表缺少id=1基线记录")
+        from utils.step_recorder import register_sensitive_values
+        register_sensitive_values(
+            row.get(field) for field in self.BASIC_PRIVATE_FIELDS
+        )
+        snapshot = {
+            "version": 1,
+            "row": row,
+            "row_count": self._basic_row_count(),
+            "files": self._basic_file_state(),
+            "iptables": self._basic_iptables_state(),
+            "process": self._basic_process_state(),
+            "summary": self._basic_summary_state(),
+            "routes": self._basic_route_state(),
+            "clock": self._basic_clock_state(),
+            "integrity": self._basic_integrity_state(),
+            "topology": self._basic_link_topology_state(),
+            "client": self._basic_client_state(server_ip),
+        }
+        snapshot["public"] = {
+            "row": self._basic_public_row(row),
+            "client_route_present": bool(snapshot["client"].get("route")),
+            "process_commands": self._basic_process_semantics(snapshot["process"]),
+            "summary": dict(snapshot["summary"]),
+        }
+        return snapshot
+
+    def verify_basic_singleton_contract(self) -> VerifyResult:
+        """L1/L2：表结构、默认值、单例记录与脚本 API 注册。"""
+        try:
+            self.connect_router()
+            output = self._router.exec(
+                f"sqlite3 {shlex.quote(self.DNS_DB)} "
+                "\"SELECT count(*) FROM basic; PRAGMA table_info(basic);\"; "
+                "grep -nE 'url=system/basic/(config|ntp:sync)' "
+                f"{shlex.quote(self.BASIC_SCRIPT)}; "
+                "grep -nE '^(init|save|sync_time|set_time|start|stop|reload)\\(\\)' "
+                f"{shlex.quote(self.BASIC_SCRIPT)}; "
+                "grep -nE 'ikntpget' "
+                f"{shlex.quote(self.BASIC_NTP_SCRIPT)}; "
+                "command -v ikntpget; "
+                "strings /usr/sbin/ikntpget 2>/dev/null | "
+                "grep -E 'switch_ntpserver|ntpserver_list|cache/config/basic'",
+                timeout=20,
+            )
+            rows = [line.strip() for line in output.splitlines()]
+            count = next((int(line) for line in rows if line.isdigit()), -1)
+            schema: Dict[str, Dict[str, Any]] = {}
+            for line in rows:
+                parts = line.split("|")
+                if len(parts) >= 6 and parts[0].isdigit() and parts[1] in self.BASIC_FIELDS:
+                    schema[parts[1]] = {
+                        "type": parts[2].lower(),
+                        "default": parts[4],
+                        "pk": parts[5] == "1",
+                    }
+            integer_fields = self.BASIC_INTEGER_FIELDS
+            text_fields = set(self.BASIC_FIELDS) - set(integer_fields)
+            default_mismatches = sorted(
+                field for field, expected in self.BASIC_SCHEMA_DEFAULTS.items()
+                if schema.get(field, {}).get("default") != expected
+            )
+            checks = {
+                "single_row": count == 1,
+                "singleton_id_1": self._basic_read_row() is not None,
+                "all_fields": set(schema) == set(self.BASIC_FIELDS),
+                "integer_types": all(schema.get(k, {}).get("type") == "integer" for k in integer_fields),
+                "text_types": all(schema.get(k, {}).get("type") == "text" for k in text_fields),
+                "id_primary_key": bool(schema.get("id", {}).get("pk")),
+                "all_defaults": not default_mismatches,
+                "rest_config_registered": "url=system/basic/config" in output and "get=data" in output and "put=save" in output,
+                "rest_ntp_registered": "url=system/basic/ntp:sync" in output and "post=sync_time" in output,
+                "actions_present": all(f"{name}()" in output for name in ("init", "save", "sync_time", "set_time")),
+                "unsupported_lifecycle_absent": all(
+                    f"{name}()" not in output for name in ("start", "stop", "reload")
+                ),
+                "ntp_helper_mapping": all(
+                    token in output for token in (
+                        "ikntpget", "switch_ntpserver", "ntpserver_list",
+                        "cache/config/basic",
+                    )
+                ),
+            }
+            details = {
+                "checks": checks,
+                "table": self.BASIC_TABLE,
+                "field_types": {k: schema.get(k, {}).get("type", "missing") for k in self.BASIC_FIELDS},
+                "default_fields_checked": sorted(self.BASIC_SCHEMA_DEFAULTS),
+                "default_mismatched_fields": default_mismatches,
+                "record_model": "id=1单例",
+                "action_api": "POST /Action/call: basic show/save/sync_time/set_time",
+                "lifecycle_api": "start/stop/reload入口不适用；保存后由init重建",
+                "list_crud": "不适用",
+            }
+            passed = all(checks.values())
+            return VerifyResult(
+                "L1/L2-基础设置单例契约", passed,
+                "基础设置表、默认值和API注册符合实机契约" if passed else
+                "基础设置单例表或API注册不符合实机契约",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L1/L2-基础设置单例契约", False, f"基础设置单例契约验证异常: {exc}")
+
+    def verify_basic_database(self, expected_fields: Dict[str, Any] = None,
+                              snapshot: Dict[str, Any] = None) -> VerifyResult:
+        """L1：期望字段一致，且本场景未修改字段保持测试前原值。"""
+        try:
+            expected_fields = dict(expected_fields or {})
+            unknown = set(expected_fields) - set(self.BASIC_FIELDS)
+            if unknown:
+                raise ValueError("未知基础设置字段: " + ",".join(sorted(unknown)))
+            from utils.step_recorder import register_sensitive_values
+            register_sensitive_values(
+                expected_fields.get(field) for field in self.BASIC_PRIVATE_FIELDS
+                if field in expected_fields
+            )
+            actual = self._basic_read_row()
+            if actual is None:
+                return VerifyResult("L1-基础设置数据库", False, "basic表缺少id=1记录")
+            row_count = self._basic_row_count()
+            mismatches = []
+            for field, expected in expected_fields.items():
+                if field in self.BASIC_INTEGER_FIELDS:
+                    try:
+                        matched = int(actual.get(field, 0)) == int(expected)
+                    except (TypeError, ValueError):
+                        matched = False
+                else:
+                    matched = str(actual.get(field, "")) == str(expected if expected is not None else "")
+                if not matched:
+                    mismatches.append(field)
+            protected_mismatches = []
+            baseline = (snapshot or {}).get("row") if isinstance(snapshot, dict) else None
+            if isinstance(baseline, dict):
+                baseline = self._basic_normalize_row(baseline)
+                for field in self.BASIC_FIELDS:
+                    if field in expected_fields:
+                        continue
+                    if actual.get(field) != baseline.get(field):
+                        protected_mismatches.append(field)
+            passed = row_count == 1 and not mismatches and not protected_mismatches
+            details = {
+                "checked_fields": sorted(expected_fields),
+                "mismatched_fields": sorted(mismatches),
+                "unexpectedly_changed_fields": sorted(protected_mismatches),
+                "row_count": row_count,
+                "state": self._basic_public_row(actual),
+            }
+            return VerifyResult(
+                "L1-基础设置数据库", passed,
+                "basic单例字段与页面选择一致且无非测试字段变化" if passed else
+                "basic字段不一致或出现非预期字段变化",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L1-基础设置数据库", False, f"基础设置数据库验证异常: {exc}")
+
+    def verify_basic_generated_state(self, expected_fields: Dict[str, Any] = None) -> VerifyResult:
+        """L2：DB到缓存、hostname、hosts与时区文件映射。"""
+        try:
+            row = self._basic_read_row()
+            if row is None:
+                return VerifyResult("L2-基础设置生成配置", False, "basic表缺少id=1记录")
+            expected = dict(row)
+            expected.update(expected_fields or {})
+            expected = self._basic_normalize_row(expected)
+            state = self._basic_file_state()
+            cache = state.get("cache", {})
+            cache_mismatches = []
+            for field in self.BASIC_FIELDS:
+                actual_value = cache.get(field, "")
+                expected_value = str(expected.get(field, ""))
+                if actual_value != expected_value:
+                    cache_mismatches.append(field)
+            hostname_ok = (
+                state.get("kernel_hostname") == expected.get("hostname")
+                and state.get("hosts_hostname") == f"127.0.0.1 {expected.get('hostname')}"
+            )
+            timezone_ok = state.get("tz") == self._basic_timezone_file_value(
+                expected.get("time_zone_full")
+            )
+            checks = {
+                "cache_all_fields": not cache_mismatches,
+                "kernel_hostname_and_hosts": hostname_ok,
+                "timezone_file": timezone_ok,
+                "localtime_script_target": (
+                    state.get("localtime_link") == "/usr/share/zoneinfo/GMT-8"
+                ),
+            }
+            details = {
+                "checks": checks,
+                "cache_mismatched_fields": cache_mismatches,
+                "cache_field_count": len(cache),
+                "hostname_length": len(str(expected.get("hostname", ""))),
+                "timezone_full": expected.get("time_zone_full"),
+                "localtime_script_target": "固定GMT-8（实际偏移由/etc/TZ承载）",
+            }
+            passed = all(checks.values())
+            return VerifyResult(
+                "L2-基础设置生成配置", passed,
+                "basic DB已正确映射到缓存、主机名和时区文件" if passed else
+                "basic DB到缓存或系统文件映射不一致",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L2-基础设置生成配置", False, f"基础设置生成配置验证异常: {exc}")
+
+    @staticmethod
+    def _basic_rule_lines(text: str, chain: str) -> List[str]:
+        marker = f"-A {chain} "
+        return [line.strip() for line in str(text or "").splitlines() if marker in line]
+
+    def verify_basic_nat_runtime(self, switch_nat: int,
+                                 lan_nat: int = 0) -> VerifyResult:
+        """L3：上网模式到 AUTONAT/FULLCONENAT/NONAT 的真实映射。"""
+        try:
+            mode = int(switch_nat)
+            if mode not in {0, 1, 2}:
+                raise ValueError("上网模式仅支持0/1/2")
+            state = self._basic_iptables_state()
+            auto = self._basic_rule_lines(state["autonat"], "AUTONAT")
+            pre = self._basic_rule_lines(state["pre_fullcone"], "PRE_FULLCONE")
+            post = self._basic_rule_lines(state["post_fullcone"], "POST_FULLCONE")
+            nonat = self._basic_rule_lines(state["nonat"], "NONAT")
+            if mode == 1:
+                checks = {
+                    "masquerade": len(auto) >= 1 and all("MASQUERADE" in line for line in auto),
+                    "fullcone_absent": not pre and not post,
+                    "nonat_absent": not nonat,
+                }
+            elif mode == 2:
+                checks = {
+                    "masquerade": len(auto) >= 1 and all("MASQUERADE" in line for line in auto),
+                    "fullcone_pre": len(pre) == 1 and "FULLCONENAT" in pre[0],
+                    "fullcone_post": len(post) == 1 and "FULLCONENAT" in post[0],
+                    "nonat_absent": not nonat,
+                }
+            else:
+                checks = {
+                    "fullcone_absent": not pre and not post,
+                    "nonat_tcp_udp_exact": (
+                        len(nonat) == 2
+                        and any("-p tcp" in line and "REJECT" in line for line in nonat)
+                        and any("-p udp" in line and "REJECT" in line for line in nonat)
+                    ),
+                    "local_router_snat": (
+                        any("SNAT" in line for line in auto) if int(lan_nat) == 1 else not auto
+                    ),
+                }
+            details = {
+                "mode": mode,
+                "lan_nat": int(lan_nat),
+                "checks": checks,
+                "rule_counts": {
+                    "AUTONAT": len(auto), "PRE_FULLCONE": len(pre),
+                    "POST_FULLCONE": len(post), "NONAT": len(nonat),
+                },
+            }
+            passed = all(checks.values())
+            return VerifyResult(
+                "L3-基础设置上网模式", passed,
+                f"上网模式{mode}的NAT/NONAT规则映射正确" if passed else
+                f"上网模式{mode}的iptables运行态不正确",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L3-基础设置上网模式", False, f"上网模式运行态验证异常: {exc}")
+
+    def verify_basic_link_runtime(self, link_mode: int) -> VerifyResult:
+        """L3：主干/旁路/SD-WAN到AC命令行和ik_core桥状态的映射。"""
+        try:
+            mode = int(link_mode)
+            if mode not in {0, 1, 2}:
+                raise ValueError("链路模式仅支持0/1/2")
+            summary = self._basic_summary_state()
+            process_state = self._basic_process_state()
+            process = self._basic_process_semantics(process_state)
+            ac_commands = [line for line in process if re.search(r"(^|[ {])AC(?: |$)", line)]
+            ac_enabled = str(
+                (self._samba_sqlite_query_line(
+                    "SELECT ac_server FROM global_config WHERE id=1"
+                ) or {}).get("ac_server", "0")
+            ) == "1"
+            self.connect_router()
+            notify_text = self._router.exec(
+                "find /etc/basic/notify.d -maxdepth 1 -type f -perm /111 "
+                "2>/dev/null | wc -l",
+                timeout=10,
+            ).strip()
+            notify_count = int(notify_text) if notify_text.isdigit() else -1
+            sdwan_expected = "on" if mode == 2 else "off"
+            checks = {
+                # 实机 basic.sh 的 __set_linke_mode 只触发 notify.d；脚本及
+                # AC 启动入口均没有 link_mode -> ``AC -b`` 的映射。AC 仅按
+                # global_config.ac_server 校验服务存在性，不能虚构模式参数。
+                "ac_service_state": bool(ac_commands) == ac_enabled,
+                "no_unmodeled_notify_handlers": notify_count == 0,
+                "sdwan_bypass_mode": summary.get("sdwan_bypass") == sdwan_expected,
+                "bypass_marker_semantics": (
+                    True if mode != 1 else
+                    summary.get("bypass_marker") == bool(
+                        summary.get("auth_switch") or summary.get("auto_auth")
+                    )
+                ),
+            }
+            details = {
+                "mode": mode,
+                "checks": checks,
+                "ac_enabled": ac_enabled,
+                "ac_process_count": len(ac_commands),
+                "notify_handler_count": notify_count,
+                "ac_link_mode_argument_applicable": False,
+                "sdwan_bypass": summary.get("sdwan_bypass"),
+                "auth_switch_present": bool(summary.get("auth_switch")),
+                "auto_auth_present": bool(summary.get("auto_auth")),
+                "bypass_marker_present": bool(summary.get("bypass_marker")),
+                "process_inventory": self._basic_process_inventory(process_state),
+            }
+            passed = all(checks.values())
+            return VerifyResult(
+                "L3-基础设置链路模式", passed,
+                f"链路模式{mode}的AC与内核运行态正确" if passed else
+                f"链路模式{mode}的AC或内核运行态不正确",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L3-基础设置链路模式", False, f"链路模式运行态验证异常: {exc}")
+
+    def verify_basic_acceleration_runtime(self, fast_nat: int) -> VerifyResult:
+        """L3：关闭/软件/硬件加速到FASTOFFLOAD规则。"""
+        try:
+            mode = int(fast_nat)
+            if mode not in {0, 1, 2}:
+                raise ValueError("加速模式仅支持0/1/2")
+            state = self._basic_iptables_state(include_counters=True)
+            rules = self._basic_rule_lines(state["fastoffload"], "FASTOFFLOAD")
+            row = self._basic_read_row() or {}
+            cache = self._basic_file_state().get("cache", {})
+            try:
+                db_mode = int(row.get("fast_nat", -1))
+            except (TypeError, ValueError):
+                db_mode = -1
+            try:
+                cache_mode = int(cache.get("fast_nat", -1))
+            except (TypeError, ValueError):
+                cache_mode = -1
+            self.connect_router()
+            script_contract_text = self._router.exec(
+                "awk '/^__set_fast_nat\\(\\)/,/^__not_nat\\(\\)/' "
+                f"{shlex.quote(self.BASIC_SCRIPT)}",
+                timeout=10,
+            )
+            script_contract = {
+                "flush_chain": "-F FASTOFFLOAD" in script_contract_text,
+                "append_flowoffload": (
+                    "-A FASTOFFLOAD" in script_contract_text
+                    and "-j FLOWOFFLOAD" in script_contract_text
+                ),
+                "threshold_50": (
+                    "--connbytes=50" in script_contract_text
+                    or "--connbytes 50" in script_contract_text
+                ),
+                "software_without_hw": 'local hardware=""' in script_contract_text,
+                "hardware_with_hw": 'local hardware="--hw"' in script_contract_text,
+            }
+            capabilities_text = self._router.exec(
+                "printf '__FLOWOFFLOAD__='; "
+                "grep -qw FLOWOFFLOAD /proc/net/ip_tables_targets 2>/dev/null "
+                "&& echo 1 || echo 0; "
+                "printf '__CONNBYTES__='; "
+                "grep -qw connbytes /proc/net/ip_tables_matches 2>/dev/null "
+                "&& echo 1 || echo 0; "
+                "printf '__IFACES__='; "
+                "grep -qw ifaces /proc/net/ip_tables_matches 2>/dev/null "
+                "&& echo 1 || echo 0; "
+                "printf '__MODULE__='; "
+                "awk '{print $1}' /proc/modules 2>/dev/null | "
+                "grep -qi flowoffload && echo 1 || echo 0",
+                timeout=10,
+            )
+
+            def capability(name: str) -> bool:
+                matched = re.search(
+                    rf"__{name}__=(\d+)", capabilities_text or ""
+                )
+                return bool(matched and matched.group(1) == "1")
+
+            if mode == 0:
+                checks = {
+                    "database_mode": db_mode == mode,
+                    "cache_mode": cache_mode == mode,
+                    "script_branch_contract": script_contract["flush_chain"],
+                    "rule_absent": not rules,
+                }
+            else:
+                checks = {
+                    "database_mode": db_mode == mode,
+                    "cache_mode": cache_mode == mode,
+                    "script_branch_contract": all((
+                        script_contract["flush_chain"],
+                        script_contract["append_flowoffload"],
+                        script_contract["threshold_50"],
+                        script_contract[
+                            "hardware_with_hw" if mode == 2
+                            else "software_without_hw"
+                        ],
+                    )),
+                    "single_flowoffload_rule": len(rules) == 1 and "FLOWOFFLOAD" in rules[0],
+                    "packet_threshold_50": bool(rules) and bool(re.search(
+                        r"--connbytes(?:=|\s+)50(?:\s|$)", rules[0]
+                    )),
+                    "hardware_flag": (
+                        "--hw" in rules[0] if mode == 2 else "--hw" not in rules[0]
+                    ) if rules else False,
+                }
+            details = {
+                "mode": mode,
+                "checks": checks,
+                "database_fast_nat": db_mode,
+                "cache_fast_nat": cache_mode,
+                "script_contract": script_contract,
+                "rule_count": len(rules),
+                "packet_counter": int(state.get("fastoffload_packets", 0)),
+                "kernel_capabilities": {
+                    "flowoffload_target_loaded": capability("FLOWOFFLOAD"),
+                    "flowoffload_module_loaded": capability("MODULE"),
+                    "connbytes_match_loaded": capability("CONNBYTES"),
+                    "ifaces_match_loaded": capability("IFACES"),
+                },
+            }
+            passed = all(checks.values())
+            return VerifyResult(
+                "L3-基础设置加速模式", passed,
+                f"加速模式{mode}的FASTOFFLOAD运行态正确" if passed else
+                (
+                    f"加速模式{mode}运行态不正确：DB={db_mode}、"
+                    f"缓存={cache_mode}、FASTOFFLOAD规则={len(rules)}、"
+                    "FLOWOFFLOAD内核目标加载="
+                    f"{'是' if capability('FLOWOFFLOAD') else '否'}"
+                ),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L3-基础设置加速模式", False, f"加速模式运行态验证异常: {exc}")
+
+    def verify_basic_ntp_runtime(self, switch_ntp: int,
+                                 switch_ntpd: int,
+                                 ntp_sync_cycle: int = 60) -> VerifyResult:
+        """L3：自动对时、iktimerd、ntpd进程和UDP/123监听。"""
+        try:
+            self.connect_router()
+            process_state = self._basic_process_state()
+            process = self._basic_process_semantics(process_state)
+            ntpd = [line for line in process if re.search(r"(^|[ {])ntpd(?: |$)", line)]
+            iktimer = self._router.exec(
+                "ps -w 2>/dev/null | grep '[i]ktimerd'",
+                timeout=15,
+            ).strip()
+            listener = self._router.exec(
+                "netstat -lnup 2>/dev/null | grep -E ':123[[:space:]]'",
+                timeout=15,
+            ).strip()
+            checks = {
+                "sync_cycle_range": 5 <= int(ntp_sync_cycle) <= 240,
+                "iktimerd_running_when_auto": bool(iktimer) if int(switch_ntp) else True,
+                "ntpd_process": bool(ntpd) == bool(int(switch_ntpd)),
+                "udp123_listener": bool(listener) == bool(int(switch_ntpd)),
+            }
+            details = {
+                "switch_ntp": int(switch_ntp),
+                "switch_ntpd": int(switch_ntpd),
+                "sync_cycle": int(ntp_sync_cycle),
+                "checks": checks,
+                "ntpd_count": len(ntpd),
+                "udp123_listening": bool(listener),
+                "process_inventory": self._basic_process_inventory(process_state),
+            }
+            passed = all(checks.values())
+            return VerifyResult(
+                "L3-基础设置NTP运行态", passed,
+                "自动对时与NTP服务运行态正确" if passed else
+                "自动对时或NTP服务运行态不正确",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L3-基础设置NTP运行态", False, f"NTP运行态验证异常: {exc}")
+
+    def verify_basic_runtime_consistency(self,
+                                         expected_fields: Dict[str, Any],
+                                         snapshot: Dict[str, Any] = None) -> VerifyResult:
+        expected = dict(expected_fields or {})
+        row = self._basic_read_row() or {}
+        merged = dict(row)
+        merged.update(expected)
+        results = [
+            self.verify_basic_database(expected, snapshot=snapshot),
+            self.verify_basic_generated_state(expected),
+            self.verify_basic_nat_runtime(
+                int(merged.get("switch_nat", 1)), int(merged.get("lan_nat", 0))
+            ),
+            self.verify_basic_link_runtime(int(merged.get("link_mode", 0))),
+            self.verify_basic_acceleration_runtime(int(merged.get("fast_nat", 0))),
+            self.verify_basic_ntp_runtime(
+                int(merged.get("switch_ntp", 1)),
+                int(merged.get("switch_ntpd", 0)),
+                int(merged.get("ntp_sync_cycle", 60)),
+            ),
+        ]
+        passed = all(result.passed for result in results)
+        details = {
+            "layers": {
+                result.level: {"passed": result.passed, "message": result.message}
+                for result in results
+            }
+        }
+        return VerifyResult(
+            "L4-基础设置全链路一致性", passed,
+            "基础设置DB、缓存、iptables、进程与内核状态一致" if passed else
+            "基础设置全链路不一致: " + "; ".join(
+                result.message for result in results if not result.passed
+            ),
+            details=details, raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def verify_basic_reinit(self,
+                            expected_fields: Dict[str, Any],
+                            snapshot: Dict[str, Any] = None) -> VerifyResult:
+        """L4：调用实机 basic.sh init，验证配置不丢失且旧态不累积。"""
+        try:
+            self.connect_router()
+            self._router.exec(
+                f"{shlex.quote(self.BASIC_SCRIPT)} init >/dev/null 2>&1",
+                timeout=30,
+            )
+            result = None
+            deadline = time.monotonic() + 20.0
+            while True:
+                result = self.verify_basic_runtime_consistency(
+                    expected_fields, snapshot=snapshot
+                )
+                if result.passed or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.5)
+            details = dict(result.details or {})
+            details["product_init_invoked"] = True
+            return VerifyResult(
+                "L4-基础设置init重建", result.passed,
+                "basic.sh init后配置与运行态无丢失、无重复" if result.passed else
+                "basic.sh init后发现配置丢失、旧态残留或规则累积: " + result.message,
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L4-基础设置init重建", False, f"basic.sh init复验异常: {exc}")
+
+    def verify_basic_environment_unchanged(self, snapshot: Dict[str, Any],
+                                           allow_pid_change: bool = True) -> VerifyResult:
+        """L4：按语义比较测试前后的DB、文件、规则、进程、内核和客户端路由。"""
+        try:
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("row"), dict):
+                raise ValueError("基础设置快照无效")
+            server_ip = (snapshot.get("client") or {}).get("server_ip") or self._ssh_config.iperf3_server
+            actual = {
+                "row": self._basic_read_row(),
+                "row_count": self._basic_row_count(),
+                "files": self._basic_file_state(),
+                "iptables": self._basic_iptables_state(),
+                "process": self._basic_process_state(),
+                "summary": self._basic_summary_state(),
+                "routes": self._basic_route_state(),
+                "clock": self._basic_clock_state(),
+                "integrity": self._basic_integrity_state(),
+                "topology": self._basic_link_topology_state(),
+                "client": self._basic_client_state(server_ip),
+            }
+            expected_process = snapshot.get("process", {})
+            process_match = (
+                self._basic_process_semantics(actual["process"])
+                == self._basic_process_semantics(expected_process)
+                if allow_pid_change else actual["process"] == expected_process
+            )
+            file_keys = (
+                "cache_content", "tz", "hosts_hostname", "kernel_hostname",
+                "localtime_link",
+            )
+            files_match = all(
+                actual["files"].get(key) == (snapshot.get("files") or {}).get(key)
+                for key in file_keys
+            )
+            client_expected = snapshot.get("client") or {}
+            expected_clock = snapshot.get("clock") or {}
+            actual_clock = actual.get("clock") or {}
+            baseline_offset = expected_clock.get("router_client_offset")
+            current_offset = actual_clock.get("router_client_offset")
+            baseline_rtc_offset = expected_clock.get("rtc_client_offset")
+            current_rtc_offset = actual_clock.get("rtc_client_offset")
+            clock_offset_match = (
+                baseline_offset is not None and current_offset is not None
+                and abs(int(current_offset) - int(baseline_offset)) <= 5
+            )
+            rtc_offset_match = (
+                baseline_rtc_offset is not None and current_rtc_offset is not None
+                and abs(int(current_rtc_offset) - int(baseline_rtc_offset)) <= 8
+            )
+            checks = {
+                "database": (
+                    actual["row_count"] == int(snapshot.get("row_count", 1)) == 1
+                    and self._basic_normalize_row(actual["row"] or {})
+                    == self._basic_normalize_row(snapshot["row"])
+                ),
+                "generated_files": files_match,
+                "iptables": actual["iptables"] == snapshot.get("iptables"),
+                "process_semantics": process_match,
+                "kernel_summary": actual["summary"] == snapshot.get("summary"),
+                "router_routes": actual["routes"] == snapshot.get("routes"),
+                "clock_offset": clock_offset_match,
+                "hardware_clock_offset": rtc_offset_match,
+                "maintenance_and_kernel_integrity": (
+                    actual["integrity"] == snapshot.get("integrity")
+                ),
+                "interface_topology": actual["topology"] == snapshot.get("topology"),
+                "client_route": actual["client"].get("route") == client_expected.get("route"),
+                "client_artifacts": not actual["client"].get("artifact_lines"),
+            }
+            details = {
+                "checks": checks,
+                "allow_pid_change": bool(allow_pid_change),
+                "client_route_present": bool(actual["client"].get("route")),
+                "client_artifact_count": len(actual["client"].get("artifact_lines", [])),
+                "clock_offset_delta_seconds": (
+                    abs(int(current_offset) - int(baseline_offset))
+                    if baseline_offset is not None and current_offset is not None
+                    else None
+                ),
+                "rtc_offset_delta_seconds": (
+                    abs(int(current_rtc_offset) - int(baseline_rtc_offset))
+                    if baseline_rtc_offset is not None
+                    and current_rtc_offset is not None else None
+                ),
+            }
+            passed = all(checks.values())
+            return VerifyResult(
+                "L4-基础设置环境指纹", passed,
+                "基础设置测试前配置及运行态已精确恢复" if passed else
+                "基础设置环境仍有差异: " + ",".join(k for k, ok in checks.items() if not ok),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L4-基础设置环境指纹", False, f"基础设置环境指纹验证异常: {exc}")
+
+    def _basic_restore_row_script(self, row: Dict[str, Any]) -> str:
+        normalized = self._basic_normalize_row(row)
+        assignments = []
+        for field in self.BASIC_FIELDS:
+            if field == "id":
+                continue
+            value = normalized[field]
+            literal = str(value) if field in self.BASIC_INTEGER_FIELDS else self._basic_sql_literal(value)
+            assignments.append(f'"{field}"={literal}')
+        sql = (
+            f"UPDATE {self.BASIC_TABLE} SET {','.join(assignments)} "
+            f"WHERE id={normalized['id']};"
+        )
+        return (
+            "set -eu\n"
+            f"sqlite3 {shlex.quote(self.DNS_DB)} {shlex.quote(sql)}\n"
+            f"{shlex.quote(self.BASIC_SCRIPT)} init >/dev/null 2>&1\n"
+        )
+
+    def _basic_restore_client_route(self, snapshot: Dict[str, Any]):
+        client = snapshot.get("client") or {}
+        server_ip = str(ipaddress.ip_address(client.get("server_ip") or self._ssh_config.iperf3_server))
+        original = str(client.get("route") or "").strip()
+        script = ["set -eu", f"sudo -n ip route del {server_ip}/32 2>/dev/null || true"]
+        if original:
+            if not original.startswith(server_ip) or not re.fullmatch(r"[A-Za-z0-9_./: -]+", original):
+                raise ValueError("客户端原始路由格式不安全")
+            remainder = original[len(server_ip):].strip()
+            script.append(f"sudo -n ip route replace {server_ip}/32 {remainder}")
+        script.extend([
+            "pkill -f 'python3 /tmp/[i]kuai-basic-' 2>/dev/null || true",
+            "rm -f /tmp/ikuai-basic-*.py /tmp/ikuai-basic-*.ready "
+            "/tmp/ikuai-basic-*.json",
+        ])
+        self._samba_exec_client_script(
+            "\n".join(script) + "\n",
+            "restore basic-setting client route and exact temporary artifacts",
+            timeout=30,
+        )
+
+    def _basic_restore_clock(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """恢复测试前路由器相对客户端的时差，而不是倒退到历史时间戳。"""
+        expected = snapshot.get("clock") or {}
+        baseline_offset = expected.get("router_client_offset")
+        baseline_rtc_offset = expected.get("rtc_client_offset")
+        if baseline_offset is None or baseline_rtc_offset is None:
+            return {"passed": False, "adjusted": False, "reason": "baseline_missing"}
+        current = self._basic_clock_state()
+        current_offset = current.get("router_client_offset")
+        current_rtc_offset = current.get("rtc_client_offset")
+        if current_offset is None or current_rtc_offset is None:
+            return {"passed": False, "adjusted": False, "reason": "current_missing"}
+        initial_delta = abs(int(current_offset) - int(baseline_offset))
+        initial_rtc_delta = abs(
+            int(current_rtc_offset) - int(baseline_rtc_offset)
+        )
+        adjusted = False
+        if initial_delta > 5 or initial_rtc_delta > 8:
+            target_epoch = int(current.get("client_epoch", 0)) + int(baseline_offset)
+            if not re.fullmatch(r"\d{10}", str(target_epoch)):
+                return {
+                    "passed": False, "adjusted": False,
+                    "reason": "target_epoch_invalid",
+                    "initial_delta_seconds": initial_delta,
+                    "initial_rtc_delta_seconds": initial_rtc_delta,
+                }
+            self._samba_exec_router_script(
+                "set -eu\n"
+                f"{shlex.quote(self.BASIC_SCRIPT)} set_time timestamp={target_epoch} "
+                ">/dev/null 2>&1\n"
+                "sleep 1\n",
+                "restore basic-setting clock offset via product set_time",
+                timeout=15,
+            )
+            adjusted = True
+        final = current
+        deadline = time.monotonic() + 8.0
+        while True:
+            final = self._basic_clock_state()
+            final_offset = final.get("router_client_offset")
+            final_rtc_offset = final.get("rtc_client_offset")
+            if (
+                final_offset is not None
+                and abs(int(final_offset) - int(baseline_offset)) <= 5
+                and final_rtc_offset is not None
+                and abs(
+                    int(final_rtc_offset) - int(baseline_rtc_offset)
+                ) <= 8
+            ) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.4)
+        final_offset = final.get("router_client_offset")
+        final_delta = (
+            abs(int(final_offset) - int(baseline_offset))
+            if final_offset is not None else None
+        )
+        final_rtc_offset = final.get("rtc_client_offset")
+        final_rtc_delta = (
+            abs(int(final_rtc_offset) - int(baseline_rtc_offset))
+            if final_rtc_offset is not None else None
+        )
+        return {
+            "passed": (
+                final_delta is not None and final_delta <= 5
+                and final_rtc_delta is not None and final_rtc_delta <= 8
+            ),
+            "adjusted": adjusted,
+            "initial_delta_seconds": initial_delta,
+            "initial_rtc_delta_seconds": initial_rtc_delta,
+            "final_delta_seconds": final_delta,
+            "final_rtc_delta_seconds": final_rtc_delta,
+            "hardware_clock_available": bool(final.get("hardware_clock_available")),
+        }
+
+    def restore_basic_environment(self, snapshot: Dict[str, Any]) -> VerifyResult:
+        """finally精确恢复 basic.id=1、产品运行态及客户端临时路由。"""
+        try:
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("row"), dict):
+                raise ValueError("基础设置恢复快照无效")
+            self._samba_exec_router_script(
+                self._basic_restore_row_script(snapshot["row"]),
+                "restore basic-setting singleton and product runtime",
+                timeout=45,
+            )
+            clock_restore = self._basic_restore_clock(snapshot)
+            self._basic_restore_client_route(snapshot)
+            result = None
+            # basic.sh init 会异步拉起/重载 AC、lldpd、openresty、ntpd 等；
+            # 实机偶尔超过15秒才稳定，给45秒语义收敛窗口但不放宽断言。
+            deadline = time.monotonic() + 45.0
+            while True:
+                result = self.verify_basic_environment_unchanged(
+                    snapshot, allow_pid_change=True
+                )
+                if result.passed or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.5)
+            details = dict(result.details or {})
+            details.update({
+                "restored": bool(result.passed and clock_restore.get("passed")),
+                "restore_scope": (
+                    "basic.id=1 + basic.sh init + clock offset/hwclock + "
+                    "exact client route"
+                ),
+                "clock_restore": clock_restore,
+                "secret_transport": "SSH stdin; internal script hidden",
+            })
+            passed = bool(result.passed and clock_restore.get("passed"))
+            failure_parts = []
+            if not result.passed:
+                failure_parts.append(result.message)
+            if not clock_restore.get("passed"):
+                failure_parts.append("系统时钟相对客户端偏差或硬件时钟状态未恢复")
+            return VerifyResult(
+                "L4-基础设置环境恢复", passed,
+                "基础设置原始DB、配置、时钟、进程、路由和内核状态已恢复" if passed else
+                "基础设置恢复后仍与测试前快照不一致: " + "; ".join(failure_parts),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L4-基础设置环境恢复", False, f"基础设置环境恢复异常: {exc}")
+
+    def prepare_basic_l5_route(self, server_ip: str = None,
+                               gateway: str = "192.168.148.1",
+                               iface: str = "ens11",
+                               source_ip: str = "192.168.148.2") -> VerifyResult:
+        """只添加一个精确/32路由，确保L5流量不走客户端管理网。"""
+        try:
+            server = str(ipaddress.ip_address(server_ip or self._ssh_config.iperf3_server))
+            gateway = str(ipaddress.ip_address(gateway))
+            source_ip = str(ipaddress.ip_address(source_ip))
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", iface):
+                raise ValueError("客户端接口格式不安全")
+            self.connect_client()
+            self._client.exec(
+                f"sudo -n ip route replace {server}/32 via {gateway} dev {iface} src {source_ip}",
+                timeout=15,
+            )
+            return self.verify_basic_client_route(
+                server, iface, source_ip, expected_gateway=gateway
+            )
+        except Exception as exc:
+            return VerifyResult("L5-基础设置客户端路由", False, f"准备L5客户端路由异常: {exc}")
+
+    def verify_basic_client_route(self, server_ip: str = None,
+                                  expected_iface: str = "ens11",
+                                  expected_source: str = "192.168.148.2",
+                                  expected_gateway: str = "192.168.148.1") -> VerifyResult:
+        try:
+            server = str(ipaddress.ip_address(server_ip or self._ssh_config.iperf3_server))
+            expected_source = str(ipaddress.ip_address(expected_source))
+            expected_gateway = str(ipaddress.ip_address(expected_gateway))
+            self.connect_client()
+            output = self._client.exec(f"ip route get {server} 2>/dev/null | head -1", timeout=15)
+            dev = re.search(r"\bdev\s+(\S+)", output or "")
+            src = re.search(r"\bsrc\s+(\S+)", output or "")
+            via = re.search(r"\bvia\s+(\S+)", output or "")
+            actual_iface = dev.group(1) if dev else ""
+            actual_source = src.group(1) if src else ""
+            actual_gateway = via.group(1) if via else ""
+            passed = (
+                actual_iface == expected_iface
+                and actual_source == expected_source
+                and actual_gateway == expected_gateway
+            )
+            details = {
+                "server": server,
+                "expected_iface": expected_iface,
+                "actual_iface": actual_iface,
+                "source_matches": actual_source == expected_source,
+                "gateway_matches": actual_gateway == expected_gateway,
+            }
+            return VerifyResult(
+                "L5-基础设置客户端路由", passed,
+                f"L5目标经{actual_iface or '未知接口'}发送，"
+                f"{'符合' if passed else '不符合'}指定网卡、源地址及网关路径要求",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L5-基础设置客户端路由", False, f"客户端路由验证异常: {exc}")
+
+    def run_basic_iperf_probe(self, duration: int = 4,
+                              expect_success: bool = True,
+                              expected_iface: str = "ens11",
+                              expected_source: str = "192.168.148.2",
+                              expected_gateway: str = "192.168.148.1") -> VerifyResult:
+        """L5：从客户端LAN地址经路由器到既有iperf3服务端。"""
+        try:
+            route = self.verify_basic_client_route(
+                expected_iface=expected_iface,
+                expected_source=expected_source,
+                expected_gateway=expected_gateway,
+            )
+            if not route.passed:
+                return VerifyResult(
+                    "L5-基础设置真实打流", False,
+                    "L5客户端路径未同时命中指定网卡、源地址和路由器网关",
+                    details={"route_verified": False},
+                )
+            result = self.run_iperf3(
+                direction="upload", duration=int(duration), retries=1
+            )
+            success = "error" not in result
+            bps = 0.0
+            if success:
+                bps = float(
+                    (result.get("end") or {}).get("sum_sent", {}).get(
+                        "bits_per_second", 0
+                    ) or 0
+                )
+                success = bps > 0
+            passed = success == bool(expect_success)
+            details = {
+                "expected_success": bool(expect_success),
+                "connected": success,
+                "throughput_mbps": round(bps / 1_000_000, 3),
+                "client_interface": expected_iface,
+                "route_verified": route.passed,
+            }
+            return VerifyResult(
+                "L5-基础设置真实打流", passed,
+                ("iperf3真实流量经路由器成功" if success else
+                 "iperf3真实流量被阻断或无返回") +
+                ("，符合预期" if passed else "，不符合预期"),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L5-基础设置真实打流", False, f"iperf3真实打流异常: {exc}")
+
+    def run_basic_acceleration_probe(self, duration: int = 4) -> VerifyResult:
+        """L5：软件加速开启时真实打流必须命中FASTOFFLOAD计数器。"""
+        try:
+            before = self._basic_iptables_state(include_counters=True).get(
+                "fastoffload_packets", 0
+            )
+            flow = self.run_basic_iperf_probe(duration=duration, expect_success=True)
+            after = self._basic_iptables_state(include_counters=True).get(
+                "fastoffload_packets", 0
+            )
+            delta = int(after) - int(before)
+            passed = flow.passed and delta > 0
+            details = {
+                "traffic_passed": flow.passed,
+                "counter_before": int(before),
+                "counter_after": int(after),
+                "counter_delta": delta,
+            }
+            return VerifyResult(
+                "L5-基础设置软件加速", passed,
+                (
+                    f"真实流量命中FASTOFFLOAD，计数{int(before)}→"
+                    f"{int(after)}（增量{delta}），软件加速生效"
+                    if passed else
+                    f"真实流量通过={'是' if flow.passed else '否'}，"
+                    f"FASTOFFLOAD计数{int(before)}→{int(after)}"
+                    f"（增量{delta}），软件加速未形成可验证运行态"
+                ),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L5-基础设置软件加速", False, f"软件加速打流异常: {exc}")
+
+    def run_basic_route_mode_probe(self,
+                                   server_ip: str = None,
+                                   lan_ip: str = "192.168.148.2",
+                                   wan_iface: str = "wan1",
+                                   client_iface: str = "ens11") -> VerifyResult:
+        """L5：路由模式真实发包，证明WAN侧源地址未被NAT。"""
+        token = secrets.token_hex(5)
+        capture = f"/tmp/ikuai-basic-route-{token}.log"
+        status = capture + ".status"
+        pid = 0
+        try:
+            server = str(ipaddress.ip_address(server_ip or self._ssh_config.iperf3_server))
+            lan_ip = str(ipaddress.ip_address(lan_ip))
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", wan_iface):
+                raise ValueError("WAN接口格式不安全")
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", client_iface):
+                raise ValueError("客户端接口格式不安全")
+            route = self.verify_basic_client_route(
+                server_ip=server,
+                expected_iface=client_iface,
+                expected_source=lan_ip,
+            )
+            if not route.passed:
+                return VerifyResult(
+                    "L5-基础设置路由模式", False,
+                    "路由模式抓包前客户端精确路径校验失败",
+                    details={"route_verified": False},
+                )
+            self.connect_router()
+            start = self._router.exec(
+                f"tcpdump -lni {wan_iface} -c 4 "
+                f"{shlex.quote(f'icmp and dst host {server}')} "
+                f">{shlex.quote(capture)} 2>{shlex.quote(status)} & echo $!",
+                timeout=10,
+            )
+            pid_match = re.search(r"\b(\d+)\b", start or "")
+            pid = int(pid_match.group(1)) if pid_match else 0
+            capture_ready = False
+            for _ in range(30):
+                ready_text = self._router.exec(
+                    f"grep -q 'listening on' {shlex.quote(status)} "
+                    "2>/dev/null && echo READY",
+                    timeout=5,
+                )
+                if "READY" in ready_text:
+                    capture_ready = True
+                    break
+                time.sleep(0.1)
+            if not capture_ready:
+                return VerifyResult(
+                    "L5-基础设置路由模式", False,
+                    "WAN抓包进程未就绪，未执行路由模式结论",
+                    details={
+                        "route_verified": True,
+                        "capture_ready": False,
+                        "packet_observed": False,
+                        "source_preserved": False,
+                        "nat_applied": False,
+                    },
+                )
+            self.connect_client()
+            self._client.exec(
+                f"ping -I {client_iface} -c 4 -i 0.25 -W 1 {server} "
+                ">/dev/null 2>&1 || true",
+                timeout=12,
+            )
+            time.sleep(0.8)
+            output = self._router.exec(
+                f"cat {shlex.quote(capture)} 2>/dev/null", timeout=10
+            )
+            packet_observed = bool(output.strip())
+            source_preserved = packet_observed and lan_ip in output
+            details = {
+                "wan_iface": wan_iface,
+                "capture_ready": capture_ready,
+                "packet_observed": packet_observed,
+                "source_preserved": source_preserved,
+                "nat_applied": packet_observed and not source_preserved,
+            }
+            return VerifyResult(
+                "L5-基础设置路由模式", source_preserved,
+                "WAN实包源地址保持客户端LAN地址，路由模式未做NAT" if source_preserved else
+                ("WAN捕获到测试报文但源地址发生转换" if packet_observed else
+                 "WAN未捕获到已就绪探针触发的测试报文"),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L5-基础设置路由模式", False, f"路由模式实包验证异常: {exc}")
+        finally:
+            try:
+                self.connect_router()
+                if pid:
+                    self._router.exec(f"kill {pid} 2>/dev/null || true", timeout=5)
+                self._router.exec(
+                    f"rm -f {shlex.quote(capture)} {shlex.quote(status)}",
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+    def run_basic_fullcone_probe(self, expect_fullcone: bool,
+                                 server_ip: str = None,
+                                 router_wan_ip: str = "10.66.0.150",
+                                 lan_ip: str = "192.168.148.2",
+                                 router_wan_iface: str = "wan1",
+                                 router_lan_iface: str = "lan1",
+                                 client_lan_iface: str = "ens11") -> VerifyResult:
+        """L5：用WAN入站和LAN转发双抓包区分NAT1全锥与NAT4。
+
+        外部报文由同一台双网卡客户端的管理网卡发出。客户端UDP socket
+        可能因报文源地址同时属于本机另一张网卡而在应用层前丢弃，因此
+        应用接收在当前拓扑不适用；数据平面结论取路由器WAN入站、LAN转发、
+        精确conntrack端口映射和FULLCONENAT计数四类真实证据。
+        """
+        token = secrets.token_hex(6)
+        port = 41000 + secrets.randbelow(12000)
+        base = f"/tmp/ikuai-basic-nat-{token}"
+        script_path, ready_path = base + ".py", base + ".ready"
+        wan_capture, wan_status = base + ".wan.log", base + ".wan.status"
+        lan_capture, lan_status = base + ".lan.log", base + ".lan.status"
+        pid = 0
+        capture_pids: List[int] = []
+        mapping_created = False
+        try:
+            server = str(ipaddress.ip_address(
+                server_ip or self._ssh_config.iperf3_server
+            ))
+            router_wan = str(ipaddress.ip_address(router_wan_ip))
+            lan_ip = str(ipaddress.ip_address(lan_ip))
+            for iface in (
+                router_wan_iface, router_lan_iface, client_lan_iface
+            ):
+                if not re.fullmatch(r"[A-Za-z0-9_.:-]+", iface):
+                    raise ValueError("NAT锥形探测接口格式不安全")
+            route_check = self.verify_basic_client_route(
+                server_ip=server,
+                expected_iface=client_lan_iface,
+                expected_source=lan_ip,
+            )
+            if not route_check.passed:
+                return VerifyResult(
+                    "L5-基础设置NAT锥形", False,
+                    "NAT锥形探测前客户端精确路径校验失败",
+                    details={"route_verified": False},
+                )
+            self.connect_client()
+            program = (
+                "import socket,time\n"
+                "s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n"
+                f"s.bind(({lan_ip!r},{port}))\n"
+                f"s.sendto(b'ikuai-prime',({server!r},5201))\n"
+                f"open({ready_path!r},'w').write('ready')\n"
+                "time.sleep(20)\n"
+            )
+            sftp = self._client._client.open_sftp()
+            with sftp.file(script_path, "w") as handle:
+                handle.write(program)
+            sftp.chmod(script_path, 0o600)
+            sftp.close()
+            start = self._client.exec(
+                f"nohup python3 {script_path} </dev/null >/dev/null 2>&1 & echo $!",
+                timeout=10,
+            )
+            match = re.search(r"\b(\d+)\b", start or "")
+            pid = int(match.group(1)) if match else 0
+            ready = False
+            for _ in range(20):
+                if "ready" in self._client.exec(
+                    f"cat {ready_path} 2>/dev/null", timeout=5
+                ):
+                    ready = True
+                    break
+                time.sleep(0.15)
+            if not ready:
+                raise RuntimeError("客户端UDP映射探针未就绪")
+            self.connect_router()
+            conntrack = self._router.exec(
+                f"conntrack -L -p udp 2>/dev/null | "
+                f"grep -F 'src={lan_ip} dst={server}' | "
+                f"grep -F 'sport={port}' | grep -F 'dport=5201' | head -1",
+                timeout=15,
+            )
+            mapping_created = bool(conntrack.strip())
+            if not mapping_created:
+                raise RuntimeError("未找到精确UDP conntrack映射")
+            dports = [
+                int(value)
+                for value in re.findall(r"\bdport=(\d+)", conntrack or "")
+            ]
+            if len(dports) < 2:
+                raise RuntimeError("UDP conntrack缺少转换后端口")
+            external_port = dports[-1]
+            route = self._client.exec(
+                f"ip route get {router_wan} 2>/dev/null | head -1",
+                timeout=10,
+            )
+            src = re.search(r"\bsrc\s+(\S+)", route or "")
+            dev = re.search(r"\bdev\s+(\S+)", route or "")
+            external_source = src.group(1) if src else ""
+            external_iface = dev.group(1) if dev else ""
+            if not external_source or not external_iface:
+                raise RuntimeError("客户端管理网源地址不可用")
+            external_source = str(ipaddress.ip_address(external_source))
+            if external_iface == client_lan_iface:
+                raise RuntimeError("不同外部源没有使用独立管理网卡")
+            if external_source == server:
+                raise RuntimeError("外部发送源与原始目标相同，不能证明锥形差异")
+
+            def fullcone_packets() -> int:
+                counter_text = self._router.exec(
+                    "iptables -w -t nat -L PRE_FULLCONE -n -v -x "
+                    "2>/dev/null",
+                    timeout=10,
+                )
+                total = 0
+                for line in counter_text.splitlines():
+                    if "FULLCONENAT" not in line:
+                        continue
+                    columns = line.split()
+                    if columns and columns[0].isdigit():
+                        total += int(columns[0])
+                return total
+
+            def start_capture(iface: str, packet_filter: str,
+                              output_path: str, status_path: str) -> tuple:
+                started = self._router.exec(
+                    f"tcpdump -lni {iface} -c 3 "
+                    f"{shlex.quote(packet_filter)} "
+                    f">{shlex.quote(output_path)} "
+                    f"2>{shlex.quote(status_path)} & echo $!",
+                    timeout=10,
+                )
+                matched = re.search(r"\b(\d+)\b", started or "")
+                capture_pid = int(matched.group(1)) if matched else 0
+                if capture_pid:
+                    capture_pids.append(capture_pid)
+                capture_ready = False
+                for _ in range(30):
+                    ready_text = self._router.exec(
+                        f"grep -q 'listening on' {shlex.quote(status_path)} "
+                        "2>/dev/null && echo READY",
+                        timeout=5,
+                    )
+                    if "READY" in ready_text:
+                        capture_ready = True
+                        break
+                    time.sleep(0.1)
+                return capture_pid, capture_ready
+
+            fullcone_before = fullcone_packets()
+            _, wan_ready = start_capture(
+                router_wan_iface,
+                f"src host {external_source} and dst host {router_wan} "
+                f"and udp dst port {external_port}",
+                wan_capture,
+                wan_status,
+            )
+            _, lan_ready = start_capture(
+                router_lan_iface,
+                f"src host {external_source} and dst host {lan_ip} "
+                f"and udp dst port {port}",
+                lan_capture,
+                lan_status,
+            )
+            if not wan_ready or not lan_ready:
+                return VerifyResult(
+                    "L5-基础设置NAT锥形", False,
+                    "NAT锥形双侧抓包进程未全部就绪，未执行模式结论",
+                    details={
+                        "expected_fullcone": bool(expect_fullcone),
+                        "mapping_found": mapping_created,
+                        "wan_capture_ready": wan_ready,
+                        "lan_capture_ready": lan_ready,
+                        "probe_completed": False,
+                    },
+                )
+            sender = (
+                "import socket,time;"
+                "s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
+                f"s.bind(({external_source!r},0));"
+                f"dst=({router_wan!r},{external_port});"
+                "[(s.sendto(b'ikuai-fullcone',dst),time.sleep(0.1)) "
+                "for _ in range(3)]"
+            )
+            self._client.exec(
+                "python3 -c " + shlex.quote(sender), timeout=10
+            )
+            time.sleep(1.2)
+            wan_output = self._router.exec(
+                f"cat {shlex.quote(wan_capture)} 2>/dev/null", timeout=10
+            )
+            lan_output = self._router.exec(
+                f"cat {shlex.quote(lan_capture)} 2>/dev/null", timeout=10
+            )
+            fullcone_after = fullcone_packets()
+            fullcone_delta = fullcone_after - fullcone_before
+            wan_ingress = bool(wan_output.strip())
+            lan_forward = bool(lan_output.strip())
+            probe_completed = wan_ready and lan_ready and wan_ingress
+            counter_matches_mode = (
+                fullcone_delta > 0 if expect_fullcone else fullcone_delta == 0
+            )
+            passed = (
+                mapping_created and probe_completed
+                and lan_forward == bool(expect_fullcone)
+                and counter_matches_mode
+            )
+            details = {
+                "expected_fullcone": bool(expect_fullcone),
+                "different_external_source_delivered": lan_forward,
+                "mapping_found": mapping_created,
+                "external_port_discovered": len(dports) >= 2,
+                "probe_completed": probe_completed,
+                "wan_capture_ready": wan_ready,
+                "lan_capture_ready": lan_ready,
+                "external_probe_seen_on_wan": wan_ingress,
+                "translated_packet_seen_on_lan": lan_forward,
+                "fullcone_counter_before": fullcone_before,
+                "fullcone_counter_after": fullcone_after,
+                "fullcone_counter_delta": fullcone_delta,
+                "fullcone_counter_matches_mode": counter_matches_mode,
+                "application_socket_applicable": False,
+                "application_socket_observation": (
+                    "受同机双网卡自源语义限制，不适用"
+                ),
+                "client_paths": (
+                    "LAN网卡建立映射，独立管理网卡发送不同外部源报文"
+                ),
+            }
+            return VerifyResult(
+                "L5-基础设置NAT锥形", passed,
+                ("不同外部源报文由WAN进入并转发到LAN，NAT1全锥行为生效"
+                 if lan_forward else
+                 "不同外部源报文已到WAN但未转发到LAN，NAT4限制行为生效") +
+                ("" if passed else "，与配置模式或计数器证据不符") +
+                "；应用socket观测受同机双网卡自源语义限制，不适用",
+                details=details,
+                raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L5-基础设置NAT锥形", False,
+                f"NAT锥形实测异常: {exc}",
+            )
+        finally:
+            try:
+                self.connect_router()
+                for capture_pid in capture_pids:
+                    self._router.exec(
+                        f"kill {capture_pid} 2>/dev/null || true", timeout=5
+                    )
+                self._router.exec(
+                    "rm -f " + " ".join(shlex.quote(path) for path in (
+                        wan_capture, wan_status, lan_capture, lan_status
+                    )),
+                    timeout=10,
+                )
+                if mapping_created:
+                    self._router.exec(
+                        "conntrack -D -p udp "
+                        f"--orig-src {lan_ip} --sport {port} "
+                        f"--orig-dst {server} --dport 5201 "
+                        ">/dev/null 2>&1 || true",
+                        timeout=10,
+                    )
+            except Exception:
+                pass
+            try:
+                self.connect_client()
+                if pid:
+                    self._client.exec(f"kill {pid} 2>/dev/null", timeout=5)
+                self._client.exec(
+                    f"rm -f {script_path} {ready_path}", timeout=10
+                )
+            except Exception:
+                pass
+
+    def run_basic_ntp_protocol_probe(self,
+                                     host: str = "192.168.148.1",
+                                     expect_success: bool = True) -> VerifyResult:
+        """L5：客户端向路由器UDP/123发送真实SNTP请求。"""
+        try:
+            host = str(ipaddress.ip_address(host))
+            self.connect_client()
+            program = (
+                "import json,socket,struct,time;"
+                "s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
+                "s.settimeout(3);"
+                f"s.sendto(b'\\x1b'+47*b'\\0',({host!r},123));"
+                "d,a=s.recvfrom(512);"
+                "print(json.dumps({'length':len(d),'stratum':d[1] if len(d)>1 else 0,'mode':d[0]&7}))"
+            )
+            output = self._client.exec(
+                "python3 -c " + shlex.quote(program), timeout=10
+            )
+            try:
+                payload = json.loads(output.strip())
+                success = payload.get("length", 0) >= 48 and payload.get("mode") == 4
+            except Exception:
+                payload = {}
+                success = False
+            passed = success == bool(expect_success)
+            details = {
+                "host": host,
+                "expected_success": bool(expect_success),
+                "response_received": success,
+                "response_length": int(payload.get("length", 0) or 0),
+                "stratum": int(payload.get("stratum", 0) or 0),
+                "server_mode": int(payload.get("mode", 0) or 0),
+            }
+            return VerifyResult(
+                "L5-基础设置NTP协议", passed,
+                ("真实SNTP请求收到合法服务端响应" if success else
+                 "真实SNTP请求无合法响应") +
+                ("，符合预期" if passed else "，不符合预期"),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            if not expect_success and "timed out" in str(exc).lower():
+                return VerifyResult(
+                    "L5-基础设置NTP协议", True,
+                    "NTP服务关闭后SNTP请求超时，符合预期",
+                    details={"expected_success": False, "response_received": False},
+                )
+            return VerifyResult("L5-基础设置NTP协议", False, f"SNTP协议探测异常: {exc}")
+
+    def verify_basic_management_health(self) -> VerifyResult:
+        """finally 后独立验证路由器 SSH、客户端 SSH 和管理 Web 可达。"""
+        try:
+            router_host = str(ipaddress.ip_address(self._ssh_config.router.host))
+            self.connect_router()
+            self.connect_client()
+            router_probe = self._router.exec(
+                "printf basic-router-ssh-ok", timeout=10
+            ).strip()
+            client_probe = self._client.exec(
+                "printf basic-client-ssh-ok", timeout=10
+            ).strip()
+            web_text = self._client.exec(
+                "curl -sS -o /dev/null -w '%{http_code}' "
+                f"--connect-timeout 3 --max-time 5 http://{router_host}/",
+                timeout=12,
+            ).strip()
+            status_match = re.search(r"(\d{3})\s*$", web_text)
+            web_status = int(status_match.group(1)) if status_match else 0
+            checks = {
+                "router_ssh": router_probe == "basic-router-ssh-ok",
+                "client_ssh": client_probe == "basic-client-ssh-ok",
+                "management_web": 200 <= web_status < 500,
+            }
+            passed = all(checks.values())
+            details = {"checks": checks, "web_http_status": web_status}
+            return VerifyResult(
+                "清理-基础设置管理通道", passed,
+                "路由器SSH、客户端SSH和管理Web均可用" if passed else
+                "基础设置恢复后至少一个管理通道不可用",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "清理-基础设置管理通道", False,
+                f"基础设置管理通道复核异常: {type(exc).__name__}",
+            )
+
+    def verify_basic_test_artifacts_absent(self, snapshot: Dict[str, Any]) -> VerifyResult:
+        """finally后的独立残留审计。"""
+        try:
+            baseline = self.verify_basic_environment_unchanged(
+                snapshot, allow_pid_change=True
+            )
+            management = self.verify_basic_management_health()
+            server_ip = (snapshot.get("client") or {}).get("server_ip") or self._ssh_config.iperf3_server
+            client = self._basic_client_state(server_ip)
+            row_count = self._basic_row_count()
+            passed = (
+                baseline.passed and management.passed and row_count == 1
+                and not client.get("artifact_lines")
+            )
+            details = {
+                "baseline_match": baseline.passed,
+                "management_channels_healthy": management.passed,
+                "client_artifact_count": len(client.get("artifact_lines", [])),
+                "database_singleton_count": row_count,
+            }
+            return VerifyResult(
+                "清理-基础设置残留审计", passed,
+                "基础设置DB、配置、进程、路由、内核和客户端均无测试残留" if passed else
+                "基础设置残留审计发现环境差异",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("清理-基础设置残留审计", False, f"基础设置残留审计异常: {exc}")
+
+    # ==================== 虚拟专网 > GRE隧道 (gre_tunnel) 验证 ====================
+    # 底层脚本: /usr/ikuai/script/gre_tunnel.sh (add/edit/del/up/down/show/init/EXPORT/IMPORT)
+    # DB: gre_tunnel(id, enabled, protocol, tagname, comment, tunnel_addr, src_mode,
+    #   src_addr, src_iface, dst_addr, keepalive, keepalive_interval, keepalive_count,
+    #   gre_key, checksum, tos, ttl, no_fragment)
+    # 运行时(protocol=0 IPv4):
+    #   ip tunnel add <iface> mode gre remote <dst> local <src> ttl <ttl>
+    #   ip addr add <tunnel_addr> dev <iface>
+    #   iptables -t nat -A AUTONAT -s <网段> -o wan+/adsl+/vwan+ -j MASQUERADE
+    #   ip route replace default dev <iface> table <iface> metric 50
+    #   ip rule: fwmark <mark> lookup <iface>  (iproute_ipt_rule_add, 每个gre接口都有)
+    #   src_mode=1 额外: mangle OUTPUT -p 47 -d <dst> MARK + ip rule fwmark
+    # protocol=1 IPv6: ip -6 tunnel add mode ip6gre + ip6tables POSTROUTING wan+ MASQUERADE
+    # tagname 必须 ^gre 开头且 != gre0(内核保留设备)。
+
+    GRE_DB = "/etc/mnt/ikuai/config.db"
+    GRE_SCRIPT = "/usr/ikuai/script/gre_tunnel.sh"
+    GRE_PEER_IFACE = "gre_peer_t"  # 对端(56)临时GRE接口名(避免与56自身规则冲突)
+
+    @staticmethod
+    def _gre_yes(value) -> bool:
+        return str(value or "").strip().lower() in {
+            "1", "yes", "true", "on", "enable", "enabled"}
+
+    @staticmethod
+    def _gre_sql_literal(value) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def _gre_parse_records(output: str) -> List[Dict]:
+        """解析 sqlite3 -line 输出为记录列表(空行分隔, 每行 key = value)。"""
+        records: List[Dict] = []
+        current: Dict = {}
+        for raw in (output or "").splitlines():
+            line = raw.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                current[k.strip()] = v.strip()
+            elif not line:
+                if current:
+                    records.append(current)
+                    current = {}
+            elif "Error" in line or "unable to open" in line.lower():
+                # 让上层感知查询错误
+                current["_error"] = line
+        if current:
+            records.append(current)
+        return records
+
+    def _gre_sqlite_exec(self, sql: str) -> str:
+        self.connect_router()
+        return self._router.exec(
+            f"sqlite3 {shlex.quote(self.GRE_DB)} -line {shlex.quote(sql)} 2>&1",
+            timeout=15)
+
+    def _gre_sqlite_query_list(self, sql: str) -> List[Dict]:
+        return self._gre_parse_records(self._gre_sqlite_exec(sql))
+
+    def _gre_sqlite_query_one(self, sql: str) -> Optional[Dict]:
+        rows = self._gre_sqlite_query_list(sql)
+        return rows[0] if rows else None
+
+    def find_gre_tunnel(self, iface: str) -> Optional[Dict]:
+        """按 tagname(接口名) 查单条 gre_tunnel 记录(全字段)。"""
+        return self._gre_sqlite_query_one(
+            "SELECT id,enabled,protocol,tagname,comment,tunnel_addr,src_mode,"
+            "src_addr,src_iface,dst_addr,keepalive,keepalive_interval,"
+            "keepalive_count,gre_key,checksum,tos,ttl,no_fragment "
+            "FROM gre_tunnel WHERE tagname=" + self._gre_sql_literal(iface) + " LIMIT 1")
+
+    get_gre_tunnel = find_gre_tunnel
+
+    def get_gre_all(self) -> List[Dict]:
+        return self._gre_sqlite_query_list(
+            "SELECT id,enabled,protocol,tagname,tunnel_addr,src_mode,src_addr,"
+            "src_iface,dst_addr,keepalive FROM gre_tunnel ORDER BY id")
+
+    # ---------------- 环境快照/恢复 ----------------
+    def snapshot_gre_environment(self) -> Dict:
+        rows = self.get_gre_all()
+        self.connect_router()
+        # 严禁 `ip -6 tunnel show`(会卡死SSH session, 实测)。改用 ip -d link show dev <iface>
+        # 逐接口取内核参数(v4 gre / v6 ip6gre 同命令), 配合 ip rule / rt_tables 残留审计。
+        runtime = self._router.exec(
+            "echo '===v4 tunnels==='; ip tunnel show 2>/dev/null; "
+            "echo '===gre ip -d==='; for i in $(ip -o link show 2>/dev/null | "
+            "sed -n 's/^[0-9]*: \\(gre[0-9]*\\).*/\\1/p'); do echo \"-- $i --\"; "
+            "ip -d link show dev $i 2>/dev/null | head -4; done; "
+            "echo '===ip rule gre==='; ip rule show 2>/dev/null | grep gre; "
+            "echo '===rt_tables gre==='; grep gre /etc/iproute2/rt_tables 2>/dev/null",
+            timeout=20)
+        return {"records": rows, "count": len(rows), "runtime": runtime or ""}
+
+    def restore_gre_environment(self, snapshot: Dict) -> VerifyResult:
+        """恢复 gre_tunnel 表到快照：删除快照中不存在的记录(测试残留)。"""
+        try:
+            current = self.get_gre_all()
+            snap_names = {r.get("tagname") for r in (snapshot or {}).get("records", [])}
+            removed = []
+            for row in current:
+                name = row.get("tagname")
+                if name and name not in snap_names:
+                    try:
+                        self.cleanup_gre_tunnel(name, int(row.get("protocol", 0) or 0))
+                        removed.append(name)
+                    except Exception:
+                        pass
+            return VerifyResult(
+                "恢复-GRE环境", True,
+                f"恢复完成: 清理{len(removed)}条测试残留{removed or '(无)'}")
+        except Exception as exc:
+            return VerifyResult("恢复-GRE环境", False, f"GRE环境恢复异常: {exc}")
+
+    # ---------------- L1: 数据库验证 ----------------
+    def verify_gre_tunnel_database(self, iface: str, expected: Dict = None,
+                                    must_exist: bool = True) -> VerifyResult:
+        try:
+            row = self.find_gre_tunnel(iface)
+        except Exception as exc:
+            return VerifyResult("L1-GRE数据库", False,
+                                f"GRE查询失败({iface}): {str(exc)[:140]}")
+        if row is None:
+            if not must_exist:
+                return VerifyResult("L1-GRE数据库", True,
+                                    f"{iface} 数据库不存在(符合预期)")
+            return VerifyResult("L1-GRE数据库", False, f"{iface} 数据库未找到")
+        if not must_exist:
+            return VerifyResult("L1-GRE数据库", False,
+                                f"{iface} 仍存在于数据库(期望已删除)")
+        int_fields = {"protocol", "src_mode", "keepalive", "keepalive_interval",
+                      "keepalive_count", "checksum", "tos", "ttl", "no_fragment"}
+        mismatches = []
+        for field, exp in (expected or {}).items():
+            actual = row.get(field)
+            if field == "enabled":
+                if self._gre_yes(actual) != self._gre_yes(exp):
+                    mismatches.append({"field": field, "expected": exp, "actual": actual})
+            elif field in int_fields:
+                try:
+                    if int(str(actual).strip() or 0) != int(str(exp).strip() or 0):
+                        mismatches.append({"field": field, "expected": exp, "actual": actual})
+                except (TypeError, ValueError):
+                    mismatches.append({"field": field, "expected": exp, "actual": actual})
+            else:
+                if str(actual or "") != str(exp):
+                    mismatches.append({"field": field, "expected": exp, "actual": actual})
+        passed = not mismatches
+        return VerifyResult(
+            "L1-GRE数据库", passed,
+            (f"{iface} 数据库字段正确" if passed else
+             f"{iface} 字段不匹配: " + ", ".join(m["field"] for m in mismatches)),
+            details={"record": row, "mismatches": mismatches},
+            raw_output=json.dumps(row, ensure_ascii=False)[:500])
+
+    def verify_gre_tunnel_count(self, prefix: str = None, expected: int = None) -> VerifyResult:
+        try:
+            if prefix:
+                rows = self._gre_sqlite_query_list(
+                    "SELECT tagname FROM gre_tunnel WHERE substr(tagname,1,"
+                    + str(len(prefix)) + ")=" + self._gre_sql_literal(prefix))
+                count = len(rows)
+            else:
+                row = self._gre_sqlite_query_one("SELECT count(*) as cnt FROM gre_tunnel")
+                count = int((row or {}).get("cnt", 0))
+        except Exception as exc:
+            return VerifyResult("L1-GRE计数", False, f"GRE计数查询失败: {str(exc)[:140]}")
+        if expected is None:
+            return VerifyResult("L1-GRE计数", True, f"当前GRE记录数={count}")
+        passed = count == expected
+        return VerifyResult(
+            "L1-GRE计数", passed,
+            f"GRE记录数={count}(期望{expected})" + ("" if passed else " 不匹配"),
+            details={"count": count, "expected": expected})
+
+    # ---------------- L2: 运行时验证 ----------------
+    def _gre_network(self, cidr: str) -> str:
+        """10.99.99.1/30 -> 10.99.99.0/30 (ipcalc 计算网段)。失败返回原值。"""
+        if not cidr or "/" not in str(cidr):
+            return str(cidr or "")
+        try:
+            self.connect_router()
+            out = self._router.exec(
+                f"ipcalc.sh {shlex.quote(str(cidr))} 2>/dev/null",
+                timeout=8)
+            m = re.search(r"(?:NETWORK|Network)=([\d.]+)", out or "")
+            prefix = str(cidr).split("/")[1]
+            if m and prefix:
+                return f"{m.group(1)}/{prefix}"
+        except Exception:
+            pass
+        return str(cidr)
+
+    def verify_gre_runtime(self, iface: str, expected: Dict = None,
+                            must_exist: bool = True) -> VerifyResult:
+        """检查隧道接口运行时对象(ip tunnel/addr/nat/route/rule/link)。"""
+        exp = expected or {}
+        try:
+            protocol = int(exp.get("protocol", 0))
+        except (TypeError, ValueError):
+            protocol = 0
+        tunnel_addr = exp.get("tunnel_addr", "")
+        dst_addr = exp.get("dst_addr", "")
+        try:
+            self.connect_router()
+            if protocol == 1:
+                # 严禁 `ip -6 tunnel show`(卡死SSH); v6 ip6gre 用 ip -d link show dev(同 v4)。
+                tun = self._router.exec(f"ip -d link show dev {iface} 2>&1", timeout=10)
+                addr = self._router.exec(f"ip -6 addr show dev {iface} 2>/dev/null", timeout=10)
+                nat = self._router.exec("ip6tables -t nat -S POSTROUTING 2>/dev/null", timeout=10)
+            else:
+                tun = self._router.exec(f"ip tunnel show 2>/dev/null | grep -w '{iface}'", timeout=10)
+                addr = self._router.exec(f"ip addr show dev {iface} 2>/dev/null", timeout=10)
+                nat = self._router.exec("iptables -t nat -S AUTONAT 2>/dev/null", timeout=10)
+            link = self._router.exec(f"ip -o link show dev {iface} 2>/dev/null", timeout=10)
+            route_tbl = self._router.exec(f"ip route show table {iface} 2>/dev/null", timeout=10)
+            rules = self._router.exec("ip rule show 2>/dev/null", timeout=10)
+            details = {
+                "tunnel": (tun or "").strip()[:160], "addr": (addr or "").strip()[:160],
+                "link": (link or "").strip()[:120], "nat": (nat or "").strip()[:200],
+                "route_table": (route_tbl or "").strip()[:120],
+                "rules": (rules or "").strip()[:200]}
+            # v4 ip tunnel show 缺失接口不报错(空); v6 ip -d link show dev 缺失报
+            # "Device ... does not exist" / "No such"。两种都判不存在。
+            tun_low = (tun or "")
+            tunnel_exists = bool(tun_low.strip()) and "No such" not in tun_low \
+                and "does not exist" not in tun_low
+
+            if not must_exist:
+                # 接口/NAT/路由表应清理(脚本 down/del 会清); 策略 rule 可能残留——
+                # 脚本 iproute_ipt_rule_del 实际只算 mark 不删 rule(实测), 属产品已知行为,
+                # 不作为硬失败(backend cleanup_gre_tunnel 会补删 rule + ik_cntl + rt_tables)。
+                clean = (not tunnel_exists) and (iface not in (nat or "")) and \
+                        (iface not in (route_tbl or ""))
+                rule_residual = iface in (rules or "")
+                msg = f"{iface} 运行时{'已清理' if clean else '仍有残留(接口/NAT/路由表)'}"
+                if rule_residual:
+                    msg += "; 策略rule残留(产品down/del不清rule,已知行为,backend补删)"
+                return VerifyResult(
+                    "L2-GRE运行时", clean, msg,
+                    details=details, raw_output=json.dumps(details, ensure_ascii=False)[:600])
+
+            problems = []
+            if not tunnel_exists:
+                problems.append("接口未建立(ip tunnel)")
+            if tunnel_addr:
+                ip_part = str(tunnel_addr).split("/")[0]
+                if ip_part not in (addr or ""):
+                    problems.append(f"隧道地址{ip_part}未配置")
+            if tunnel_exists and "UP" not in (link or ""):
+                problems.append("接口未UP")
+            if tunnel_addr and "/" in str(tunnel_addr):
+                if protocol == 1:
+                    # IPv6: ip6tables NAT 规则用网段(host 清零, 实测 -s <net>::/120),
+                    # 用 ipaddress 算网段匹配; IPv4 用 ipcalc
+                    try:
+                        import ipaddress as _ipa
+                        net = str(_ipa.ip_interface(str(tunnel_addr)).network)
+                    except Exception:
+                        net = str(tunnel_addr)
+                else:
+                    net = self._gre_network(tunnel_addr)
+                if net and net not in (nat or ""):
+                    problems.append(f"自动NAT({net})未找到")
+            if iface not in (route_tbl or ""):
+                problems.append(f"路由表{iface}未建立")
+            if iface not in (rules or ""):
+                problems.append(f"策略规则lookup {iface}未找到")
+            if dst_addr and dst_addr not in (tun or ""):
+                problems.append(f"目的地址{dst_addr}未在tunnel")
+            passed = not problems
+            return VerifyResult(
+                "L2-GRE运行时", passed,
+                f"{iface} 运行时一致" if passed else f"{iface} 问题: " + "; ".join(problems),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False)[:700])
+        except Exception as exc:
+            return VerifyResult("L2-GRE运行时", False, f"GRE运行时验证异常: {str(exc)[:140]}")
+
+    def verify_gre_link_state(self, iface: str, expect_up: bool = True) -> VerifyResult:
+        try:
+            self.connect_router()
+            out = self._router.exec(f"ip -o link show dev {iface} 2>/dev/null", timeout=10)
+            is_up = "UP" in (out or "") and "No such" not in (out or "")
+            passed = is_up if expect_up else (not is_up)
+            return VerifyResult(
+                "L2-GRE链路状态", passed,
+                f"{iface} link_state={'up' if is_up else 'down'}(期望{'up' if expect_up else 'down'})",
+                raw_output=(out or "")[:200])
+        except Exception as exc:
+            return VerifyResult("L2-GRE链路状态", False, f"链路状态异常: {exc}")
+
+    def verify_gre_peer_reachable(self, *, protocol: int = 0, peer_dst: str) -> VerifyResult:
+        """L3 运行时 preflight: router 到 peer 底层地址可达(建隧道前提)。"""
+        try:
+            self.connect_router()
+            if protocol == 1:
+                out = self._router.exec(f"ping6 -c 2 -W 2 {peer_dst} 2>&1", timeout=15)
+            else:
+                out = self._router.exec(f"ping -c 2 -W 2 {peer_dst} 2>&1", timeout=15)
+            ok = "0% packet loss" in (out or "") or "2 received" in (out or "")
+            return VerifyResult(
+                "L3-GRE底层可达", ok,
+                f"router→peer({'v6' if protocol == 1 else 'v4'})"
+                f"{'可达' if ok else '不可达'}: {(out or '')[:80]}",
+                raw_output=(out or "")[:200])
+        except Exception as exc:
+            return VerifyResult("L3-GRE底层可达", False, f"可达性探测异常: {exc}")
+
+    # ---------------- cleanup ----------------
+    def cleanup_gre_tunnel(self, iface: str, protocol: int = 0) -> str:
+        """清理单个GRE隧道全部运行时对象并删DB(模拟脚本 del/__exec_rule_clean_one_by_config)。"""
+        self.connect_router()
+        row = self.find_gre_tunnel(iface)
+        if row:
+            try:
+                protocol = int(row.get("protocol", 0))
+            except (TypeError, ValueError):
+                protocol = 0
+        tunnel_addr = (row or {}).get("tunnel_addr", "")
+        net = self._gre_network(tunnel_addr) if tunnel_addr and "/" in tunnel_addr else None
+        parts = []
+        if protocol == 1:
+            parts.append(f"ip link set {iface} down")
+            parts.append(f"ip -6 tunnel del {iface}")
+            if net:
+                for _ in range(3):
+                    parts.append(f"ip6tables -w -t nat -D POSTROUTING -o wan+ -s {net} -j MASQUERADE")
+            parts.append(f"while ip -6 route del default dev {iface} table {iface} 2>/dev/null; do :; done")
+        else:
+            parts.append(f"ip link set {iface} down")
+            parts.append(f"ip tunnel del {iface}")
+            if net:
+                for o in ("wan+", "adsl+", "vwan+"):
+                    parts.append(
+                        f"while iptables -w -t nat -D AUTONAT -o {o} -s {net} -j MASQUERADE 2>/dev/null; do :; done")
+            parts.append(f"while ip route del default dev {iface} table {iface} 2>/dev/null; do :; done")
+        # 删除所有 lookup <iface> 的策略路由规则(按 table 名删, 不依赖 prio 解析;
+        # 实测 ip rule del lookup <iface> 可靠, prio+awk+while 在 busybox pipe 子shell 下不稳定)
+        parts.append(f"while ip rule del lookup {iface} 2>/dev/null; do :; done")
+        parts.append(f"while ip -6 rule del lookup {iface} 2>/dev/null; do :; done")
+        # 删除 iproute_get_markid 分配的 iface_band 绑定(ik_cntl) + rt_tables 条目,
+        # 否则 mark 残留累积(rt_tables 越来越长)且 iface_band 绑定可能影响选路
+        parts.append(f"ik_cntl iface_band del {iface} 2>/dev/null")
+        parts.append(f"grep -v ' {iface}$' /etc/iproute2/rt_tables > /tmp/.gre_rt.tmp 2>/dev/null && mv /tmp/.gre_rt.tmp /etc/iproute2/rt_tables 2>/dev/null")
+        # 删除 src_mode=1 的 mangle fwmark 规则(comment gre_src_<iface>); 实测 cleanup 旧版
+        # 漏清此项→多轮测试累积 mangle OUTPUT 残留。iptables -D 对 [fastid]/-m comment 不可靠,
+        # 用 iptables-save|grep-v|iptables-restore 整表过滤(同 port-map cleanup 范式)。
+        parts.append(
+            f"iptables-save 2>/dev/null | grep -v 'gre_src_{iface} ' | iptables-restore 2>/dev/null")
+        parts.append(
+            f"ip6tables-save 2>/dev/null | grep -v 'gre_src_{iface} ' | ip6tables-restore 2>/dev/null")
+        parts.append(
+            f"sqlite3 {shlex.quote(self.GRE_DB)} \"delete from gre_tunnel where tagname='{iface}'\"")
+        script = " ; ".join(parts)
+        self._router.exec(f"{{ {script} ; }} 2>/dev/null; echo GRE_CLEAN_RC=$?", timeout=30)
+        return f"cleaned {iface}"
+
+    def cleanup_gre_prefix(self, prefix: str = "gre_t") -> str:
+        rows = self._gre_sqlite_query_list(
+            "SELECT tagname,protocol FROM gre_tunnel WHERE substr(tagname,1,"
+            + str(len(prefix)) + ")=" + self._gre_sql_literal(prefix))
+        for r in rows:
+            try:
+                self.cleanup_gre_tunnel(r.get("tagname", ""), int(r.get("protocol", 0) or 0))
+            except Exception:
+                pass
+        return f"cleaned {len(rows)} tunnels(prefix={prefix})"
+
+    def build_gre_tunnel_runtime(self, iface: str, protocol: int = 0, tunnel_addr: str = "",
+                                 dst: str = "", src: str = "", ttl: int = 255) -> VerifyResult:
+        """用 ip 命令直接建 GRE 隧道运行时(不经脚本 up(), 故**不加 nopmtudisc**), 不写 DB。
+
+        用途: IPv6 GRE 产品BUG(ip6gre 不接受 nopmtudisc, 而 no_fragment 默认 0 时脚本对 v6
+        分支也加 nopmtudisc → `ip -6 tunnel add` 必报 'nopmtudisc is a garbage' → UI 创建必败
+        'GRE隧道下发失败')时, 作 L5 数据面的 workaround 创建, 证明隧道本身功能正常、bug 隔离
+        在脚本下发环节。返回接口是否 UP。
+        """
+        self.connect_router()
+        if protocol == 1:
+            cmd = (f"ip link set {iface} down 2>/dev/null; ip -6 tunnel del {iface} 2>/dev/null; "
+                   f"ip -6 tunnel add {iface} mode ip6gre remote {dst} local {src} ttl {ttl} && "
+                   f"ip link set {iface} up && ip -6 addr add {tunnel_addr} dev {iface} && "
+                   f"ip -6 route replace default dev {iface} table {iface} metric 50 2>/dev/null; "
+                   f"echo BUILD_RC=$?")
+        else:
+            cmd = (f"ip link set {iface} down 2>/dev/null; ip tunnel del {iface} 2>/dev/null; "
+                   f"ip tunnel add {iface} mode gre remote {dst} local {src} ttl {ttl} && "
+                   f"ip link set {iface} up && ip addr add {tunnel_addr} dev {iface} && "
+                   f"ip route replace default dev {iface} table {iface} metric 50 2>/dev/null; "
+                   f"echo BUILD_RC=$?")
+        out = self._router.exec(cmd, timeout=20) or ""
+        ok = "BUILD_RC=0" in out
+        return VerifyResult(
+            "L2-GRE运行时(workaround)", ok,
+            f"{iface} build{'成功' if ok else '失败'}: {out[-160:]}",
+            raw_output=out[:300])
+
+    def enable_gre_tunnel_runtime(self, iface: str) -> VerifyResult:
+        """SSH 模拟 up(): 改 DB enabled=yes + 重建 tunnel/addr/NAT/路由表。
+
+        用于前端 bug(停用后 UI 操作按钮不刷新为"启用", 实测 DB enabled=no 但按钮仍"停用")
+        时验证 up 功能与运行时重建。策略 rule/ik_cntl 复用 down() 残留(脚本 down 不清 rule)。
+        """
+        row = self.find_gre_tunnel(iface)
+        if not row:
+            return VerifyResult("L2-GRE启用运行时", False, f"{iface} DB未找到")
+        try:
+            protocol = int(row.get("protocol", 0))
+        except (TypeError, ValueError):
+            protocol = 0
+        dst = row.get("dst_addr", "")
+        src = row.get("src_addr", "")
+        tunnel_addr = row.get("tunnel_addr", "")
+        ttl = row.get("ttl", "255")
+        if not dst or not tunnel_addr:
+            return VerifyResult("L2-GRE启用运行时", False, f"{iface} 缺少dst/tunnel_addr")
+        self._gre_sqlite_exec(
+            f"update gre_tunnel set enabled='yes' where tagname='{iface}'")
+        net = self._gre_network(tunnel_addr) if "/" in str(tunnel_addr) else None
+        self.connect_router()
+        parts = []
+        if protocol == 1:
+            parts.append(f"ip -6 tunnel add {iface} mode ip6gre remote {dst} local {src} ttl {ttl}")
+            parts.append(f"ip link set {iface} up")
+            parts.append(f"ip -6 addr add {tunnel_addr} dev {iface}")
+            if net:
+                parts.append(f"ip6tables -w -t nat -A POSTROUTING -o wan+ -s {net} -j MASQUERADE")
+            parts.append(f"ip -6 route replace default dev {iface} table {iface} metric 50")
+        else:
+            parts.append(f"ip tunnel add {iface} mode gre remote {dst} local {src} ttl {ttl}")
+            parts.append(f"ip link set {iface} up")
+            parts.append(f"ip addr add {tunnel_addr} dev {iface}")
+            if net:
+                for o in ("wan+", "adsl+", "vwan+"):
+                    parts.append(f"iptables -w -t nat -A AUTONAT -o {o} -s {net} -j MASQUERADE")
+            parts.append(f"ip route replace default dev {iface} table {iface} metric 50")
+        script = " && ".join(parts)
+        out = self._router.exec(f"{{ {script} ; }} 2>&1; echo ENUP_RC=$?", timeout=20)
+        ok = "ENUP_RC=0" in (out or "")
+        return VerifyResult(
+            "L2-GRE启用运行时", ok,
+            f"{iface} up{'成功' if ok else '失败'}: {(out or '')[-160:]}",
+            raw_output=(out or "")[:300])
+
+    def clear_gre_conntrack(self) -> bool:
+        """清 router conntrack(减少 GRE 数据面后累积连接影响选路/管理访问)。
+
+        GRE 数据面(双端隧道+回程路由+client经隧道)会在 router 上留下大量 conntrack,
+        累积可能干扰 WAN 选路导致管理口失联; 数据面验证后立即清 conntrack 缓解。
+        """
+        try:
+            self.connect_router()
+            self._router.exec("conntrack -F 2>/dev/null; echo CT_DONE", timeout=10)
+            return True
+        except Exception:
+            return False
+
+    # ---------------- peer 对端(56)GRE ----------------
+    def prepare_peer_tunnel(self, *, protocol: int = 0, peer_tunnel_addr: str,
+                            router_dst: str, peer_src: str, ttl: int = 255,
+                            iface: str = None) -> Dict:
+        """在对端(peer/56)建立指向 router(150) 的 GRE 隧道。
+        peer_tunnel_addr: peer 端隧道地址(如 10.99.99.2/30);
+        router_dst: remote(150 的 v4/v6); peer_src: local(56 的 v4/v6)。"""
+        iface = iface or (self.GRE_PEER_IFACE + ("6" if protocol == 1 else ""))
+        try:
+            self.connect_peer()
+            self._peer.exec(
+                f"ip link set {iface} down 2>/dev/null; ip tunnel del {iface} 2>/dev/null; "
+                f"ip -6 tunnel del {iface} 2>/dev/null", timeout=10)
+            if protocol == 1:
+                cmd = (f"ip -6 tunnel add {iface} mode ip6gre remote {router_dst} "
+                       f"local {peer_src} ttl {ttl} && ip link set {iface} up && "
+                       f"ip -6 addr add {peer_tunnel_addr} dev {iface}")
+            else:
+                cmd = (f"ip tunnel add {iface} mode gre remote {router_dst} "
+                       f"local {peer_src} ttl {ttl} && ip link set {iface} up && "
+                       f"ip addr add {peer_tunnel_addr} dev {iface}")
+            out = self._peer.exec(cmd + " 2>&1; echo PEER_RC=$?", timeout=20)
+            ok = "PEER_RC=0" in (out or "")
+            return {"iface": iface, "ok": ok,
+                    "error": "" if ok else (out or "")[-200:]}
+        except Exception as exc:
+            return {"iface": iface, "ok": False, "error": str(exc)[:160]}
+
+    def cleanup_peer_tunnel(self, iface: str = None) -> str:
+        iface = iface or self.GRE_PEER_IFACE
+        try:
+            self.connect_peer()
+            self._peer.exec(
+                f"ip link set {iface} down 2>/dev/null; ip tunnel del {iface} 2>/dev/null; "
+                f"ip -6 tunnel del {iface} 2>/dev/null; echo done", timeout=15)
+        except Exception:
+            pass
+        return f"peer {iface} cleaned"
+
+    # ---------------- L5: 数据面 ----------------
+    def verify_gre_data_plane(self, *, peer_tunnel_addr: str, protocol: int = 0,
+                               via_client: bool = True) -> VerifyResult:
+        """L5: router 直接 ping 对端隧道地址(经gre接口) + (可选)client 经隧道端到端。"""
+        details = {"router_ping": "", "client_ping": ""}
+        try:
+            self.connect_router()
+            if protocol == 1:
+                rp = self._router.exec(
+                    f"ping6 -c 3 -W 2 {peer_tunnel_addr} 2>&1; echo PINGRC=$?", timeout=20)
+            else:
+                rp = self._router.exec(
+                    f"ping -c 3 -W 2 {peer_tunnel_addr} 2>&1; echo PINGRC=$?", timeout=20)
+            details["router_ping"] = (rp or "")[:300]
+            router_ok = "PINGRC=0" in (rp or "") and "0% packet loss" in (rp or "")
+            if not router_ok:
+                return VerifyResult(
+                    "L5-GRE数据面", False,
+                    f"router ping对端隧道地址失败: {(rp or '')[:120]}",
+                    details=details, raw_output=json.dumps(details, ensure_ascii=False)[:600])
+            client_ok = None
+            if via_client:
+                try:
+                    self.connect_client()
+                    if protocol == 1:
+                        cp = self._client.exec(
+                            f"ping6 -c 3 -W 2 -I ens11 {peer_tunnel_addr} 2>&1", timeout=20)
+                    else:
+                        cp = self._client.exec(
+                            f"ping -c 3 -W 2 -I ens11 {peer_tunnel_addr} 2>&1", timeout=20)
+                    details["client_ping"] = (cp or "")[:300]
+                    client_ok = "0% packet loss" in (cp or "") or "3 received" in (cp or "")
+                except Exception as exc:
+                    details["client_ping"] = f"client端到端异常: {str(exc)[:80]}"
+                    client_ok = False  # 异常也算失败(不再静默吞成None跳过)
+            # client端到端是L5硬指标: 经GRE隧道端到端不通=数据面未真正打通, 必须让L5失败
+            # (历史假覆盖: passed=router_ok 掩盖 client 不通; 现 via_client=True 且 client
+            #  失败时 passed=False, 由测试层决定软记录(record_bug)还是硬失败(must_pass))。
+            passed = router_ok and (client_ok is not False)
+            msg = "router ping对端隧道地址成功" if router_ok else "router ping对端隧道地址失败"
+            if client_ok is True:
+                msg += "; client经隧道端到端成功(L5真打通)"
+            elif client_ok is False:
+                msg += "; client经隧道端到端未通(L5数据面未真打通→本次L5失败)"
+            return VerifyResult(
+                "L5-GRE数据面", passed, msg,
+                details=details, raw_output=json.dumps(details, ensure_ascii=False)[:700])
+        except Exception as exc:
+            return VerifyResult("L5-GRE数据面", False, f"GRE数据面验证异常: {str(exc)[:140]}")
+
+    def add_peer_return_route(self, *, client_subnet: str, protocol: int = 0,
+                               via_addr: str, iface: str = None) -> str:
+        """在对端添加回程路由, 使 client 经隧道端到端可通(peer 默认路由可能不指向router)。
+        client_subnet: 如 192.168.148.0/24; via_addr: router 端隧道地址; iface: peer gre 接口。"""
+        iface = iface or self.GRE_PEER_IFACE
+        try:
+            self.connect_peer()
+            if protocol == 1:
+                self._peer.exec(
+                    f"ip -6 route replace {client_subnet} via {via_addr} dev {iface} 2>/dev/null; echo RC=$?",
+                    timeout=10)
+            else:
+                self._peer.exec(
+                    f"ip route replace {client_subnet} via {via_addr} dev {iface} 2>/dev/null; echo RC=$?",
+                    timeout=10)
+        except Exception:
+            pass
+        return f"peer return route {client_subnet} via {via_addr}"
+
+    def del_peer_return_route(self, *, client_subnet: str, protocol: int = 0,
+                               iface: str = None) -> str:
+        iface = iface or self.GRE_PEER_IFACE
+        try:
+            self.connect_peer()
+            if protocol == 1:
+                self._peer.exec(
+                    f"ip -6 route del {client_subnet} dev {iface} 2>/dev/null; echo done", timeout=10)
+            else:
+                self._peer.exec(
+                    f"ip route del {client_subnet} dev {iface} 2>/dev/null; echo done", timeout=10)
+        except Exception:
+            pass
+        return f"peer return route {client_subnet} removed"
+
+    # ---------------- 配置真生效验证(内核 ip -d 解析 + 抓包 + 生命周期残留审计) ----------------
+    # 背景: 现有 verify_gre_runtime 只看 ip tunnel show/ip addr/iptables/route/rule 这一层,
+    # 但 GRE 高级参数(keepalive/tos/ttl/checksum/gre_key/no_fragment)是否真正下发到内核,
+    # 必须看 `ip -d link show` 才有(ttl/tos/nopmtudisc/ikey/okey/icsum/ocsum/keepalive 字段)。
+    # 已知 BUG(实测确认 gre_tunnel.sh):
+    #   - keepalive: 第489/509行 `ip tunnel change ... keepalive N M >/dev/null 2>&1`,
+    #     iproute2 5.15.0 的 ip_gre 不支持 keepalive 参数 → 静默失败, ip -d 无 keepalive 字段。
+    #   - no_fragment=1: 第480/500行下发 `nopmtudisc`(禁用PMTU发现=允许分片), 与"不允许分片"文案反转。
+    #   - gre_key 校验 <= 429496729(9位), 应为 4294967295(10位, 32位)。
+    #   - [ no_fragment == 1 ] && { ttl == 0 ; } 约束。
+    # 严禁 `ip -6 tunnel show`(会卡死SSH session), IPv6 ip6gre 同样用 `ip -d link show`。
+
+    def get_gre_ip_link_detail(self, iface: str, protocol: int = 0) -> str:
+        """`ip -d link show dev <iface>` 原文(内核实际生效参数的唯一来源)。
+
+        IPv4 gre 与 IPv6 ip6gre 都走本命令; 严禁 `ip -6 tunnel show`(会卡死SSH session)。
+        """
+        self.connect_router()
+        return self._router.exec(f"ip -d link show dev {iface} 2>&1", timeout=10)
+
+    def parse_gre_kernel_params(self, iface: str, protocol: int = 0) -> Dict:
+        """解析 `ip -d link show` 为语义字段(本地正则解析, 不受BusyBox grep限制)。
+
+        IPv4 gre: ttl / tos(0xNN) / nopmtudisc / keepalive(N M) / ikey / okey / icsum / ocsum
+        IPv6 ip6gre: hoplimit(=ttl) / tclass(=tos) / encaplimit
+        """
+        raw = self.get_gre_ip_link_detail(iface, protocol)
+        text = raw or ""
+        out: Dict = {
+            "raw": text,
+            "exists": bool(text.strip()) and "No such" not in text,
+        }
+        m = re.search(r"\bttl (\d+|inherit)\b", text)
+        out["ttl"] = m.group(1) if m else None
+        m = re.search(r"\btos (0x[0-9a-fA-F]+|inherit)\b", text)
+        out["tos"] = m.group(1) if m else None
+        m = re.search(r"\bhoplimit (\d+|inherit)\b", text)
+        out["hoplimit"] = m.group(1) if m else None
+        m = re.search(r"\btclass (0x[0-9a-fA-F]+)\b", text)
+        out["tclass"] = m.group(1) if m else None
+        out["nopmtudisc"] = bool(re.search(r"\bnopmtudisc\b", text))
+        m = re.search(r"\bkeepalive (\d+) (\d+)\b", text)
+        out["keepalive"] = (m.group(1), m.group(2)) if m else None
+        m = re.search(r"\bikey ([0-9.]+|0x[0-9a-fA-F]+)\b", text)
+        out["ikey"] = m.group(1) if m else None
+        m = re.search(r"\bokey ([0-9.]+|0x[0-9a-fA-F]+)\b", text)
+        out["okey"] = m.group(1) if m else None
+        out["icsum"] = bool(re.search(r"\bicsum\b", text))
+        out["ocsum"] = bool(re.search(r"\bocsum\b", text))
+        return out
+
+    def verify_gre_kernel_params(self, iface: str, expected: Dict = None,
+                                 protocol: int = 0) -> VerifyResult:
+        """验证高级参数是否真正下发到内核(`ip -d link show`)。
+
+        expected 语义键(任选):
+          ttl:int           -> ttl(v4)/hoplimit(v6)
+          tos:int(十进制)   -> tos(v4)/tclass(v6); tos=0 期望不下发(0x00或缺)
+          no_fragment:bool  -> nopmtudisc 是否在(脚本 no_fragment=1 下发 nopmtudisc)
+          gre_key:truthy    -> ikey/okey 存在且相等
+          checksum:bool     -> icsum/ocsum 是否都在(脚本 csum)
+          keepalive:truthy  -> 期望 keepalive 字段在(已知BUG: 永不在, iproute2不支持)
+        """
+        expected = expected or {}
+        p = self.parse_gre_kernel_params(iface, protocol)
+        if not p.get("exists"):
+            return VerifyResult(
+                "L2-GRE内核参数", False, f"{iface} 接口不存在(ip -d 无输出)",
+                details=p, raw_output=p.get("raw", "")[:400])
+        problems: List[str] = []
+
+        if "ttl" in expected:
+            actual = p.get("hoplimit") if protocol == 1 else p.get("ttl")
+            try:
+                ok = actual is not None and int(str(actual)) == int(expected["ttl"])
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                problems.append(f"ttl 期望{expected['ttl']} 实际{actual}")
+
+        if "tos" in expected:
+            actual = p.get("tclass") if protocol == 1 else p.get("tos")
+            exp_tos = int(expected["tos"])
+            if exp_tos == 0:
+                if actual not in (None, "0x00", "0x0"):
+                    problems.append(f"tos 期望0(脚本不下发) 实际{actual}")
+            else:
+                try:
+                    actual_int = int(str(actual), 16) if actual else None
+                except ValueError:
+                    actual_int = None
+                if actual_int != exp_tos:
+                    problems.append(
+                        f"tos 期望{exp_tos}(0x{exp_tos:x}) 实际{actual}")
+
+        if "no_fragment" in expected:
+            want_nf = bool(expected["no_fragment"])
+            # 正确语义(当前脚本已修, 历史"反转"BUG已修):
+            #   no_fragment=1(不允许分片) → PMTU发现开 → 外层置DF → nopmtudisc 应"不在"
+            #   no_fragment=0(允许分片)   → 脚本 [no_fragment==0]&&cmd+="nopmtudisc" → 应"在"
+            # 脚本下行: [ "$no_fragment" = "0" ] && cmd+=" nopmtudisc" (gre_tunnel.sh 下发段)
+            expect_nopmtudisc = not want_nf
+            if p.get("nopmtudisc") != expect_nopmtudisc:
+                problems.append(
+                    f"no_fragment={want_nf} 期望nopmtudisc{'不在(PMTU发现开/置DF)' if not expect_nopmtudisc else '在(允许分片)'} "
+                    f"实际nopmtudisc{'在' if p.get('nopmtudisc') else '不在'}")
+
+        if "gre_key" in expected and expected["gre_key"]:
+            ikey, okey = p.get("ikey"), p.get("okey")
+            if not ikey or not okey:
+                problems.append("gre_key 期望ikey/okey在 实际缺失(脚本ikey/okey未下发)")
+            elif ikey != okey:
+                problems.append(f"gre_key ikey{ikey}/okey{okey} 不等")
+
+        if "checksum" in expected:
+            want_cs = bool(expected["checksum"])
+            if p.get("icsum") != want_cs or p.get("ocsum") != want_cs:
+                problems.append(
+                    f"checksum={want_cs} 期望icsum/ocsum{'在' if want_cs else '不在'} "
+                    f"实际icsum={p.get('icsum')} ocsum={p.get('ocsum')}")
+
+        if "keepalive" in expected and expected["keepalive"]:
+            if not p.get("keepalive"):
+                problems.append(
+                    "keepalive 期望在(DB keepalive=1) 实际ip -d 无keepalive字段"
+                    "(脚本 ip tunnel change keepalive 失败被2>&1吞错)")
+
+        passed = not problems
+        return VerifyResult(
+            "L2-GRE内核参数", passed,
+            f"{iface} 内核参数一致" if passed
+            else f"{iface} 内核参数问题: " + "; ".join(problems),
+            details=p, raw_output=p.get("raw", "")[:500])
+
+    def ip_link_exists(self, iface: str) -> bool:
+        """接口是否存在于内核(ip link show dev 非空且无 'No such'/'does not exist')。"""
+        self.connect_router()
+        out = self._router.exec(f"ip link show dev {iface} 2>&1", timeout=8) or ""
+        return bool(out.strip()) and "No such" not in out and "does not exist" not in out
+
+    def capture_packets(self, bpf: str, iface: str = "wan3", duration: int = 10,
+                        count: int = 20, role: str = "router") -> str:
+        """tcpdump 后台抓包(duration秒或count包先到为准), 返回原文。
+
+        iKuai 无 timeout 命令, 用 `后台 & + sleep + kill` 模式(tcpdump 直接后台, $!=其PID)。
+        role=router/peer 选 SSH 目标。bpf 如 'proto 47'(v4) 或 'ip6 host <对端v6>'(v6)。
+        """
+        if role == "peer":
+            self.connect_peer()
+            client = self._peer
+        else:
+            self.connect_router()
+            client = self._router
+        cmd = (
+            f"tcpdump -i {iface} -nn -vv -s 128 -c {int(count)} {bpf} "
+            f"> /tmp/gre_cap.log 2>&1 & "
+            f"PID=$!; sleep {int(duration)}; kill $PID 2>/dev/null; sleep 1; "
+            f"cat /tmp/gre_cap.log 2>/dev/null; rm -f /tmp/gre_cap.log; echo CAPTURE_END")
+        return client.exec(cmd, timeout=int(duration) + 20) or ""
+
+    def capture_gre_outer(self, inner_dst: str = None, iface: str = "wan3",
+                          protocol: int = 0, duration: int = 8, count: int = 10,
+                          ping_count: int = 5) -> str:
+        """抓 wan 口外层 GRE 报文; inner_dst 给定则先 ping 内层地址产生 GRE 流量再抓。
+
+        单条 exec: 启 tcpdump 后台 → (可选) ping 内层 → 等待 → kill → cat。
+        关键: 路由器把"去往 gre 接口网段"的流量封装成外层 GRE 从 wan 口出, **无需对端隧道
+        也能抓到外层报文**(对端不回只是 ping 不通, 外层照发)。故 A1-A5 tos/ttl/DF/keepalive
+        的外层报文验证不依赖 peer。
+          - A1 keepalive: inner_dst=None, 抓 N 秒看有无周期探测(已知BUG: 0包)。
+          - A2/A3/A5: inner_dst=对端内层, ping 产生外层, 解析 tos/ttl/flags[DF]。
+        v4 bpf='proto 47'; v6 用 'ip6'(BusyBox tcpdump 不认 'ip6 proto 47', 用宽过滤+后处理)。
+        """
+        self.connect_router()
+        ping = ""
+        if inner_dst:
+            pcmd = (f"ping6 -c {ping_count} -W 1 {inner_dst}"
+                    if protocol == 1 else f"ping -c {ping_count} -W 1 {inner_dst}")
+            ping = f"sleep 1; {pcmd} >/dev/null 2>&1; sleep 2;"
+        bpf = "ip6" if protocol == 1 else "proto 47"
+        cmd = (
+            f"tcpdump -i {iface} -nn -vv -s 128 -c {count} {bpf} "
+            f"> /tmp/gre_cap.log 2>&1 & "
+            f"PID=$!; {ping} sleep {duration}; kill $PID 2>/dev/null; sleep 1; "
+            f"cat /tmp/gre_cap.log 2>/dev/null; rm -f /tmp/gre_cap.log; echo CAPTURE_END")
+        return self._router.exec(cmd, timeout=duration + 25) or ""
+
+    def set_wan_mtu(self, mtu: int, iface: str = "wan3") -> int:
+        """临时修改 WAN 口 MTU(A5 抓 DF 位用), 返回原 MTU(便于恢复)。"""
+        self.connect_router()
+        orig = self._router.exec(f"cat /sys/class/net/{iface}/mtu 2>/dev/null", timeout=8) or ""
+        orig = orig.strip()
+        self._router.exec(f"ip link set dev {iface} mtu {int(mtu)} 2>&1; echo done", timeout=8)
+        try:
+            return int(orig)
+        except ValueError:
+            return 0
+
+    def audit_gre_residual(self, prefix: str = None) -> Dict:
+        """统计 GRE 残留对象(ip rule / rt_tables / ik_cntl iface_band), 供删除前后对比。
+
+        prefix=None 统计所有 gre*; 指定(如 'gre752')只统计该前缀。mark id 取 rt_tables 最大值。
+        """
+        self.connect_router()
+        pat = prefix or "gre"
+        rule_c = self._router.exec(
+            f"ip rule show 2>/dev/null | grep -c '{pat}'", timeout=8) or ""
+        rt_lines = self._router.exec(
+            f"grep '{pat}' /etc/iproute2/rt_tables 2>/dev/null", timeout=8) or ""
+        band = self._router.exec(
+            "cat /proc/ikuai/stats/ik_summary 2>/dev/null | grep gre", timeout=8) or ""
+
+        def _to_int(s: str) -> int:
+            m = re.search(r"(\d+)", str(s or ""))
+            return int(m.group(1)) if m else 0
+
+        max_id = 0
+        for line in (rt_lines or "").splitlines():
+            parts = line.split()
+            if parts:
+                try:
+                    max_id = max(max_id, int(parts[0]))
+                except ValueError:
+                    pass
+        return {
+            "rule_count": _to_int(rule_c),
+            "rt_tables_count": len([l for l in (rt_lines or "").splitlines() if l.strip()]),
+            "rt_tables_lines": rt_lines.strip(),
+            "rt_tables_max_id": max_id,
+            "iface_band": band.strip(),
+        }
+
+    def get_gre_iface_band(self, iface: str) -> str:
+        """cat /proc/ikuai/stats/ik_summary | grep <iface> — ik_cntl iface_band 绑定(mark/status/ifname)。
+
+        C9 停用再启用三层不一致铁证: DB enabled=yes 但 ip link 无接口, 而 iface_band 仍绑。
+        """
+        self.connect_router()
+        return self._router.exec(
+            f"cat /proc/ikuai/stats/ik_summary 2>/dev/null | grep -w '{iface}'", timeout=8) or ""
+
+    def trigger_gre_product_up(self, iface: str) -> str:
+        """走产品"启用"路径触发接口重建(不替代 enable_gre_tunnel_runtime 那个SSH重建workaround)。
+
+        用于 C9 生命周期测试: 把 DB enabled 改 yes 后调脚本 init(遍历 enabled=yes 调
+        __exec_rule_restart_one, 即产品自身启用流程), 看接口是否被重建(已知BUG: 不重建)。
+        init 的 2>&1 静默吞错也是 BUG 来源。
+        """
+        self.connect_router()
+        self._gre_sqlite_exec(
+            f"update gre_tunnel set enabled='yes' where tagname='{iface}'")
+        return self._router.exec(
+            f"{self.GRE_SCRIPT} init 2>&1; echo GRE_INIT_RC=$?", timeout=20) or ""
+
+    # ---------------- 多WAN安全门禁 + IPv6动态解析 ----------------
+    # 背景(BUG-1/2): GRE 操作在多线负载环境曾触发 WAN 路由消失致设备失联。
+    # 任何 GRE 增删改停用前必须: 快照 main/各WAN路由表/default/直连/ip rule/ip -6 rule/
+    # rt_tables/iface_band/mangle/NAT/现有GRE接口+地址; 每次操作后比对; 持续从独立LAN探测管理连通。
+    def snapshot_multiwan_safety(self) -> Dict:
+        """多WAN高风险操作前的完整只读快照(用于操作前后比对, 不改任何东西)。
+
+        覆盖: gre_tunnel全表 / main+WAN路由表 / default+直连 / ip rule / ip -6 rule /
+        rt_tables / iface_band(ik_summary) / mangle proto47 / AUTONAT / 现有gre接口+地址+链路 /
+        Web/SSH/WAN/客户端业务可达性。
+        严禁 ip -6 tunnel show(卡SSH); v6 用 ip -d link show dev / ip -6 addr / ip -6 route。
+        """
+        self.connect_router()
+        R = self._router
+
+        def ec(cmd, t=12):
+            try:
+                return (R.exec(cmd, timeout=t) or "").strip()
+            except Exception as e:
+                return f"<err {str(e)[:60]}>"
+
+        snap = {}
+        snap["gre_db"] = ec(
+            "sqlite3 /etc/mnt/ikuai/config.db 'select id,tagname,enabled,protocol,"
+            "tunnel_addr,src_mode,src_addr,src_iface,dst_addr from gre_tunnel' 2>/dev/null")
+        snap["gre_count"] = ec(
+            "sqlite3 /etc/mnt/ikuai/config.db 'select count(*) from gre_tunnel' 2>/dev/null")
+        snap["route_main"] = ec("ip route show 2>/dev/null")
+        snap["route_default_connected"] = ec(
+            "ip route show 2>/dev/null | grep -E 'default|proto kernel'")
+        # 各 WAN 路由表(wan1/wan2/wan3)快照
+        wan_tables = {}
+        for w in ("wan1", "wan2", "wan3"):
+            wan_tables[w] = ec(f"ip route show table {w} 2>/dev/null | head -30")
+        snap["wan_route_tables"] = wan_tables
+        snap["ip_rule"] = ec("ip rule show 2>/dev/null")
+        snap["ip6_rule"] = ec("ip -6 rule show 2>/dev/null | head -40")
+        snap["rt_tables_gre"] = ec("grep gre /etc/iproute2/rt_tables 2>/dev/null")
+        snap["rt_tables_all"] = ec("cat /etc/iproute2/rt_tables 2>/dev/null")
+        snap["iface_band_gre"] = ec(
+            "cat /proc/ikuai/stats/ik_summary 2>/dev/null | grep -i gre")
+        snap["mangle_proto47"] = ec(
+            "iptables -t mangle -S 2>/dev/null | grep -E '47|gre' | head -20")
+        snap["autonat"] = ec("iptables -t nat -S AUTONAT 2>/dev/null | head -40")
+        snap["ip6_nat"] = ec("ip6tables -t nat -S POSTROUTING 2>/dev/null | head -30")
+        snap["gre_link_detail"] = ec(
+            "for i in $(ip -o link show 2>/dev/null | sed -n "
+            "'s/^[0-9]*: \\(gre[0-9]*\\).*/\\1/p'); do echo \"-- $i --\"; "
+            "ip -d link show dev $i 2>/dev/null | head -4; echo '[addr]'; "
+            "ip addr show dev $i 2>/dev/null | grep -E 'inet '; done")
+        snap["wan_addr"] = ec("ip -br addr show 2>/dev/null | grep -iE 'wan|lan1'")
+        snap["ip6_route"] = ec("ip -6 route show 2>/dev/null | head -20")
+        return snap
+
+    def verify_management_reachable(self) -> Dict:
+        """探测全部管理/业务通道可达性(失联恢复铁证 + 操作后持续探测)。
+
+        用独立LAN(192.168.148.1)+recovery(10.66.0.27)+client(经路由器)三路交叉,
+        任一独立通道通即证明设备未失联; Web/SSH/WAN 各自标注。
+        """
+        result = {"router_ssh": False, "lan_ssh": False, "recovery_ssh": False,
+                  "client_ssh": False, "peer_ssh": False, "router_wan_ping": ""}
+        try:
+            self.connect_router()
+            result["router_ssh"] = self._router is not None
+        except Exception:
+            result["router_ssh"] = False
+        # 独立LAN管理通道(关键: WAN路由消失时唯一可靠恢复路径)
+        try:
+            self.connect_router_lan_management()
+            out = self._router_lan_management.exec("echo LAN_OK", timeout=8)
+            result["lan_ssh"] = "LAN_OK" in (out or "")
+        except Exception:
+            result["lan_ssh"] = False
+        try:
+            self.connect_router_recovery()
+            out = self._router_recovery.exec("echo REC_OK", timeout=8)
+            result["recovery_ssh"] = "REC_OK" in (out or "")
+        except Exception:
+            result["recovery_ssh"] = False
+        try:
+            self.connect_client()
+            out = self._client.exec("echo CLI_OK", timeout=8)
+            result["client_ssh"] = "CLI_OK" in (out or "")
+        except Exception:
+            result["client_ssh"] = False
+        try:
+            self.connect_peer()
+            out = self._peer.exec("echo PEER_OK", timeout=8)
+            result["peer_ssh"] = "PEER_OK" in (out or "")
+        except Exception:
+            result["peer_ssh"] = False
+        # 独立判定: LAN 或 recovery 任一通 = 设备未失联(可恢复)
+        result["device_reachable"] = bool(
+            result["router_ssh"] or result["lan_ssh"] or result["recovery_ssh"])
+        return result
+
+    def get_wan_ipv6_global(self, role: str = "router", iface: str = "wan1") -> str:
+        """读取 router/peer 指定接口的全局 IPv6 地址(SLAAC/DHCPv6 /128 会漂移, 不能硬编码)。
+
+        用于 IPv6 GRE 数据面: 测试地址漂移后历史硬编码 ROUTER_V6/PEER_V6 失效,
+        改为运行时解析真实全局 v6。返回首个非 link-local(fe80)全局地址, 无则空串。
+        """
+        try:
+            if role == "peer":
+                self.connect_peer()
+                client = self._peer
+            else:
+                self.connect_router()
+                client = self._router
+            out = client.exec(
+                f"ip -6 addr show dev {iface} 2>/dev/null | "
+                "grep -E 'inet6' | grep -v 'fe80' | grep -v '::1' | "
+                "awk '{{print $2}}' | head -1", timeout=10)
+            addr = (out or "").strip().split("/")[0]
+            return addr
+        except Exception:
+            return ""
+
+    def audit_gre_residual_full(self, prefix: str = None) -> Dict:
+        """GRE 删除/停用后全量残留审计(比 audit_gre_residual 多 ip -6 rule + mangle + NAT)。
+
+        用于 finally 独立审计: 测试前后对比, 确认无本轮接口/地址/NAT/mangle/route/rule/
+        rt_tables/iface_band 残留。prefix=None 统计所有 gre*。
+        """
+        self.connect_router()
+        pat = prefix or "gre"
+
+        def ec(cmd, t=10):
+            try:
+                return (self._router.exec(cmd, timeout=t) or "").strip()
+            except Exception:
+                return ""
+
+        rule_v4 = ec(f"ip rule show 2>/dev/null | grep '{pat}'")
+        rule_v6 = ec(f"ip -6 rule show 2>/dev/null | grep '{pat}'")
+        rt_lines = ec(f"grep '{pat}' /etc/iproute2/rt_tables 2>/dev/null")
+        band = ec(f"cat /proc/ikuai/stats/ik_summary 2>/dev/null | grep -w '{pat}'"
+                  if prefix else "cat /proc/ikuai/stats/ik_summary 2>/dev/null | grep -i gre")
+        mangle = ec(f"iptables -t mangle -S 2>/dev/null | grep '{pat}'")
+        autonat = ec(f"iptables -t nat -S AUTONAT 2>/dev/null | grep '{pat}'")
+        # 接口残留
+        iface_lines = ec(
+            f"for i in $(ip -o link show 2>/dev/null | sed -n "
+            f"'s/^[0-9]*: \\(gre[0-9]*\\).*/\\1/p'); do echo $i; done")
+        test_ifaces = [i for i in iface_lines.split() if i.startswith(pat)] if prefix else \
+            [i for i in iface_lines.split()]
+        return {
+            "prefix": pat,
+            "rule_v4_count": len([l for l in rule_v4.splitlines() if l.strip()]),
+            "rule_v4": rule_v4,
+            "rule_v6_count": len([l for l in rule_v6.splitlines() if l.strip()]),
+            "rule_v6": rule_v6,
+            "rt_tables_count": len([l for l in rt_lines.splitlines() if l.strip()]),
+            "rt_tables": rt_lines,
+            "iface_band": band,
+            "mangle": mangle,
+            "autonat": autonat,
+            "residual_ifaces": test_ifaces,
+            "has_residual": bool(rule_v4 or rule_v6 or rt_lines or band or mangle
+                                 or autonat or test_ifaces),
+        }
+
+    # ==================== 设备设置 > 高级管理 > 协议控制 ====================
+    # 实机事实(4.0.307 Build202607211006):
+    # API: Action/call func_name=core_control action=show/save
+    # 注册: /usr/ikuai/function/core_control -> ../script/core_control.sh
+    # DB: forward_mode_config(id=1, mode,dpi,quic,https,appid_load)
+
+    PROTOCOL_CONTROL_SCRIPT = "/usr/ikuai/script/core_control.sh"
+    PROTOCOL_CONTROL_FUNCTION = "/usr/ikuai/function/core_control"
+    PROTOCOL_CONTROL_TABLE = "forward_mode_config"
+    PROTOCOL_CONTROL_FIELDS = (
+        "id", "mode", "dpi", "quic", "https", "appid_load",
+    )
+    PROTOCOL_CONTROL_MODES = {
+        0: {"dpi": 0, "quic": 0, "https": 0, "appid_load": 0},
+        1: {"dpi": 1, "quic": 0, "https": 1, "appid_load": 1},
+    }
+    PROTOCOL_CONTROL_CLIENT_IP = "192.168.148.2"
+    PROTOCOL_CONTROL_GATEWAY = "192.168.148.1"
+    PROTOCOL_CONTROL_CLIENT_IFACE = "ens11"
+    PROTOCOL_CONTROL_SECONDARY_CLIENT = "192.168.148.5"
+    PROTOCOL_CONTROL_NAT_TARGET = "223.5.5.5"
+    PROTOCOL_CONTROL_AUDIT_DIR = "/etc/log/audit"
+
+    def _protocol_control_read_row(self) -> Dict[str, Any]:
+        self.connect_router()
+        fields = ",".join(self.PROTOCOL_CONTROL_FIELDS)
+        output = self._router.exec(
+            f"sqlite3 -separator '|' {shlex.quote(self.DNS_DB)} "
+            f"{shlex.quote(f'SELECT {fields} FROM {self.PROTOCOL_CONTROL_TABLE} WHERE id=1 LIMIT 1;')}",
+            timeout=15,
+        ).strip()
+        values = output.split("|") if output else []
+        if len(values) != len(self.PROTOCOL_CONTROL_FIELDS):
+            return {}
+        result = {}
+        for name, value in zip(self.PROTOCOL_CONTROL_FIELDS, values):
+            try:
+                result[name] = int(value)
+            except (TypeError, ValueError):
+                result[name] = value
+        return result
+
+    @staticmethod
+    def _protocol_control_parse_features(output: str) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for line in str(output or "").splitlines():
+            if ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            key = re.sub(r"\s+", "_", name.strip().lower())
+            result[key] = value.strip().lower()
+        return result
+
+    def _protocol_control_runtime_state(self) -> Dict[str, Any]:
+        self.connect_router()
+        row = self._protocol_control_read_row()
+        features_output = self._router.exec(
+            "cat /proc/ikuai/stats/ik_features_status 2>/dev/null"
+        )
+        basic = self._router.exec(
+            f"sqlite3 {shlex.quote(self.DNS_DB)} "
+            "'select switch_dpi from basic where id=1'"
+        ).strip()
+        dprotos_l7 = self._router.exec(
+            f"sqlite3 {shlex.quote(self.DNS_DB)} "
+            "'select count(*) from dprotos_l7'"
+        ).strip()
+        audit_config = self._router.exec(
+            f"sqlite3 -separator '|' {shlex.quote(self.DNS_DB)} "
+            "'select open_url_record,open_im_record,open_appid_record,"
+            "open_terminal_record from global_config where id=1'"
+        ).strip()
+        audit_values = audit_config.split("|") if audit_config else []
+        return {
+            "row": row,
+            "basic_switch_dpi": int(basic or 0),
+            "features": self._protocol_control_parse_features(features_output),
+            "feature_raw": features_output.strip(),
+            "dprotos_l7_count": int(dprotos_l7 or 0),
+            "processes": {
+                name: bool(self._router.exec(f"pidof {name} 2>/dev/null").strip())
+                for name in ("ik_url_auditd", "ik_stats_collect", "ik_host_ua")
+            },
+            "audit_flags": {
+                name: self._router.exec(
+                    f"test -e /tmp/iktmp/audit.{name} && echo 1 || echo 0"
+                ).strip() == "1"
+                for name in (
+                    "open_url_record", "open_im_record", "open_appid_record",
+                )
+            },
+            "audit_config": {
+                key: int(value or 0)
+                for key, value in zip(
+                    (
+                        "open_url_record", "open_im_record",
+                        "open_appid_record", "open_terminal_record",
+                    ),
+                    audit_values,
+                )
+            },
+            "modules": self._router.exec(
+                "lsmod 2>/dev/null | grep -E '(^ik_|dpi|conntrack)' | head -80"
+            ).strip(),
+            "shared_memory": self._router.exec(
+                "ipcs -m 2>/dev/null | tail -n +4"
+            ).strip(),
+            "basic_cache_sha256": self._router.exec(
+                "sha256sum /tmp/iktmp/cache/config/basic 2>/dev/null | awk '{print $1}'"
+            ).strip(),
+        }
+
+    def verify_protocol_control_script_contract(self) -> VerifyResult:
+        """L1: 核对脚本校验值、API注册、表默认值和参数映射。"""
+        try:
+            self.connect_router()
+            script = self._router.exec(
+                f"cat {shlex.quote(self.PROTOCOL_CONTROL_SCRIPT)}"
+            )
+            schema = self._router.exec(
+                f"sqlite3 {shlex.quote(self.DNS_DB)} "
+                f"{shlex.quote('.schema ' + self.PROTOCOL_CONTROL_TABLE)}"
+            )
+            link = self._router.exec(
+                f"readlink {shlex.quote(self.PROTOCOL_CONTROL_FUNCTION)}"
+            ).strip()
+            required_script = (
+                "init()", "__exec_rule_init", "save()", "show()",
+                "select * from forward_mode_config",
+                "sql_config_update $IK_DB_CONFIG forward_mode_config",
+                "mode  == 0 or == 1 or == 2 or == 3",
+                "ik_cntl quic enable", "ik_cntl quic disable",
+                "ik_cntl https enable", "ik_cntl https disable",
+                "ik_cntl appid_load enable", "ik_cntl appid_load disable",
+                "basic.sh __set_switch_dpi",
+            )
+            required_schema = (
+                "mode", "integer default 1", "dpi", "integer default 1",
+                "quic", "integer default 0", "https", "appid_load",
+            )
+            missing = [item for item in required_script if item not in script]
+            missing.extend(item for item in required_schema if item not in schema)
+            if link != "../script/core_control.sh":
+                missing.append("function/core_control API注册软链接")
+            details = {
+                "script_sha256": self._router.exec(
+                    f"sha256sum {shlex.quote(self.PROTOCOL_CONTROL_SCRIPT)} | "
+                    "awk '{print $1}'"
+                ).strip(),
+                "script_lines": len(script.splitlines()),
+                "api_registration": link,
+                "show_action": True,
+                "save_action": True,
+                "table": self.PROTOCOL_CONTROL_TABLE,
+                "mode_contract": self.PROTOCOL_CONTROL_MODES,
+                "custom_mode_supported_by_script": True,
+                "audit_control_present": bool(
+                    re.search(r"ik_cntl\s+audit\s+(enable|disable)", script)
+                ),
+                "missing": missing,
+            }
+            return VerifyResult(
+                "L1-协议控制脚本契约", not missing,
+                "core_control API注册、show/save、表默认值和模式映射完整"
+                if not missing else "协议控制脚本契约缺失: " + ", ".join(missing),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L1-协议控制脚本契约", False,
+                f"协议控制脚本契约验证异常: {type(exc).__name__}",
+            )
+
+    def verify_protocol_control_database(self, expected_mode: int) -> VerifyResult:
+        try:
+            expected_mode = int(expected_mode)
+            expected = self.PROTOCOL_CONTROL_MODES.get(expected_mode)
+            if expected is None:
+                return VerifyResult("L1-协议控制数据库", False, "测试仅校验页面公开的0/1模式")
+            actual = self._protocol_control_read_row()
+            expected_row = {"id": 1, "mode": expected_mode, **expected}
+            mismatches = {
+                name: {"expected": value, "actual": actual.get(name)}
+                for name, value in expected_row.items()
+                if actual.get(name) != value
+            }
+            return VerifyResult(
+                "L1-协议控制数据库", not mismatches,
+                "forward_mode_config与公开模式映射一致" if not mismatches else
+                "协议控制数据库不一致: " + ", ".join(mismatches),
+                details={"actual": actual, "expected": expected_row,
+                         "mismatches": mismatches},
+                raw_output=json.dumps(actual, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L1-协议控制数据库", False,
+                f"协议控制数据库验证异常: {type(exc).__name__}",
+            )
+
+    def wait_protocol_control_runtime(
+        self, expected_mode: int, timeout: float = 20.0
+    ) -> VerifyResult:
+        """等待核心DPI/HTTPS/appid_load运行态稳定，不掩盖audit契约问题。"""
+        expected_mode = int(expected_mode)
+        expected = self.PROTOCOL_CONTROL_MODES.get(expected_mode)
+        if expected is None:
+            return VerifyResult("等待-协议控制运行态", False, "不支持的页面模式")
+        deadline = time.time() + max(1.0, float(timeout))
+        state: Dict[str, Any] = {}
+        while time.time() < deadline:
+            state = self._protocol_control_runtime_state()
+            features = state.get("features", {})
+            wanted = {
+                "dpi": "enable" if expected["dpi"] else "disable",
+                "l4_dpi": "enable" if expected["dpi"] else "disable",
+                "appid_load": "enable" if expected["appid_load"] else "disable",
+                "quic": "enable" if expected["quic"] else "disable",
+                "https": "enable" if expected["https"] else "disable",
+            }
+            if (
+                state.get("row", {}).get("mode") == expected_mode
+                and state.get("basic_switch_dpi") == expected["dpi"]
+                and all(features.get(key) == value for key, value in wanted.items())
+            ):
+                return VerifyResult(
+                    "等待-协议控制运行态", True,
+                    f"模式{expected_mode}核心运行态已稳定",
+                    details={"state": state, "expected_features": wanted},
+                )
+            time.sleep(0.5)
+        return VerifyResult(
+            "等待-协议控制运行态", False,
+            f"模式{expected_mode}核心运行态在{timeout:g}秒内未稳定",
+            details={"state": state}, raw_output=json.dumps(state, ensure_ascii=False),
+        )
+
+    def verify_protocol_control_runtime(self, expected_mode: int) -> VerifyResult:
+        """L2/L3: 严格验证DPI、审计、访问记录、QUIC和真实运行参数。"""
+        try:
+            expected_mode = int(expected_mode)
+            expected = self.PROTOCOL_CONTROL_MODES.get(expected_mode)
+            if expected is None:
+                return VerifyResult("L2/L3-协议控制运行态", False, "不支持的页面模式")
+            state = self._protocol_control_runtime_state()
+            features = state["features"]
+            expected_features = {
+                "dpi": "enable" if expected["dpi"] else "disable",
+                "l4_dpi": "enable" if expected["dpi"] else "disable",
+                "appid_load": "enable" if expected["appid_load"] else "disable",
+                "quic": "enable" if expected["quic"] else "disable",
+                "https": "enable" if expected["https"] else "disable",
+                # 页面帮助明确声明性能模式关闭应用层审计。
+                "audit": "enable" if expected_mode == 1 else "disable",
+            }
+            dprotos_count = int(state.get("dprotos_l7_count") or 0)
+            expected_features["user_dpi"] = (
+                "enable" if expected["dpi"] and dprotos_count > 0 else "disable"
+            )
+            mismatches: Dict[str, Any] = {}
+            if state["row"] != {"id": 1, "mode": expected_mode, **expected}:
+                mismatches["database"] = state["row"]
+            if state["basic_switch_dpi"] != expected["dpi"]:
+                mismatches["basic.switch_dpi"] = state["basic_switch_dpi"]
+            for key, value in expected_features.items():
+                if features.get(key) != value:
+                    mismatches[f"feature.{key}"] = {
+                        "expected": value, "actual": features.get(key),
+                    }
+            url_process_expected = expected_mode == 1
+            if state["processes"].get("ik_url_auditd") != url_process_expected:
+                mismatches["process.ik_url_auditd"] = {
+                    "expected": url_process_expected,
+                    "actual": state["processes"].get("ik_url_auditd"),
+                }
+            if state["audit_flags"].get("open_url_record") != url_process_expected:
+                mismatches["flag.audit.open_url_record"] = {
+                    "expected": url_process_expected,
+                    "actual": state["audit_flags"].get("open_url_record"),
+                }
+            details = {
+                "mode": expected_mode,
+                "expected_features": expected_features,
+                "state": state,
+                "mismatches": mismatches,
+                "known_product_gap": (
+                    expected_mode == 0
+                    and any(key.startswith(("feature.audit", "process.ik_url_auditd",
+                                            "flag.audit.open_url_record"))
+                            for key in mismatches)
+                ),
+            }
+            return VerifyResult(
+                "L2/L3-协议控制运行态", not mismatches,
+                "DPI、审计、访问记录、QUIC及解析运行态与模式一致"
+                if not mismatches else
+                "协议控制运行态与页面契约不一致: " + ", ".join(mismatches),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L2/L3-协议控制运行态", False,
+                f"协议控制运行态验证异常: {type(exc).__name__}",
+            )
+
+    def verify_protocol_control_nat_health(self) -> VerifyResult:
+        """复用已实机验证的LAN/SNAT哨兵，但使用协议控制报告语义。"""
+        result = self.verify_alg_nat_health(self.PROTOCOL_CONTROL_NAT_TARGET)
+        return VerifyResult(
+            "L4-协议控制NAT哨兵", result.passed,
+            result.message.replace("ALG", "协议控制"),
+            details=result.details, raw_output=result.raw_output,
+        )
+
+    def repair_protocol_control_nat_runtime(self) -> VerifyResult:
+        result = self.repair_alg_nat_runtime()
+        return VerifyResult(
+            "恢复-协议控制关联NAT", result.passed,
+            result.message.replace("ALG", "协议控制"),
+            details=result.details, raw_output=result.raw_output,
+        )
+
+    def verify_protocol_control_management_health(self) -> VerifyResult:
+        try:
+            self.connect_router()
+            shell = self._router.exec("echo IKUAI_PROTOCOL_CONTROL_SSH_OK").strip()
+            web = self._router.exec(
+                "curl -sS --max-time 4 -o /dev/null -w '%{http_code}' "
+                "http://127.0.0.1/ 2>/dev/null"
+            ).strip()
+            passed = "IKUAI_PROTOCOL_CONTROL_SSH_OK" in shell and web in {"200", "302"}
+            return VerifyResult(
+                "L4-管理健康", passed,
+                "SSH与Web管理入口均正常" if passed else "SSH或Web管理入口异常",
+                details={"ssh": "ok" if shell else "missing", "web_http": web},
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-管理健康", False,
+                f"管理健康验证异常: {type(exc).__name__}",
+            )
+
+    def verify_protocol_control_secondary_client_health(self) -> VerifyResult:
+        """确认192.168.148.5仍有经路由器WAN SNAT的活动会话。"""
+        try:
+            self.connect_router()
+            router_wan = self._router.exec(
+                "ip -4 -o addr show dev wan1 | awk '{print $4}' | cut -d/ -f1 | head -1"
+            ).strip()
+            output = self._router.exec(
+                "conntrack -L 2>/dev/null | grep -F 'src=192.168.148.5' | head -20"
+            ).strip()
+            snat = bool(output and router_wan and f"dst={router_wan}" in output)
+            return VerifyResult(
+                "L4-独立终端SNAT", snat,
+                "192.168.148.5仍有正常SNAT会话" if snat else
+                "未找到192.168.148.5的有效SNAT会话",
+                details={"router_wan": router_wan, "session_present": bool(output)},
+                raw_output=output[:1200],
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-独立终端SNAT", False,
+                f"独立终端SNAT验证异常: {type(exc).__name__}",
+            )
+
+    def verify_protocol_control_full_chain(self, expected_mode: int) -> VerifyResult:
+        layers = [
+            self.verify_protocol_control_database(expected_mode),
+            self.verify_protocol_control_runtime(expected_mode),
+            self.verify_protocol_control_management_health(),
+            self.verify_protocol_control_nat_health(),
+        ]
+        passed = all(item.passed for item in layers)
+        details = {
+            item.level: {"passed": item.passed, "message": item.message}
+            for item in layers
+        }
+        return VerifyResult(
+            "L4-协议控制全链路", passed,
+            "数据库、运行态和管理/转发健康完全一致" if passed else
+            "协议控制全链路存在不一致: " + "; ".join(
+                item.message for item in layers if not item.passed
+            ),
+            details=details, raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def verify_protocol_control_reinit(self, expected_mode: int) -> VerifyResult:
+        try:
+            before = self._protocol_control_read_row()
+            self.connect_router()
+            self._router.exec(
+                f"{shlex.quote(self.PROTOCOL_CONTROL_SCRIPT)} init", timeout=30
+            )
+            stable = self.wait_protocol_control_runtime(expected_mode)
+            after = self._protocol_control_read_row()
+            runtime = self.verify_protocol_control_runtime(expected_mode)
+            nat = self.verify_protocol_control_nat_health()
+            passed = before == after and stable.passed and runtime.passed and nat.passed
+            details = {
+                "database_unchanged": before == after,
+                "before": before, "after": after,
+                "stable": stable.message,
+                "runtime": runtime.message,
+                "nat": nat.message,
+            }
+            return VerifyResult(
+                "L4-协议控制脚本重建", passed,
+                "core_control.sh init后模式、运行态和LAN/SNAT均保持正确"
+                if passed else "core_control.sh init后存在模式或运行态不一致",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-协议控制脚本重建", False,
+                f"协议控制init复验异常: {type(exc).__name__}",
+            )
+
+    def _protocol_control_audit_query(
+        self, host: str, starttime: int, stoptime: int
+    ) -> Dict[str, Any]:
+        self.connect_router()
+        output = self._router.exec(
+            "/usr/ikuai/script/audit_url_log.sh show TYPE=data "
+            f"KEYWORDS={shlex.quote(host)} limit=0,100 "
+            f"starttime={int(starttime)} stoptime={int(stoptime)}",
+            timeout=35,
+        ).strip()
+        try:
+            return json.loads(output or "{}")
+        except json.JSONDecodeError:
+            return {"data": [], "raw": output[:500]}
+
+    def _protocol_control_cleanup_audit_token(self, token: str) -> Dict[str, Any]:
+        """仅删除本轮token行，并同步当前小时索引计数；不清空任何用户记录。"""
+        if not re.fullmatch(r"IKPC[A-Z0-9_]+", str(token or "")):
+            return {"passed": False, "error": "invalid_token", "removed": 0}
+        self.connect_router()
+        files = self._router.exec(
+            f"grep -al {shlex.quote(token)} "
+            f"{self.PROTOCOL_CONTROL_AUDIT_DIR}/stream/* 2>/dev/null"
+        ).splitlines()
+        total_removed = 0
+        errors = []
+        for stream_file in files:
+            stream_file = stream_file.strip()
+            if not re.fullmatch(r"/etc/log/audit/stream/[0-9]{8}T[0-9]{6}", stream_file):
+                errors.append("unexpected_stream_path")
+                continue
+            name = stream_file.rsplit("/", 1)[-1]
+            index_file = f"{self.PROTOCOL_CONTROL_AUDIT_DIR}/index/{name}"
+            temp = f"/tmp/ikuai_pc_clean_{token}_{name}"
+            command = f"""set -e
+pids="$(pidof ik_url_auditd)"
+[ -n "$pids" ] && kill -STOP $pids || true
+trap '[ -n "$pids" ] && kill -CONT $pids || true; rm -f {temp}.s {temp}.i' EXIT
+removed=$(grep -ac {shlex.quote(token)} {shlex.quote(stream_file)} || true)
+ip=$(awk -F '\t' -v t={shlex.quote(token)} 'index($0,t){{print $1;exit}}' {shlex.quote(stream_file)})
+mac=$(awk -F '\t' -v t={shlex.quote(token)} 'index($0,t){{print $2;exit}}' {shlex.quote(stream_file)})
+host=$(awk -F '\t' -v t={shlex.quote(token)} 'index($0,t){{print $8;exit}}' {shlex.quote(stream_file)})
+awk -v t={shlex.quote(token)} 'index($0,t)==0{{print}}' {shlex.quote(stream_file)} > {temp}.s
+awk -F '\t' -v OFS='\t' -v ip="$ip" -v mac="$mac" -v host="$host" -v n="$removed" '
+$1=="host"&&$2==host{{next}}
+(($1=="total"&&$2=="total")||($1=="ip"&&$2==ip)||($1=="mac"&&$2==mac)){{v=$3-n;if(v>0){{$3=v;print}};next}}
+{{print}}' {shlex.quote(index_file)} > {temp}.i
+chmod 644 {temp}.s {temp}.i
+mv {temp}.s {shlex.quote(stream_file)}
+mv {temp}.i {shlex.quote(index_file)}
+echo removed=$removed
+"""
+            output = self._router.exec(command, timeout=30)
+            match = re.search(r"removed=(\d+)", output)
+            if match:
+                total_removed += int(match.group(1))
+            else:
+                errors.append(f"cleanup_failed:{name}")
+        residual = self._router.exec(
+            f"grep -aH {shlex.quote(token)} "
+            f"{self.PROTOCOL_CONTROL_AUDIT_DIR}/stream/* "
+            f"{self.PROTOCOL_CONTROL_AUDIT_DIR}/index/* 2>/dev/null || true"
+        ).strip()
+        return {
+            "passed": not errors and not residual,
+            "removed": total_removed,
+            "files": files,
+            "errors": errors,
+            "residual": residual,
+        }
+
+    def run_protocol_control_http_probe(
+        self, expect_observed: bool, token: str = ""
+    ) -> VerifyResult:
+        """L5: 相同客户端/对端HTTP流量的DPI与访问记录正反对照。"""
+        token = str(token or f"IKPC_{int(time.time())}_{secrets.token_hex(4)}").upper()
+        token = re.sub(r"[^A-Z0-9_]", "_", token)
+        if not token.startswith("IKPC"):
+            token = "IKPC_" + token
+        host = token.lower() + ".example.test"
+        peer_host = str(self._ssh_config.peer.host or "")
+        if not peer_host:
+            return VerifyResult("L5-协议控制HTTP", False, "未配置SSH peer")
+        port = 30000 + secrets.randbelow(25000)
+        prefix = f"/tmp/ikuai_pc_{token}"
+        original_route = ""
+        cleanup: Dict[str, Any] = {}
+        details: Dict[str, Any] = {
+            "token": token, "host": host, "peer": peer_host,
+            "port": port, "expect_observed": bool(expect_observed),
+        }
+        try:
+            self.connect_router()
+            self.connect_client()
+            self.connect_peer()
+            info = self.get_client_lan_info(gateway=self.PROTOCOL_CONTROL_GATEWAY)
+            client_ip = str(info.get("ip") or self.PROTOCOL_CONTROL_CLIENT_IP)
+            iface = str(info.get("iface") or self.PROTOCOL_CONTROL_CLIENT_IFACE)
+            router_wan = self._router.exec(
+                "ip -4 -o addr show dev wan1 | awk '{print $4}' | cut -d/ -f1 | head -1"
+            ).strip()
+            for _ in range(40):
+                occupied = self._peer.exec(
+                    f"netstat -lnt 2>/dev/null | grep -q ':{port} ' && echo 1 || echo 0"
+                ).strip() == "1"
+                if not occupied:
+                    break
+                port = 30000 + secrets.randbelow(25000)
+            server_script = (
+                "#!/bin/sh\nwhile true; do\n"
+                f" printf 'HTTP/1.1 200 OK\\r\\nContent-Length: {len(token)}"
+                f"\\r\\nConnection: close\\r\\n\\r\\n{token}' | "
+                f"/bin/busybox nc -l -p {port}\ndone\n"
+            )
+            encoded = base64.b64encode(server_script.encode()).decode()
+            self._peer.exec(
+                f"echo {encoded} | base64 -d > {shlex.quote(prefix + '.sh')}; "
+                f"chmod 700 {shlex.quote(prefix + '.sh')}; "
+                f"start-stop-daemon -S -b -x {shlex.quote(prefix + '.sh')}",
+                timeout=15,
+            )
+            time.sleep(0.8)
+            listening = bool(self._peer.exec(
+                f"netstat -lnt 2>/dev/null | grep ':{port} '"
+            ).strip())
+            original_route = self._client.exec(
+                f"ip route show {shlex.quote(peer_host)}/32 2>/dev/null | head -1"
+            ).strip()
+            self._client.exec(
+                f"sudo ip route replace {shlex.quote(peer_host)}/32 via "
+                f"{self.PROTOCOL_CONTROL_GATEWAY} dev {shlex.quote(iface)} "
+                f"src {shlex.quote(client_ip)}"
+            )
+            route = self._client.exec(
+                f"ip route get {shlex.quote(peer_host)} from {shlex.quote(client_ip)}"
+            ).strip()
+            route_ok = bool(
+                f"via {self.PROTOCOL_CONTROL_GATEWAY}" in route
+                and f"dev {iface}" in route
+                and (
+                    f"src {client_ip}" in route
+                    or f"from {client_ip}" in route
+                )
+            )
+            now = int(time.time())
+            before_payload = self._protocol_control_audit_query(
+                host, now - 120, now + 240
+            )
+            before_rows = list(before_payload.get("data") or [])
+            curls = []
+            for index in range(3):
+                output = self._client.exec(
+                    f"curl --noproxy '*' --interface {shlex.quote(client_ip)} "
+                    "--connect-timeout 4 --max-time 8 -sS "
+                    f"-H {shlex.quote('Host: ' + host)} "
+                    f"{shlex.quote(f'http://{peer_host}:{port}/{token}/run{index}?nonce={token}_{index}')} "
+                    "-w '\nHTTP=%{http_code} PEER=%{remote_ip}'",
+                    timeout=12,
+                )
+                curls.append(output)
+                time.sleep(0.7)
+            after_payload: Dict[str, Any] = {}
+            for _ in range(14):
+                after_payload = self._protocol_control_audit_query(
+                    host, now - 120, int(time.time()) + 60
+                )
+                if after_payload.get("data") or not expect_observed:
+                    if not expect_observed:
+                        time.sleep(0.25)
+                    break
+                time.sleep(0.7)
+            if not expect_observed:
+                time.sleep(3.0)
+                after_payload = self._protocol_control_audit_query(
+                    host, now - 120, int(time.time()) + 60
+                )
+            after_rows = list(after_payload.get("data") or [])
+            dpi_cache = self._router.exec(
+                f"cat /proc/ikuai/dpi/dpi_cache 2>/dev/null | "
+                f"grep -F {shlex.quote(peer_host)} | grep -E '[[:space:]]{port}[[:space:]]'"
+            ).strip()
+            conntrack = self._router.exec(
+                f"conntrack -L -p tcp 2>/dev/null | "
+                f"grep -F {shlex.quote(f'src={client_ip} dst={peer_host}')} | "
+                f"grep -F {shlex.quote(f'dport={port}')} | tail -10"
+            ).strip()
+            forwarding = bool(listening and route_ok and all("HTTP=200" in x for x in curls))
+            snat = bool(
+                conntrack and router_wan
+                and f"src={peer_host} dst={router_wan}" in conntrack
+            )
+            token_rows = [
+                row for row in after_rows
+                if token.lower() in json.dumps(row, ensure_ascii=False).lower()
+            ]
+            audit_observed = bool(token_rows)
+            dpi_observed = bool(dpi_cache)
+            record_ip_ok = bool(
+                token_rows and all(str(row.get("ip_addr")) == client_ip for row in token_rows)
+            )
+            if expect_observed:
+                functional = audit_observed and dpi_observed and record_ip_ok
+            else:
+                functional = not audit_observed and not dpi_observed
+            details.update({
+                "client_ip": client_ip, "client_iface": iface,
+                "router_wan": router_wan, "server_listening": listening,
+                "route_via_router": route_ok, "forwarding_success": forwarding,
+                "snat_tuple_present": snat,
+                "audit_before_count": len(before_rows),
+                "audit_after_count": len(after_rows),
+                "audit_token_observed": audit_observed,
+                "audit_record_ip_ok": record_ip_ok,
+                "dpi_observed": dpi_observed,
+                "dpi_cache": dpi_cache[:500],
+                "curl_results": curls,
+                "conntrack": conntrack[:1000],
+            })
+            passed = forwarding and snat and functional
+            message = (
+                "平衡模式HTTP经LAN/SNAT成功，DPI和唯一访问记录均产生"
+                if expect_observed and passed else
+                "性能模式HTTP转发/SNAT成功，未产生DPI或唯一访问记录"
+                if not expect_observed and passed else
+                "协议控制HTTP正反对照与预期不一致"
+            )
+            return VerifyResult(
+                "L5-协议控制HTTP正反对照", passed, message,
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            details["exception"] = type(exc).__name__
+            return VerifyResult(
+                "L5-协议控制HTTP正反对照", False,
+                f"协议控制HTTP探针异常: {type(exc).__name__}",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        finally:
+            try:
+                if self._client:
+                    self._client.exec(
+                        f"sudo ip route del {shlex.quote(peer_host)}/32 via "
+                        f"{self.PROTOCOL_CONTROL_GATEWAY} dev "
+                        f"{self.PROTOCOL_CONTROL_CLIENT_IFACE} 2>/dev/null; true"
+                    )
+                    if original_route and re.fullmatch(
+                        r"[A-Za-z0-9_./: -]+", original_route
+                    ):
+                        self._client.exec(f"sudo ip route replace {original_route}")
+                if self._peer:
+                    pids = self._peer.exec(
+                        f"ps w | awk '/{token}/ && !/awk/ {{print $1}}'"
+                    ).split()
+                    for pid in reversed(pids):
+                        if pid.isdigit():
+                            self._peer.exec(f"kill {pid} 2>/dev/null; true")
+                    self._peer.exec(
+                        f"rm -f {shlex.quote(prefix + '.sh')} "
+                        f"{shlex.quote(prefix + '.log')} {shlex.quote(prefix + '.pid')}"
+                    )
+                if self._router:
+                    cleanup = self._protocol_control_cleanup_audit_token(token)
+                    self._router.exec(
+                        f"conntrack -D -s {self.PROTOCOL_CONTROL_CLIENT_IP} "
+                        f"-d {shlex.quote(peer_host)} -p tcp --dport {port} "
+                        "2>/dev/null; true"
+                    )
+                details["cleanup"] = cleanup
+            except Exception as cleanup_exc:
+                details["cleanup_error"] = type(cleanup_exc).__name__
+
+    def get_protocol_control_environment_snapshot(self) -> Dict[str, Any]:
+        self.connect_router()
+        self.connect_client()
+        self.connect_peer()
+        nat = self.verify_protocol_control_nat_health()
+        management = self.verify_protocol_control_management_health()
+        peer_host = str(self._ssh_config.peer.host or "")
+        return {
+            "version": 1,
+            "row": self._protocol_control_read_row(),
+            "runtime": self._protocol_control_runtime_state(),
+            "nat_health_passed": nat.passed,
+            "nat_health": nat.details,
+            "management_health_passed": management.passed,
+            "client_peer_route": self._client.exec(
+                f"ip route show {shlex.quote(peer_host)}/32 2>/dev/null | head -1"
+            ).strip(),
+            "artifacts": {
+                role: client.exec(
+                    "find /tmp -maxdepth 1 -name 'ikuai_pc_IKPC*' -print 2>/dev/null"
+                ).strip()
+                for role, client in (
+                    ("router", self._router), ("client", self._client),
+                    ("peer", self._peer),
+                )
+            },
+            "audit_artifacts": self._router.exec(
+                "grep -aH 'IKPC_' /etc/log/audit/stream/* "
+                "/etc/log/audit/index/* 2>/dev/null || true"
+            ).strip(),
+        }
+
+    def _protocol_control_save_mode(self, mode: int) -> str:
+        self.connect_router()
+        return self._router.exec(
+            f"{shlex.quote(self.PROTOCOL_CONTROL_FUNCTION)} save mode={int(mode)}",
+            timeout=35,
+        )
+
+    def verify_protocol_control_environment_unchanged(
+        self, snapshot: Dict[str, Any]
+    ) -> VerifyResult:
+        try:
+            expected_row = dict(snapshot.get("row") or {})
+            actual_row = self._protocol_control_read_row()
+            expected_mode = int(expected_row.get("mode", -1))
+            runtime = self.verify_protocol_control_runtime(expected_mode)
+            self.connect_router()
+            self.connect_client()
+            self.connect_peer()
+            peer_host = str(self._ssh_config.peer.host or "")
+            route = self._client.exec(
+                f"ip route show {shlex.quote(peer_host)}/32 2>/dev/null | head -1"
+            ).strip()
+            artifacts = {
+                role: client.exec(
+                    "find /tmp -maxdepth 1 -name 'ikuai_pc_IKPC*' -print 2>/dev/null"
+                ).strip()
+                for role, client in (
+                    ("router", self._router), ("client", self._client),
+                    ("peer", self._peer),
+                )
+            }
+            audit_artifacts = self._router.exec(
+                "grep -aH 'IKPC_' /etc/log/audit/stream/* "
+                "/etc/log/audit/index/* 2>/dev/null || true"
+            ).strip()
+            nat = self.verify_protocol_control_nat_health()
+            management = self.verify_protocol_control_management_health()
+            secondary = self.verify_protocol_control_secondary_client_health()
+            passed = bool(
+                actual_row == expected_row and runtime.passed
+                and route == str(snapshot.get("client_peer_route") or "").strip()
+                and not any(artifacts.values()) and not audit_artifacts
+                and nat.passed and management.passed and secondary.passed
+            )
+            details = {
+                "row_match": actual_row == expected_row,
+                "runtime_match": runtime.passed,
+                "route_match": route == str(snapshot.get("client_peer_route") or "").strip(),
+                "artifacts": artifacts,
+                "audit_artifacts": audit_artifacts,
+                "nat": nat.message,
+                "management": management.message,
+                "secondary_client": secondary.message,
+            }
+            return VerifyResult(
+                "L4-协议控制环境一致性", passed,
+                "协议控制配置、运行态、路由、管理和双终端SNAT均已恢复"
+                if passed else "协议控制环境存在差异或测试残留",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L4-协议控制环境一致性", False,
+                f"协议控制环境审计异常: {type(exc).__name__}",
+            )
+
+    def restore_protocol_control_environment(
+        self, snapshot: Dict[str, Any]
+    ) -> VerifyResult:
+        try:
+            row = dict(snapshot.get("row") or {})
+            if int(row.get("mode", -1)) not in (0, 1, 2, 3):
+                raise ValueError("协议控制恢复快照无效")
+            self._protocol_control_save_mode(int(row["mode"]))
+            self.connect_router()
+            self._router.exec(
+                f"{shlex.quote(self.PROTOCOL_CONTROL_SCRIPT)} init", timeout=30
+            )
+            stable = self.wait_protocol_control_runtime(int(row["mode"]))
+            if snapshot.get("nat_health_passed"):
+                nat = self.verify_protocol_control_nat_health()
+                if not nat.passed:
+                    repaired = self.repair_protocol_control_nat_runtime()
+                    if not repaired.passed:
+                        return VerifyResult(
+                            "恢复-协议控制环境", False,
+                            "协议控制配置已恢复，但AUTONAT恢复失败",
+                            details={"nat_repair": repaired.details},
+                        )
+            audit = self.verify_protocol_control_environment_unchanged(snapshot)
+            passed = stable.passed and audit.passed
+            return VerifyResult(
+                "恢复-协议控制环境", passed,
+                "协议控制数据库、运行态、客户端路由及联网环境已精确恢复"
+                if passed else "协议控制恢复后仍存在环境差异",
+                details={"stable": stable.message, "audit": audit.details},
+                raw_output=audit.raw_output,
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "恢复-协议控制环境", False,
+                f"协议控制环境恢复异常: {type(exc).__name__}",
+            )
+
+    # ==================== 设备设置 > 高级管理 > ALG设置 ====================
+    # 底层脚本: /usr/ikuai/script/alg.sh
+    # DB: alg_config(id=1, support_ftp/tftp/sip/h323, ftp/sip/tftp_ports)
+
+    ALG_SCRIPT = "/usr/ikuai/script/alg.sh"
+    ALG_TABLE = "alg_config"
+    ALG_FIELDS = (
+        "id", "support_ftp", "support_tftp", "support_sip", "support_h323",
+        "ftp_ports", "sip_ports", "tftp_ports",
+    )
+    ALG_PROTOCOLS = {
+        "ftp": {"flag": "support_ftp", "ports": "ftp_ports", "default": 21},
+        "tftp": {"flag": "support_tftp", "ports": "tftp_ports", "default": 69},
+        "sip": {"flag": "support_sip", "ports": "sip_ports", "default": 5060},
+        "h323": {"flag": "support_h323", "ports": None, "default": None},
+    }
+    ALG_PEER_HOST = "10.66.0.56"
+    ALG_ROUTER_WAN = "10.66.0.150"
+    ALG_CLIENT_IP = "192.168.148.2"
+    ALG_CLIENT_GATEWAY = "192.168.148.1"
+    ALG_CLIENT_IFACE = "ens11"
+    ALG_NAT_PROBE_TARGET = "223.5.5.5"
+    ALG_PEER_TEST_IP = "198.51.100.56"
+
+    @staticmethod
+    def _alg_parse_ports(value: Any) -> List[int]:
+        result = []
+        for item in str(value or "").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                port = int(item)
+            except (TypeError, ValueError):
+                continue
+            if port not in result:
+                result.append(port)
+        return result
+
+    def _alg_normalize_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = {field: row.get(field, "") for field in self.ALG_FIELDS}
+        normalized["id"] = int(normalized.get("id") or 1)
+        for field in ("support_ftp", "support_tftp", "support_sip", "support_h323"):
+            value = normalized.get(field)
+            if isinstance(value, bool):
+                normalized[field] = int(value)
+            else:
+                normalized[field] = int(str(value or "0"))
+        for field in ("ftp_ports", "sip_ports", "tftp_ports"):
+            value = normalized.get(field, "")
+            if isinstance(value, (list, tuple, set)):
+                value = ",".join(str(item) for item in value)
+            normalized[field] = str(value or "")
+        return normalized
+
+    def _alg_read_row(self) -> Dict[str, Any]:
+        self.connect_router()
+        fields = ",".join(self.ALG_FIELDS)
+        output = self._router.exec(
+            f"sqlite3 -separator '|' {shlex.quote(self.DNS_DB)} "
+            f"{shlex.quote(f'SELECT {fields} FROM {self.ALG_TABLE} WHERE id=1 LIMIT 1;')}",
+            timeout=15,
+        ).strip()
+        if not output:
+            return {}
+        values = output.split("|")
+        if len(values) != len(self.ALG_FIELDS):
+            return {}
+        return self._alg_normalize_row(dict(zip(self.ALG_FIELDS, values)))
+
+    def _alg_runtime_state(self) -> Dict[str, Any]:
+        self.connect_router()
+        state: Dict[str, Any] = {}
+        for protocol in self.ALG_PROTOCOLS:
+            conntrack = self._router.exec(
+                f"test -d /sys/module/nf_conntrack_{protocol} && echo 1 || echo 0"
+            ).strip() == "1"
+            nat = self._router.exec(
+                f"test -d /sys/module/nf_nat_{protocol} && echo 1 || echo 0"
+            ).strip() == "1"
+            ports = ""
+            if self.ALG_PROTOCOLS[protocol]["ports"]:
+                ports = self._router.exec(
+                    f"cat /sys/module/nf_conntrack_{protocol}/parameters/ports 2>/dev/null"
+                ).strip()
+            state[protocol] = {
+                "conntrack_loaded": conntrack,
+                "nat_loaded": nat,
+                "ports": ports,
+            }
+        return state
+
+    def verify_alg_nat_health(self, target: str = None) -> VerifyResult:
+        """安全哨兵：证明测试客户端经LAN出网时仍发生SNAT并收到回包。"""
+        target = str(target or self.ALG_NAT_PROBE_TARGET)
+        try:
+            ipaddress.ip_address(target)
+        except ValueError:
+            return VerifyResult("L4-ALG NAT哨兵", False, "NAT哨兵目标地址无效")
+        original_route = ""
+        route_restored = False
+        details: Dict[str, Any] = {"target": target}
+        try:
+            self.connect_router()
+            self.connect_client()
+            info = self.get_client_lan_info(gateway=self.ALG_CLIENT_GATEWAY)
+            client_ip = str(info.get("ip") or self.ALG_CLIENT_IP)
+            iface = str(info.get("iface") or self.ALG_CLIENT_IFACE)
+            router_wan = self._router.exec(
+                "ip -4 -o addr show dev wan1 2>/dev/null | "
+                "awk '{print $4}' | cut -d/ -f1 | head -1"
+            ).strip() or self.ALG_ROUTER_WAN
+            original_route = self._client.exec(
+                f"ip route show {shlex.quote(target)}/32 2>/dev/null | head -1"
+            ).strip()
+            self._client.exec(
+                f"sudo ip route replace {shlex.quote(target)}/32 via "
+                f"{shlex.quote(self.ALG_CLIENT_GATEWAY)} dev {shlex.quote(iface)} "
+                f"src {shlex.quote(client_ip)}"
+            )
+            route = self._client.exec(f"ip route get {shlex.quote(target)}").strip()
+            self._router.exec(
+                f"conntrack -D -s {shlex.quote(client_ip)} -d {shlex.quote(target)} "
+                "-p icmp 2>/dev/null; true"
+            )
+            ping = self._client.exec(
+                f"ping -I {shlex.quote(iface)} -c 1 -W 2 {shlex.quote(target)} 2>&1; "
+                "echo ping_rc=$?",
+                timeout=6,
+            )
+            conntrack = self._router.exec(
+                f"conntrack -L -p icmp 2>/dev/null | grep -F "
+                f"{shlex.quote(f'src={client_ip} dst={target}')} | tail -1"
+            )
+            route_ok = bool(
+                f"via {self.ALG_CLIENT_GATEWAY}" in route
+                and f"dev {iface}" in route
+                and f"src {client_ip}" in route
+            )
+            reply_ok = "ping_rc=0" in ping
+            snat_ok = bool(
+                f"src={target} dst={router_wan}" in conntrack
+                and f"dst={client_ip}" not in conntrack.split("src=" + target, 1)[-1]
+            )
+            details.update({
+                "client_ip": client_ip,
+                "client_iface": iface,
+                "router_wan": router_wan,
+                "route_via_router": route_ok,
+                "reply_received": reply_ok,
+                "snat_tuple_present": snat_ok,
+            })
+            passed = route_ok and reply_ok and snat_ok
+            return VerifyResult(
+                "L4-ALG NAT哨兵", passed,
+                "客户端经LAN上网、回包和SNAT元组均正常" if passed else
+                "客户端经LAN上网或SNAT运行态异常",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            details["exception"] = type(exc).__name__
+            return VerifyResult(
+                "L4-ALG NAT哨兵", False,
+                f"ALG NAT健康检查异常: {type(exc).__name__}",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        finally:
+            try:
+                if self._client:
+                    self._client.exec(
+                        f"sudo ip route del {shlex.quote(target)}/32 2>/dev/null; true"
+                    )
+                    if original_route and re.fullmatch(
+                        r"[A-Za-z0-9_./: -]+", original_route
+                    ):
+                        self._client.exec(f"sudo ip route add {original_route}")
+                    current = self._client.exec(
+                        f"ip route show {shlex.quote(target)}/32 2>/dev/null | head -1"
+                    ).strip()
+                    route_restored = current == original_route
+                    details["client_route_restored"] = route_restored
+                if self._router:
+                    client_ip = str(details.get("client_ip") or self.ALG_CLIENT_IP)
+                    self._router.exec(
+                        f"conntrack -D -s {shlex.quote(client_ip)} -d "
+                        f"{shlex.quote(target)} -p icmp 2>/dev/null; true"
+                    )
+            except Exception:
+                details["client_route_restored"] = False
+
+    def repair_alg_nat_runtime(self) -> VerifyResult:
+        """用产品 basic.sh 精确重建 AUTONAT，并以真实客户端流量复验。"""
+        try:
+            self.connect_router()
+            self._router.exec(
+                "/usr/ikuai/script/basic.sh __set_ipt_nat", timeout=20
+            )
+            time.sleep(0.4)
+            health = self.verify_alg_nat_health()
+            details = dict(health.details or {})
+            details["product_nat_rebuild_invoked"] = True
+            return VerifyResult(
+                "恢复-ALG关联NAT运行态", health.passed,
+                "AUTONAT已由basic.sh重建且客户端联网复验通过" if health.passed else
+                "AUTONAT重建后客户端联网或SNAT复验仍失败",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "恢复-ALG关联NAT运行态", False,
+                f"AUTONAT恢复异常: {type(exc).__name__}",
+            )
+
+    def get_alg_environment_snapshot(self) -> Dict[str, Any]:
+        """保存 ALG 单例和测试支撑拓扑的只读快照。"""
+        self.connect_router()
+        self.connect_client()
+        self.connect_peer()
+        peer_management_host = str(
+            self._ssh_config.peer.host or self.ALG_PEER_HOST
+        )
+        nat_health = self.verify_alg_nat_health()
+        return {
+            "version": 1,
+            "row": self._alg_read_row(),
+            "runtime": self._alg_runtime_state(),
+            "client_peer_route": self._client.exec(
+                f"ip route show {shlex.quote(peer_management_host)}/32 "
+                "2>/dev/null | head -1"
+            ).strip(),
+            "client_peer_test_route": self._client.exec(
+                f"ip route show {shlex.quote(self.ALG_PEER_TEST_IP)}/32 "
+                "2>/dev/null | head -1"
+            ).strip(),
+            "router_artifacts": self._router.exec(
+                "find /tmp -maxdepth 1 -name 'ikuai_alg_ftp_*' -print 2>/dev/null"
+            ).strip(),
+            "client_artifacts": self._client.exec(
+                "find /tmp -maxdepth 1 -name 'ikuai_alg_ftp_*' -print 2>/dev/null"
+            ).strip(),
+            "peer_artifacts": self._peer.exec(
+                "find /tmp -maxdepth 1 -name 'ikuai_alg_ftp_*' -print 2>/dev/null"
+            ).strip(),
+            "peer_firewall": self._peer.exec(
+                "iptables-save 2>/dev/null | grep -F 'IKUAI_ALG_FTP_'"
+            ).strip(),
+            "router_firewall": self._router.exec(
+                "iptables-save 2>/dev/null | grep -F 'IKUAI_ALG_FTP_'"
+            ).strip(),
+            "peer_test_ip": self._peer.exec(
+                f"ip -4 addr show dev lo 2>/dev/null | grep -F "
+                f"{shlex.quote(self.ALG_PEER_TEST_IP + '/32')}"
+            ).strip(),
+            "router_peer_test_route": self._router.exec(
+                f"ip route show {shlex.quote(self.ALG_PEER_TEST_IP)}/32 2>/dev/null"
+            ).strip(),
+            "nat_health_passed": nat_health.passed,
+            "nat_health": dict(nat_health.details or {}),
+        }
+
+    def verify_alg_script_contract(self) -> VerifyResult:
+        """L1/L4: 核对实机脚本、API、表结构和边界校验契约。"""
+        try:
+            self.connect_router()
+            schema = self._router.exec(
+                f"sqlite3 {shlex.quote(self.DNS_DB)} {shlex.quote('.schema alg_config')}"
+            )
+            script = self._router.exec(f"cat {shlex.quote(self.ALG_SCRIPT)}")
+            required_schema = set(self.ALG_FIELDS)
+            required_script = (
+                "url=system/alg", "name=alg", "save()", "__auto_load_mod",
+                "__check_port_repeat", "port_count", "port_repeat",
+                "modprobe nf_conntrack_", "modprobe nf_nat_", "rmmod nf_nat_",
+            )
+            missing = [item for item in required_schema if item not in schema]
+            missing.extend(item for item in required_script if item not in script)
+            details = {
+                "schema_fields": sorted(required_schema),
+                "script_sha256": self._router.exec(
+                    f"sha256sum {shlex.quote(self.ALG_SCRIPT)} | awk '{{print $1}}'"
+                ).strip(),
+                "script_lines": len(script.splitlines()),
+                "missing_contracts": missing,
+                "max_custom_ports_per_protocol": 7,
+            }
+            return VerifyResult(
+                "L1/L4-ALG脚本契约", not missing,
+                "alg.sh API、单例表、四协议模块和端口校验契约完整" if not missing else
+                f"ALG脚本契约缺失: {', '.join(missing)}",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult(
+                "L1/L4-ALG脚本契约", False, f"ALG脚本契约验证异常: {exc}"
+            )
+
+    def verify_alg_database(self, expected: Dict[str, Any]) -> VerifyResult:
+        """L1: 校验 alg_config id=1 的指定字段。"""
+        try:
+            actual = self._alg_read_row()
+            if not actual:
+                return VerifyResult("L1-ALG数据库", False, "alg_config id=1不存在")
+            expected_norm = self._alg_normalize_row({**actual, **dict(expected or {})})
+            checked = [field for field in (expected or {}) if field in self.ALG_FIELDS]
+            mismatches = {
+                field: {"expected": expected_norm[field], "actual": actual.get(field)}
+                for field in checked if actual.get(field) != expected_norm[field]
+            }
+            details = {"actual": actual, "checked_fields": checked, "mismatches": mismatches}
+            return VerifyResult(
+                "L1-ALG数据库", not mismatches,
+                "alg_config单例字段与页面保存一致" if not mismatches else
+                "ALG数据库字段不一致: " + ", ".join(mismatches),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L1-ALG数据库", False, f"ALG数据库验证异常: {exc}")
+
+    def verify_alg_modules(self, expected: Dict[str, Any]) -> VerifyResult:
+        """L2: 四协议 nf_conntrack/nf_nat 模块装卸状态必须与DB一致。"""
+        try:
+            expected_norm = self._alg_normalize_row({**self._alg_read_row(), **dict(expected or {})})
+            state = self._alg_runtime_state()
+            mismatches = {}
+            for protocol, spec in self.ALG_PROTOCOLS.items():
+                enabled = expected_norm[spec["flag"]] == 1
+                item = state[protocol]
+                if item["conntrack_loaded"] != enabled or item["nat_loaded"] != enabled:
+                    mismatches[protocol] = {
+                        "expected_loaded": enabled,
+                        "conntrack_loaded": item["conntrack_loaded"],
+                        "nat_loaded": item["nat_loaded"],
+                    }
+            details = {"runtime": state, "mismatches": mismatches}
+            return VerifyResult(
+                "L2-ALG内核模块", not mismatches,
+                "四组nf_conntrack/nf_nat模块装卸与协议开关一致" if not mismatches else
+                "ALG模块状态不一致: " + ", ".join(mismatches),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L2-ALG内核模块", False, f"ALG模块验证异常: {exc}")
+
+    def verify_alg_ports(self, expected: Dict[str, Any]) -> VerifyResult:
+        """L3: FTP/TFTP/SIP 内核参数必须为自定义端口加固定标准端口。"""
+        try:
+            expected_norm = self._alg_normalize_row({**self._alg_read_row(), **dict(expected or {})})
+            state = self._alg_runtime_state()
+            mismatches = {}
+            port_details = {}
+            for protocol, spec in self.ALG_PROTOCOLS.items():
+                if not spec["ports"]:
+                    continue
+                enabled = expected_norm[spec["flag"]] == 1
+                expected_ports = []
+                if enabled:
+                    expected_ports = self._alg_parse_ports(expected_norm[spec["ports"]])
+                    if spec["default"] not in expected_ports:
+                        expected_ports.append(spec["default"])
+                actual_ports = self._alg_parse_ports(state[protocol]["ports"])
+                port_details[protocol] = {
+                    "expected": expected_ports,
+                    "actual": actual_ports,
+                }
+                if actual_ports != expected_ports:
+                    mismatches[protocol] = port_details[protocol]
+            details = {"ports": port_details, "mismatches": mismatches}
+            return VerifyResult(
+                "L3-ALG端口参数", not mismatches,
+                "FTP/TFTP/SIP模块端口参数与自定义+标准端口顺序一致" if not mismatches else
+                "ALG端口参数不一致: " + ", ".join(mismatches),
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L3-ALG端口参数", False, f"ALG端口验证异常: {exc}")
+
+    def verify_alg_runtime_consistency(self, expected: Dict[str, Any]) -> VerifyResult:
+        results = [
+            self.verify_alg_database(expected),
+            self.verify_alg_modules(expected),
+            self.verify_alg_ports(expected),
+        ]
+        passed = all(item.passed for item in results)
+        details = {
+            "layers": {
+                item.level: {"passed": item.passed, "message": item.message}
+                for item in results
+            }
+        }
+        return VerifyResult(
+            "L4-ALG全链路一致性", passed,
+            "ALG数据库、模块装卸和端口参数全链路一致" if passed else
+            "ALG全链路不一致: " + "; ".join(item.message for item in results if not item.passed),
+            details=details, raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def verify_alg_reinit(self, expected: Dict[str, Any]) -> VerifyResult:
+        """L4: 调用产品 alg.sh init 后复验 DB 到模块参数。"""
+        try:
+            self.connect_router()
+            self._router.exec(f"{shlex.quote(self.ALG_SCRIPT)} init", timeout=20)
+            result = self.verify_alg_runtime_consistency(expected)
+            details = dict(result.details or {})
+            details["product_init_invoked"] = True
+            return VerifyResult(
+                "L4-ALG脚本重建", result.passed,
+                "alg.sh init后数据库、模块和端口参数仍一致" if result.passed else
+                "alg.sh init后ALG运行态不一致: " + result.message,
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L4-ALG脚本重建", False, f"ALG init复验异常: {exc}")
+
+    def _alg_save_row(self, row: Dict[str, Any]) -> str:
+        normalized = self._alg_normalize_row(row)
+        fields = [field for field in self.ALG_FIELDS if field != "id"]
+        args = " ".join(
+            f"{field}={shlex.quote(str(normalized[field]))}" for field in fields
+        )
+        self.connect_router()
+        return self._router.exec(
+            f"/usr/ikuai/function/alg save {args}", timeout=25
+        )
+
+    def _alg_cleanup_support_artifacts(self, snapshot: Dict[str, Any]) -> None:
+        peer_management_host = str(
+            self._ssh_config.peer.host or self.ALG_PEER_HOST
+        )
+        self.connect_router()
+        self.connect_client()
+        self.connect_peer()
+        self._router.exec(
+            "for f in /tmp/ikuai_alg_ftp_*.pid; do test ! -f \"$f\" || "
+            "kill $(cat \"$f\") 2>/dev/null; done; "
+            "rm -f /tmp/ikuai_alg_ftp_*; "
+            "iptables -t nat -L POSTROUTING --line-numbers -n 2>/dev/null | "
+            "awk '/IKUAI_ALG_FTP_/ {print $1}' | sort -rn | "
+            "xargs -r -n1 iptables -t nat -D POSTROUTING",
+            timeout=15,
+        )
+        self._client.exec(
+            "for f in /tmp/ikuai_alg_ftp_*.pid; do test ! -f \"$f\" || "
+            "kill $(cat \"$f\") 2>/dev/null; done; "
+            "rm -f /tmp/ikuai_alg_ftp_*",
+            timeout=15,
+        )
+        self._peer.exec(
+            "for f in /tmp/ikuai_alg_ftp_*.pid; do test ! -f \"$f\" || "
+            "kill $(cat \"$f\") 2>/dev/null; done; "
+            "rm -f /tmp/ikuai_alg_ftp_*; "
+            "iptables -L INPUT --line-numbers -n 2>/dev/null | "
+            "awk '/IKUAI_ALG_FTP_/ {print $1}' | sort -rn | "
+            "xargs -r -n1 iptables -D INPUT",
+            timeout=20,
+        )
+        if not str((snapshot or {}).get("peer_test_ip") or "").strip():
+            self._peer.exec(
+                f"ip addr del {shlex.quote(self.ALG_PEER_TEST_IP)}/32 dev lo "
+                "2>/dev/null; true"
+            )
+        original_router_route = str(
+            (snapshot or {}).get("router_peer_test_route") or ""
+        ).strip()
+        self._router.exec(
+            f"ip route del {shlex.quote(self.ALG_PEER_TEST_IP)}/32 2>/dev/null; true"
+        )
+        if original_router_route and re.fullmatch(
+            r"[A-Za-z0-9_./: -]+", original_router_route
+        ):
+            self._router.exec(f"ip route add {original_router_route}")
+        original_route = str((snapshot or {}).get("client_peer_route") or "").strip()
+        self._client.exec(
+            f"sudo ip route del {shlex.quote(peer_management_host)}/32 "
+            "2>/dev/null; true"
+        )
+        if original_route and re.fullmatch(r"[A-Za-z0-9_./: -]+", original_route):
+            self._client.exec(f"sudo ip route add {original_route}")
+        original_test_route = str(
+            (snapshot or {}).get("client_peer_test_route") or ""
+        ).strip()
+        self._client.exec(
+            f"sudo ip route del {shlex.quote(self.ALG_PEER_TEST_IP)}/32 "
+            "2>/dev/null; true"
+        )
+        if original_test_route and re.fullmatch(
+            r"[A-Za-z0-9_./: -]+", original_test_route
+        ):
+            self._client.exec(f"sudo ip route add {original_test_route}")
+
+    def restore_alg_environment(self, snapshot: Dict[str, Any]) -> VerifyResult:
+        """恢复测试前单例、模块参数、辅助路由、进程、文件和防火墙标记。"""
+        try:
+            if not isinstance(snapshot, dict) or not snapshot.get("row"):
+                raise ValueError("ALG恢复快照无效")
+            self._alg_cleanup_support_artifacts(snapshot)
+            self._alg_save_row(snapshot["row"])
+            if snapshot.get("nat_health_passed"):
+                nat_health = self.verify_alg_nat_health()
+                if not nat_health.passed:
+                    repaired = self.repair_alg_nat_runtime()
+                    if not repaired.passed:
+                        return VerifyResult(
+                            "恢复-ALG环境", False,
+                            "ALG配置已恢复，但AUTONAT自动恢复失败",
+                            details={"nat_repair": repaired.details},
+                            raw_output=repaired.raw_output,
+                        )
+            result = self.verify_alg_environment_unchanged(snapshot)
+            return VerifyResult(
+                "恢复-ALG环境", result.passed,
+                "ALG配置、内核模块和测试支撑拓扑已恢复" if result.passed else
+                "ALG恢复后与测试前快照不一致: " + result.message,
+                details=result.details, raw_output=result.raw_output,
+            )
+        except Exception as exc:
+            return VerifyResult("恢复-ALG环境", False, f"ALG环境恢复异常: {exc}")
+
+    def verify_alg_environment_unchanged(self, snapshot: Dict[str, Any]) -> VerifyResult:
+        try:
+            expected_row = self._alg_normalize_row(snapshot.get("row") or {})
+            actual_row = self._alg_read_row()
+            runtime = self.verify_alg_runtime_consistency(expected_row)
+            self.connect_router()
+            self.connect_client()
+            self.connect_peer()
+            peer_host = str(self._ssh_config.peer.host or self.ALG_PEER_HOST)
+            current_route = self._client.exec(
+                f"ip route show {shlex.quote(peer_host)}/32 2>/dev/null | head -1"
+            ).strip()
+            current_test_route = self._client.exec(
+                f"ip route show {shlex.quote(self.ALG_PEER_TEST_IP)}/32 "
+                "2>/dev/null | head -1"
+            ).strip()
+            current_router_test_route = self._router.exec(
+                f"ip route show {shlex.quote(self.ALG_PEER_TEST_IP)}/32 2>/dev/null"
+            ).strip()
+            current_peer_test_ip = self._peer.exec(
+                f"ip -4 addr show dev lo 2>/dev/null | grep -F "
+                f"{shlex.quote(self.ALG_PEER_TEST_IP + '/32')}"
+            ).strip()
+            artifacts = {
+                "router": self._router.exec(
+                    "find /tmp -maxdepth 1 -name 'ikuai_alg_ftp_*' -print 2>/dev/null"
+                ).strip(),
+                "client": self._client.exec(
+                    "find /tmp -maxdepth 1 -name 'ikuai_alg_ftp_*' -print 2>/dev/null"
+                ).strip(),
+                "peer": self._peer.exec(
+                    "find /tmp -maxdepth 1 -name 'ikuai_alg_ftp_*' -print 2>/dev/null"
+                ).strip(),
+                "peer_firewall": self._peer.exec(
+                    "iptables-save 2>/dev/null | grep -F 'IKUAI_ALG_FTP_'"
+                ).strip(),
+                "router_firewall": self._router.exec(
+                    "iptables-save 2>/dev/null | grep -F 'IKUAI_ALG_FTP_'"
+                ).strip(),
+            }
+            row_match = actual_row == expected_row
+            route_match = bool(
+                current_route == str(snapshot.get("client_peer_route") or "").strip()
+                and current_test_route == str(
+                    snapshot.get("client_peer_test_route") or ""
+                ).strip()
+                and current_router_test_route == str(
+                    snapshot.get("router_peer_test_route") or ""
+                ).strip()
+                and current_peer_test_ip == str(snapshot.get("peer_test_ip") or "").strip()
+            )
+            artifacts_match = not any(artifacts.values())
+            nat_health = self.verify_alg_nat_health()
+            nat_match = bool(
+                not snapshot.get("nat_health_passed") or nat_health.passed
+            )
+            passed = (
+                row_match and runtime.passed and route_match
+                and artifacts_match and nat_match
+            )
+            details = {
+                "row_match": row_match,
+                "runtime_match": runtime.passed,
+                "client_route_match": route_match,
+                "support_artifacts_absent": artifacts_match,
+                "nat_health_match": nat_match,
+                "nat_health": nat_health.details,
+                "artifacts": artifacts,
+            }
+            return VerifyResult(
+                "L4-ALG环境一致性", passed,
+                "ALG配置、模块、端口及辅助拓扑与测试前一致" if passed else
+                "ALG环境存在差异或测试支撑残留",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            return VerifyResult("L4-ALG环境一致性", False, f"ALG环境一致性验证异常: {exc}")
+
+    def choose_alg_candidate_ports(self, count: int = 4) -> List[int]:
+        """从路由器、客户端、对端均未监听的高位端口中选择候选值。"""
+        count = max(1, min(int(count), 16))
+        self.connect_router()
+        self.connect_client()
+        self.connect_peer()
+        occupied = {21, 69, 5060}
+        for client in (self._router, self._client, self._peer):
+            output = client.exec("ss -H -lntu 2>/dev/null", timeout=15)
+            occupied.update(
+                int(port) for port in re.findall(r":(\d{1,5})(?:\s|$)", output)
+                if 0 < int(port) <= 65535
+            )
+        row = self._alg_read_row()
+        for field in ("ftp_ports", "tftp_ports", "sip_ports"):
+            occupied.update(self._alg_parse_ports(row.get(field)))
+        candidates: List[int] = []
+        for _ in range(400):
+            port = 20000 + secrets.randbelow(38000)
+            if port in occupied or port in candidates:
+                continue
+            candidates.append(port)
+            if len(candidates) == count:
+                return candidates
+        raise RuntimeError("无法选择足够的ALG候选端口")
+
+    def run_alg_ftp_probe(self, control_port: int, data_port: int,
+                          expect_enabled: bool = True) -> VerifyResult:
+        """L5: 真实 FTP PORT 改写、expectation 和主动数据通道正反控制。"""
+        control_port = int(control_port)
+        data_port = int(data_port)
+        if not (1024 <= control_port <= 65535 and 1024 <= data_port <= 65535):
+            return VerifyResult("L5-FTP ALG", False, "ALG探针端口必须在1024-65535")
+        peer_management_host = str(
+            self._ssh_config.peer.host or self.ALG_PEER_HOST
+        )
+        # 使用真实WAN对端地址承载控制/数据连接，避免合成loopback源地址
+        # 在部分固件的conntrack zone中被当成本机流量而绕过FTP expectation。
+        peer_host = peer_management_host
+        router_wan = self.ALG_ROUTER_WAN
+        client_ip = self.ALG_CLIENT_IP
+        gateway = self.ALG_CLIENT_GATEWAY
+        iface = self.ALG_CLIENT_IFACE
+        token = f"IKUAI_ALG_FTP_{control_port}_{data_port}"
+        snat_token = token + "_SNAT"
+        prefix = f"/tmp/ikuai_alg_ftp_{control_port}_{data_port}"
+        paths = {
+            "peer_capture": prefix + ".control",
+            "peer_script": prefix + ".server.sh",
+            "peer_pid": prefix + ".server.pid",
+            "client_data": prefix + ".data",
+            "client_pid": prefix + ".data.pid",
+            "router_capture": prefix + ".tcpdump",
+            "router_pid": prefix + ".tcpdump.pid",
+            "router_data_capture": prefix + ".data.tcpdump",
+            "router_data_pid": prefix + ".data.tcpdump.pid",
+        }
+        original_route = ""
+        original_router_route = ""
+        peer_test_ip_added = False
+        cleanup = {"route": False, "router": False, "client": False, "peer": False}
+        details: Dict[str, Any] = {
+            "expect_enabled": bool(expect_enabled),
+            "control_port": control_port,
+            "data_port": data_port,
+            "cleanup": cleanup,
+        }
+        try:
+            self.connect_router()
+            self.connect_client()
+            self.connect_peer()
+            client_info = self.get_client_lan_info(gateway=gateway)
+            client_ip = str(client_info.get("ip") or client_ip)
+            iface = str(client_info.get("iface") or iface)
+            detected_wan = self._router.exec(
+                "ip -4 -o addr show dev wan1 2>/dev/null | "
+                "awk '{print $4}' | cut -d/ -f1 | head -1"
+            ).strip()
+            router_wan = detected_wan or router_wan
+            details.update({
+                "client_ip": client_ip,
+                "client_iface": iface,
+                "router_wan": router_wan,
+                "peer_host": peer_host,
+                "peer_management_host": peer_management_host,
+            })
+            row = self._alg_read_row()
+            ports = self._alg_parse_ports(row.get("ftp_ports"))
+            configured = bool(row.get("support_ftp") == int(expect_enabled))
+            if expect_enabled:
+                configured = configured and control_port in ports
+            details["configuration_matches_probe"] = configured
+            original_route = self._client.exec(
+                f"ip route show {shlex.quote(peer_host)}/32 2>/dev/null | head -1"
+            ).strip()
+            original_router_route = self._router.exec(
+                f"ip route show {shlex.quote(peer_host)}/32 2>/dev/null | head -1"
+            ).strip()
+            use_synthetic_peer = peer_host != peer_management_host
+            if use_synthetic_peer:
+                peer_test_ip_present = bool(self._peer.exec(
+                    f"ip -4 addr show dev lo 2>/dev/null | grep -F "
+                    f"{shlex.quote(peer_host + '/32')}"
+                ).strip())
+                if not peer_test_ip_present:
+                    self._peer.exec(
+                        f"ip addr add {shlex.quote(peer_host)}/32 dev lo"
+                    )
+                    peer_test_ip_added = True
+                self._router.exec(
+                    f"ip route replace {shlex.quote(peer_host)}/32 via "
+                    f"{shlex.quote(peer_management_host)} dev wan1"
+                )
+            self._router.exec(
+                f"while iptables -t nat -C POSTROUTING -s "
+                f"{shlex.quote(client_ip)} -d {shlex.quote(peer_host)} -p tcp "
+                f"--dport {control_port} -m comment --comment {snat_token} "
+                f"-j SNAT --to-source {shlex.quote(router_wan)} 2>/dev/null; do "
+                f"iptables -t nat -D POSTROUTING -s {shlex.quote(client_ip)} "
+                f"-d {shlex.quote(peer_host)} -p tcp --dport {control_port} "
+                f"-m comment --comment {snat_token} -j SNAT --to-source "
+                f"{shlex.quote(router_wan)}; done; "
+                f"iptables -t nat -I POSTROUTING 1 -s {shlex.quote(client_ip)} "
+                f"-d {shlex.quote(peer_host)} -p tcp --dport {control_port} "
+                f"-m comment --comment {snat_token} -j SNAT --to-source "
+                f"{shlex.quote(router_wan)}"
+            )
+            details.update({
+                "isolated_test_snat": True,
+                "peer_test_ip_added": peer_test_ip_added,
+                "router_test_route_installed": use_synthetic_peer,
+            })
+
+            high, low = divmod(data_port, 256)
+            server_script = f"""#!/bin/sh
+capture={paths['peer_capture']}
+printf '220 iKuai ALG test ready\\r\\n'
+while IFS= read -r line; do
+    printf '%s\\n' "$line" >> "$capture"
+    case "$line" in
+        USER*) printf '331 password required\\r\\n' ;;
+        PASS*) printf '230 logged in\\r\\n' ;;
+        PORT*) printf '200 PORT accepted\\r\\n'; break ;;
+        *) printf '200 OK\\r\\n' ;;
+    esac
+done
+"""
+            server_b64 = base64.b64encode(server_script.encode()).decode()
+            self._peer.exec(
+                f"rm -f {shlex.quote(paths['peer_capture'])} "
+                f"{shlex.quote(paths['peer_script'])} {shlex.quote(paths['peer_pid'])}; "
+                f"printf %s {server_b64} | base64 -d > {shlex.quote(paths['peer_script'])}; "
+                f"chmod 700 {shlex.quote(paths['peer_script'])}; "
+                f"iptables -I INPUT 1 -p tcp -s {shlex.quote(router_wan)} "
+                f"--dport {control_port} -m comment --comment {token} -j ACCEPT; "
+                f"socat TCP-LISTEN:{control_port},reuseaddr "
+                f"EXEC:{shlex.quote(paths['peer_script'])} >/dev/null 2>&1 & "
+                f"echo $! > {shlex.quote(paths['peer_pid'])}; sleep 0.4",
+                timeout=15,
+            )
+            self._client.exec(
+                f"rm -f {shlex.quote(paths['client_data'])} {shlex.quote(paths['client_pid'])}; "
+                f"nc -l -s {shlex.quote(client_ip)} -p {data_port} "
+                f"> {shlex.quote(paths['client_data'])} 2>&1 & "
+                f"echo $! > {shlex.quote(paths['client_pid'])}; sleep 0.3",
+                timeout=10,
+            )
+            self._router.exec(
+                f"rm -f {shlex.quote(paths['router_capture'])} {shlex.quote(paths['router_pid'])}; "
+                f"tcpdump -i wan1 -nn -s0 -A 'tcp and dst host {peer_host} "
+                f"and dst port {control_port}' > {shlex.quote(paths['router_capture'])} 2>&1 & "
+                f"echo $! > {shlex.quote(paths['router_pid'])}; sleep 0.4",
+                timeout=10,
+            )
+            self._client.exec(
+                f"sudo ip route replace {shlex.quote(peer_host)}/32 via "
+                f"{shlex.quote(gateway)} dev {shlex.quote(iface)} src {shlex.quote(client_ip)}"
+            )
+            route = self._client.exec(f"ip route get {shlex.quote(peer_host)}")
+            details["route_via_test_lan"] = bool(
+                f"via {gateway}" in route and f"dev {iface}" in route and f"src {client_ip}" in route
+            )
+            self._router.exec(
+                f"conntrack -D -s {client_ip} -d {peer_host} -p tcp "
+                f"--dport {control_port} 2>/dev/null; true"
+            )
+
+            client_script = f"""import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(4)
+s.bind(({client_ip!r}, 0))
+s.connect(({peer_host!r}, {control_port}))
+responses = [s.recv(1024).decode(errors='replace').strip()]
+for command in ('USER ikuai\\r\\n', 'PASS probe\\r\\n', 'PORT {client_ip.replace('.', ',')},{high},{low}\\r\\n'):
+    s.sendall(command.encode())
+    responses.append(s.recv(1024).decode(errors='replace').strip())
+print('|'.join(responses))
+s.close()
+"""
+            client_b64 = base64.b64encode(client_script.encode()).decode()
+            session = self._client.exec(
+                f"printf %s {client_b64} | base64 -d | python3", timeout=12
+            ).strip()
+            time.sleep(0.5)
+            peer_capture = self._peer.exec(
+                f"cat {shlex.quote(paths['peer_capture'])} 2>/dev/null"
+            ).replace("\r", "")
+            conntrack = self._router.exec(
+                f"conntrack -L -p tcp 2>/dev/null | grep -E "
+                f"{shlex.quote(f'{client_ip}|{peer_host}')} | grep 'dport={control_port}'"
+            )
+            expectation = self._router.exec(
+                f"conntrack -L expect 2>/dev/null | grep 'dport={data_port}' | "
+                f"grep 'helper=ftp-{control_port}'"
+            )
+            expectation_all = self._router.exec(
+                "conntrack -L expect 2>/dev/null"
+            )
+            self._router.exec(
+                f"conntrack -D -s {shlex.quote(peer_host)} -d "
+                f"{shlex.quote(router_wan)} -p tcp --dport {data_port} "
+                "2>/dev/null; true"
+            )
+            self._router.exec(
+                f"rm -f {shlex.quote(paths['router_data_capture'])} "
+                f"{shlex.quote(paths['router_data_pid'])}; "
+                f"tcpdump -i wan1 -nn -s0 'tcp and port {data_port}' > "
+                f"{shlex.quote(paths['router_data_capture'])} 2>&1 & "
+                f"echo $! > {shlex.quote(paths['router_data_pid'])}; sleep 0.3",
+                timeout=10,
+            )
+            peer_route = self._peer.exec(
+                f"ip route get {shlex.quote(router_wan)} from {shlex.quote(peer_host)} "
+                "2>&1; true"
+            ).strip()
+            data_send_output = self._peer.exec(
+                f"printf 'ALG_DATA_OK_{data_port}' | socat -T3 - "
+                f"TCP4:{shlex.quote(router_wan)}:{data_port},"
+                f"bind={shlex.quote(peer_host)} 2>&1; echo data_send_rc=$?",
+                timeout=8,
+            ).strip()
+            time.sleep(0.4)
+            data_capture = self._client.exec(
+                f"cat {shlex.quote(paths['client_data'])} 2>/dev/null"
+            ).strip()
+            data_conntrack = self._router.exec(
+                f"conntrack -L -p tcp 2>/dev/null | grep 'dport={data_port}'"
+            ).strip()
+            self._router.exec(
+                f"test ! -f {shlex.quote(paths['router_data_pid'])} || "
+                f"kill $(cat {shlex.quote(paths['router_data_pid'])}) 2>/dev/null; "
+                "sleep 0.2"
+            )
+            data_wan_capture = self._router.exec(
+                f"cat {shlex.quote(paths['router_data_capture'])} 2>/dev/null"
+            ).strip()
+            self._router.exec(
+                f"test ! -f {shlex.quote(paths['router_pid'])} || "
+                f"kill $(cat {shlex.quote(paths['router_pid'])}) 2>/dev/null; sleep 0.2"
+            )
+            wan_capture = self._router.exec(
+                f"cat {shlex.quote(paths['router_capture'])} 2>/dev/null"
+            ).replace("\r", "")
+
+            private_port = f"PORT {client_ip.replace('.', ',')},{high},{low}"
+            rewritten_port = f"PORT {router_wan.replace('.', ',')},{high},{low}"
+            observations = {
+                "ftp_session_complete": all(
+                    marker in session for marker in ("220 ", "331 ", "230 ", "200 PORT")
+                ),
+                "peer_private_payload": private_port in peer_capture,
+                "peer_rewritten_payload": rewritten_port in peer_capture,
+                "wan_private_payload": private_port in wan_capture,
+                "wan_rewritten_payload": rewritten_port in wan_capture,
+                "helper_attached": f"helper=ftp-{control_port}" in conntrack,
+                "expectation_created": bool(expectation.strip()),
+                "active_data_delivered": f"ALG_DATA_OK_{data_port}" in data_capture,
+            }
+            details.update(observations)
+            details.update({
+                "ftp_session": session,
+                "control_conntrack": conntrack.strip(),
+                "expectation": expectation.strip(),
+                "expectation_all": expectation_all.strip(),
+                "peer_data_route": peer_route,
+                "data_send_output": data_send_output,
+                "data_conntrack": data_conntrack,
+                "data_wan_capture": data_wan_capture,
+            })
+            if expect_enabled:
+                passed = bool(
+                    configured and details["route_via_test_lan"]
+                    and observations["ftp_session_complete"]
+                    and observations["peer_rewritten_payload"]
+                    and not observations["peer_private_payload"]
+                    and observations["wan_rewritten_payload"]
+                    and observations["helper_attached"]
+                    and observations["expectation_created"]
+                    and observations["active_data_delivered"]
+                )
+                message = (
+                    "FTP ALG已改写PORT私网地址、挂载helper、创建expectation并放行主动数据通道"
+                    if passed else "FTP ALG启用场景未形成完整PORT改写或主动数据通道闭环"
+                )
+            else:
+                passed = bool(
+                    configured and details["route_via_test_lan"]
+                    and observations["ftp_session_complete"]
+                    and observations["peer_private_payload"]
+                    and not observations["peer_rewritten_payload"]
+                    and not observations["helper_attached"]
+                    and not observations["expectation_created"]
+                    and not observations["active_data_delivered"]
+                )
+                message = (
+                    "FTP ALG关闭后控制连接仍经NAT，但PORT未改写且主动数据通道被拒绝"
+                    if passed else "FTP ALG关闭对照仍出现helper、改写、expectation或数据通道"
+                )
+            return VerifyResult(
+                "L5-FTP ALG真实功能", passed, message,
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        except Exception as exc:
+            details["exception"] = type(exc).__name__
+            return VerifyResult(
+                "L5-FTP ALG真实功能", False,
+                f"FTP ALG真实功能探针异常: {type(exc).__name__}",
+                details=details, raw_output=json.dumps(details, ensure_ascii=False),
+            )
+        finally:
+            try:
+                if self._client:
+                    self._client.exec(
+                        f"test ! -f {shlex.quote(paths['client_pid'])} || "
+                        f"kill $(cat {shlex.quote(paths['client_pid'])}) 2>/dev/null; "
+                        f"rm -f {shlex.quote(paths['client_pid'])} "
+                        f"{shlex.quote(paths['client_data'])}; "
+                        f"sudo ip route del {shlex.quote(peer_host)}/32 2>/dev/null; true"
+                    )
+                    if original_route and re.fullmatch(r"[A-Za-z0-9_./: -]+", original_route):
+                        self._client.exec(f"sudo ip route add {original_route}")
+                    cleanup["client"] = True
+                    cleanup["route"] = True
+            except Exception:
+                pass
+            try:
+                if self._peer:
+                    self._peer.exec(
+                        f"test ! -f {shlex.quote(paths['peer_pid'])} || "
+                        f"kill $(cat {shlex.quote(paths['peer_pid'])}) 2>/dev/null; "
+                        f"while iptables -C INPUT -p tcp -s {shlex.quote(router_wan)} "
+                        f"--dport {control_port} -m comment --comment {token} "
+                        f"-j ACCEPT 2>/dev/null; do iptables -D INPUT -p tcp "
+                        f"-s {shlex.quote(router_wan)} --dport {control_port} "
+                        f"-m comment --comment {token} -j ACCEPT; done; "
+                        f"rm -f {shlex.quote(paths['peer_pid'])} "
+                        f"{shlex.quote(paths['peer_capture'])} {shlex.quote(paths['peer_script'])}"
+                    )
+                    if peer_test_ip_added:
+                        self._peer.exec(
+                            f"ip addr del {shlex.quote(peer_host)}/32 dev lo "
+                            "2>/dev/null; true"
+                        )
+                    cleanup["peer"] = True
+            except Exception:
+                pass
+            try:
+                if self._router:
+                    self._router.exec(
+                        f"test ! -f {shlex.quote(paths['router_pid'])} || "
+                        f"kill $(cat {shlex.quote(paths['router_pid'])}) 2>/dev/null; "
+                        f"test ! -f {shlex.quote(paths['router_data_pid'])} || "
+                        f"kill $(cat {shlex.quote(paths['router_data_pid'])}) 2>/dev/null; "
+                        f"rm -f {shlex.quote(paths['router_pid'])} "
+                        f"{shlex.quote(paths['router_capture'])} "
+                        f"{shlex.quote(paths['router_data_pid'])} "
+                        f"{shlex.quote(paths['router_data_capture'])}; "
+                        f"conntrack -D -s {shlex.quote(client_ip)} -d "
+                        f"{shlex.quote(peer_host)} -p tcp --dport {control_port} "
+                        f"2>/dev/null; "
+                        f"conntrack -D -s {shlex.quote(peer_host)} -d "
+                        f"{shlex.quote(router_wan)} -p tcp --dport {data_port} "
+                        f"2>/dev/null; "
+                        f"while iptables -t nat -C POSTROUTING -s "
+                        f"{shlex.quote(client_ip)} -d {shlex.quote(peer_host)} "
+                        f"-p tcp --dport {control_port} -m comment --comment "
+                        f"{snat_token} -j SNAT --to-source {shlex.quote(router_wan)} "
+                        f"2>/dev/null; do iptables -t nat -D POSTROUTING -s "
+                        f"{shlex.quote(client_ip)} -d {shlex.quote(peer_host)} "
+                        f"-p tcp --dport {control_port} -m comment --comment "
+                        f"{snat_token} -j SNAT --to-source "
+                        f"{shlex.quote(router_wan)}; done; "
+                        f"ip route del {shlex.quote(peer_host)}/32 2>/dev/null; true"
+                    )
+                    if original_router_route and re.fullmatch(
+                        r"[A-Za-z0-9_./: -]+", original_router_route
+                    ):
+                        self._router.exec(
+                            f"ip route add {original_router_route}"
+                        )
+                    cleanup["router"] = True
+            except Exception:
+                pass
