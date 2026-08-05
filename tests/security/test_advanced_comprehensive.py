@@ -21,6 +21,9 @@ URL: /login#/securityCenter/advancedSetting
   dos_lan→raw CONNLIMIT peerconns DROP; tcp_mss→mangle TCPMSS + ik_cntl syn_proxy set_mss
 - reset默认: noping_*=0, tcp_mss=1/1400, dos_lan_num=300
 """
+import ipaddress
+from urllib.parse import urlparse
+
 import pytest
 from utils.step_recorder import StepRecorder
 from utils.verify_helper import make_ssh_verify
@@ -37,7 +40,40 @@ FIELD_CN = {
 
 CLIENT_IP = "192.168.148.2"
 ROUTER_LAN_IP = "192.168.148.1"
-ROUTER_WAN_IP = "10.66.0.150"  # 路由器wan1, client经enp2s0(10.66.0.18)可达wan侧
+
+
+def resolve_router_wan_ip(page, backend_verifier=None, recorder=None):
+    """Return the DUT's actual wan1 address for a WAN-side probe.
+
+    The page can be opened through a LAN/recovery address, so wan1 from the
+    DUT is authoritative.  The current Web host is only a no-SSH fallback.
+    """
+    if backend_verifier is not None:
+        try:
+            backend_verifier.connect_router()
+            detected = backend_verifier._router.exec(
+                "ip -4 -o addr show dev wan1 2>/dev/null | "
+                "awk '{print $4}' | cut -d/ -f1 | head -1"
+            ).strip()
+            ipaddress.IPv4Address(detected)
+            if recorder is not None:
+                recorder.add_detail(f"  [目标地址] SSH实测wan1={detected}")
+            return detected
+        except Exception as exc:
+            if recorder is not None:
+                recorder.add_detail(
+                    f"  [目标地址] SSH读取wan1失败: {type(exc).__name__}"
+                )
+            return ""
+
+    try:
+        fallback = urlparse(page.base_url).hostname or ""
+        ipaddress.IPv4Address(fallback)
+        if recorder is not None:
+            recorder.add_detail(f"  [目标地址] 使用Web地址回退: {fallback}")
+        return fallback
+    except ValueError:
+        return ""
 
 
 class TestAdvancedComprehensive:
@@ -69,6 +105,7 @@ class TestAdvancedComprehensive:
             expect_block=True=勾选后期望不通(noping), =False=不阻断(只测联通)."""
             if bv is None:
                 rec.add_detail("  [L5] 跳过(无SSH验证器)")
+                rec.not_applicable_current_step("无SSH验证器，无法执行L5端到端探测")
                 return
             bv.connect_client()
             # 基线: ping应通(retries=2抗抖动)
@@ -76,24 +113,59 @@ class TestAdvancedComprehensive:
             rec.add_detail(f"  [基线] ping {dst_ip}@{src_iface}: {base['detail']}")
             if not base["connected"]:
                 rec.add_detail(f"  [L5] 基线不通, 跳过{field}功能验证")
+                rec.warn_current_step(f"{field}基线不通，功能结果不确定")
                 return
             # 勾选
-            page.save_config(**{field: True})
+            if not page.save_config(**{field: True}):
+                message = f"{field}保存未持久化，无法进行L5探测"
+                rec.add_detail(f"  [FAIL] {message}")
+                ui_failures.append(message)
+                rec.fail_current_step(message)
+                return
+            rec.add_detail(f"  [UI] {field}开启保存并持久化: [OK]")
             page.page.wait_for_timeout(1500)
+            if bv is not None:
+                runtime = bv.verify_advanced_iptables(field, expect_present=True)
+                rec.add_detail(f"  [运行规则] {runtime.message}")
+                if not runtime.passed:
+                    message = f"{field}运行规则未生效: {runtime.message}"
+                    rec.add_detail(f"  [FAIL] {message}")
+                    ui_failures.append(message)
+                    rec.fail_current_step(message)
             # 验证阻断(期望不通, 严禁传retries会掩盖规则效果)
             blk = bv.verify_connectivity(src_iface=src_iface, dst_ip=dst_ip)
             rec.add_detail(f"  [勾选后] ping {dst_ip}: {blk['detail']}")
             if expect_block and blk["connected"]:
-                ui_failures.append(f"{field}未阻断ping({dst_ip}仍通)")
+                message = f"{field}未阻断ping({dst_ip}仍通)"
+                ui_failures.append(message)
+                rec.add_detail(f"  [FAIL] {message}")
+                rec.fail_current_step(message)
             elif expect_block and not blk["connected"]:
                 rec.add_detail(f"  [OK] {field}阻断生效(ping不通)")
             # 恢复
-            page.save_config(**{field: False})
+            restored_config = page.save_config(**{field: False})
             page.page.wait_for_timeout(1500)
+            if not restored_config:
+                message = f"取消{field}未持久化"
+                ui_failures.append(message)
+                rec.add_detail(f"  [FAIL] {message}")
+                rec.fail_current_step(message)
+            elif bv is not None:
+                rec.add_detail(f"  [UI] {field}关闭保存并持久化: [OK]")
+                runtime = bv.verify_advanced_iptables(field, expect_present=False)
+                rec.add_detail(f"  [运行规则] {runtime.message}")
+                if not runtime.passed:
+                    message = f"取消{field}后运行规则仍残留: {runtime.message}"
+                    ui_failures.append(message)
+                    rec.add_detail(f"  [FAIL] {message}")
+                    rec.fail_current_step(message)
             restore = bv.verify_connectivity(src_iface=src_iface, dst_ip=dst_ip, retries=2)
             rec.add_detail(f"  [恢复后] ping {dst_ip}: {restore['detail']}")
             if not restore["connected"]:
-                ui_failures.append(f"取消{field}后ping未恢复({dst_ip}不通)")
+                message = f"取消{field}后ping未恢复({dst_ip}不通)"
+                ui_failures.append(message)
+                rec.add_detail(f"  [FAIL] {message}")
+                rec.fail_current_step(message)
 
         try:
             # ========== 步骤1: 环境清理(恢复默认, 确保干净起点) ==========
@@ -157,8 +229,16 @@ class TestAdvancedComprehensive:
 
             with rec.step("步骤9.2: L5-noping_wan(阻断外网ping路由器wan口)",
                           "基线ping wan通→勾选→不通(硬)→恢复通"):
-                # noping_wan: 从wan侧(enp2s0, 10.66.0.18)ping路由器wan1(10.66.0.150)
-                _verify_l5_noping("noping_wan", ROUTER_WAN_IP, "enp2s0")
+                # noping_wan: 从wan侧(enp2s0) ping DUT 的真实 wan1 地址。
+                wan_ip = resolve_router_wan_ip(page, bv, rec)
+                if not wan_ip:
+                    message = "无法解析DUT wan1地址，跳过noping_wan L5探测"
+                    rec.add_detail(f"  [FAIL] {message}")
+                    ui_failures.append(message)
+                    rec.fail_current_step(message)
+                else:
+                    rec.add_detail(f"  [目标] noping_wan探测地址={wan_ip}")
+                    _verify_l5_noping("noping_wan", wan_ip, "enp2s0")
 
             with rec.step("步骤9.3: L5-notracert(阻断traceroute)",
                           "基线traceroute多跳→勾选→跳数骤降(硬)→恢复"):

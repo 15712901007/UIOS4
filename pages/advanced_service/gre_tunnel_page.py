@@ -654,6 +654,97 @@ class GreTunnelPage(IkuaiTablePage):
             pass
         return vals
 
+    # ==================== JIRA 盲区只读取值（功能测试用，命中即软记录，不阻断） ====================
+    def get_drawer_title(self) -> str:
+        """读 drawer 标题文本(新建/编辑)。IKOS-7114: 编辑态误显"新建"。
+
+        Ant Drawer 标题选择器多版本兜底; 取不到返回空(测试软观察, 不阻断)。
+        """
+        try:
+            self._drawer()
+            return self.page.evaluate("""() => {
+                const vis = e => { if(!e) return false; const cs=getComputedStyle(e);
+                    return cs.display!=='none' && cs.visibility!=='hidden'
+                        && cs.opacity!=='0' && e.getClientRects().length>0; };
+                const d = document.querySelector('.ant-drawer-content');
+                if (!d) return '';
+                for (const sel of ['.ant-drawer-title', '.ant-drawer-header-title',
+                                   '.ant-drawer-header', '.ant-pro-drawer-title']) {
+                    const el = d.querySelector(sel);
+                    if (el && (el.innerText || '').trim()) return (el.innerText || '').trim();
+                }
+                // 回退: 取 drawer 内第一个含"新建/编辑/GRE"的短文本块
+                const heads = [...d.querySelectorAll('div,span,h2,h3,header')].filter(e => {
+                    const t = (e.innerText||'').trim();
+                    return vis(e) && t && (t.includes('新建')||t.includes('编辑')||t.includes('GRE'))
+                        && t.length < 12
+                        && [...e.children].every(c => (c.innerText||'').trim() !== t);
+                });
+                return heads.length ? (heads[0].innerText||'').trim() : '';
+            }""") or ""
+        except Exception:
+            return ""
+
+    def get_drawer_submit_text(self) -> str:
+        """读 drawer 底部主提交按钮文本(保存/确定)。IKOS-7096: 应为"确定"却显"保存"。"""
+        try:
+            self._drawer()
+            return self.page.evaluate("""() => {
+                const ok = e => { if(!e) return false; const cs=getComputedStyle(e);
+                    return cs.display!=='none' && cs.visibility!=='hidden'
+                        && cs.opacity!=='0' && e.getClientRects().length>0; };
+                const d = document.querySelector('.ant-drawer-content');
+                if (!d) return '';
+                const footer = d.querySelector('.ant-drawer-footer') || d;
+                const btns = [...footer.querySelectorAll('button')].filter(ok);
+                const primary = btns.find(b => b.classList.contains('ant-btn-primary'));
+                const cand = primary || btns.find(b => {
+                    const t=(b.innerText||'').replace(/\\s+/g,'').trim();
+                    return t==='保存'||t==='确定'||t==='确认';
+                });
+                return cand ? (cand.innerText||'').replace(/\\s+/g,'').trim() : '';
+            }""") or ""
+        except Exception:
+            return ""
+
+    def get_tagname_placeholder(self) -> str:
+        """读隧道编号 input#tagname 的 placeholder。IKOS-7086: 提示文案/输入规则错误。"""
+        try:
+            el = self.page.locator(".ant-drawer-content input#tagname").first
+            if el.count() == 0:
+                return ""
+            return (el.get_attribute("placeholder") or "").strip()
+        except Exception:
+            return ""
+
+    def get_input_value(self, selector: str) -> str:
+        """读 drawer 内指定 input 当前 value(高级配置默认值/自动修改检测)。IKOS-7093/7092。"""
+        try:
+            el = self.page.locator(f".ant-drawer-content {selector}").first
+            if el.count() == 0:
+                return ""
+            return (el.input_value() or "").strip()
+        except Exception:
+            return ""
+
+    def get_default_ttl(self) -> str:
+        """读展开高级、no_fragment=0 默认态下 input#ttl 的 value/placeholder。IKOS-7093。"""
+        try:
+            val = self.get_input_value("input#ttl")
+            if val:
+                return val
+            ph = self.page.locator(".ant-drawer-content input#ttl").first
+            if ph.count() > 0:
+                return (ph.get_attribute("placeholder") or "").strip()
+            return ""
+        except Exception:
+            return ""
+
+    def fill_tunnel_addr_mask_only(self, protocol, mask: str) -> bool:
+        """单独填接口地址掩码字段(支持点分十进制掩码如 255.255.255.252)。IKOS-7111。"""
+        proto = self._protocol_index(protocol)
+        return self._fill_input(f"input#tunnel_addr{proto}_1", mask)
+
     # ==================== 组合：新增/编辑 ====================
     def fill_tunnel_form(self, spec: Dict) -> bool:
         """按 spec 填写表单（不保存）。spec 见模块 docstring。"""
@@ -1178,6 +1269,47 @@ class GreTunnelPage(IkuaiTablePage):
                 }
                 return '';
             }""", str(iface)) or ""
+        except Exception:
+            return ""
+
+    def get_list_cell_by_header(self, iface: str, header_text: str) -> str:
+        """读列表指定表头列的单元格文本。IKOS-6991: src_mode=指定接口时"源地址"列无法展示。
+
+        GRE 列表为自定义虚拟表格。先按表头文本(如"源地址")定位列序号, 再在该接口名
+        所在行取对应列文本。取不到返回空(测试软观察, 不阻断)。
+        """
+        try:
+            return self.page.evaluate("""({name, header}) => {
+                const vis = e => { if(!e) return false; const cs=getComputedStyle(e);
+                    return cs.display!=='none' && cs.visibility!=='hidden'
+                        && cs.opacity!=='0' && e.getClientRects().length>0; };
+                const norm = s => (s||'').replace(/\\s+/g,'').trim();
+                // 1) 找表头列序号
+                const ths = [...document.querySelectorAll(
+                    'main .ant-table-thead th, main [class*=table-thead] th, main [class*=head] *')]
+                    .filter(vis).map(t => norm(t.innerText));
+                let idx = ths.findIndex(t => t.includes(norm(header)));
+                if (idx < 0) idx = 3;  // 回退: 源地址=第4列(索引3)
+                // 2) 找接口名所在叶子
+                const cells = [...document.querySelectorAll('main *')].filter(e =>
+                    vis(e) && norm(e.innerText) === norm(name)
+                    && [...e.children].every(c => norm(c.innerText) !== norm(name)));
+                if (cells.length === 0) return '';
+                let p = cells[0].parentElement, depth = 0;
+                while (p && depth < 8) {
+                    const rowCells = [...p.querySelectorAll('.ant-table-cell, [class*=cell], div, span')]
+                        .filter(vis)
+                        .filter(c => {
+                            const t = norm(c.innerText);
+                            return t && [...c.children].every(ch => norm(ch.innerText) !== t);
+                        });
+                    if (rowCells.length >= 4 && rowCells[idx]) {
+                        return norm(rowCells[idx].innerText);
+                    }
+                    p = p.parentElement; depth++;
+                }
+                return '';
+            }""", {"name": str(iface), "header": str(header_text)}) or ""
         except Exception:
             return ""
 

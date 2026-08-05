@@ -1,0 +1,11 @@
+[Unit]
+Description=Prepare hugepages, VFIO, and CPU policy for the DPDK lab
+After=systemd-sysctl.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dpdk-lab-prepare
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

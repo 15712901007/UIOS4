@@ -902,10 +902,10 @@ class TestDmzHostComprehensive:
 @pytest.mark.dmz_host
 @pytest.mark.network
 class TestDmzHostFlowVerification:
-    """DMZ主机功能验证(L5 NETMAP打流, 硬断言): 建DMZ→外网访问wan3口→conntrack DNAT条目=生效.
+    """DMZ主机功能验证(L5 NETMAP打流, 硬断言): 建DMZ→外网访问wan3口→NETMAP规则计数增加.
 
     DMZ=NETMAP全端口DNAT(外网访问路由器WAN口任意端口→DMZ主机同端口). 用wan3(避开wan1管理网段, page强制).
-    L5铁证=conntrack DNAT条目(orig dst=wan_ip:端口, reply src=DMZ主机IP:同端口), SYN即触发不依赖hairpin."""
+    L5主证据=精确NETMAP规则包计数增量；conntrack仅作辅助，避免5秒SYN超时或proc接口不可用导致误报。"""
 
     PREFIX = "dmzflow_"
     WAN_IFACE = "wan3"
@@ -929,21 +929,16 @@ class TestDmzHostFlowVerification:
         def _force_clean():
             try:
                 bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM one_one_map WHERE tagname LIKE '{self.PREFIX}%'\"")
+                # netmap.sh init在DB为空时不会刷新NETNAT；先清链再按剩余DB重建，
+                # 否则进程中断或SQL兜底删除会留下仍生效的NETMAP规则。
+                bv._router.exec("iptables -w -t nat -F NETNAT 2>/dev/null")
                 bv._router.exec("/usr/ikuai/script/netmap.sh init 2>/dev/null")
             except Exception:
                 pass
 
-        def _trigger_dnat():
-            """client外网侧(10.66.0.18)发SYN到wan3:TEST_PORT, 触发NETMAP DNAT建conntrack条目."""
-            bv.connect_client()
-            for _ in range(3):
-                bv._client.exec(
-                    f"curl -s -o /dev/null --connect-timeout 2 -m 3 http://{self.WAN_IP}:{self.TEST_PORT}/ 2>/dev/null",
-                    timeout=8)
-
         try:
             # 环境检查: 动态获取wan3 IP + client外网侧可达
-            with rec.step("环境检查", "动态获取wan3 IP + client可达"):
+            with rec.step("环境检查", "动态获取wan3 IP + client独立外网源可达"):
                 bv.connect_router()
                 import re
                 wan_ip_out = bv._router.exec("ip -4 addr show wan3 2>/dev/null")
@@ -956,7 +951,18 @@ class TestDmzHostFlowVerification:
                 ping = bv._client.exec(f"ping -c 1 -W 2 {wan_ip} 2>/dev/null | grep -c '1 received'")
                 if ping.strip() == "0":
                     pytest.skip(f"client无法访问wan3 {wan_ip}, 跳过DMZ功能验证")
-                rec.add_detail(f"  ✓ wan3={wan_ip} 可达")
+                route = bv._client.exec(f"ip route get {wan_ip} 2>/dev/null | head -1")
+                source_match = re.search(r'\bsrc\s+(\d+\.\d+\.\d+\.\d+)', route)
+                external_source = source_match.group(1) if source_match else ""
+                if not external_source or external_source == self.LAN_IP:
+                    pytest.skip(
+                        f"client无独立外网源地址(source={external_source or 'unknown'}), "
+                        "DMZ打流环境不满足"
+                    )
+                rec.add_detail(
+                    f"  ✓ wan3={wan_ip} 可达, 外网源={external_source}, "
+                    f"DMZ目标={self.LAN_IP}"
+                )
 
             # 建DMZ: wan3, DMZ主机=192.168.148.2, 全端口NETMAP
             with rec.step("建DMZ规则", f"{self.WAN_IFACE}→DMZ主机{self.LAN_IP}(全端口NETMAP)"):
@@ -992,18 +998,30 @@ class TestDmzHostFlowVerification:
                         if not r.passed:
                             failures.append(f"{r.level}: {r.message}")
 
-                # L5: 触发NETMAP DNAT + 查conntrack DNAT条目(铁证)
-                with rec.step("L5 NETMAP验证", f"外网访问{self.WAN_IP}:{self.TEST_PORT}→conntrack DNAT到{self.LAN_IP}:{self.TEST_PORT}"):
-                    _trigger_dnat()
-                    res = bv.verify_dnat_conntrack(self.WAN_IP, self.TEST_PORT, self.LAN_IP, self.TEST_PORT)
+                # L5: NETMAP规则包计数增量是主判据；conntrack短生命周期仅作辅助。
+                with rec.step("L5 NETMAP验证", f"外网访问{self.WAN_IP}:{self.TEST_PORT}→NETMAP到{self.LAN_IP}:{self.TEST_PORT}"):
+                    res = bv.verify_dmz_netmap_counter_increment(
+                        self.WAN_IP,
+                        self.TEST_PORT,
+                        self.LAN_IP,
+                        wan_interface=self.WAN_IFACE,
+                        source_ip=external_source,
+                    )
                     rec.add_detail(f"  {res.message}")
                     if res.raw_output:
-                        rec.add_detail(f"  conntrack: {res.raw_output}")
+                        rec.add_detail(f"  NETMAP规则计数: {res.raw_output}")
                     if res.passed:
                         rec.add_detail("  ✓ DMZ NETMAP生效(数据平面)")
                     else:
-                        rec.add_detail("  ✗ DMZ未生效(无DNAT条目, 疑PREROUTING未引用NETNAT链)")
+                        rec.add_detail("  ✗ DMZ未生效(SYN未命中精确NETMAP规则)")
                         failures.append(f"DMZ NETMAP未生效: {res.message}")
+                    try:
+                        cres = bv.verify_dnat_conntrack(
+                            self.WAN_IP, self.TEST_PORT,
+                            self.LAN_IP, self.TEST_PORT)
+                        rec.add_detail(f"  [辅助] conntrack: {cres.message}")
+                    except Exception:
+                        pass
 
                 # 删规则→验证DNAT消失(恢复)
                 with rec.step("删规则恢复", "删DMZ→再访问→DNAT应消失"):
@@ -1015,13 +1033,19 @@ class TestDmzHostFlowVerification:
                         pass
                     _force_clean()
                     page.page.wait_for_timeout(1500)
-                    _trigger_dnat()
-                    res2 = bv.verify_dnat_conntrack(self.WAN_IP, self.TEST_PORT, self.LAN_IP, self.TEST_PORT)
+                    res2 = bv.verify_dmz_netmap_counter_increment(
+                        self.WAN_IP,
+                        self.TEST_PORT,
+                        self.LAN_IP,
+                        wan_interface=self.WAN_IFACE,
+                        source_ip=external_source,
+                    )
+                    rec.add_detail(f"  {res2.message}")
                     if res2.passed:
-                        rec.add_detail("  ✗ 删规则后仍有DNAT(规则残留)")
-                        failures.append("删规则后DNAT仍存在(残留)")
+                        rec.add_detail("  ✗ 删规则后NETMAP仍生效(规则残留)")
+                        failures.append("删规则后NETMAP仍存在(残留)")
                     else:
-                        rec.add_detail("  ✓ 删规则后DNAT消失(恢复)")
+                        rec.add_detail("  ✓ 删规则后NETMAP消失(恢复)")
         finally:
             try:
                 page.navigate_to_dmz()

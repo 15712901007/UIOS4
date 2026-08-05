@@ -345,18 +345,34 @@ class DhcpServerPage(IkuaiTablePage):
         return self._toggle_checkbox("只应用于DHCP中继", enable)
 
     def _toggle_checkbox(self, label_text: str, enable: bool):
-        """通用checkbox切换(通过label文本定位)"""
+        """切换DHCP表单checkbox。
+
+        实机两个checkbox的可见文字都只是“开启”，字段名称位于外层表单label，
+        不能用``.ant-checkbox-wrapper``文本区分。优先使用稳定的字段id，保留
+        文本定位仅用于兼容旧版页面。
+        """
         try:
-            # checkbox的label包含目标文本
-            wrapper = self.page.locator('.ant-checkbox-wrapper').filter(has_text=label_text)
-            if wrapper.count() > 0:
-                cb = wrapper.first.locator('input[type="checkbox"]')
-                if cb.count() > 0:
-                    checked = cb.first.is_checked()
-                    if checked != enable:
-                        wrapper.first.click()
-                        self.page.wait_for_timeout(200)
-                        logger.info(f"[操作] {label_text}: {'开启' if enable else '关闭'}")
+            field_ids = {
+                "检查接口IP有效性": "check_addr_valid",
+                "只应用于DHCP中继": "check_relay_only",
+            }
+            field_id = field_ids.get(label_text)
+            cb = self.page.locator(f'input#{field_id}') if field_id else None
+            if cb is None or cb.count() == 0:
+                wrapper = self.page.locator(
+                    '.ant-form-item',
+                    has=self.page.locator('[class*="label"]').filter(has_text=label_text),
+                ).first
+                cb = wrapper.locator('input[type="checkbox"]')
+            if cb.count() == 0:
+                logger.warning(f"[操作] 未找到checkbox: {label_text}")
+                return self
+            if cb.first.is_checked() != enable:
+                cb.first.set_checked(enable, force=True)
+                self.page.wait_for_timeout(200)
+            if cb.first.is_checked() != enable:
+                raise RuntimeError("checkbox状态未达到期望")
+            logger.info(f"[操作] {label_text}: {'开启' if enable else '关闭'}")
         except Exception as e:
             logger.warning(f"[操作] 切换{label_text}失败: {e}")
         return self
@@ -371,14 +387,34 @@ class DhcpServerPage(IkuaiTablePage):
 
     def _is_checkbox_checked(self, label_text: str) -> bool:
         try:
-            wrapper = self.page.locator('.ant-checkbox-wrapper').filter(has_text=label_text)
-            if wrapper.count() > 0:
-                cb = wrapper.first.locator('input[type="checkbox"]')
-                if cb.count() > 0:
-                    return cb.first.is_checked()
+            field_ids = {
+                "检查接口IP有效性": "check_addr_valid",
+                "只应用于DHCP中继": "check_relay_only",
+            }
+            field_id = field_ids.get(label_text)
+            cb = self.page.locator(f'input#{field_id}') if field_id else None
+            if cb is None or cb.count() == 0:
+                wrapper = self.page.locator(
+                    '.ant-form-item',
+                    has=self.page.locator('[class*="label"]').filter(has_text=label_text),
+                ).first
+                cb = wrapper.locator('input[type="checkbox"]')
+            if cb.count() > 0:
+                return cb.first.is_checked()
         except Exception:
             pass
         return False
+
+    def get_sortable_columns(self):
+        """返回页面实际声明了排序控件的列名。"""
+        try:
+            return self.page.evaluate("""() => Array.from(document.querySelectorAll('th'))
+                .filter(th => th.matches('[aria-sort]') || th.querySelector(
+                    '.sortIcon, .ant-table-column-sorter, .ant-table-column-sorters'))
+                .map(th => (th.textContent || '').trim())
+                .filter(Boolean)""") or []
+        except Exception:
+            return []
 
     # ==================== 表单读取(用于编辑页回显校验) ====================
 

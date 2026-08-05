@@ -159,7 +159,7 @@ class ConfigDialog(QDialog):
         form_layout = QFormLayout(capture_group)
 
         self.screenshot_check = QCheckBox("失败时自动截图")
-        self.screenshot_check.setChecked(True)
+        self.screenshot_check.setChecked(False)
         form_layout.addRow("", self.screenshot_check)
 
         self.video_check = QCheckBox("失败时录制视频")
@@ -267,6 +267,15 @@ class ConfigDialog(QDialog):
         self.ssh_client_port.setRange(1, 65535)
         self.ssh_client_port.setValue(22)
         form_layout.addRow("端口:", self.ssh_client_port)
+
+        self.kernel_peer_host = QLineEdit()
+        self.kernel_peer_host.setPlaceholderText("如: 10.66.0.57")
+        form_layout.addRow("内核设置L5对端:", self.kernel_peer_host)
+
+        self.kernel_peer_port = QSpinBox()
+        self.kernel_peer_port.setRange(1, 65535)
+        self.kernel_peer_port.setValue(22)
+        form_layout.addRow("L5对端SSH端口:", self.kernel_peer_port)
 
         layout.addWidget(client_group)
 
@@ -391,6 +400,12 @@ class ConfigDialog(QDialog):
         self.ssh_client_username.setText(self.config.ssh.client.username)
         self.ssh_client_password.setText(self.config.ssh.client.password)
         self.ssh_client_port.setValue(self.config.ssh.client.port)
+        self.kernel_peer_host.setText(
+            getattr(self.config.ssh, "kernel_peer_host", "10.66.0.57")
+        )
+        self.kernel_peer_port.setValue(
+            int(getattr(self.config.ssh, "kernel_peer_port", 22))
+        )
 
         self.iperf3_server.setText(self.config.ssh.iperf3_server)
         self.iperf3_duration.setValue(self.config.ssh.iperf3_duration)
@@ -430,6 +445,8 @@ class ConfigDialog(QDialog):
         self.config.ssh.client.username = self.ssh_client_username.text()
         self.config.ssh.client.password = self.ssh_client_password.text()
         self.config.ssh.client.port = self.ssh_client_port.value()
+        self.config.ssh.kernel_peer_host = self.kernel_peer_host.text()
+        self.config.ssh.kernel_peer_port = self.kernel_peer_port.value()
 
         self.config.ssh.iperf3_server = self.iperf3_server.text()
         self.config.ssh.iperf3_duration = self.iperf3_duration.value()

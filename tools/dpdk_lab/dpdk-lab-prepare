@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+modprobe vfio
+modprobe vfio-pci
+modprobe vfio_iommu_type1
+sysctl -q -w vm.nr_hugepages=2048
+
+shopt -s nullglob
+for governor in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+    if grep -qw performance "${governor%/*}/scaling_available_governors"; then
+        echo performance > "${governor}"
+    fi
+done

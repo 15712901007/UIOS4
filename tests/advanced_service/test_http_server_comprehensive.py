@@ -35,7 +35,7 @@ pytestmark = [pytest.mark.advanced_service, pytest.mark.http_server]
 
 PARTITION = "666"
 LAN_HOST, LAN_IFACE = "192.168.148.1", "ens11"
-WAN_HOST, WAN_IFACE = "10.66.0.150", "enp2s0"
+WAN_IFACE = "enp2s0"
 
 EXPORT_HEADERS = [
     "id", "enabled", "tagname", "http_port", "server_name",
@@ -1106,6 +1106,17 @@ class TestHttpServerComprehensive:
                 "步骤22: 验证HTTP外网访问开关",
                 "操作：关闭主规则的外网访问后分别从内外网请求同一文件，再重新允许外网；验证：关闭时端口进入阻断集合、内网仍可读取但外网超时，恢复后外网可读取正确SHA256",
             ):
+                wan_target = require_ssh(
+                    "L0-WAN探测拓扑", backend.verify_local_service_wan_target,
+                    WAN_IFACE,
+                )
+                wan_host = wan_target.details["host"]
+                require_ssh(
+                    "L5-WAN允许基线", backend.run_http_probe,
+                    p_edit, "fetch", wan_host, WAN_IFACE,
+                    "/payload.bin", "http", primary_domain,
+                    payloads["edited"]["sha256"], 200,
+                )
                 restricted = page.update_rule(primary, access=False)
                 require_ui("关闭主规则外网访问", result_ok(restricted), result_error(restricted))
                 primary_expected["access"] = 0
@@ -1115,7 +1126,7 @@ class TestHttpServerComprehensive:
                 require_ssh(
                     "L5-WAN DROP且LAN控制成功",
                     backend.run_http_probe,
-                    p_edit, "connect_fail", WAN_HOST, WAN_IFACE,
+                    p_edit, "connect_fail", wan_host, WAN_IFACE,
                     "/payload.bin", "http", primary_domain,
                     payloads["edited"]["sha256"], 200, None,
                     control_port=p_edit, control_host=LAN_HOST,
@@ -1130,7 +1141,7 @@ class TestHttpServerComprehensive:
                 require_ssh(
                     "L5-WAN读取恢复",
                     backend.run_http_probe,
-                    p_edit, "fetch", WAN_HOST, WAN_IFACE,
+                    p_edit, "fetch", wan_host, WAN_IFACE,
                     "/payload.bin", "http", primary_domain,
                     payloads["edited"]["sha256"], 200,
                 )

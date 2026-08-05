@@ -34,7 +34,7 @@ pytestmark = [pytest.mark.advanced_service, pytest.mark.samba_server]
 
 PARTITION = "666"
 LAN_HOST, LAN_IFACE = "192.168.148.1", "ens11"
-WAN_HOST, WAN_IFACE = "10.66.0.150", "enp2s0"
+WAN_IFACE = "enp2s0"
 
 # smbd.sh -> export_txt(config.db, smbd_dir, ...), tagname 被明确排除。
 # passwd 为解密后的明文，严禁打印任何 CSV 行。
@@ -1326,10 +1326,15 @@ class TestSambaServerComprehensive:
                 "步骤22: 验证Samba外网访问开关",
                 "操作：先在允许外网时建立访问基线，再关闭外网并分别从内外网连接，最后恢复；验证：关闭后8项端口进入阻断集合、外网连接失败但内网仍可用，恢复后外网可用",
             ):
+                wan_target = require_ssh(
+                    "L0-WAN探测拓扑", backend.verify_local_service_wan_target,
+                    WAN_IFACE,
+                )
+                wan_host = wan_target.details["host"]
                 require_ssh(
                     "L5-WAN允许基线", backend.run_samba_probe,
                     username=rw_user, password=rw_password,
-                    host=WAN_HOST, iface=WAN_IFACE, operation="list",
+                    host=wan_host, iface=WAN_IFACE, operation="list",
                     share_name=rw_share,
                 )
                 page.navigate_to_samba_server()
@@ -1350,7 +1355,7 @@ class TestSambaServerComprehensive:
                 require_ssh(
                     "L5-WAN关闭阻断", backend.run_samba_probe,
                     username=rw_user, password=rw_password,
-                    host=WAN_HOST, iface=WAN_IFACE, operation="connect_fail",
+                    host=wan_host, iface=WAN_IFACE, operation="connect_fail",
                     share_name=rw_share,
                     control_host=LAN_HOST,
                     control_iface=LAN_IFACE,
@@ -1364,7 +1369,7 @@ class TestSambaServerComprehensive:
                 require_ssh(
                     "L5-WAN恢复", backend.run_samba_probe,
                     username=rw_user, password=rw_password,
-                    host=WAN_HOST, iface=WAN_IFACE, operation="list",
+                    host=wan_host, iface=WAN_IFACE, operation="list",
                     share_name=rw_share,
                 )
 

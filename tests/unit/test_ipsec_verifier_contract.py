@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from pages.network.ipsec_vpn_page import IpsecVpnPage
+from utils.backend_verifier import VerifyResult
 from utils.ipsec_verifier import IpsecTopology, IpsecVerifier
 
 
@@ -20,10 +24,10 @@ class _Backend:
 def _topology():
     return IpsecTopology(
         token="abc123",
-        router_policy="ipsec_t_r_abc123",
-        peer_policy="ipsec_t_p_abc123",
-        router_proposal="ike_t_r_abc123",
-        peer_proposal="ike_t_p_abc123",
+        router_policy="iprabc123",
+        peer_policy="ippabc123",
+        router_proposal="ikerabc123",
+        peer_proposal="ikepabc123",
         client_source="10.99.99.1",
         peer_service="198.18.1.2",
         client_iface="ens11",
@@ -78,6 +82,225 @@ def test_policy_params_are_symmetric_and_secret_is_runtime_only():
     peer_traffic = json.loads(base64_decode(peer["traffic"]))
     assert router_traffic[0]["src"] == peer_traffic[0]["dst"]
     assert router_traffic[0]["dst"] == peer_traffic[0]["src"]
+
+
+def test_extended_topology_params_cover_ipv6_hub_and_transport_modes():
+    verifier = IpsecVerifier(_Backend())
+    topology = IpsecTopology(
+        **{
+            **_topology().__dict__,
+            "addr_type": "v6",
+            "protocol": "any",
+            "router_role": "spoke",
+            "peer_role": "hub",
+            "encap_mode": "tunnel",
+        }
+    )
+    params = verifier._policy_params("peer", topology, 9, "runtime-only-psk")
+    assert params["addr_type"] == "v6"
+    assert params["role"] == "hub"
+    assert params["local_id_type"] == "IPV6"
+    assert params["remote_addr"] == ""
+    assert params["traffic"] == ""
+
+    transport = IpsecTopology(
+        **{
+            **_topology().__dict__,
+            "encap_mode": "transport",
+            "protocol": "icmp",
+        }
+    )
+    transport_params = verifier._policy_params(
+        "router", transport, 7, "runtime-only-psk"
+    )
+    assert transport_params["encap_mode"] == "transport"
+    assert json.loads(base64_decode(transport_params["traffic"]))[0]["src"] == (
+        transport.router_selector
+    )
+
+
+def test_topology_selector_prefix_is_family_aware():
+    base = _topology()
+    v6 = IpsecTopology(**{**base.__dict__, "addr_type": "v6"})
+    assert v6.router_selector.endswith("/128")
+    assert v6.peer_selector.endswith("/128")
+    assert v6.uses_loopback_data_plane
+
+
+def test_multi_tunnel_observability_aggregates_all_rows(monkeypatch):
+    verifier = IpsecVerifier(_Backend())
+
+    class _Ssh:
+        def exec(self, command, timeout=0):
+            if "TYPE='list,list_total'" in command:
+                return json.dumps({
+                    "list_total": 2,
+                    "list": [
+                        {"policy_id": 7, "tunnel_key": "key-a",
+                         "status": "established", "in_bytes": 12,
+                         "out_bytes": 12},
+                        {"policy_id": 9, "tunnel_key": "key-b",
+                         "status": "established", "in_bytes": 16,
+                         "out_bytes": 16},
+                    ],
+                })
+            if "TYPE='detail'" in command:
+                value = 12 if "key-a" in command else 16
+                return json.dumps({"statistics": {"traffic_rate": {
+                    "in_protected_bytes": value,
+                    "out_protected_bytes": value,
+                    "in_protected_packets": 1,
+                    "out_protected_packets": 1,
+                }}, "sa": {"esp": {"inbound": {}, "outbound": {}}}})
+            if "TYPE='log'" in command:
+                return json.dumps({"title": "ok"})
+            if "swanctl --list-sas" in command:
+                return ("ipsec2-spoke-7: #1, ESTABLISHED\n"
+                        "  ipsec2-spoke-7-esp: INSTALLED\n"
+                        "ipsec2-spoke-9: #2, ESTABLISHED\n"
+                        "  ipsec2-spoke-9-esp: INSTALLED\n")
+            raise AssertionError(command)
+
+    monkeypatch.setattr(verifier, "_router", lambda: _Ssh())
+    result = verifier.query_multi_tunnel_observability([7, 9], "router")
+    assert result["matched_rows"] == 2
+    assert result["distinct_tunnel_keys"] == 2
+    assert result["aggregate_statistics"]["in_protected_bytes"] == 28
+    assert result["child_inventory"]["total_installed"] == 2
+
+
+def test_created_object_registry_enforces_current_tagname_limit():
+    verifier = IpsecVerifier(_Backend())
+    verifier.register_created_object("router", "policy", 7, "iprabc123")
+    assert ("router", "policy", 7, "iprabc123") in verifier._created_objects
+    with pytest.raises(ValueError, match="名称不符合"):
+        verifier.register_created_object("router", "policy", 8, "p" * 16)
+
+
+def test_cleanup_never_deletes_an_unowned_matching_name():
+    backend = _Backend()
+    verifier = IpsecVerifier(backend)
+    result = verifier.cleanup(_topology())
+    assert result.passed is True
+    assert result.details["owned_object_count"] == 0
+    assert backend.body == ""
+
+
+def test_terminate_result_depends_on_final_sa_absence(monkeypatch):
+    verifier = IpsecVerifier(_Backend())
+
+    class _Ssh:
+        def exec(self, command, timeout=0):
+            return "terminate failed: peer already removed the IKE_SA"
+
+    router = _Ssh()
+    peer = _Ssh()
+    listings = {id(router): 0, id(peer): 0}
+
+    def sa_text(ssh):
+        listings[id(ssh)] += 1
+        policy_id = 7 if ssh is router else 9
+        return (
+            f"ipsec2-spoke-{policy_id}: #1, ESTABLISHED\n"
+            if listings[id(ssh)] == 1 else ""
+        )
+
+    monkeypatch.setattr(verifier, "_router", lambda: router)
+    monkeypatch.setattr(verifier, "_peer", lambda: peer)
+    monkeypatch.setattr(verifier, "_sa_text", sa_text)
+    monkeypatch.setattr(
+        verifier,
+        "wait_for_sa_absent",
+        lambda *args, **kwargs: VerifyResult(
+            "L4", True, "absent", details={"router_present": False,
+                                             "peer_present": False},
+        ),
+    )
+
+    result = verifier.terminate_test_sas(7, 9)
+
+    assert result.passed is True
+    assert len(result.details["terminate_diagnostics"]) == 2
+
+
+def test_rekey_child_uses_requested_endpoint(monkeypatch):
+    verifier = IpsecVerifier(_Backend())
+
+    class _Ssh:
+        command = ""
+
+        def exec(self, command, timeout=0):
+            self.command = command
+            return "rekey completed successfully"
+
+    router = _Ssh()
+    monkeypatch.setattr(verifier, "_router", lambda: router)
+    monkeypatch.setattr(
+        verifier, "_peer",
+        lambda: pytest.fail("router rekey must not contact peer endpoint"),
+    )
+
+    result = verifier.rekey_child("router", 7)
+
+    assert result.passed is True
+    assert result.details["initiator"] == "router"
+    assert "ipsec2-spoke-7-esp" in router.command
+
+
+def test_select_option_key_normalizes_fullwidth_display_punctuation():
+    assert (
+        IpsecVpnPage._option_key("MODP 2048（组14）")
+        == IpsecVpnPage._option_key("MODP 2048(组14)")
+    )
+    assert (
+        IpsecVpnPage._option_key("MODP 2048（组14）")
+        != IpsecVpnPage._option_key("MODP 2048（组24）")
+    )
+
+
+def test_tunnel_observability_normalizes_nested_statistics_and_sa(monkeypatch):
+    verifier = IpsecVerifier(_Backend())
+
+    class _Ssh:
+        def exec(self, command, timeout=0):
+            if "TYPE='list,list_total'" in command:
+                return json.dumps({
+                    "list_total": 1,
+                    "list": [{
+                        "policy_id": 7, "tunnel_key": "safe-key",
+                        "status": "established", "in_bytes": 672,
+                        "out_bytes": 672,
+                    }],
+                })
+            if "TYPE='detail'" in command:
+                return json.dumps({
+                    "statistics": {"traffic_rate": {
+                        "in_protected_packets": 8,
+                        "out_protected_packets": 8,
+                        "in_protected_bytes": 672,
+                        "out_protected_bytes": 672,
+                    }},
+                    "sa": {"esp": {
+                        "inbound": {"ipsec_sa_lifetime_bytes": 1843200},
+                        "outbound": {"ipsec_sa_lifetime_bytes": 1843200},
+                    }},
+                })
+            if "TYPE='log'" in command:
+                return json.dumps({"title": "ok", "diagnosis": {},
+                                   "technical_logs": ["ok"]})
+            raise AssertionError(command)
+
+    monkeypatch.setattr(verifier, "_router", lambda: _Ssh())
+
+    result = verifier.query_tunnel_observability(7, "router")
+
+    assert result["detail"]["statistics"] == {
+        "in_protected_packets": 8,
+        "out_protected_packets": 8,
+        "in_protected_bytes": 672,
+        "out_protected_bytes": 672,
+    }
+    assert result["detail"]["sa"]["ipsec_sa_lifetime_bytes"] == 1843200
 
 
 def base64_decode(value: str) -> str:

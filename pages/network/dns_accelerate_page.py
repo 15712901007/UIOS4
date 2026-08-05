@@ -216,6 +216,35 @@ class DnsAcceleratePage(IkuaiTablePage):
             logger.warning(f"[读取] 获取老化时间失败: {e}")
         return ""
 
+    def get_doh_query(self) -> str:
+        """获取DoH模式的请求地址。"""
+        try:
+            el = self.page.locator("#query")
+            if el.count() > 0:
+                return el.input_value().strip()
+        except Exception as e:
+            logger.warning(f"[读取] 获取DoH请求地址失败: {e}")
+        return ""
+
+    def get_proxy_dns_servers(self) -> List[str]:
+        """获取第三方代理模式的首选和三个备选DNS。"""
+        servers = []
+        for element_id in (
+            "proxy_force_dns",
+            "proxy_force_dns1",
+            "proxy_force_dns2",
+            "proxy_force_dns3",
+        ):
+            try:
+                el = self.page.locator(f"#{element_id}")
+                if el.count() > 0:
+                    value = el.input_value().strip()
+                    if value:
+                        servers.append(value)
+            except Exception as e:
+                logger.warning(f"[读取] 获取第三方代理DNS #{element_id} 失败: {e}")
+        return servers
+
     def get_basic_config(self) -> dict:
         """获取基础配置全部字段"""
         return {
@@ -227,6 +256,8 @@ class DnsAcceleratePage(IkuaiTablePage):
             "cachemode": self.get_cachemode(),
             "cachemode_value": self.get_cachemode_value(),
             "cache_ttl": self.get_cache_ttl(),
+            "query": self.get_doh_query(),
+            "proxy_dns_servers": self.get_proxy_dns_servers(),
         }
 
     # ==================== 基础配置: 表单操作(全JS) ====================
@@ -341,6 +372,31 @@ class DnsAcceleratePage(IkuaiTablePage):
         else:
             logger.error(f"[操作] 填写老化时间失败")
 
+    def fill_doh_query(self, query: str):
+        """填写DoH请求地址。"""
+        if self._js_set_value("query", query):
+            self.page.wait_for_timeout(300)
+            logger.info(f"[操作] DoH请求地址: {query}")
+        else:
+            logger.error("[操作] 填写DoH请求地址失败")
+
+    def fill_proxy_dns_servers(self, servers: List[str]):
+        """填写第三方代理模式的首选和三个备选DNS。"""
+        values = list(servers or [])[:4]
+        values.extend([""] * (4 - len(values)))
+        element_ids = (
+            "proxy_force_dns",
+            "proxy_force_dns1",
+            "proxy_force_dns2",
+            "proxy_force_dns3",
+        )
+        for element_id, value in zip(element_ids, values):
+            if not self._js_set_value(element_id, value):
+                logger.error(f"[操作] 填写第三方代理DNS失败: #{element_id}")
+                continue
+            self.page.wait_for_timeout(200)
+        logger.info(f"[操作] 第三方代理DNS: {values}")
+
     # ==================== 基础配置: 保存 ====================
 
     def click_save_basic(self) -> bool:
@@ -369,7 +425,9 @@ class DnsAcceleratePage(IkuaiTablePage):
                           forbid_aaaa: Optional[bool] = None,
                           proxy_force: Optional[bool] = None,
                           cachemode: Optional[str] = None,
-                          cache_ttl: Optional[str] = None) -> bool:
+                          cache_ttl: Optional[str] = None,
+                          query: Optional[str] = None,
+                          proxy_dns_servers: Optional[List[str]] = None) -> bool:
         """
         配置DNS加速基础配置并保存(全JS操作绕过浮层)
 
@@ -381,11 +439,17 @@ class DnsAcceleratePage(IkuaiTablePage):
             proxy_force: 强制客户端DNS代理, None不修改
             cachemode: 加速模式(UDP/DoH/多线分路/第三方代理), None不修改
             cache_ttl: 老化时间秒, None不修改
+            query: DoH请求地址, None不修改
+            proxy_dns_servers: 第三方代理首选/备选DNS列表(最多4个), None不修改
 
         Returns:
             保存是否成功
         """
         try:
+            # 模式切换会重渲染基础表单。必须先切模式，再修改开关和模式专属字段；
+            # 否则第三方代理切回UDP时，重渲染可能把刚切换的开关恢复为旧值。
+            if cachemode is not None:
+                self.select_cachemode(cachemode)
             if enable is not None:
                 # 开关切换必须成功, 否则在错误状态下保存→假绿(步骤6/7根因)
                 if not self.toggle_enable(enable):
@@ -397,8 +461,10 @@ class DnsAcceleratePage(IkuaiTablePage):
                 self.fill_dns2(dns2)
             if forbid_aaaa is not None:
                 self.toggle_forbid_aaaa(forbid_aaaa)
-            if cachemode is not None:
-                self.select_cachemode(cachemode)
+            if query is not None:
+                self.fill_doh_query(query)
+            if proxy_dns_servers is not None:
+                self.fill_proxy_dns_servers(proxy_dns_servers)
             if proxy_force is not None:
                 self.toggle_proxy_force(proxy_force)
             if cache_ttl is not None:
@@ -451,6 +517,10 @@ class DnsAcceleratePage(IkuaiTablePage):
                 expected["cachemode"] = cachemode
             if cache_ttl is not None:
                 expected["cache_ttl"] = cache_ttl
+            if query is not None:
+                expected["query"] = query
+            if proxy_dns_servers is not None:
+                expected["proxy_dns_servers"] = [v for v in proxy_dns_servers[:4] if v]
 
             mismatches = []
             for k, v in expected.items():
@@ -726,15 +796,13 @@ class DnsAcceleratePage(IkuaiTablePage):
             logger.info(f"[表单] 解析类型已是 {parse_type}, 跳过")
             return
         try:
-            # JS click .ant-select-selector 打开下拉(含#parse_type的select)
-            self.page.evaluate("""() => {
-                const sel = document.querySelector('#parse_type');
-                if (!sel) return false;
-                const selector = sel.closest('.ant-select')?.querySelector('.ant-select-selector');
-                if (selector) { selector.click(); return true; }
-                return false;
-            }""")
-            self.page.wait_for_timeout(700)
+            # Ant Select需要从combobox触发，直接JS click selector在部分固件不会展开选项。
+            combo = self.page.locator("#parse_type")
+            if combo.count() == 0:
+                logger.error("[表单] 未找到解析类型combobox")
+                return
+            combo.click(force=True)
+            self.page.wait_for_timeout(500)
 
             # JS click 对应option(可见)
             clicked = self.page.evaluate("""(text) => {
@@ -748,7 +816,11 @@ class DnsAcceleratePage(IkuaiTablePage):
             }""", parse_type)
             if clicked:
                 self.page.wait_for_timeout(400)
-                logger.info(f"[表单] 解析类型: {parse_type}")
+                selected = self.get_parse_type()
+                if selected == parse_type:
+                    logger.info(f"[表单] 解析类型: {parse_type}")
+                else:
+                    logger.error(f"[表单] 解析类型切换未生效: 期望{parse_type}, 实际{selected}")
             else:
                 logger.warning(f"[表单] 解析类型选项未找到: {parse_type}")
                 self.page.keyboard.press("Escape")

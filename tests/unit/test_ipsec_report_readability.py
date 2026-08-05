@@ -27,10 +27,10 @@ UNSAFE_COMMAND = re.compile(
 def _topology() -> IpsecTopology:
     return IpsecTopology(
         token="abc123",
-        router_policy="ipsec_t_r_abc123",
-        peer_policy="ipsec_t_p_abc123",
-        router_proposal="ike_t_r_abc123",
-        peer_proposal="ike_t_p_abc123",
+        router_policy="iprabc123",
+        peer_policy="ippabc123",
+        router_proposal="ikerabc123",
+        peer_proposal="ikepabc123",
         client_source="10.99.99.1",
         peer_service="198.18.1.2",
         client_iface="ens11",
@@ -139,13 +139,15 @@ def test_ipsec_report_uses_page_labels_and_plain_chinese_failure_summaries():
     assert 'f"策略高级配置包含“{field_label}”"' in source
 
     for plain_summary in (
-        "用户无法完成一套完整配置",
+        "后端只接受1-15字符",
         "页面与后台功能没有配套",
         "所有可见必填项都已填写",
         "虽然配置已经保存，但隧道不能直接使用",
         "连接结果错误地依赖发起方向",
         "双向数据仍然不通",
         "安全限制没有生效",
+        "两端页面均保存DPD 10/30秒",
+        "隧道已有双向加密流量，但列表页收发字节仍为0",
     ):
         assert plain_summary in source
 

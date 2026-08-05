@@ -143,9 +143,9 @@ class TestMacRateLimitComprehensive:
             print("  [2.2] 清理路由对象数据...")
             rec.add_detail(f"【2.2 清理路由对象数据】")
 
-            # 获取当前URL的基础部分
-            current_url = page.page.url
-            base_url_part = current_url.split('/#')[0] if '/#' in current_url else "http://10.66.0.150"
+            # 当前页面使用 /login#/... 路由，不能通过匹配 /# 推断设备地址。
+            # Page 对象的 base_url 来自 GUI 注入的 DEVICE_IP，是本次测试的权威地址。
+            base_url_part = page.base_url.rstrip('/')
             print(f"  基础URL: {base_url_part}")
 
             # 清理MAC分组 - 导航到路由对象页面，点击MAC分组tab
@@ -505,6 +505,7 @@ class TestMacRateLimitComprehensive:
                     expected_fields = {
                         "upload": str(rule["upload"]),
                         "download": str(rule["download"]),
+                        "type": "1" if rule["mode"] == "共享限速" else "0",
                     }
                     l1 = ssh_verify(
                         f"L1-数据库({rule_name})",
@@ -567,6 +568,8 @@ class TestMacRateLimitComprehensive:
                                     rule_id=rule_id,
                                     expected_speed_kbps=rule["upload"],
                                     set_prefix=set_prefix,
+                                    direction="upload",
+                                    rate_mode=rule["mode"],
                                 )
                             if rule["download"] > 0:
                                 ssh_verify(
@@ -577,6 +580,8 @@ class TestMacRateLimitComprehensive:
                                     rule_id=rule_id,
                                     expected_speed_kbps=rule["download"],
                                     set_prefix=set_prefix,
+                                    direction="download",
+                                    rate_mode=rule["mode"],
                                 )
 
                         verify_passed += 1
@@ -1402,104 +1407,161 @@ class TestMacRateLimitComprehensive:
         print("  - 清理MAC组和时间计划")
 
         # ========== 步骤22: iperf3实测限速功能验证 ==========
-        # 通过客户端10.66.0.18(从路由器DHCP获取内网IP)iperf3打流，实测MAC限速是否生效
-        # MAC限速按源MAC匹配，iperf3绑client内网IP发包即用client网卡MAC，规则命中
-        # 环境不通→软记录跳过，不阻断综合测试
-        with rec.step("步骤22: iperf3实测限速功能验证", "动态获取客户端内网IP/MAC→建MAC规则→iperf3打流→验证实测带宽达标"):
+        with rec.step("步骤22: iperf3实测限速功能验证", "先测未限速基线→动态选限速值→验证独立限速和共享限速"):
             print("\n[步骤22] iperf3实测限速功能验证...")
-            rec.add_detail("【iperf3实测限速】客户端10.66.0.18打流验证MAC限速实测生效")
+            rec.add_detail("【iperf3实测限速】双边容差校验；共享模式使用4条并发流验证聚合带宽")
+            rec.add_detail("  共享验证范围: 单客户端多流共享桶；不等同于多MAC成员公平性测试")
 
-            flow_rule_name = "mac_flow_iperf3"
-            flow_upload = 1024    # KB/s (约8Mbps)
-            flow_download = 2048  # KB/s (约16Mbps)
-            flow_rule_added = False
+            flow_rule_names = ("mac_flow_ind", "mac_flow_shared", "mac_flow_iperf3")
+            active_rule_name = None
             flow_route_added = False
 
             if backend_verifier is None:
-                rec.add_detail("  SSH未配置，跳过iperf3实测")
-                print("  [SKIP] SSH未配置，跳过iperf3实测")
+                message = "步骤22需要SSH客户端和iperf3环境，未配置时不能判定功能通过"
+                rec.add_detail(f"  ✗ {message}")
+                ssh_failures.append(message)
             else:
                 iperf3_server = get_config().ssh.iperf3_server
                 try:
-                    # 1. 动态获取客户端连路由器LAN的内网IP和MAC(即"10.66.0.18获取IP")
                     info = backend_verifier.get_client_lan_info()
-                    client_ip = info.get("ip") or "192.168.148.2"
+                    client_ip = info.get("ip")
+                    client_iface = info.get("iface")
                     client_mac = info.get("mac")
-                    rec.add_detail(f"  客户端内网IP: {client_ip} (iface={info.get('iface')})")
+                    if not client_ip or not client_iface or not client_mac:
+                        raise RuntimeError("未能动态获取客户端LAN接口、内网IP和MAC")
+                    rec.add_detail(f"  客户端内网IP: {client_ip} (iface={client_iface})")
                     rec.add_detail(f"  客户端网卡MAC: {client_mac}")
                     print(f"  客户端内网IP: {client_ip}, MAC: {client_mac}")
 
-                    if not client_mac:
-                        rec.add_detail("  ✗ 未获取到客户端MAC，跳过MAC限速实测")
-                        print("  [WARN] 未获取到客户端MAC，跳过实测")
-                    else:
-                        # 1.5 清理MAC_QOS残留(产品bug), 确保iperf3实测命中新建规则而非残留
-                        flushed = backend_verifier.flush_mac_qos_chain()
-                        if flushed > 0:
-                            rec.add_detail(f"  清理MAC_QOS残留 {flushed} 条规则(产品bug, 确保iperf3实测干净)")
-                            print(f"  [CLEAN] 清理MAC_QOS残留 {flushed} 条规则")
-                        # 2. 新建专用MAC限速规则(目标=客户端网卡MAC)
-                        page.navigate_to_mac_rate_limit()
-                        page.page.wait_for_timeout(500)
-                        if page.rule_exists(flow_rule_name):  # 清理同名残留
-                            page.delete_rule(flow_rule_name)
+                    page.navigate_to_mac_rate_limit()
+                    page.page.wait_for_timeout(500)
+                    for stale_name in flow_rule_names:
+                        if page.rule_exists(stale_name):
+                            page.delete_rule(stale_name)
                             page.page.wait_for_timeout(500)
-                        success = page.add_rule(
-                            name=flow_rule_name,
-                            mac=client_mac,
-                            protocol_stack="IPv4",
-                            line="任意",
-                            rate_mode="独立限速",
-                            upload_speed=flow_upload,
-                            download_speed=flow_download,
-                            remark="iperf3实测MAC限速",
-                        )
-                        if not success:
-                            rec.add_detail("  ✗ 建规则失败，跳过实测")
-                            print("  [WARN] 建规则失败，跳过iperf3实测")
-                        else:
-                            flow_rule_added = True
-                            rec.add_detail(f"  ✓ 建规则成功: {flow_rule_name} mac={client_mac} 上行{flow_upload}/下行{flow_download} KB/s")
-                            page.page.wait_for_timeout(1500)
 
-                            # 3. 加策略路由让客户端流量经路由器(命中MAC_QOS链)
-                            backend_verifier.add_route_via_router(iperf3_server)
-                            flow_route_added = True
-                            rec.add_detail(f"  策略路由已加: 客户端→路由器→{iperf3_server}")
+                    flushed = backend_verifier.flush_mac_qos_chain()
+                    if flushed > 0:
+                        rec.add_detail(f"  基线前清理MAC_QOS残留 {flushed} 条，避免旧规则污染实测")
 
-                            # 4. 探活(1秒; 不通则软跳过)
-                            probe = backend_verifier.run_iperf3(direction="upload", duration=1)
-                            if "error" in probe or not probe.get("end"):
-                                rec.add_detail(f"  iperf3环境不可达，软跳过实测(不阻断): {str(probe)[:80]}")
-                                print(f"  [SKIP] iperf3环境不可达，软跳过: {str(probe)[:80]}")
+                    if not backend_verifier.add_route_via_router(
+                        iperf3_server, dev=client_iface, src_ip=client_ip
+                    ):
+                        raise RuntimeError("客户端策略路由添加失败")
+                    flow_route_added = True
+                    rec.add_detail(f"  策略路由已加: {client_ip}→路由器→{iperf3_server}")
+
+                    profiles = {
+                        "independent": {"label": "独立限速", "streams": 1, "rule": "mac_flow_ind"},
+                        "shared": {"label": "共享限速", "streams": 4, "rule": "mac_flow_shared"},
+                    }
+                    baseline_failed = False
+                    for profile in profiles.values():
+                        profile["baseline"] = {}
+                        for direction in ("upload", "download"):
+                            measured = backend_verifier.measure_iperf3(
+                                direction,
+                                bind_ip=client_ip,
+                                duration=6,
+                                omit_seconds=1,
+                                parallel_streams=profile["streams"],
+                            )
+                            tag = "✓" if measured.passed else "✗"
+                            rec.add_detail(f"  {tag} {measured.level}: {measured.message}")
+                            if measured.passed:
+                                profile["baseline"][direction] = measured.details["actual_mbps"]
                             else:
-                                rec.add_detail("  iperf3探活通过，开始全链路实测(L1数据库→L2iptables→L3ipset→L4内核→L5实测)")
-                                # 5. 全链路实测(含L5 iperf3)
-                                result = backend_verifier.verify_mac_qos_full_chain(
-                                    tagname=flow_rule_name,
-                                    mac=client_mac,
-                                    upload_kbps=flow_upload,
-                                    download_kbps=flow_download,
-                                    bind_ip=client_ip,
-                                    run_iperf3=True,
+                                baseline_failed = True
+                                ssh_failures.append(f"步骤22-{measured.level}: {measured.message}")
+
+                    if not baseline_failed:
+                        for mode, profile in profiles.items():
+                            try:
+                                upload_kbps = backend_verifier.select_test_rate_limit(
+                                    profile["baseline"]["upload"]
                                 )
-                                for r in result.results:
-                                    tag = "✓" if r.passed else "✗"
-                                    rec.add_detail(f"  {tag} {r.level}: {r.message}")
-                                    print(f"  [{tag}] {r.level}: {r.message}")
-                                    # 硬断言: 任何链路失败(L1-L5)进ssh_failures. MAC限速6.12产品bug"完全不生效"→
-                                    # L5 iperf3不限速→FAIL(如实反映, 报禅道). 残留/下行不限速均如实FAIL.
-                                    if not r.passed:
-                                        ssh_failures.append(f"步骤22-{r.level}: {r.message}")
-                finally:
-                    # 6. 清理: 删规则 + 移除路由
-                    try:
-                        if flow_rule_added:
+                                download_kbps = backend_verifier.select_test_rate_limit(
+                                    profile["baseline"]["download"]
+                                )
+                            except ValueError as exc:
+                                ssh_failures.append(f"步骤22-{profile['label']}基线不足: {exc}")
+                                rec.add_detail(f"  ✗ {profile['label']}基线不足: {exc}")
+                                continue
+
+                            rule_name = profile["rule"]
+                            active_rule_name = rule_name
+                            rec.add_detail(
+                                f"  【{profile['label']}】{profile['streams']}流，动态限速 "
+                                f"上行{upload_kbps}/下行{download_kbps} KB/s"
+                            )
+                            success = page.add_rule(
+                                name=rule_name,
+                                mac=client_mac,
+                                protocol_stack="IPv4",
+                                line="任意",
+                                rate_mode=profile["label"],
+                                upload_speed=upload_kbps,
+                                download_speed=download_kbps,
+                                remark=f"iperf3{profile['label']}实测",
+                            )
+                            if not success:
+                                message = f"{profile['label']}规则{rule_name}创建失败"
+                                rec.add_detail(f"  ✗ {message}")
+                                ssh_failures.append(f"步骤22-{message}")
+                                active_rule_name = None
+                                continue
+
+                            page.page.wait_for_timeout(1500)
+                            result = backend_verifier.verify_mac_qos_full_chain(
+                                tagname=rule_name,
+                                mac=client_mac,
+                                upload_kbps=upload_kbps,
+                                download_kbps=download_kbps,
+                                bind_ip=client_ip,
+                                run_iperf3=True,
+                                rate_mode=mode,
+                                baseline_upload_mbps=profile["baseline"]["upload"],
+                                baseline_download_mbps=profile["baseline"]["download"],
+                                parallel_streams=profile["streams"],
+                                omit_seconds=2,
+                            )
+                            for r in result.results:
+                                tag = "✓" if r.passed else "✗"
+                                rec.add_detail(f"  {tag} {profile['label']}-{r.level}: {r.message}")
+                                print(f"  [{tag}] {profile['label']}-{r.level}: {r.message}")
+                                if not r.passed:
+                                    ssh_failures.append(
+                                        f"步骤22-{profile['label']}-{r.level}: {r.message}"
+                                    )
+
                             page.navigate_to_mac_rate_limit()
                             page.page.wait_for_timeout(500)
-                            if page.rule_exists(flow_rule_name):
-                                page.delete_rule(flow_rule_name)
-                                rec.add_detail(f"  清理: 已删除规则 {flow_rule_name}")
+                            if page.rule_exists(rule_name):
+                                page.delete_rule(rule_name)
+                                page.page.wait_for_timeout(1000)
+                                rec.add_detail(f"  清理: 已删除规则 {rule_name}")
+                            active_rule_name = None
+
+                            residual = backend_verifier.count_mac_qos_iptables_rules()
+                            if residual > 0:
+                                message = f"删除{profile['label']}规则后MAC_QOS仍残留{residual}条"
+                                rec.add_detail(f"  ✗ {message}；已隔离清理后继续下一场景")
+                                ssh_failures.append(f"步骤22-{message}")
+                                backend_verifier.flush_mac_qos_chain()
+                except Exception as e:
+                    message = f"步骤22执行异常: {str(e)[:160]}"
+                    rec.add_detail(f"  ✗ {message}")
+                    ssh_failures.append(message)
+                finally:
+                    try:
+                        page.navigate_to_mac_rate_limit()
+                        page.page.wait_for_timeout(500)
+                        cleanup_names = (active_rule_name,) if active_rule_name else flow_rule_names
+                        for rule_name in cleanup_names:
+                            if rule_name and page.rule_exists(rule_name):
+                                page.delete_rule(rule_name)
+                                rec.add_detail(f"  清理: 已删除规则 {rule_name}")
+                        backend_verifier.flush_mac_qos_chain()
                     except Exception as e:
                         rec.add_detail(f"  清理规则异常: {str(e)[:60]}")
                     try:

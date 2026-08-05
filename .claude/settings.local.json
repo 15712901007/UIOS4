@@ -28,10 +28,12 @@
       "Bash(git add *)",
       "Bash(git commit -m 'feat: 添加UPnP/NAT设置综合测试\\(28步全量覆盖+SSH L1-L4验证\\) *)",
       "mcp__ssh__ssh_shell_start",
-      "mcp__ssh__ssh_shell_read"
+      "mcp__ssh__ssh_shell_read",
+      "Bash(cd \"c:/Users/51355/Desktop/4.0前端UI自动化测试\" && rm -f *.png && echo \"根目录png删除完成, 剩余png:\" && ls *.png 2>/dev/null | wc -l)"
     ],
     "additionalDirectories": [
-      "c:\\Users\\51355\\.claude\\projects\\c--Users-51355-Desktop-4-0--UI-----\\memory"
+      "c:\\Users\\51355\\.claude\\projects\\c--Users-51355-Desktop-4-0--UI-----\\memory",
+      "C:\\Users\\51355\\Desktop\\4.0前端UI自动化测试"
     ]
   },
   "enabledMcpjsonServers": [

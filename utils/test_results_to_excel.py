@@ -81,6 +81,13 @@ _MODULE_NAMES = {
     "basic_setting": "设备设置-基础设置",
     "alg_setting": "设备设置-高级管理-ALG设置",
     "protocol_control": "设备设置-高级管理-协议控制",
+    "kernel_setting": "设备设置-高级管理-内核设置",
+    "cloud_service_binding": "设备设置-云服务绑定",
+    "ppp_package": "认证服务-套餐管理",
+    "pppuser": "认证服务-账号管理",
+    "ppp_passwd": "认证服务-自助密码管理",
+    "ppp_paylog": "认证服务-总账管理",
+    "coupon": "认证服务-上网码",
 }
 
 _STATUS_CN = {

@@ -66,6 +66,21 @@ def _dispatch_packaged_protocol_control_smoke() -> None:
 _dispatch_packaged_protocol_control_smoke()
 
 
+def _dispatch_packaged_kernel_setting_smoke() -> None:
+    """Run the frozen kernel-setting collect entry before GUI initialization."""
+    if not getattr(sys, "frozen", False):
+        return
+    if "--collect-kernel-setting-smoke" not in sys.argv:
+        return
+
+    from gui.test_runner import run_packaged_kernel_setting_collect_smoke
+
+    raise SystemExit(run_packaged_kernel_setting_collect_smoke())
+
+
+_dispatch_packaged_kernel_setting_smoke()
+
+
 def _dispatch_packaged_ospf_smoke() -> None:
     """Run the frozen OSPF collect entry before GUI initialization."""
     if not getattr(sys, "frozen", False):

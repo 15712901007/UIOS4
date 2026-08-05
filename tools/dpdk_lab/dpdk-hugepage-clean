@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( EUID != 0 )); then
+    echo "Run as root: sudo $0" >&2
+    exit 1
+fi
+
+if pgrep -x dperf >/dev/null || pgrep -x t-rex-64 >/dev/null || pgrep -x dpdk-testpmd >/dev/null; then
+    echo "Refusing to clean hugepages while a known DPDK application is running." >&2
+    exit 1
+fi
+
+if lsof +D /dev/hugepages 2>/dev/null | tail -n +2 | grep -q .; then
+    echo "Refusing to clean hugepages while files are open." >&2
+    exit 1
+fi
+
+count=$(find /dev/hugepages -maxdepth 1 -type f | wc -l)
+find /dev/hugepages -maxdepth 1 -type f -delete
+echo "Removed ${count} stale hugepage mapping files."
+grep -E 'HugePages_Total|HugePages_Free|HugePages_Rsvd' /proc/meminfo

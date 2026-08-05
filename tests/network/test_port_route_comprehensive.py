@@ -21,6 +21,8 @@ SSH后台验证: L1数据库+L2 iptables(STREAM_IPPORT_NEW链)+L3策略路由+L4
 """
 import pytest
 import os
+import json
+import re
 from pages.network.port_route_page import PortRoutePage
 from config.config import get_config
 from utils.verify_helper import make_ssh_verify, make_kernel_check
@@ -1268,17 +1270,76 @@ class TestPortRouteComprehensive:
 @pytest.mark.port_route
 @pytest.mark.network
 class TestPortRouteFlowVerification:
-    """端口分流功能验证(命中+选路, 硬断言): 两场景(指定IP/不指定)×多端口→mangle Δpkts>0+conntrack含目标WAN.
+    """端口分流真实功能验证。
 
-    分流=选路非阻断(流量仍通,从指定WAN出). 命中铁证=mangle STREAM_IPPORT_NEW counter Δpkts>0;
-    选路铁证=conntrack client流 remote_if含目标WAN. iptables L4可靠(不走DPI)→6.12下应正常硬PASS.
-    两场景: ①src_addr=client_ip(仅该IP生效) ②src_addr空(全IP生效). 多端口(80=http/443=https)逐个curl验."""
+    覆盖五种协议选项、六种负载模式、源/目的端口、源/目的地址、反向匹配、
+    生效时间、多线路、下一跳、优先级冲突及停用/启用/删除后的数据面变化。
+    命中铁证=mangle规则计数增量；选路铁证=连接mark属于规则mark集合。
+    """
 
-    PREFIX = "prflow_"
+    PREFIX = "ptf_"
     TARGET_WAN = "wan2"
-    # (端口, 协议标签, curl URL)
-    TEST_PORTS = [("80", "http", "http://www.baidu.com/"),
-                  ("443", "https", "https://www.baidu.com/")]
+    SECOND_WAN = "wan3"
+    CLIENT_IP = "192.168.148.2"
+    CLIENT_IFACE = "ens11"
+    PUBLIC_TEST_IP = "223.5.5.5"
+    PARALLEL_SRC_PORT_START = 41000
+
+    PROBES = {
+        "tcp80": (
+            "tcp", 80,
+            "curl -sS -o /dev/null -w 'code=%{http_code}' --interface ens11 "
+            "--connect-timeout 5 -m 10 http://www.baidu.com/",
+        ),
+        "tcp443": (
+            "tcp", 443,
+            "curl -k -sS -o /dev/null -w 'code=%{http_code}' --interface ens11 "
+            "--connect-timeout 5 -m 10 https://www.baidu.com/",
+        ),
+        "tcp53": (
+            "tcp", 53,
+            "dig +tcp @223.5.5.5 www.baidu.com A -b 192.168.148.2 "
+            "+time=3 +tries=1 +comments +answer",
+        ),
+        "udp53": (
+            "udp", 53,
+            "dig @223.5.5.5 www.baidu.com A -b 192.168.148.2 "
+            "+time=3 +tries=1 +comments +answer",
+        ),
+        "icmp": (
+            "icmp", None,
+            "ping -I ens11 -c 3 -W 2 223.5.5.5",
+        ),
+        "sport_in": (
+            "tcp", 53,
+            "nc -z -w 3 -s 192.168.148.2 -p 40080 223.5.5.5 53 "
+            "&& echo connected || echo failed",
+        ),
+        "sport_out": (
+            "tcp", 53,
+            "nc -z -w 3 -s 192.168.148.2 -p 40100 223.5.5.5 53 "
+            "&& echo connected || echo failed",
+        ),
+    }
+
+    @classmethod
+    def parallel_tcp53_command(cls, attempts=6):
+        """Build concurrent, uniquely identifiable TCP/53 connections.
+
+        ``mode=0`` balances by active connection count. Short sequential curls can
+        finish before the next probe starts and legitimately keep choosing the same
+        least-loaded WAN. Holding fixed-source-port connections concurrently makes
+        the load-mode assertion deterministic and keeps every flow attributable.
+        """
+        ports = range(cls.PARALLEL_SRC_PORT_START,
+                      cls.PARALLEL_SRC_PORT_START + attempts)
+        port_list = " ".join(str(port) for port in ports)
+        return (
+            f"for p in {port_list}; do "
+            f"(sleep 2 | nc -w 5 -s {cls.CLIENT_IP} -p \"$p\" "
+            f"{cls.PUBLIC_TEST_IP} 53 >/dev/null 2>&1; "
+            f"echo port=$p rc=$?) & done; wait"
+        )
 
     def test_port_route_flow(self, port_route_page_logged_in, step_recorder: StepRecorder, request):
         page = port_route_page_logged_in
@@ -1287,106 +1348,701 @@ class TestPortRouteFlowVerification:
             bv = request.getfixturevalue('backend_verifier')
         except Exception:
             pytest.skip("无SSH验证器, 跳过端口分流功能验证")
-        client_ip = "192.168.148.2"
+        if bv is None:
+            pytest.skip("无SSH验证器, 跳过端口分流功能验证")
+
+        client_ip = self.CLIENT_IP
         target_wan = self.TARGET_WAN
+        second_wan = self.SECOND_WAN
         failures = []
+        client_route_snapshots = {}
         print("\n" + "=" * 50)
-        print(f"端口分流功能验证(两场景×{len(self.TEST_PORTS)}端口)")
+        print("端口分流全协议/优先级/生命周期功能验证")
         print("=" * 50)
 
-        def _force_clean():
-            try:
-                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM stream_ipport WHERE tagname LIKE '{self.PREFIX}%'\"")
-                bv._router.exec("/usr/ikuai/script/stream_ipport.sh init 2>/dev/null")
-            except Exception:
-                pass
+        def _fail(message):
+            failures.append(message)
+            rec.add_detail(f"  [FAIL] {message}")
 
-        def _verify_port(rule_name, rid, dport, url):
-            """单端口命中+选路: 清conntrack→curl×3→mangle Δpkts(命中)+conntrack含目标WAN(选路)."""
-            cnt_before = bv.read_mangle_counter("STREAM_IPPORT_NEW", int(rid))
+        def _force_clean(strict=False):
+            """只清理本用例前缀，保留设备上的其他端口分流规则。"""
+            try:
+                result = bv.cleanup_stream_ipport_test(self.PREFIX)
+                deleted_ids = result.details.get("deleted_ids", []) if result.details else []
+                if deleted_ids:
+                    rec.add_detail(f"  清理测试规则ID: {deleted_ids} (固件正式删除入口)")
+                if not result.passed:
+                    _fail(result.message)
+                bv.clear_client_conntrack(client_ip)
+                return result.passed
+            except Exception as exc:
+                if strict:
+                    _fail(f"清理异常: {exc}")
+                return False
+
+        def _record_verification(result, rule_name):
+            status = "OK" if result.passed else "FAIL"
+            rec.add_detail(f"  {result.level}: [{status}] {result.message}")
+            if not result.passed:
+                _fail(f"{result.level}-{rule_name}: {result.message}")
+
+        def _add_rule(name, **kwargs):
+            """通过UI建规则，并强制验证精确名称、ID、DB字段及运行时规则。"""
+            if len(name) > 15:
+                _fail(f"测试规则名超过15字符: {name}")
+                return None
+            page.navigate_to_port_route()
+            page.page.wait_for_timeout(400)
+            created = page.add_rule(name=name, diversion_type=kwargs.get("diversion_type", "外网线路"),
+                                    line=kwargs.get("line", target_wan),
+                                    nexthop=kwargs.get("nexthop"),
+                                    priority=kwargs.get("priority", 31),
+                                    mode=kwargs.get("mode", "新建连接数"),
+                                    protocol=kwargs.get("protocol", "any"),
+                                    src_addr=kwargs.get("src_addr"),
+                                    src_addr_inv=kwargs.get("src_addr_inv"),
+                                    dst_addr=kwargs.get("dst_addr"),
+                                    dst_addr_inv=kwargs.get("dst_addr_inv"),
+                                    src_port=kwargs.get("src_port"),
+                                    dst_port=kwargs.get("dst_port"),
+                                    line_binding=kwargs.get("line_binding"),
+                                    time_mode=kwargs.get("time_mode"),
+                                    time_days=kwargs.get("time_days"),
+                                    time_start=kwargs.get("time_start"),
+                                    time_end=kwargs.get("time_end"))
+            if not created:
+                _fail(f"{name}: UI建规则失败")
+                return None
+            page.page.wait_for_timeout(1200)
+            rule = bv.find_stream_ipport_rule(tagname=name)
+            if not rule or not rule.get("id"):
+                existing = [r.get("tagname") for r in bv.query_stream_ipport_rules()]
+                _fail(f"{name}: 保存后无法按精确名称查到规则ID, 当前规则={existing}")
+                return None
+
+            diversion_type = kwargs.get("diversion_type", "外网线路")
+            mode_name = kwargs.get("mode", "新建连接数")
+            expected = {
+                "enabled": "yes",
+                "type": "1" if diversion_type == "下一跳网关" else "0",
+                "prio": str(kwargs.get("priority", 31)),
+                "mode": PortRoutePage.MODE_TO_DB[mode_name],
+                "protocol": kwargs.get("protocol", "any"),
+            }
+            if diversion_type == "下一跳网关":
+                expected["nexthop"] = kwargs.get("nexthop")
+            else:
+                expected["interface"] = kwargs.get("line", target_wan)
+            if kwargs.get("line_binding") is not None:
+                expected["iface_band"] = "1" if kwargs["line_binding"] else "0"
+            if kwargs.get("src_addr_inv") is not None:
+                expected["src_addr_inv"] = "1" if kwargs["src_addr_inv"] else "0"
+            if kwargs.get("dst_addr_inv") is not None:
+                expected["dst_addr_inv"] = "1" if kwargs["dst_addr_inv"] else "0"
+
+            rid = int(rule["id"])
+            _record_verification(
+                bv.verify_stream_ipport_database(name, expected_fields=expected), name
+            )
+            expected_ifname = None if diversion_type == "下一跳网关" else expected["interface"]
+            expected_mode = None if diversion_type == "下一跳网关" else int(expected["mode"])
+            _record_verification(
+                bv.verify_stream_ipport_iptables(
+                    rid, expected_ifname=expected_ifname, expected_mode=expected_mode
+                ),
+                name,
+            )
+            _record_verification(bv.verify_stream_ipport_policy_routing(), name)
+            _record_verification(bv.verify_stream_ipport_kernel(), name)
+
+            def _field_populated(value):
+                if isinstance(value, dict):
+                    return bool(value.get("custom") or value.get("object"))
+                return bool(value)
+
+            for field in ("src_addr", "dst_addr", "src_port", "dst_port"):
+                if kwargs.get(field) and not _field_populated(rule.get(field)):
+                    _fail(f"{name}: DB字段{field}为空, 期望包含{kwargs[field]}")
+            if kwargs.get("time_mode"):
+                time_value = rule.get("time")
+                if not _field_populated(time_value):
+                    _fail(f"{name}: 生效时间未写入DB")
+                elif kwargs.get("time_days"):
+                    day_map = {"一": "1", "二": "2", "三": "3", "四": "4",
+                               "五": "5", "六": "6", "日": "7"}
+                    expected_days = "".join(day_map[d] for d in kwargs["time_days"])
+                    if expected_days not in json.dumps(time_value, ensure_ascii=False):
+                        _fail(f"{name}: DB星期不匹配, 期望={expected_days}, 实际={time_value}")
+            rec.add_detail(
+                f"  [OK] 建规则 {name}: id={rid}, protocol={expected['protocol']}, "
+                f"mode={expected['mode']}, prio={expected['prio']}"
+            )
+            return rule
+
+        def _probe_ok(probe_name, output):
+            if probe_name in ("tcp53", "udp53"):
+                return "status: NOERROR" in (output or "")
+            if probe_name in ("tcp80", "tcp443"):
+                match = re.search(r"code=(\d{3})", output or "")
+                return bool(match and match.group(1) != "000")
+            if probe_name.startswith("sport"):
+                return "connected" in (output or "")
+            if probe_name == "icmp":
+                return bool(re.search(r"\b0% packet loss", output or ""))
+            return False
+
+        def _send_probe(probe_name):
+            proto, dport, command = self.PROBES[probe_name]
+            bv.connect_client()
+            output = bv._client.exec(command, timeout=20)
+            return {
+                "name": probe_name,
+                "proto": proto,
+                "dport": dport,
+                "output": output,
+                "ok": _probe_ok(probe_name, output),
+            }
+
+        def _flow_signature(probe_name):
+            proto, dport, _ = self.PROBES[probe_name]
+            public_names = {"tcp53", "udp53", "icmp", "sport_in", "sport_out"}
+            source_ports = {"sport_in": 40080, "sport_out": 40100}
+            return {
+                "proto": proto,
+                "dst_ip": self.PUBLIC_TEST_IP if probe_name in public_names else None,
+                "src_port": source_ports.get(probe_name),
+                "dst_port": dport,
+            }
+
+        def _flow_entries(probe_name):
+            return bv.conntrack_client_flow_entries(
+                client_ip, **_flow_signature(probe_name)
+            )
+
+        def _wait_for_flow(probe_name, timeout_ms=4000):
+            entries = []
+            elapsed = 0
+            while elapsed <= timeout_ms:
+                entries = _flow_entries(probe_name)
+                if entries:
+                    break
+                page.page.wait_for_timeout(200)
+                elapsed += 200
+            return entries
+
+        def _entry_marks(entries):
+            return {
+                int(match.group(1))
+                for entry in entries
+                for match in [re.search(r"\bmark=(\d+)", entry)]
+                if match
+            }
+
+        def _entry_wans(entries):
+            return sorted({
+                match.group(1)
+                for entry in entries
+                for match in [re.search(r"\bremote_if=(\S+)", entry)]
+                if match
+            })
+
+        def _exercise(rule, probe_name, expect_hit=True):
+            """单次真实打流，正向要求计数+mark，负向要求流通但本规则不命中。"""
+            if not rule:
+                return None
+            rid = int(rule["id"])
+            cnt_before = bv.read_mangle_counter("STREAM_IPPORT_NEW", rid)
+            bv.clear_client_conntrack(client_ip)
+            probe = _send_probe(probe_name)
+            rule_marks = set(bv.read_mangle_rule_marks("STREAM_IPPORT_NEW", rid))
+            cnt_after = cnt_before
+            entries = []
+            flow_marks = set()
+            selected_marks = []
+            elapsed = 0
+            while elapsed <= 4000:
+                cnt_after = bv.read_mangle_counter("STREAM_IPPORT_NEW", rid)
+                entries = _flow_entries(probe_name)
+                flow_marks = _entry_marks(entries)
+                selected_marks = sorted(rule_marks & flow_marks)
+                delta = cnt_after - cnt_before
+                condition_met = (
+                    bool(entries) and delta > 0 and bool(selected_marks)
+                    if expect_hit else
+                    bool(entries) and delta == 0 and not selected_marks
+                )
+                if condition_met:
+                    break
+                page.page.wait_for_timeout(200)
+                elapsed += 200
+            delta = cnt_after - cnt_before
+            wans = _entry_wans(entries)
+
+            if expect_hit:
+                passed = probe["ok"] and bool(entries) and delta > 0 and bool(selected_marks)
+                expectation = "应命中并选路"
+            else:
+                passed = probe["ok"] and bool(entries) and delta == 0 and not selected_marks
+                expectation = "应放行但不命中本规则"
+            status = "OK" if passed else "FAIL"
+            rec.add_detail(
+                f"  [{status}] {rule.get('tagname')}/{probe_name}: {expectation}; "
+                f"probe_ok={probe['ok']}, Δpkts={delta}, rule_marks={sorted(rule_marks)}, "
+                f"matched_marks={selected_marks}, remote_if={wans}"
+            )
+            if not passed:
+                chain = bv._router.exec(
+                    "iptables -t mangle -L STREAM_IPPORT_NEW -n -v -x "
+                    "--line-numbers 2>/dev/null"
+                )
+                rule_pattern = re.compile(rf"/\*\s*{rid}(?!\d)")
+                rule_lines = [line for line in chain.splitlines() if rule_pattern.search(line)]
+                set_names = []
+                for line in rule_lines:
+                    for set_name in re.findall(r"match-set\s+(\S+)", line):
+                        if set_name not in set_names:
+                            set_names.append(set_name)
+                set_dump = []
+                for set_name in set_names:
+                    content = bv._router.exec(f"ipset list {set_name} 2>/dev/null")
+                    set_dump.append(f"{set_name}: {content[:1200]}")
+                conntrack = "\n".join(entries) or bv.conntrack_client_entries(client_ip)
+                target = _flow_signature(probe_name)["dst_ip"] or "www.baidu.com"
+                route = bv._client.exec(
+                    f"ip route get {target} from {client_ip} 2>/dev/null"
+                )
+                rec.add_detail(
+                    f"  诊断-{rule.get('tagname')}/{probe_name}: "
+                    f"route={route.strip()}; rule_lines={rule_lines}; "
+                    f"conntrack={conntrack[:2400] or '无'}; ipset={set_dump or '无'}"
+                )
+                _fail(
+                    f"{rule.get('tagname')}/{probe_name}: {expectation}失败 "
+                    f"(probe_ok={probe['ok']}, Δpkts={delta}, "
+                    f"rule_marks={sorted(rule_marks)}, flow_marks={sorted(flow_marks)}, "
+                    f"flow_count={len(entries)})"
+                )
+            return {"passed": passed, "delta": delta, "selected_marks": selected_marks}
+
+        def _assert_mark_cardinality(rule, probe_name, attempts, expected_count, label):
+            """多连接后验证负载模式的mark分布/粘性。"""
+            if not rule:
+                return
+            rid = int(rule["id"])
+            before = bv.read_mangle_counter("STREAM_IPPORT_NEW", rid)
+            bv.clear_client_conntrack(client_ip)
+            probe_results = [_send_probe(probe_name) for _ in range(attempts)]
+            rule_marks = set(bv.read_mangle_rule_marks("STREAM_IPPORT_NEW", rid))
+            after = before
+            observed = set()
+            elapsed = 0
+            while elapsed <= 4000:
+                after = bv.read_mangle_counter("STREAM_IPPORT_NEW", rid)
+                observed = rule_marks & _entry_marks(_flow_entries(probe_name))
+                if after - before >= attempts and len(observed) == expected_count:
+                    break
+                page.page.wait_for_timeout(200)
+                elapsed += 200
+            passed = (all(item["ok"] for item in probe_results) and
+                      after - before >= attempts and len(observed) == expected_count)
+            status = "OK" if passed else "FAIL"
+            rec.add_detail(
+                f"  [{status}] {label}: connections={attempts}, Δpkts={after-before}, "
+                f"rule_marks={sorted(rule_marks)}, observed={sorted(observed)}, "
+                f"期望mark数={expected_count}"
+            )
+            if not passed:
+                _fail(f"{label}失败: Δpkts={after-before}, observed={sorted(observed)}")
+
+        def _assert_new_connection_distribution(rule, attempts=6):
+            """Verify mode=0 with overlapping fixed-target connections."""
+            if not rule:
+                return
+            rid = int(rule["id"])
+            source_ports = set(range(
+                self.PARALLEL_SRC_PORT_START,
+                self.PARALLEL_SRC_PORT_START + attempts,
+            ))
+            before = bv.read_mangle_counter("STREAM_IPPORT_NEW", rid)
             bv.clear_client_conntrack(client_ip)
             bv.connect_client()
-            curl_cmd = "curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 "
-            if url.startswith("https"):
-                curl_cmd += "-k "
-            curl_cmd += url
-            for _ in range(3):
-                bv._client.exec(curl_cmd, timeout=15)
-            cnt_after = bv.read_mangle_counter("STREAM_IPPORT_NEW", int(rid))
-            delta = cnt_after - cnt_before
-            # 选路铁证: client连接mark==规则--set-mark(NTH_CONNMARK的remote_if不可靠, 同协议分流:
-            # baidu:80连接mark=规则值=被匹配+打标+--set-ifname选路; 未匹配的DNS等mark=0走默认WAN,
-            # 混入conntrack remote_if→wans误读成默认WAN. 故用mark判定, remote_if仅辅助展示)
-            rule_mark = bv.read_mangle_rule_mark("STREAM_IPPORT_NEW", int(rid))
-            client_marks = bv.conntrack_client_marks(client_ip)
-            wans = bv.conntrack_client_wans(client_ip, proto="tcp")  # 辅助参考(时序不可靠)
-            hit = delta > 0
-            selected = rule_mark > 0 and rule_mark in client_marks
-            ok = hit and selected
-            rec.add_detail(f"    {'✓' if ok else '✗'} dport={dport}: Δpkts={delta} mark={rule_mark}(命中:{rule_mark in client_marks}) remote_if={wans}")
-            if not hit:
-                failures.append(f"{rule_name}/dport={dport} 未命中(Δpkts={delta})")
-            if not selected:
-                failures.append(f"{rule_name}/dport={dport} 未选路(规则mark={rule_mark}不在client连接mark{client_marks})")
+            output = bv._client.exec(
+                self.parallel_tcp53_command(attempts), timeout=20
+            ) or ""
+            successful_ports = {
+                int(match.group(1))
+                for match in re.finditer(r"port=(\d+)\s+rc=0\b", output)
+                if int(match.group(1)) in source_ports
+            }
+            rule_marks = set(bv.read_mangle_rule_marks("STREAM_IPPORT_NEW", rid))
+            after = before
+            entries = []
+            seen_ports = set()
+            observed = set()
+            elapsed = 0
+            while elapsed <= 4000:
+                after = bv.read_mangle_counter("STREAM_IPPORT_NEW", rid)
+                all_entries = bv.conntrack_client_flow_entries(
+                    client_ip, proto="tcp", dst_ip=self.PUBLIC_TEST_IP, dst_port=53
+                )
+                entries = []
+                seen_ports = set()
+                for entry in all_entries:
+                    match = re.search(r"\bsport=(\d+)\b", entry)
+                    if match and int(match.group(1)) in source_ports:
+                        entries.append(entry)
+                        seen_ports.add(int(match.group(1)))
+                observed = rule_marks & _entry_marks(entries)
+                if (after - before >= attempts and len(seen_ports) == attempts and
+                        len(successful_ports) == attempts and len(observed) == 2):
+                    break
+                page.page.wait_for_timeout(200)
+                elapsed += 200
+            passed = (
+                len(successful_ports) == attempts and
+                len(seen_ports) == attempts and
+                after - before >= attempts and
+                len(rule_marks) == 2 and
+                observed == rule_marks
+            )
+            status = "OK" if passed else "FAIL"
+            rec.add_detail(
+                f"  [{status}] 新建连接数模式双WAN并发分布: "
+                f"connect_ok={len(successful_ports)}/{attempts}, "
+                f"flow_ports={len(seen_ports)}/{attempts}, Δpkts={after-before}, "
+                f"rule_marks={sorted(rule_marks)}, observed={sorted(observed)}"
+            )
+            if not passed:
+                rec.add_detail(
+                    f"  并发分布诊断: command_output={output[:800] or '无'}; "
+                    f"conntrack={' | '.join(entries)[:2400] or '无'}"
+                )
+                _fail(
+                    "新建连接数模式双WAN并发分布失败: "
+                    f"connect_ok={len(successful_ports)}/{attempts}, "
+                    f"flow_ports={len(seen_ports)}/{attempts}, Δpkts={after-before}, "
+                    f"rule_marks={sorted(rule_marks)}, observed={sorted(observed)}"
+                )
 
-        def _run_scenario(scenario_label, rule_prefix, src_addr):
-            src_desc = src_addr or "空(全IP生效)"
-            with rec.step(scenario_label, f"{len(self.TEST_PORTS)}端口(80/443) line={target_wan} src_addr={src_desc}"):
-                for dport, proto_label, url in self.TEST_PORTS:
-                    rname = f"{rule_prefix}{dport}"
-                    page.navigate_to_port_route()
-                    page.page.wait_for_timeout(500)
-                    try:
-                        page.delete_rule(rname)
-                        page.page.wait_for_timeout(300)
-                    except Exception:
-                        pass
-                    _force_clean()
-                    ok = page.add_rule(rname, diversion_type="外网线路", line=target_wan,
-                                       protocol="tcp", dst_port=dport, src_addr=src_addr, priority=1)
-                    if not ok:
-                        failures.append(f"{scenario_label}/dport={dport} 建规则失败")
-                        rec.add_detail(f"  ✗ 建规则失败 dport={dport}")
-                        continue
-                    page.page.wait_for_timeout(1500)
-                    rule = bv.find_stream_ipport_rule(tagname=rname)
-                    rid = rule.get("id") if rule else None
-                    rec.add_detail(f"  ✓ 建规则 dport={dport}({proto_label}) id={rid} src_addr={src_desc}")
-                    if rid:
-                        # L1-L4 后端验证(报告体现: 数据库→iptables(STREAM_IPPORT_NEW)→策略路由→ik_core模块)
-                        for _r in (
-                            bv.verify_stream_ipport_database(rname, expected_fields={"enabled": "yes"}),
-                            bv.verify_stream_ipport_iptables(rid),
-                            bv.verify_stream_ipport_policy_routing(),
-                            bv.verify_stream_ipport_kernel(),
-                        ):
-                            rec.add_detail(f"  {_r.level}: {'[OK]' if _r.passed else '[FAIL]'} {_r.message}")
-                            if not _r.passed:
-                                failures.append(f"{_r.level}-{rname}: {_r.message}")
-                        _verify_port(rname, rid, dport, url)
-                    try:
-                        page.navigate_to_port_route()
-                        page.page.wait_for_timeout(300)
-                        page.delete_rule(rname)
-                    except Exception:
-                        pass
-                    _force_clean()
+        def _assert_preemption(winner, other, label):
+            """优先级链允许两行计数都增加，最终连接mark才决定实际选路。"""
+            if not winner or not other:
+                return
+            winner_id = int(winner["id"])
+            other_id = int(other["id"])
+            winner_before = bv.read_mangle_counter("STREAM_IPPORT_NEW", winner_id)
+            other_before = bv.read_mangle_counter("STREAM_IPPORT_NEW", other_id)
+            bv.clear_client_conntrack(client_ip)
+            probe = _send_probe("tcp80")
+            winner_marks = set(bv.read_mangle_rule_marks("STREAM_IPPORT_NEW", winner_id))
+            other_marks = set(bv.read_mangle_rule_marks("STREAM_IPPORT_NEW", other_id))
+            winner_delta = 0
+            other_delta = 0
+            flow_marks = set()
+            elapsed = 0
+            while elapsed <= 4000:
+                winner_delta = (
+                    bv.read_mangle_counter("STREAM_IPPORT_NEW", winner_id) - winner_before
+                )
+                other_delta = (
+                    bv.read_mangle_counter("STREAM_IPPORT_NEW", other_id) - other_before
+                )
+                flow_marks = _entry_marks(_flow_entries("tcp80"))
+                if winner_marks & flow_marks and not (other_marks & flow_marks):
+                    break
+                page.page.wait_for_timeout(200)
+                elapsed += 200
+            passed = (probe["ok"] and bool(winner_marks & flow_marks) and
+                      not (other_marks & flow_marks))
+            status = "OK" if passed else "FAIL"
+            rec.add_detail(
+                f"  [{status}] {label}: 胜出规则Δ={winner_delta}, 另一规则Δ={other_delta}, "
+                f"winner_marks={sorted(winner_marks)}, flow_marks={sorted(flow_marks)}"
+            )
+            if not passed:
+                _fail(f"{label}失败: winner_marks={sorted(winner_marks)}, "
+                      f"flow_marks={sorted(flow_marks)}")
+
+        def _wait_enabled(name, expected, timeout_ms=6000):
+            elapsed = 0
+            while elapsed <= timeout_ms:
+                rule = bv.find_stream_ipport_rule(tagname=name)
+                if rule and rule.get("enabled") == expected:
+                    return rule
+                page.page.wait_for_timeout(500)
+                elapsed += 500
+            return bv.find_stream_ipport_rule(tagname=name)
 
         try:
-            with rec.step("基线探活", "curl baidu --interface ens11 应通(确认环境经路由器)"):
+            with rec.step("前置检查: 测试链路与三协议基线",
+                          "router=10.66.0.45; client SSH=10.66.0.18; 数据面源=192.168.148.2/ens11"):
+                _force_clean(strict=True)
+                bv.connect_router()
                 bv.connect_client()
-                base = bv.verify_connectivity(dst_domain="www.baidu.com", retries=2)
-                rec.add_detail(f"  基线: {base['detail']}")
-                if not base["connected"]:
-                    pytest.skip(f"基线baidu经ens11不可达, 跳过端口分流功能验证: {base['detail']}")
-            _run_scenario("场景1: 指定内网IP(仅该IP生效)", f"{self.PREFIX}srcip_", client_ip)
-            _run_scenario("场景2: 不指定内网IP(全IP生效)", f"{self.PREFIX}allip_", None)
+                rec.add_detail(
+                    f"  测试角色: 路由器={bv._ssh_config.router.host}, "
+                    f"客户端SSH={bv._ssh_config.client.host}, 数据面={client_ip}/{self.CLIENT_IFACE}"
+                )
+                iface = bv._client.exec(f"ip -br -4 addr show dev {self.CLIENT_IFACE}")
+                if client_ip not in iface or "UP" not in iface:
+                    pytest.skip(f"客户端数据面接口不满足: {iface}")
+                for target, label in ((self.PUBLIC_TEST_IP, "公网协议探针"),):
+                    snapshot = bv._client.exec(
+                        f"ip route show exact {target}/32"
+                    ).strip()
+                    used_metrics = {
+                        int(value) for value in re.findall(r"\bmetric\s+(\d+)", snapshot)
+                    }
+                    metric = next(value for value in range(5, 100) if value not in used_metrics)
+                    client_route_snapshots[target] = {
+                        "snapshot": snapshot,
+                        "metric": metric,
+                    }
+                    bv._client.exec(
+                        f"sudo -n ip route replace {target}/32 via 192.168.148.1 "
+                        f"dev {self.CLIENT_IFACE} src {client_ip} metric {metric}"
+                    )
+                    active_route = bv._client.exec(f"ip route show exact {target}/32")
+                    if ("via 192.168.148.1" not in active_route or
+                            self.CLIENT_IFACE not in active_route or
+                            f"metric {metric}" not in active_route):
+                        pytest.skip(f"无法建立{label}数据面路由: {active_route}")
+                    rec.add_detail(
+                        f"  {label}临时路由: {active_route.strip()}; "
+                        f"原始={snapshot or '无'}"
+                    )
+                baseline = []
+                for name in ("tcp80", "tcp443", "tcp53", "udp53", "icmp", "sport_in"):
+                    bv.clear_client_conntrack(client_ip)
+                    item = _send_probe(name)
+                    entries = _wait_for_flow(name)
+                    if not item["ok"]:
+                        rec.add_detail(f"  基线 {name}: 首次失败, 重试1次")
+                        bv.clear_client_conntrack(client_ip)
+                        item = _send_probe(name)
+                        entries = _wait_for_flow(name)
+                    item["flow_count"] = len(entries)
+                    item["selectable"] = any(
+                        "can_sel_route=true" in entry for entry in entries
+                    )
+                    baseline.append(item)
+                for item in baseline:
+                    passed = item["ok"] and item["flow_count"] > 0 and item["selectable"]
+                    rec.add_detail(
+                        f"  基线 {item['name']}: {'[OK]' if passed else '[BLOCKED]'}; "
+                        f"probe_ok={item['ok']}, flow_count={item['flow_count']}, "
+                        f"can_sel_route={item['selectable']}"
+                    )
+                if not all(
+                        item["ok"] and item["flow_count"] > 0 and item["selectable"]
+                        for item in baseline):
+                    pytest.skip(
+                        "公网TCP/UDP/ICMP基线不可达或can_sel_route=false, "
+                        "环境不满足端口分流判定"
+                    )
+                _record_verification(bv.verify_stream_ipport_policy_routing(), "baseline")
+
+            with rec.step("场景1: TCP+源IP+目的端口范围+源IP粘性",
+                          "tcp 80/443应命中; tcp 53不命中; mode=源IP; wan2+wan3同源连接固定一条线路"):
+                _force_clean()
+                tcp_rule = _add_rule(
+                    "ptf_tcprange", line=f"{target_wan},{second_wan}", priority=31,
+                    mode="源IP", protocol="tcp", src_addr=client_ip, dst_port="80-443",
+                )
+                _exercise(tcp_rule, "tcp80", expect_hit=True)
+                _exercise(tcp_rule, "tcp443", expect_hit=True)
+                _exercise(tcp_rule, "tcp53", expect_hit=False)
+                _assert_mark_cardinality(tcp_rule, "tcp80", attempts=4, expected_count=1,
+                                         label="源IP模式同源粘性")
+
+            with rec.step("场景2: 指定源IP不匹配",
+                          "规则源IP=192.168.148.99; 192.168.148.2访问应放行但不命中"):
+                _force_clean()
+                miss_rule = _add_rule(
+                    "ptf_srcmiss", line=target_wan, priority=31, mode="新建连接数",
+                    protocol="tcp", src_addr="192.168.148.99", dst_port="80",
+                )
+                _exercise(miss_rule, "tcp80", expect_hit=False)
+
+            with rec.step("场景3: TCP源端口范围",
+                          "源端口40080应命中40080-40089; 40100不命中; mode=源IP+源端口"):
+                _force_clean()
+                sport_rule = _add_rule(
+                    "ptf_sport", line=target_wan, priority=31, mode="源IP+源端口",
+                    protocol="tcp", src_port="40080-40089", dst_port="53",
+                )
+                _exercise(sport_rule, "sport_in", expect_hit=True)
+                _exercise(sport_rule, "sport_out", expect_hit=False)
+
+            with rec.step("场景4: UDP+目的IP+目的端口",
+                          "UDP DNS应命中; 同目标TCP DNS不命中; mode=源IP+目的IP"):
+                _force_clean()
+                udp_rule = _add_rule(
+                    "ptf_udp", line=target_wan, priority=31, mode="源IP+目的IP",
+                    protocol="udp", dst_addr=self.PUBLIC_TEST_IP, dst_port="53",
+                )
+                _exercise(udp_rule, "udp53", expect_hit=True)
+                _exercise(udp_rule, "tcp53", expect_hit=False)
+
+            with rec.step("场景5: 源地址反向匹配+ICMP协议+主备模式",
+                          "TCP验证源地址取反; 独立ICMP规则验证协议命中和主备选路"):
+                _force_clean()
+                src_inv_rule = _add_rule(
+                    "ptf_srcinv", line=target_wan, priority=31,
+                    mode="新建连接数", protocol="tcp", src_addr="192.168.148.99",
+                    src_addr_inv=True, dst_port="80",
+                )
+                _exercise(src_inv_rule, "tcp80", expect_hit=True)
+                _force_clean()
+                icmp_rule = _add_rule(
+                    "ptf_icmp", line=f"{target_wan},{second_wan}", priority=31,
+                    mode="主备模式", protocol="icmp", line_binding=True,
+                )
+                _exercise(icmp_rule, "icmp", expect_hit=True)
+                _exercise(icmp_rule, "tcp80", expect_hit=False)
+
+            with rec.step("场景6: any全协议+目的地址反向+生效时间+多线路轮询",
+                          "TCP/UDP/ICMP均命中; 排除保留地址; 全天生效; 6条并发TCP/53连接分布到2条WAN"):
+                _force_clean()
+                any_rule = _add_rule(
+                    "ptf_any", line=f"{target_wan},{second_wan}", priority=31,
+                    mode="新建连接数", protocol="any", dst_addr="198.51.100.1",
+                    dst_addr_inv=True, time_mode="按周循环",
+                    time_days=["一", "二", "三", "四", "五", "六", "日"],
+                    time_start="00:00", time_end="23:59",
+                )
+                for probe_name in ("tcp80", "udp53", "icmp"):
+                    _exercise(any_rule, probe_name, expect_hit=True)
+                _assert_new_connection_distribution(any_rule, attempts=6)
+
+            with rec.step("场景7: tcp+udp组合协议及协议排他",
+                          "公网DNS TCP和UDP 53均命中; ICMP不命中; mode=五元组"):
+                _force_clean()
+                both_rule = _add_rule(
+                    "ptf_both", line=target_wan, priority=31,
+                    mode="源IP+目的IP+目的端口", protocol="tcp+udp", dst_port="53",
+                )
+                _exercise(both_rule, "tcp53", expect_hit=True)
+                _exercise(both_rule, "udp53", expect_hit=True)
+                _exercise(both_rule, "icmp", expect_hit=False)
+
+            with rec.step("场景8: 下一跳网关分流",
+                          "type=1, nexthop=10.66.0.1; TCP 80命中并生成独立策略表"):
+                _force_clean()
+                gateway_rule = _add_rule(
+                    "ptf_nexthop", diversion_type="下一跳网关", nexthop="10.66.0.1",
+                    priority=31, mode="新建连接数", protocol="tcp",
+                    src_addr=client_ip, dst_port="80",
+                )
+                if gateway_rule:
+                    table_id = 15000 + int(gateway_rule["id"])
+                    ip_rules = bv._router.exec("ip rule show")
+                    routes = bv._router.exec(f"ip route show table {table_id}")
+                    runtime_ok = f"lookup {table_id}" in ip_rules and "default via 10.66.0.1" in routes
+                    rec.add_detail(
+                        f"  [{'OK' if runtime_ok else 'FAIL'}] 下一跳策略: table={table_id}, "
+                        f"rule={f'lookup {table_id}' in ip_rules}, default={routes.strip()}"
+                    )
+                    if not runtime_ok:
+                        _fail(f"下一跳策略表{table_id}未正确生成")
+                _exercise(gateway_rule, "tcp80", expect_hit=True)
+
+            with rec.step("场景9: 优先级冲突+停用/启用/删除回退",
+                          "同条件prio=63/1冲突; 数值1最终选路; 停用1后63接管; 启用1后恢复; 删除1后63再次接管"):
+                _force_clean()
+                p01_rule = _add_rule(
+                    "ptf_p01", line=second_wan, priority=1, mode="新建连接数",
+                    protocol="tcp", src_addr=client_ip, dst_port="80",
+                )
+                p63_rule = _add_rule(
+                    "ptf_p63", line=target_wan, priority=63, mode="新建连接数",
+                    protocol="tcp", src_addr=client_ip, dst_port="80", line_binding=True,
+                )
+                if p63_rule and p01_rule:
+                    high_pos = bv.read_mangle_rule_line_numbers(
+                        "STREAM_IPPORT_NEW", int(p63_rule["id"])
+                    )
+                    low_pos = bv.read_mangle_rule_line_numbers(
+                        "STREAM_IPPORT_NEW", int(p01_rule["id"])
+                    )
+                    ordered = bool(high_pos and low_pos and min(high_pos) < min(low_pos))
+                    rec.add_detail(
+                        f"  [{'OK' if ordered else 'FAIL'}] 链顺序: prio63行={high_pos}, "
+                        f"prio1行={low_pos}"
+                    )
+                    if not ordered:
+                        _fail(f"优先级链顺序错误: prio63={high_pos}, prio1={low_pos}")
+                _assert_preemption(p01_rule, p63_rule, "prio1最终mark优先于prio63")
+
+                page.navigate_to_port_route()
+                if not page.disable_rule("ptf_p01"):
+                    _fail("prio1规则停用操作未发起")
+                disabled = _wait_enabled("ptf_p01", "no")
+                if not disabled or disabled.get("enabled") != "no":
+                    _fail("prio1规则停用后DB未变为enabled=no")
+                if p01_rule:
+                    _record_verification(
+                        bv.verify_stream_ipport_iptables(int(p01_rule["id"]), should_exist=False),
+                        "ptf_p01-disabled",
+                    )
+                _exercise(p63_rule, "tcp80", expect_hit=True)
+
+                page.navigate_to_port_route()
+                if not page.enable_rule("ptf_p01"):
+                    _fail("prio1规则启用操作未发起")
+                enabled = _wait_enabled("ptf_p01", "yes")
+                if not enabled or enabled.get("enabled") != "yes":
+                    _fail("prio1规则启用后DB未恢复enabled=yes")
+                _assert_preemption(p01_rule, p63_rule, "重新启用后prio1恢复最终选路")
+
+                page.navigate_to_port_route()
+                if not page.delete_rule("ptf_p01"):
+                    _fail("prio1规则删除操作失败")
+                page.page.wait_for_timeout(800)
+                if bv.find_stream_ipport_rule(tagname="ptf_p01") is not None:
+                    _fail("prio1规则删除后DB仍残留")
+                if p01_rule:
+                    _record_verification(
+                        bv.verify_stream_ipport_iptables(int(p01_rule["id"]), should_exist=False),
+                        "ptf_p01-deleted",
+                    )
+                _exercise(p63_rule, "tcp80", expect_hit=True)
+
+            with rec.step("场景10: 清理与残留检查",
+                          "测试前缀DB规则、iptables行、conntrack均清理"):
+                _force_clean(strict=True)
+                chain = bv._router.exec(
+                    "iptables -t mangle -L STREAM_IPPORT_NEW -n -v -x --line-numbers 2>/dev/null"
+                )
+                chain_clean = self.PREFIX not in chain
+                rec.add_detail(f"  [{'OK' if chain_clean else 'FAIL'}] iptables测试前缀残留={not chain_clean}")
+                if not chain_clean:
+                    _fail("清理后STREAM_IPPORT_NEW仍有测试前缀规则")
         finally:
             try:
                 page.navigate_to_port_route()
                 page.page.wait_for_timeout(500)
             except Exception:
                 pass
-            _force_clean()
-        print(f"\n[端口分流功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+            _force_clean(strict=True)
+            try:
+                for target, route_state in client_route_snapshots.items():
+                    snapshot = route_state["snapshot"]
+                    metric = route_state["metric"]
+                    bv._client.exec(
+                        f"sudo -n ip route del {target}/32 via 192.168.148.1 "
+                        f"dev {self.CLIENT_IFACE} src {client_ip} metric {metric} "
+                        "2>/dev/null"
+                    )
+                    restored = bv._client.exec(
+                        f"ip route show exact {target}/32"
+                    ).strip()
+                    if restored != snapshot:
+                        _fail(
+                            f"客户端{target}路由恢复不一致: 原始={snapshot or '无'}, "
+                            f"恢复后={restored or '无'}"
+                        )
+            except Exception as exc:
+                _fail(f"客户端临时路由恢复异常: {exc}")
+        print(f"\n[端口分流全功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
         assert not failures, f"端口分流功能验证失败({len(failures)}项): {'; '.join(failures)}"

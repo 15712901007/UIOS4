@@ -20,7 +20,7 @@ from utils.verify_helper import attach_cmd_recording_to_closure
 pytestmark = [pytest.mark.advanced_service, pytest.mark.snmp_server]
 
 LAN_HOST, LAN_IFACE = "192.168.148.1", "ens11"
-WAN_HOST, WAN_IFACE = "10.66.0.150", "enp2s0"
+WAN_IFACE = "enp2s0"
 SYSTEM_NAME_OID = "1.3.6.1.2.1.1.5.0"
 SYSTEM_TREE_OID = "1.3.6.1.2.1.1"
 INVALID_OID = "1.3.6.1.2.1.99999.1.0"
@@ -623,13 +623,18 @@ class TestSnmpServerComprehensive:
                 "步骤5 操作：从10.66.0.18执行真实V2C snmpget/snmpwalk；验证：正确OID与配置值",
                 "操作：客户端经ens11访问192.168.148.1动态端口；验证：正确版本、OID和sysName值，并遍历system树",
             ):
+                wan_target = require_ssh(
+                    "L0-WAN探测拓扑", backend.verify_local_service_wan_target,
+                    WAN_IFACE, fatal=True,
+                )
+                wan_host = wan_target.details["host"]
                 require_ssh(
                     "L5-LAN路由路径", backend.verify_snmp_client_route,
                     LAN_HOST, LAN_IFACE,
                 )
                 require_ssh(
                     "L5-WAN路由路径", backend.verify_snmp_client_route,
-                    WAN_HOST, WAN_IFACE,
+                    wan_host, WAN_IFACE,
                 )
                 require_ssh(
                     "L5-V2C get", backend.run_snmp_probe,
@@ -662,7 +667,7 @@ class TestSnmpServerComprehensive:
                 )
                 require_ssh(
                     "L5-WAN来源无权限", backend.run_snmp_probe,
-                    "v2c", f"{WAN_HOST}:{candidate_ports[0]}", SYSTEM_NAME_OID,
+                    "v2c", f"{wan_host}:{candidate_ports[0]}", SYSTEM_NAME_OID,
                     operation="get", community=v2_community, expect_success=False,
                     expected_failure="source",
                 )
@@ -881,17 +886,17 @@ class TestSnmpServerComprehensive:
                     priv_pass=v3_priv,
                 )
                 require_ssh(
-                    "L5-10.66.0.18到10.66.0.150正向get",
+                    "L5-WAN正向get",
                     backend.run_snmp_probe,
-                    "v3", f"{WAN_HOST}:{candidate_ports[2]}", SYSTEM_NAME_OID,
+                    "v3", f"{wan_host}:{candidate_ports[2]}", SYSTEM_NAME_OID,
                     username=v3_user, security="authPriv", auth_proto="SHA",
                     auth_pass=v3_auth, priv_proto="AES", priv_pass=v3_priv,
                     expected_value=sysname_v3,
                 )
                 require_ssh(
-                    "L5-10.66.0.18到10.66.0.150正向walk",
+                    "L5-WAN正向walk",
                     backend.run_snmp_probe,
-                    "v3", f"{WAN_HOST}:{candidate_ports[2]}", SYSTEM_TREE_OID,
+                    "v3", f"{wan_host}:{candidate_ports[2]}", SYSTEM_TREE_OID,
                     operation="walk", username=v3_user, security="authPriv",
                     auth_proto="SHA", auth_pass=v3_auth, priv_proto="AES",
                     priv_pass=v3_priv,

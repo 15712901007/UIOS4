@@ -21,6 +21,8 @@ SSH后台验证: L1数据库+L2 ipset(sdomain_src_{id})+L3 /proc/ikuai/stats/ik_
 """
 import pytest
 import os
+import json
+import re
 from pages.network.domain_route_page import DomainRoutePage
 from config.config import get_config
 from utils.verify_helper import make_ssh_verify, attach_cmd_recording_to_closure
@@ -1234,148 +1236,721 @@ class TestDomainRouteComprehensive:
 @pytest.mark.domain_route
 @pytest.mark.network
 class TestDomainRouteFlowVerification:
-    """域名分流功能验证(选路, 硬断言): 两场景(指定内网IP/不指定IP)×多域名→conntrack含目标WAN=生效PASS.
+    """域名分流真实功能验证。
 
-    域名走ik_core url_route(DNS解析后选路); 需DNS+url_route生效. 选路未生效→FAIL(6.12 url_route匹配不打mark报禅道).
-    两场景: ①src_addr=client_ip(仅该IP生效) ②src_addr空(全IP生效). 多域名(baidu/qq/taobao/jd)逐个curl验选路(conntrack remote_if铁证)."""
+    命中证据为域名cflow增量，选路证据为目标HTTP连接的extended conntrack
+    ``remote_if``。覆盖指定/不指定源IP、非目标域名、源IP不匹配、生效时间，
+    以及停用、启用、删除后的数据面变化。
+    """
 
     PREFIX = "dmflow_"
     TARGET_WAN = "wan2"
+    SECOND_WAN = "wan3"
+    CLIENT_IP = "192.168.148.2"
+    CLIENT_IFACE = "ens11"
     TEST_DOMAINS = ["www.baidu.com", "www.qq.com", "www.taobao.com", "www.jd.com"]
+    NON_MATCH_DOMAIN = "www.163.com"
+    OBJECT_PREFIX = "DMFLOW"
+    DOMAIN_GROUP_NAME = "DMFLOWDOM"
+    IP_GROUP_NAME = "DMFLOWIP"
+    TIME_PLAN_NAME = "DMFLOWTIME"
 
-    def test_domain_route_flow(self, domain_route_page_logged_in, step_recorder, request):
+    @classmethod
+    def curl_probe_command(cls, domain):
+        """构造可从输出反查精确conntrack目标IP的单连接探针。"""
+        if not re.fullmatch(r"[A-Za-z0-9.-]+", domain):
+            raise ValueError(f"非法探测域名: {domain}")
+        return (
+            "curl -4 -sS -o /dev/null "
+            "-w 'remote_ip=%{remote_ip} code=%{http_code}' "
+            f"--interface {cls.CLIENT_IFACE} --connect-timeout 5 -m 10 "
+            f"http://{domain}/"
+        )
+
+    @classmethod
+    def parallel_curl_probe_command(cls, domains):
+        """构造并发HTTP探针，供多线路分布验证。"""
+        commands = []
+        for index, domain in enumerate(domains):
+            if not re.fullmatch(r"[A-Za-z0-9.-]+", domain):
+                raise ValueError(f"非法探测域名: {domain}")
+            commands.append(
+                "(curl -4 -sS -o /dev/null "
+                f"-w 'probe={index} domain={domain} "
+                "remote_ip=%{remote_ip} code=%{http_code}\\n' "
+                f"--interface {cls.CLIENT_IFACE} --connect-timeout 5 -m 10 "
+                f"http://{domain}/) &"
+            )
+        return " ".join(commands) + " wait"
+
+    def test_domain_route_flow(self, domain_route_page_logged_in,
+                               step_recorder: StepRecorder, request):
         page = domain_route_page_logged_in
         rec = step_recorder
         try:
             bv = request.getfixturevalue('backend_verifier')
         except Exception:
             pytest.skip("无SSH验证器, 跳过域名分流功能验证")
-        client_ip = "192.168.148.2"
+        if bv is None:
+            pytest.skip("无SSH验证器, 跳过域名分流功能验证")
+
+        client_ip = self.CLIENT_IP
         target_wan = self.TARGET_WAN
+        second_wan = self.SECOND_WAN
         failures = []
+        from pages.network.route_object_page import (
+            DomainGroupPage, IpGroupPage, TimePlanPage,
+        )
+        domain_group_page = DomainGroupPage(page.page, page.base_url)
+        ip_group_page = IpGroupPage(page.page, page.base_url)
+        time_plan_page = TimePlanPage(page.page, page.base_url)
+        route_objects = {}
         print("\n" + "=" * 50)
-        print(f"域名分流功能验证(选路, 两场景×{len(self.TEST_DOMAINS)}域名)")
+        print("域名分流命中/选路/生命周期功能验证")
         print("=" * 50)
 
-        def _force_clean():
+        def _fail(message):
+            failures.append(message)
+            rec.add_detail(f"  [FAIL] {message}")
+
+        def _force_clean(strict=False):
+            """只清理本用例前缀，保留设备上的其他域名分流规则。"""
             try:
-                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM stream_domain WHERE tagname LIKE '{self.PREFIX}%'\"")
-                bv._router.exec("/usr/ikuai/script/stream_domain.sh init 2>/dev/null")
-            except Exception:
-                pass
+                result = bv.cleanup_stream_domain_test(self.PREFIX)
+                deleted_ids = result.details.get("deleted_ids", []) if result.details else []
+                if deleted_ids:
+                    rec.add_detail(f"  清理测试规则ID: {deleted_ids} (固件正式删除入口)")
+                if not result.passed:
+                    _fail(result.message)
+                bv.clear_client_conntrack(client_ip)
+                return result.passed
+            except Exception as exc:
+                if strict:
+                    _fail(f"域名分流清理异常: {exc}")
+                return False
 
-        def _verify_domain(domain):
-            """单域名选路验证: 清conntrack→flush DNS缓存→curl×3→conntrack含target_wan=生效.
+        def _force_object_clean(strict=False):
+            """清理功能测试创建的DMFLOW路由对象，保留其他分组。"""
+            try:
+                result = bv.cleanup_route_object_test(
+                    self.OBJECT_PREFIX, type_keys=("ip", "time", "domain")
+                )
+                deleted_ids = result.details.get("deleted_ids", []) if result.details else []
+                if deleted_ids:
+                    rec.add_detail(f"  清理临时路由对象ID: {deleted_ids} (固件正式删除入口)")
+                if not result.passed:
+                    _fail(result.message)
+                return result.passed
+            except Exception as exc:
+                if strict:
+                    _fail(f"路由对象清理异常: {exc}")
+                return False
 
-            flush client DNS缓存强制重新解析→路由器ikdnsx处理DNS→url_route重新学习"域名→IP"映射→
-            选路。不flush则systemd-resolved缓存命中→不查询路由器→reset后映射空→选路失败
-            (baidu等CNAME域名尤甚: IP缓存复用, 不触发重新解析)。"""
+        def _record_verification(result, rule_name):
+            status = "OK" if result.passed else "FAIL"
+            rec.add_detail(f"  {result.level}: [{status}] {result.message}")
+            if not result.passed:
+                _fail(f"{result.level}-{rule_name}: {result.message}")
+
+        def _field_contains(rule, field, expected):
+            raw = rule.get(field)
+            serialized = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+            return str(expected) in serialized
+
+        def _wait_object_ref(group_id, expected, timeout_ms=6000):
+            elapsed = 0
+            while elapsed <= timeout_ms:
+                actual = bv.get_object_ref_count(group_id)
+                if actual == expected:
+                    return actual
+                page.page.wait_for_timeout(500)
+                elapsed += 500
+            return bv.get_object_ref_count(group_id)
+
+        def _verify_object(name, type_key, expected_value, check_ipset=False):
+            result = bv.verify_object_group_database(
+                name, type_key, expected_value=expected_value
+            )
+            _record_verification(result, name)
+            _record_verification(
+                bv.verify_object_group_cache(name, type_key), name
+            )
+            if check_ipset:
+                _record_verification(
+                    bv.verify_object_group_ipset(name, type_key), name
+                )
+            return bv.find_object_group(name, type_key)
+
+        def _assert_object_ref(name, type_key, expected, label):
+            group = bv.find_object_group(name, type_key)
+            group_id = group.get("group_id") if group else ""
+            actual = _wait_object_ref(group_id, expected) if group_id else -1
+            passed = actual == expected
+            rec.add_detail(
+                f"  [{'OK' if passed else 'FAIL'}] {label}: "
+                f"{name}({group_id or '无group_id'}) ref_count={actual}, 期望={expected}"
+            )
+            if not passed:
+                _fail(f"{label}: {name}引用计数期望{expected}实际{actual}")
+            return passed
+
+        def _add_rule(name, domains=None, line=target_wan, src_addr=None,
+                      domain_group=None, src_group=None,
+                      time_mode=None, time_days=None,
+                      time_start=None, time_end=None, time_plan=None):
+            if len(name) > 15:
+                _fail(f"测试规则名超过15字符: {name}")
+                return None
+            page.navigate_to_domain_route()
+            page.page.wait_for_timeout(400)
+            created = page.add_rule(
+                name, line=line, domains=domains, src_addr=src_addr,
+                domain_group=domain_group, src_group=src_group,
+                time_mode=time_mode, time_days=time_days,
+                time_start=time_start, time_end=time_end, time_plan=time_plan,
+            )
+            if not created:
+                _fail(f"{name}: UI建规则失败")
+                return None
+            page.page.wait_for_timeout(1200)
+            rule = bv.find_stream_domain_rule(tagname=name)
+            if not rule or not rule.get("id"):
+                existing = [r.get("tagname") for r in bv.query_stream_domain_rules()]
+                _fail(f"{name}: 保存后无法按精确名称查到规则ID, 当前规则={existing}")
+                return None
+
+            _record_verification(
+                bv.verify_stream_domain_database(
+                    name, expected_fields={"enabled": "yes", "interface": line}
+                ),
+                name,
+            )
+            rule_id = int(rule["id"])
+            for result in (
+                bv.verify_stream_domain_ipset(rule_id),
+                bv.verify_stream_domain_kernel_status(),
+                bv.verify_stream_domain_kernel(),
+            ):
+                _record_verification(result, name)
+
+            for domain in domains or []:
+                if not _field_contains(rule, "domain", domain):
+                    _fail(f"{name}: DB域名字段缺少{domain}, 实际={rule.get('domain')}")
+            if src_addr and not _field_contains(rule, "src_addr", src_addr):
+                _fail(f"{name}: DB源地址字段缺少{src_addr}, 实际={rule.get('src_addr')}")
+            object_expectations = (
+                (domain_group, "domain", "domain"),
+                (src_group, "ip", "src_addr"),
+                (time_plan, "time", "time"),
+            )
+            for object_name, type_key, field in object_expectations:
+                if not object_name:
+                    continue
+                group = bv.find_object_group(object_name, type_key)
+                group_id = group.get("group_id") if group else ""
+                if not group_id or not _field_contains(rule, field, group_id):
+                    _fail(
+                        f"{name}: DB字段{field}未引用{object_name}({group_id or '无group_id'}), "
+                        f"实际={rule.get(field)}"
+                    )
+                elif _wait_object_ref(group_id, 1) != 1:
+                    _fail(f"{name}: 路由对象{object_name}引用计数未变为1")
+            if time_mode and not rule.get("time"):
+                _fail(f"{name}: 生效时间未写入DB")
+            if time_mode == "按周循环" and time_days:
+                day_map = {"一": "1", "二": "2", "三": "3", "四": "4",
+                           "五": "5", "六": "6", "日": "7"}
+                expected_days = "".join(day_map[day] for day in time_days)
+                if not _field_contains(rule, "time", expected_days):
+                    _fail(f"{name}: DB星期不匹配, 期望={expected_days}, 实际={rule.get('time')}")
+                for expected_time in (time_start, time_end):
+                    if expected_time and not _field_contains(rule, "time", expected_time):
+                        _fail(
+                            f"{name}: DB生效时间缺少{expected_time}, 实际={rule.get('time')}"
+                        )
+            rec.add_detail(
+                f"  [OK] 建规则 {name}: id={rule_id}, line={line}, "
+                f"domains={len(domains or [])}, domain_group={domain_group or '无'}, "
+                f"src={src_addr or src_group or '全部'}, time_plan={time_plan or '无'}"
+            )
+            return rule
+
+        def _probe(domain, expect_hit, label, record_failure=True,
+                   expected_wans=None):
+            """清缓存后发一个HTTP连接，并按精确目标IP/80轮询命中与选路证据。"""
+            expected_wans = set(expected_wans or [target_wan])
             bv.clear_client_conntrack(client_ip)
             bv.reset_cflow_stats()
             cf_b = bv.read_cflow_stats()["domain"]
             bv.connect_client()
             bv._client.exec("sudo -n resolvectl flush-caches 2>/dev/null", timeout=10)
-            for _ in range(3):
-                bv._client.exec(
-                    f"curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 http://{domain}/",
-                    timeout=15)
-            cf_a = bv.read_cflow_stats()["domain"]
-            wans = bv.conntrack_client_wans(client_ip, proto="tcp")
-            cf_delta = cf_a - cf_b
-            selected = target_wan in wans
-            rec.add_detail(f"    {'✓' if selected else '✗'} {domain}: wans={wans} cflow {cf_b}→{cf_a}(Δ{cf_delta})")
-            if not selected:
-                failures.append(f"{domain} 未选路{target_wan}(wans={wans})")
+            command = self.curl_probe_command(domain)
+            try:
+                output = bv._client.exec(command, timeout=15) or ""
+            except Exception as exc:
+                output = f"probe_error={str(exc)[:160]}"
 
-        def _run_scenario(scenario_label, rule_name, src_addr):
-            """单场景: 建规则(多域名+src_addr)→逐域名验选路→删规则."""
-            src_desc = src_addr or "空(全IP生效)"
-            with rec.step(scenario_label, f"domains={len(self.TEST_DOMAINS)}个 line={target_wan} src_addr={src_desc}"):
-                page.navigate_to_domain_route()
-                page.page.wait_for_timeout(800)
-                try:
-                    page.delete_rule(rule_name)
-                    page.page.wait_for_timeout(500)
-                except Exception:
-                    pass
-                _force_clean()
-                ok = page.add_rule(rule_name, line=target_wan,
-                                   domains=self.TEST_DOMAINS, src_addr=src_addr)
-                if not ok:
-                    failures.append(f"{scenario_label}建规则失败: {rule_name}")
-                    rec.add_detail("  ✗ 建规则失败")
-                    return
-                page.page.wait_for_timeout(2000)
-                rule = bv.find_stream_domain_rule(tagname=rule_name)
-                rec.add_detail(f"  ✓ 建规则 id={rule.get('id') if rule else '?'} src_addr={src_desc}")
-                # L1-L4 后端验证(报告体现: 数据库→url_route内核group/ipset→内核状态→ik_core模块)
-                rid = rule.get("id") if rule else None
-                if rid:
-                    for _r in (
-                        bv.verify_stream_domain_database(rule_name, expected_fields={"enabled": "yes"}),
-                        bv.verify_stream_domain_ipset(rid),
-                        bv.verify_stream_domain_kernel_status(),
-                        bv.verify_stream_domain_kernel(),
-                    ):
-                        rec.add_detail(f"  {_r.level}: {'[OK]' if _r.passed else '[FAIL]'} {_r.message}")
-                        if not _r.passed:
-                            failures.append(f"{_r.level}-{rule_name}: {_r.message}")
-                for d in self.TEST_DOMAINS:
-                    _verify_domain(d)
-                try:
-                    page.navigate_to_domain_route()
-                    page.page.wait_for_timeout(300)
-                    page.delete_rule(rule_name)
-                except Exception:
-                    pass
-                _force_clean()
+            ip_match = re.search(r"\bremote_ip=((?:\d{1,3}\.){3}\d{1,3})\b", output)
+            code_match = re.search(r"\bcode=(\d{3})\b", output)
+            remote_ip = ip_match.group(1) if ip_match else ""
+            http_code = code_match.group(1) if code_match else "000"
+            entries = []
+            wans = []
+            cf_a = cf_b
+            for _ in range(21):
+                cf_a = bv.read_cflow_stats()["domain"]
+                if remote_ip:
+                    entries = bv.conntrack_client_flow_entries(
+                        client_ip, proto="tcp", dst_ip=remote_ip, dst_port=80
+                    )
+                wans = []
+                for entry in entries:
+                    match = re.search(r"\bremote_if=(\S+)", entry)
+                    if match and match.group(1) not in wans:
+                        wans.append(match.group(1))
+                delta = cf_a - cf_b
+                if expect_hit and delta > 0 and expected_wans.intersection(wans):
+                    break
+                if (not expect_hit and entries and delta == 0 and
+                        not expected_wans.intersection(wans)):
+                    break
+                page.page.wait_for_timeout(200)
+
+            cf_delta = cf_a - cf_b
+            probe_ok = bool(remote_ip) and http_code != "000"
+            selectable = any("can_sel_route=true" in entry for entry in entries)
+            marks = sorted({
+                int(match.group(1))
+                for entry in entries
+                for match in [re.search(r"\bmark=(\d+)", entry)]
+                if match
+            })
+            if expect_hit:
+                passed = (probe_ok and bool(entries) and selectable and
+                          cf_delta > 0 and bool(expected_wans.intersection(wans)))
+            else:
+                passed = (probe_ok and bool(entries) and selectable and
+                          cf_delta == 0 and not expected_wans.intersection(wans))
+            status = "OK" if passed else "FAIL"
+            rec.add_detail(
+                f"  [{status}] {label} {domain}: code={http_code}, ip={remote_ip or '无'}, "
+                f"wans={wans}, marks={marks}, cflow {cf_b}→{cf_a}(Δ{cf_delta}), "
+                f"can_sel_route={selectable}"
+            )
+            rec.add_verification_command(
+                command,
+                target_label="打流客户端", target="client",
+                host=bv._ssh_config.client.host, shell="bash",
+                purpose=f"复验{domain}的HTTP探针", expected="返回非000 HTTP状态和remote_ip",
+                actual=output[:500],
+            )
+            if remote_ip:
+                inspect_command = (
+                    "conntrack -L -o extended 2>/dev/null | "
+                    f"grep 'src={client_ip} ' | grep 'dst={remote_ip} ' | grep 'dport=80 '"
+                )
+                rec.add_verification_command(
+                    inspect_command,
+                    target_label="被测路由器", target="router",
+                    host=bv._ssh_config.router.host, shell="bash",
+                    purpose=f"复验{domain}精确连接的remote_if/mark",
+                    expected=(f"remote_if属于{sorted(expected_wans)}" if expect_hit
+                              else f"remote_if不属于{sorted(expected_wans)}"),
+                    actual="\n".join(entries)[:2000],
+                )
+            if not passed:
+                rec.add_detail(f"  conntrack诊断: {' | '.join(entries)[:2400] or '无精确连接'}")
+                if record_failure:
+                    expectation = (
+                        f"命中并选路{sorted(expected_wans)}" if expect_hit
+                        else f"不命中且不选路{sorted(expected_wans)}"
+                    )
+                    _fail(
+                        f"{label}-{domain}: 期望{expectation}, code={http_code}, "
+                        f"ip={remote_ip or '无'}, wans={wans}, Δcflow={cf_delta}, "
+                        f"can_sel_route={selectable}"
+                    )
+            return {
+                "passed": passed, "probe_ok": probe_ok, "remote_ip": remote_ip,
+                "http_code": http_code, "entries": entries, "wans": wans,
+                "cflow_delta": cf_delta, "selectable": selectable,
+            }
+
+        def _probe_multi_wan(domains):
+            """并发建立多条域名连接，验证wan2/wan3均实际承载流量。"""
+            expected_wans = {target_wan, second_wan}
+            bv.clear_client_conntrack(client_ip)
+            bv.reset_cflow_stats()
+            cf_before = bv.read_cflow_stats()["domain"]
+            bv.connect_client()
+            bv._client.exec("sudo -n resolvectl flush-caches 2>/dev/null", timeout=10)
+            command = self.parallel_curl_probe_command(domains)
+            try:
+                output = bv._client.exec(command, timeout=30) or ""
+            except Exception as exc:
+                output = f"probe_error={str(exc)[:160]}"
+
+            parsed = []
+            for match in re.finditer(
+                    r"probe=(\d+)\s+domain=([A-Za-z0-9.-]+)\s+"
+                    r"remote_ip=((?:\d{1,3}\.){3}\d{1,3})\s+code=(\d{3})",
+                    output):
+                parsed.append({
+                    "probe": int(match.group(1)), "domain": match.group(2),
+                    "remote_ip": match.group(3), "code": match.group(4),
+                })
+
+            entries = []
+            cf_after = cf_before
+            observed_wans = set()
+            for _ in range(21):
+                cf_after = bv.read_cflow_stats()["domain"]
+                entries = []
+                for remote_ip in {item["remote_ip"] for item in parsed}:
+                    for entry in bv.conntrack_client_flow_entries(
+                            client_ip, proto="tcp", dst_ip=remote_ip, dst_port=80):
+                        if entry not in entries:
+                            entries.append(entry)
+                observed_wans = {
+                    match.group(1)
+                    for entry in entries
+                    for match in [re.search(r"\bremote_if=(\S+)", entry)]
+                    if match
+                }
+                if expected_wans.issubset(observed_wans) and cf_after > cf_before:
+                    break
+                page.page.wait_for_timeout(200)
+
+            successful = [item for item in parsed if item["code"] != "000"]
+            selectable = bool(entries) and all(
+                "can_sel_route=true" in entry for entry in entries
+            )
+            marks = sorted({
+                int(match.group(1))
+                for entry in entries
+                for match in [re.search(r"\bmark=(\d+)", entry)]
+                if match
+            })
+            passed = (
+                len(parsed) == len(domains) and len(successful) == len(domains) and
+                selectable and cf_after > cf_before and
+                expected_wans.issubset(observed_wans) and
+                observed_wans.issubset(expected_wans)
+            )
+            rec.add_detail(
+                f"  [{'OK' if passed else 'FAIL'}] 多线路并发分布: "
+                f"probe_ok={len(successful)}/{len(domains)}, flows={len(entries)}, "
+                f"wans={sorted(observed_wans)}, marks={marks}, "
+                f"cflow {cf_before}→{cf_after}(Δ{cf_after-cf_before})"
+            )
+            rec.add_verification_command(
+                command,
+                target_label="打流客户端", target="client",
+                host=bv._ssh_config.client.host, shell="bash",
+                purpose="复验域名分流wan2+wan3并发分布",
+                expected=f"{len(domains)}个HTTP探针成功",
+                actual=output[:2000],
+            )
+            rec.add_verification_command(
+                "conntrack -L -o extended 2>/dev/null | "
+                f"grep 'src={client_ip} ' | grep 'dport=80 '",
+                target_label="被测路由器", target="router",
+                host=bv._ssh_config.router.host, shell="bash",
+                purpose="复验并发连接的remote_if/mark分布",
+                expected=f"同时出现remote_if={target_wan}和remote_if={second_wan}",
+                actual="\n".join(entries)[:5000],
+            )
+            if not passed:
+                rec.add_detail(
+                    f"  并发诊断: output={output[:1200] or '无'}; "
+                    f"conntrack={' | '.join(entries)[:3600] or '无'}"
+                )
+                _fail(
+                    "多线路并发分布失败: "
+                    f"probe_ok={len(successful)}/{len(domains)}, flows={len(entries)}, "
+                    f"wans={sorted(observed_wans)}, Δcflow={cf_after-cf_before}"
+                )
+            return passed
+
+        def _wait_enabled(name, expected, timeout_ms=6000):
+            elapsed = 0
+            while elapsed <= timeout_ms:
+                rule = bv.find_stream_domain_rule(tagname=name)
+                if rule and rule.get("enabled") == expected:
+                    return rule
+                page.page.wait_for_timeout(500)
+                elapsed += 500
+            return bv.find_stream_domain_rule(tagname=name)
 
         dns_snap = None
         dns_was_enabled = None
         try:
-            # 前置: DNS加速开启 + client DNS指向路由器(域名分流选路依赖DNS学习建映射)。
-            # client(多网卡Ubuntu)默认DNS走enp2s0公网绕过路由器→ikdnsx看不到DNS→url_route无
-            # "域名→IP"映射→cflow domain=0/选路不生效(实测SNI/HTTP Host的DPI识别也不触发选路,
-            # 因连接首包已按默认路由转发, 事后识别无法改路)。故必须DNS经路由器学习。
-            with rec.step("前置: DNS加速+client DNS经路由器", "域名分流选路依赖DNS经路由器学习建映射"):
+            with rec.step(
+                    "前置检查: DNS学习与可选路基线",
+                    "router=10.66.0.45; client=192.168.148.2/ens11; 无规则时应走非wan2"):
+                _force_clean(strict=True)
+                _force_object_clean(strict=True)
+                foreign_rules = [
+                    rule.get("tagname") for rule in bv.query_stream_domain_rules()
+                    if not str(rule.get("tagname", "")).startswith(self.PREFIX)
+                ]
+                if foreign_rules:
+                    pytest.skip(f"设备存在非本测试域名分流规则, 无法建立隔离基线: {foreign_rules}")
+
+                bv.connect_client()
+                iface = bv._client.exec(f"ip -br -4 addr show dev {self.CLIENT_IFACE}")
+                if client_ip not in iface or "UP" not in iface:
+                    pytest.skip(f"客户端数据面接口不满足: {iface}")
                 dr = bv.ensure_dns_accel_enabled()
                 rec.add_detail(f"  {dr.level}: {'[OK]' if dr.passed else '[FAIL]'} {dr.message}")
                 if not dr.passed:
                     pytest.skip(f"DNS加速前置不满足, 域名分流无法选路: {dr.message}")
                 dns_was_enabled = dr.details.get("was_enabled")
                 dns_snap = bv.setup_client_dns_via_router()
-                ok = dns_snap.get("configured")
+                dns_status = bv._client.exec(
+                    f"resolvectl dns {self.CLIENT_IFACE} 2>/dev/null", timeout=10
+                )
+                ok = dns_snap.get("configured") and "192.168.148.1" in dns_status
                 rec.add_detail(
-                    f"  client DNS→路由器: {'[OK] 测试期间临时指向路由器, 测后恢复' if ok else '[FAIL]'}"
-                    + ("" if ok else f" {dns_snap.get('error')}"))
+                    f"  client DNS→路由器: {'[OK] 临时指向192.168.148.1, 测后恢复' if ok else '[FAIL]'}"
+                    + ("" if ok else f" status={dns_status}; error={dns_snap.get('error')}"))
                 if not ok:
                     pytest.skip(f"client DNS配置失败, 域名分流无法选路: {dns_snap.get('error')}")
-            # 基线探活: curl baidu经ens11应通(无规则时走默认wan1), 不通=环境问题skip
-            with rec.step("基线探活", "curl baidu --interface ens11 应通(确认环境经路由器)"):
-                bv.connect_client()
-                base = bv.verify_connectivity(dst_domain="www.baidu.com", retries=2)
-                rec.add_detail(f"  基线: {base['detail']}")
-                if not base["connected"]:
-                    pytest.skip(f"基线baidu经ens11不可达, 跳过域名分流功能验证: {base['detail']}")
-            _run_scenario("场景1: 指定内网IP(仅该IP生效)", f"{self.PREFIX}srcip", client_ip)
-            _run_scenario("场景2: 不指定内网IP(全IP生效)", f"{self.PREFIX}allip", None)
+                baseline = _probe(
+                    self.TEST_DOMAINS[0], expect_hit=False,
+                    label="无规则基线", record_failure=False,
+                )
+                if not baseline["passed"]:
+                    pytest.skip(
+                        "基线不可达、连接不可选路、cflow不为0或默认已走wan2, "
+                        f"无法形成确定性域名分流判定: {baseline}"
+                    )
+
+            with rec.step(
+                    "前置对象: 创建域名/IP/时间分组",
+                    "仅供本功能测试引用，验证DB/cache/ipset并在结束后正式删除"):
+                domain_ok = domain_group_page.add_rule(
+                    self.DOMAIN_GROUP_NAME, self.TEST_DOMAINS[:2]
+                )
+                ip_ok = ip_group_page.add_rule(
+                    self.IP_GROUP_NAME, [client_ip], ip_version="ipv4"
+                )
+                time_ok = time_plan_page.add_rule(self.TIME_PLAN_NAME)
+                for ok, name in (
+                    (domain_ok, self.DOMAIN_GROUP_NAME),
+                    (ip_ok, self.IP_GROUP_NAME),
+                    (time_ok, self.TIME_PLAN_NAME),
+                ):
+                    rec.add_detail(f"  [{'OK' if ok else 'FAIL'}] 创建临时对象{name}")
+                    if not ok:
+                        _fail(f"创建临时路由对象失败: {name}")
+                if domain_ok:
+                    route_objects["domain"] = _verify_object(
+                        self.DOMAIN_GROUP_NAME, "domain", self.TEST_DOMAINS[:2]
+                    )
+                    _assert_object_ref(
+                        self.DOMAIN_GROUP_NAME, "domain", 0, "域名分组初始未引用"
+                    )
+                if ip_ok:
+                    route_objects["ip"] = _verify_object(
+                        self.IP_GROUP_NAME, "ip", client_ip, check_ipset=True
+                    )
+                    _assert_object_ref(
+                        self.IP_GROUP_NAME, "ip", 0, "IP分组初始未引用"
+                    )
+                if time_ok:
+                    route_objects["time"] = _verify_object(
+                        self.TIME_PLAN_NAME, "time", "weekly"
+                    )
+                    _assert_object_ref(
+                        self.TIME_PLAN_NAME, "time", 0, "时间计划初始未引用"
+                    )
+
+            with rec.step(
+                    "场景1: 指定源IP+多域名精确选路",
+                    "4个目标域名应命中wan2; 未配置域名应继续走基线线路"):
+                _force_clean()
+                rule = _add_rule(
+                    f"{self.PREFIX}src", self.TEST_DOMAINS, src_addr=client_ip
+                )
+                if rule:
+                    for domain in self.TEST_DOMAINS:
+                        _probe(domain, expect_hit=True, label="目标域名")
+                    _probe(self.NON_MATCH_DOMAIN, expect_hit=False, label="非目标域名")
+
+            with rec.step(
+                    "场景2: 指定源IP不匹配",
+                    "规则源IP=192.168.148.99; 当前客户端访问目标域名不应命中wan2"):
+                _force_clean()
+                rule = _add_rule(
+                    f"{self.PREFIX}miss", [self.TEST_DOMAINS[0]],
+                    src_addr="192.168.148.99",
+                )
+                if rule:
+                    _probe(self.TEST_DOMAINS[0], expect_hit=False, label="源IP不匹配")
+
+            with rec.step(
+                    "场景3: 不指定源IP",
+                    "纯域名规则对当前客户端生效并选路wan2，不创建sdomain_src ipset"):
+                _force_clean()
+                rule = _add_rule(f"{self.PREFIX}all", [self.TEST_DOMAINS[1]])
+                if rule:
+                    _probe(self.TEST_DOMAINS[1], expect_hit=True, label="全源IP规则")
+
+            with rec.step(
+                    "场景4: wan2+wan3并发分布",
+                    "同一域名规则8条并发HTTP连接应同时分布到wan2和wan3"):
+                _force_clean()
+                rule = _add_rule(
+                    f"{self.PREFIX}multi", self.TEST_DOMAINS,
+                    line=f"{target_wan},{second_wan}",
+                )
+                if rule:
+                    _probe_multi_wan(self.TEST_DOMAINS * 2)
+
+            with rec.step(
+                    "场景5: 域名分组引用",
+                    "规则引用DMFLOWDOM; 组内域名命中wan2，组外域名不命中"):
+                _force_clean()
+                if route_objects.get("domain"):
+                    rule = _add_rule(
+                        f"{self.PREFIX}dgroup", domain_group=self.DOMAIN_GROUP_NAME
+                    )
+                    if rule:
+                        for domain in self.TEST_DOMAINS[:2]:
+                            _probe(domain, expect_hit=True, label="域名分组内")
+                        _probe(
+                            self.NON_MATCH_DOMAIN, expect_hit=False,
+                            label="域名分组外",
+                        )
+                    _force_clean()
+                    _assert_object_ref(
+                        self.DOMAIN_GROUP_NAME, "domain", 0, "删除规则后域名分组解引用"
+                    )
+
+            with rec.step(
+                    "场景6: IP分组限定源地址",
+                    "规则引用含192.168.148.2的DMFLOWIP，应命中wan2并建立对象引用"):
+                _force_clean()
+                if route_objects.get("ip"):
+                    rule = _add_rule(
+                        f"{self.PREFIX}ipgroup", [self.TEST_DOMAINS[0]],
+                        src_group=self.IP_GROUP_NAME,
+                    )
+                    if rule:
+                        _probe(self.TEST_DOMAINS[0], expect_hit=True, label="IP分组内源地址")
+                    _force_clean()
+                    _assert_object_ref(
+                        self.IP_GROUP_NAME, "ip", 0, "删除规则后IP分组解引用"
+                    )
+
+            with rec.step(
+                    "场景7: 按周循环生效与非生效",
+                    "全周全天应命中；仅配置非当前星期时应不命中"):
+                _force_clean()
+                rule = _add_rule(
+                    f"{self.PREFIX}time", [self.TEST_DOMAINS[2]],
+                    time_mode="按周循环",
+                    time_days=["一", "二", "三", "四", "五", "六", "日"],
+                    time_start="00:00", time_end="23:59",
+                )
+                if rule:
+                    _probe(self.TEST_DOMAINS[2], expect_hit=True, label="全天生效")
+
+                _force_clean()
+                current_weekday = int((bv._router.exec("date +%u") or "1").strip())
+                day_names = {1: "一", 2: "二", 3: "三", 4: "四",
+                             5: "五", 6: "六", 7: "日"}
+                inactive_day_number = current_weekday % 7 + 1
+                inactive_day = day_names[inactive_day_number]
+                rule = _add_rule(
+                    f"{self.PREFIX}offtime", [self.TEST_DOMAINS[2]],
+                    time_mode="按周循环", time_days=[inactive_day],
+                    time_start="00:00", time_end="23:59",
+                )
+                rec.add_detail(
+                    f"  路由器当前星期={current_weekday}, 非生效规则仅选星期{inactive_day}"
+                )
+                if rule:
+                    _probe(self.TEST_DOMAINS[2], expect_hit=False, label="非当前星期")
+
+            with rec.step(
+                    "场景8: 时间计划引用",
+                    "规则引用全周全天DMFLOWTIME，应命中wan2并建立/撤销对象引用"):
+                _force_clean()
+                if route_objects.get("time"):
+                    rule = _add_rule(
+                        f"{self.PREFIX}tplan", [self.TEST_DOMAINS[1]],
+                        time_mode="时间计划", time_plan=self.TIME_PLAN_NAME,
+                    )
+                    if rule:
+                        _probe(self.TEST_DOMAINS[1], expect_hit=True, label="时间计划生效")
+                    _force_clean()
+                    _assert_object_ref(
+                        self.TIME_PLAN_NAME, "time", 0, "删除规则后时间计划解引用"
+                    )
+
+            with rec.step(
+                    "场景9: 停用/启用/删除数据面回退",
+                    "启用命中; 停用不命中; 再启用恢复; 删除后再次不命中"):
+                _force_clean()
+                name = f"{self.PREFIX}life"
+                rule = _add_rule(name, [self.TEST_DOMAINS[3]], src_addr=client_ip)
+                if rule:
+                    rule_id = int(rule["id"])
+                    _probe(self.TEST_DOMAINS[3], expect_hit=True, label="初始启用")
+
+                    page.navigate_to_domain_route()
+                    if not page.disable_rule(name):
+                        _fail(f"{name}: 停用操作未成功发起")
+                    disabled = _wait_enabled(name, "no")
+                    if not disabled or disabled.get("enabled") != "no":
+                        _fail(f"{name}: 停用后DB未变为enabled=no")
+                    _record_verification(
+                        bv.verify_stream_domain_ipset(rule_id, should_exist=False),
+                        f"{name}-disabled",
+                    )
+                    _probe(self.TEST_DOMAINS[3], expect_hit=False, label="停用后回退")
+
+                    page.navigate_to_domain_route()
+                    if not page.enable_rule(name):
+                        _fail(f"{name}: 启用操作未成功发起")
+                    enabled = _wait_enabled(name, "yes")
+                    if not enabled or enabled.get("enabled") != "yes":
+                        _fail(f"{name}: 启用后DB未恢复enabled=yes")
+                    _record_verification(
+                        bv.verify_stream_domain_ipset(rule_id),
+                        f"{name}-enabled",
+                    )
+                    _probe(self.TEST_DOMAINS[3], expect_hit=True, label="重新启用")
+
+                    page.navigate_to_domain_route()
+                    if not page.delete_rule(name):
+                        _fail(f"{name}: 删除操作失败")
+                    if bv.find_stream_domain_rule(tagname=name) is not None:
+                        _fail(f"{name}: 删除后DB仍残留")
+                    _record_verification(
+                        bv.verify_stream_domain_ipset(rule_id, should_exist=False),
+                        f"{name}-deleted",
+                    )
+                    _probe(self.TEST_DOMAINS[3], expect_hit=False, label="删除后回退")
+
+            with rec.step(
+                    "场景10: 清理与残留检查",
+                    "规则、url_route group、sdomain ipset、路由对象和conntrack均清理"):
+                _force_clean(strict=True)
+                _force_object_clean(strict=True)
         finally:
-            # 关回DNS加速(若测试前是关的, 避免影响其他功能测试)
-            if dns_was_enabled is not None:
-                bv.restore_dns_accel(dns_was_enabled)
-            # 恢复client DNS(避免污染client环境, 即便后续清理异常也先恢复)
-            if dns_snap:
-                bv.restore_client_dns(dns_snap)
             try:
                 page.navigate_to_domain_route()
                 page.page.wait_for_timeout(500)
-                for rn in (f"{self.PREFIX}srcip", f"{self.PREFIX}allip"):
-                    try:
-                        page.delete_rule(rn)
-                    except Exception:
-                        pass
             except Exception:
                 pass
-            _force_clean()
-        print(f"\n[域名分流功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
+            _force_clean(strict=True)
+            _force_object_clean(strict=True)
+            if dns_snap and not bv.restore_client_dns(dns_snap):
+                failures.append("客户端DNS恢复失败")
+            if dns_was_enabled is not None and not bv.restore_dns_accel(dns_was_enabled):
+                failures.append("路由器DNS加速状态恢复失败")
+        print(f"\n[域名分流全功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
         assert not failures, f"域名分流功能验证失败({len(failures)}项): {'; '.join(failures)}"

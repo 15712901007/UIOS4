@@ -727,10 +727,14 @@ class MainWindow(QMainWindow):
                         "testcases": [
                             # 跨三层服务综合测试（21步：添加8条(V2/V3)+编辑+停用+启用+删除+搜索+排序+导出+异常+批量操作+导入+频率+帮助+SSH验证）
                             "test_cross_layer_service_comprehensive.py::TestCrossLayerServiceComprehensive::test_cross_layer_service_comprehensive",
+                            "test_cross_layer_service_functional.py::TestCrossLayerServiceFunctional::test_cross_layer_service_real_snmp_mac_learning",
                         ],
                         "groups": {
                             "综合测试（推荐）": [
                                 "test_cross_layer_service_comprehensive.py::TestCrossLayerServiceComprehensive::test_cross_layer_service_comprehensive",
+                            ],
+                            "真实功能测试": [
+                                "test_cross_layer_service_functional.py::TestCrossLayerServiceFunctional::test_cross_layer_service_real_snmp_mac_learning",
                             ],
                         }
                     },
@@ -739,20 +743,28 @@ class MainWindow(QMainWindow):
                             "自定义协议": {
                                 "testcases": [
                                     "test_custom_protocol_comprehensive.py::TestCustomProtocolComprehensive::test_custom_protocol_comprehensive",
+                                    "test_custom_protocol_functional.py::TestCustomProtocolFunctional::test_custom_protocol_real_tcp_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
                                         "test_custom_protocol_comprehensive.py::TestCustomProtocolComprehensive::test_custom_protocol_comprehensive",
+                                    ],
+                                    "真实功能测试": [
+                                        "test_custom_protocol_functional.py::TestCustomProtocolFunctional::test_custom_protocol_real_tcp_flow",
                                     ],
                                 }
                             },
                             "高级自定义协议": {
                                 "testcases": [
                                     "test_custom_protocol_comprehensive.py::TestAdvancedCustomProtocolComprehensive::test_advanced_custom_protocol_comprehensive",
+                                    "test_custom_protocol_functional.py::TestAdvancedCustomProtocolFunctional::test_advanced_custom_protocol_real_l7_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
                                         "test_custom_protocol_comprehensive.py::TestAdvancedCustomProtocolComprehensive::test_advanced_custom_protocol_comprehensive",
+                                    ],
+                                    "真实功能测试": [
+                                        "test_custom_protocol_functional.py::TestAdvancedCustomProtocolFunctional::test_advanced_custom_protocol_real_l7_flow",
                                     ],
                                 }
                             },
@@ -822,10 +834,14 @@ class MainWindow(QMainWindow):
                             "UPnP设置": {
                                 "testcases": [
                                     "test_upnp_setting_comprehensive.py::TestUpnpSettingComprehensive::test_upnp_setting_comprehensive",
+                                    "test_upnp_functional.py::TestUpnpFunctional::test_upnp_real_port_mapping",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
                                         "test_upnp_setting_comprehensive.py::TestUpnpSettingComprehensive::test_upnp_setting_comprehensive",
+                                    ],
+                                    "真实功能测试": [
+                                        "test_upnp_functional.py::TestUpnpFunctional::test_upnp_real_port_mapping",
                                     ],
                                 }
                             },
@@ -869,30 +885,42 @@ class MainWindow(QMainWindow):
                             "IGMP代理": {
                                 "testcases": [
                                     "test_igmp_proxy_comprehensive.py::TestIgmpProxyComprehensive::test_igmp_proxy_comprehensive",
+                                    "test_igmp_proxy_functional.py::TestIgmpProxyFunctional::test_igmp_proxy_real_multicast",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
                                         "test_igmp_proxy_comprehensive.py::TestIgmpProxyComprehensive::test_igmp_proxy_comprehensive",
+                                    ],
+                                    "真实功能测试": [
+                                        "test_igmp_proxy_functional.py::TestIgmpProxyFunctional::test_igmp_proxy_real_multicast",
                                     ],
                                 }
                             },
                             "IPTV透传": {
                                 "testcases": [
                                     "test_iptv_comprehensive.py::TestIptvComprehensive::test_iptv_comprehensive",
+                                    "test_iptv_functional.py::TestIptvFunctional::test_iptv_real_passthrough",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
                                         "test_iptv_comprehensive.py::TestIptvComprehensive::test_iptv_comprehensive",
+                                    ],
+                                    "真实功能测试": [
+                                        "test_iptv_functional.py::TestIptvFunctional::test_iptv_real_passthrough",
                                     ],
                                 }
                             },
                             "UDPXY设置": {
                                 "testcases": [
                                     "test_udp_proxy_comprehensive.py::TestUdpProxyComprehensive::test_udp_proxy_comprehensive",
+                                    "test_udp_proxy_functional.py::TestUdpProxyFunctional::test_udpxy_real_multicast_to_http",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
                                         "test_udp_proxy_comprehensive.py::TestUdpProxyComprehensive::test_udp_proxy_comprehensive",
+                                    ],
+                                    "真实功能测试": [
+                                        "test_udp_proxy_functional.py::TestUdpProxyFunctional::test_udpxy_real_multicast_to_http",
                                     ],
                                 }
                             },
@@ -903,10 +931,14 @@ class MainWindow(QMainWindow):
                             "DNS加速服务": {
                                 "testcases": [
                                     "test_dns_accelerate_comprehensive.py::TestDnsAccelerateComprehensive::test_dns_accelerate_comprehensive",
+                                    "test_dns_accelerate_functional.py::TestDnsAccelerateFunctional::test_dns_accelerate_flow",
                                 ],
                                 "groups": {
                                     "综合测试（推荐）": [
                                         "test_dns_accelerate_comprehensive.py::TestDnsAccelerateComprehensive::test_dns_accelerate_comprehensive",
+                                    ],
+                                    "功能验证": [
+                                        "test_dns_accelerate_functional.py::TestDnsAccelerateFunctional::test_dns_accelerate_flow",
                                     ],
                                 }
                             },
@@ -1178,6 +1210,26 @@ class MainWindow(QMainWindow):
                                     ],
                                 }
                             },
+                            "内核设置": {
+                                "testcases": [
+                                    "device_setting/test_kernel_setting_comprehensive.py::TestKernelSettingComprehensive::test_kernel_setting_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "device_setting/test_kernel_setting_comprehensive.py::TestKernelSettingComprehensive::test_kernel_setting_comprehensive",
+                                    ],
+                                }
+                            },
+                        }
+                    },
+                    "云服务绑定": {
+                        "testcases": [
+                            "device_setting/test_cloud_service_binding_comprehensive.py::TestCloudServiceBindingComprehensive::test_cloud_service_binding_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "device_setting/test_cloud_service_binding_comprehensive.py::TestCloudServiceBindingComprehensive::test_cloud_service_binding_comprehensive",
+                            ],
                         }
                     },
                 }
@@ -1261,40 +1313,20 @@ class MainWindow(QMainWindow):
                     },
                     "GRE": {
                         "testcases": [
-                            # GRE隧道 完整6用例(综合CRUD + 配置真生效 + 边界 + 生命周期 + UI提示 + 数据面抓包)
-                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_tunnel_comprehensive",
-                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_config_effect",
-                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_boundary",
-                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_lifecycle",
-                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_ui_prompts",
-                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_dataplane_capture",
+                            # GRE隧道 2用例(6用例整合): 综合测试(全链路L1-L5+双端数据面) + 功能测试(配置生效/边界/生命周期/提示规范/高级默认值+9个JIRA盲区)
+                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_comprehensive",
+                            "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_functional",
                         ],
                         "groups": {
-                            "完整回归（6用例,推荐）": [
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_tunnel_comprehensive",
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_config_effect",
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_boundary",
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_lifecycle",
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_ui_prompts",
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_dataplane_capture",
+                            "完整回归（2用例,推荐）": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_comprehensive",
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_functional",
                             ],
                             "综合测试": [
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_tunnel_comprehensive",
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_comprehensive",
                             ],
-                            "配置真生效(内核ip -d)": [
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_config_effect",
-                            ],
-                            "边界值校验": [
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_boundary",
-                            ],
-                            "生命周期/残留": [
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_lifecycle",
-                            ],
-                            "UI提示规范": [
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_ui_prompts",
-                            ],
-                            "数据面抓包": [
-                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_dataplane_capture",
+                            "功能测试": [
+                                "advanced_service/test_gre_tunnel_comprehensive.py::TestGreTunnelComprehensive::test_gre_functional",
                             ],
                         }
                     },
@@ -1405,6 +1437,60 @@ class MainWindow(QMainWindow):
                             "命中告警": {"testcases": []},
                             "事件响应": {"testcases": []},
                             "报表中心": {"testcases": []},
+                        }
+                    },
+                }
+            },
+            "认证服务": {
+                "children": {
+                    "套餐管理": {
+                        "testcases": [
+                            "authentication/test_ppp_package_comprehensive.py::TestPppPackageComprehensive::test_ppp_package_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "authentication/test_ppp_package_comprehensive.py::TestPppPackageComprehensive::test_ppp_package_comprehensive",
+                            ]
+                        }
+                    },
+                    "账号管理": {
+                        "testcases": [
+                            "authentication/test_pppuser_comprehensive.py::TestPppuserComprehensive::test_pppuser_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "authentication/test_pppuser_comprehensive.py::TestPppuserComprehensive::test_pppuser_comprehensive",
+                            ]
+                        }
+                    },
+                    "自助密码管理": {
+                        "testcases": [
+                            "authentication/test_ppp_passwd_comprehensive.py::TestPppPasswdComprehensive::test_ppp_passwd_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "authentication/test_ppp_passwd_comprehensive.py::TestPppPasswdComprehensive::test_ppp_passwd_comprehensive",
+                            ]
+                        }
+                    },
+                    "总账管理": {
+                        "testcases": [
+                            "authentication/test_ppp_paylog_comprehensive.py::TestPppPaylogComprehensive::test_ppp_paylog_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "authentication/test_ppp_paylog_comprehensive.py::TestPppPaylogComprehensive::test_ppp_paylog_comprehensive",
+                            ]
+                        }
+                    },
+                    "上网码": {
+                        "testcases": [
+                            "authentication/test_coupon_comprehensive.py::TestCouponComprehensive::test_coupon_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "authentication/test_coupon_comprehensive.py::TestCouponComprehensive::test_coupon_comprehensive",
+                            ]
                         }
                     },
                 }
@@ -1680,6 +1766,7 @@ class MainWindow(QMainWindow):
         self.config.device.ip = self.ip_input.text()
         self.config.device.username = self.username_input.text()
         self.config.device.password = self.password_input.text()
+        self.device_status_label.setText(f"设备: {self.config.device.ip}")
 
         # 保存测试人员和版本到报告配置
         if not hasattr(self.config, 'report'):

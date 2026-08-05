@@ -24,12 +24,103 @@ VLAN综合测试用例
 - 填MAC+IP+扩展IP
 - 完整信息
 """
+import csv
 import pytest
 import os
+import re
+import time
 from pages.network.vlan_page import VlanPage
 from config.config import get_config
 from utils.step_recorder import StepRecorder
 from utils.verify_helper import make_ssh_verify, make_kernel_check
+
+
+def _expected_vlan_fields(vlan: dict, enabled: str = "yes") -> dict:
+    """把页面输入转换成后台 VLAN 记录的完整期望字段。"""
+    subnet = vlan.get("subnet") or "255.255.255.0"
+    ext_ip = vlan.get("ext_ip") or ""
+    return {
+        "enabled": enabled,
+        "tagname": vlan["name"],
+        "vlan_name": vlan["name"],
+        "vlan_id": vlan["id"],
+        "interface": vlan.get("line") or "lan1",
+        "mac": vlan.get("mac") or "",
+        "ip_addr": vlan.get("ip") or "",
+        "netmask": subnet,
+        "ip_mask": f"{ext_ip}/{subnet}" if ext_ip else "",
+        "comment": vlan.get("remark") or "",
+    }
+
+
+def _decode_export_file(file_path: str) -> str:
+    with open(file_path, "rb") as export_file:
+        raw = export_file.read()
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise AssertionError(f"导出文件编码无法识别: {file_path}")
+
+
+def _read_vlan_export(file_path: str) -> list:
+    """结构化解析 VLAN CSV/TXT 导出，返回每条配置字典。"""
+    text = _decode_export_file(file_path)
+    if file_path.lower().endswith(".csv"):
+        return [dict(row) for row in csv.DictReader(text.splitlines())]
+
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        row = {
+            match.group(1): match.group(2).strip()
+            for match in re.finditer(
+                r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=(.*?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|$)",
+                line,
+            )
+        }
+        rows.append(row)
+    return rows
+
+
+def _assert_export_matches(file_path: str, expected_vlans: list) -> None:
+    assert os.path.isfile(file_path), f"导出文件不存在: {file_path}"
+    assert os.path.getsize(file_path) > 0, f"导出文件为空: {file_path}"
+    rows = _read_vlan_export(file_path)
+    by_name = {row.get("vlan_name"): row for row in rows}
+    expected_names = {vlan["name"] for vlan in expected_vlans}
+    assert set(by_name) == expected_names, (
+        f"导出VLAN集合不一致: 期望{sorted(expected_names)}, 实际{sorted(set(by_name))}"
+    )
+    for vlan in expected_vlans:
+        expected = _expected_vlan_fields(vlan)
+        row = by_name[vlan["name"]]
+        for field in ("enabled", "vlan_name", "vlan_id", "interface", "mac",
+                      "ip_addr", "netmask", "ip_mask", "comment"):
+            assert str(row.get(field, "")) == str(expected[field]), (
+                f"{os.path.basename(file_path)}中{vlan['name']}.{field}不一致: "
+                f"期望{expected[field]!r}, 实际{row.get(field, '')!r}"
+            )
+
+
+def _wait_for_vlan_ui(page: VlanPage, expected_names, timeout_ms: int = 12000):
+    """等待异步表格稳定到精确集合，避免加载瞬间“共0条”造成假通过。"""
+    expected = set(expected_names)
+    deadline = time.monotonic() + timeout_ms / 1000
+    last_count, last_names = -1, []
+    while time.monotonic() < deadline:
+        last_count = page.get_vlan_count()
+        last_names = sorted(page.get_vlan_list())
+        # 数量和 VLAN 名称列的完整集合都必须一致，不接受页面其他区域的同名文本。
+        if last_count == len(expected) and len(last_names) == len(expected) and set(last_names) == expected:
+            return sorted(expected)
+        page.page.wait_for_timeout(400)
+    raise AssertionError(
+        f"VLAN表格未稳定到期望集合: 期望{sorted(expected)}, "
+        f"实际count={last_count}, names={last_names}"
+    )
 
 
 @pytest.mark.vlan
@@ -67,6 +158,76 @@ class TestVlanComprehensive:
 
         ssh_verify = make_ssh_verify(backend_verifier, rec, ssh_failures)
 
+        def verify_vlan_active(vlan, label: str):
+            """逐条验证启用 VLAN 的数据库、接口和内核映射。"""
+            parent = vlan.get("line") or "lan1"
+            results = [
+                ssh_verify(
+                    f"L1-数据库-{label}({vlan['name']})",
+                    backend_verifier.verify_vlan_database,
+                    vlan["name"], must_pass=True,
+                    expected_fields=_expected_vlan_fields(vlan, "yes"),
+                ),
+                ssh_verify(
+                    f"L2-网络接口-{label}({vlan['name']})",
+                    backend_verifier.verify_vlan_interface,
+                    vlan["name"], must_pass=True, expected_parent=parent,
+                ),
+                ssh_verify(
+                    f"L3-proc-{label}({vlan['name']})",
+                    backend_verifier.verify_vlan_proc,
+                    vlan["name"], must_pass=True,
+                    expected_vlan_id=vlan["id"], expected_parent=parent,
+                ),
+            ]
+            return all(result is not None and result.passed for result in results)
+
+        def verify_vlan_disabled(vlan, label: str):
+            """停用后配置、接口和/proc映射保留，但接口必须明确为DOWN。"""
+            parent = vlan.get("line") or "lan1"
+            results = [
+                ssh_verify(
+                    f"L1-数据库-{label}({vlan['name']})",
+                    backend_verifier.verify_vlan_database,
+                    vlan["name"], must_pass=True,
+                    expected_fields=_expected_vlan_fields(vlan, "no"),
+                ),
+                ssh_verify(
+                    f"L2-接口DOWN-{label}({vlan['name']})",
+                    backend_verifier.verify_vlan_interface,
+                    vlan["name"], must_pass=True,
+                    expected_state="DOWN", expected_parent=parent,
+                ),
+                ssh_verify(
+                    f"L3-proc保留-{label}({vlan['name']})",
+                    backend_verifier.verify_vlan_proc,
+                    vlan["name"], must_pass=True,
+                    expected_vlan_id=vlan["id"], expected_parent=parent,
+                ),
+            ]
+            return all(result is not None and result.passed for result in results)
+
+        def verify_vlan_absent(vlan_name: str, label: str):
+            """删除后逐层确认数据库、接口和/proc都无残留。"""
+            results = [
+                ssh_verify(
+                    f"L1-数据库删除-{label}({vlan_name})",
+                    backend_verifier.verify_vlan_database_absent,
+                    vlan_name, must_pass=True,
+                ),
+                ssh_verify(
+                    f"L2-接口删除-{label}({vlan_name})",
+                    backend_verifier.verify_vlan_interface_absent,
+                    vlan_name, must_pass=True,
+                ),
+                ssh_verify(
+                    f"L3-proc删除-{label}({vlan_name})",
+                    backend_verifier.verify_vlan_proc_absent,
+                    vlan_name, must_pass=True,
+                ),
+            ]
+            return all(result is not None and result.passed for result in results)
+
         # 测试数据 - 8条VLAN，覆盖各种数据组合场景
         test_vlans = [
             # 场景1: 普通VLAN ID + 最少信息
@@ -98,6 +259,13 @@ class TestVlanComprehensive:
         with rec.step("步骤1: 检查并清理环境", "检查当前VLAN数量并清理残留数据"):
             print("\n[步骤1] 检查并清理环境...")
             current_count = page.get_vlan_count()
+            cleanup_vlan_names = set(page.get_vlan_list())
+            if backend_verifier is not None:
+                rules_before_cleanup = backend_verifier.query_vlan_rules(strict=True)
+                cleanup_vlan_names.update(
+                    str(rule.get("tagname")) for rule in rules_before_cleanup
+                    if rule.get("tagname")
+                )
             print(f"  当前VLAN数量: {current_count}")
             rec.add_detail(f"【环境检查】")
             rec.add_detail(f"  当前VLAN数量: {current_count}")
@@ -106,12 +274,14 @@ class TestVlanComprehensive:
                 print("  检测到残留数据，执行批量清理...")
                 rec.add_detail(f"【清理操作】")
                 rec.add_detail("  检测到残留数据，执行批量清理")
-                # 使用全选功能
-                select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
-                if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
+                # 使用带选中数量复读的全选功能
+                if page.select_all_rules():
+                    selected_count = page.get_selected_count()
+                    assert selected_count == current_count, (
+                        f"步骤1全选数量错误: 期望{current_count}, 实际{selected_count}"
+                    )
                     rec.add_detail("  1. 点击全选复选框")
-                    select_all_checkbox.click()
-                    page.page.wait_for_timeout(500)
+                    rec.add_detail(f"     已精确选中 {selected_count} 条")
                     rec.add_detail("  2. 点击批量删除按钮")
                     # 批量删除
                     page.batch_delete()
@@ -127,15 +297,27 @@ class TestVlanComprehensive:
                 else:
                     print("  [WARN] 无法全选，尝试逐个清理...")
                     rec.add_detail("  无法全选，尝试逐个清理")
-                    # 逐个删除测试数据
-                    for vlan in test_vlans:
-                        if page.vlan_exists(vlan["name"]):
-                            page.delete_vlan(vlan["name"])
-                            print(f"    - 已删除: {vlan['name']}")
-                            rec.add_detail(f"  已删除: {vlan['name']}")
+                    # 逐个删除清理前实际发现的精确名称
+                    for vlan_name in sorted(cleanup_vlan_names):
+                        if page.vlan_exists(vlan_name):
+                            page.delete_vlan(vlan_name)
+                            print(f"    - 已删除: {vlan_name}")
+                            rec.add_detail(f"  已删除: {vlan_name}")
             else:
                 print("  [OK] 环境干净，无需清理")
                 rec.add_detail("  环境干净，无需清理")
+
+            page.clear_search()
+            page.page.reload()
+            page.page.wait_for_load_state("networkidle")
+            _wait_for_vlan_ui(page, [])
+            assert page.get_vlan_count() == 0, "步骤1清理后页面仍有VLAN"
+            if backend_verifier is not None:
+                backend_rules = backend_verifier.query_vlan_rules(strict=True)
+                assert backend_rules == [], f"步骤1清理后数据库仍有VLAN: {backend_rules}"
+                rec.add_detail("  SSH-L1-环境清理: [OK] 数据库VLAN数量=0")
+                for vlan_name in sorted(cleanup_vlan_names):
+                    verify_vlan_absent(vlan_name, "步骤1环境清理")
 
         # ========== 步骤2: 清理已存在的测试数据（备用检查） ==========
         with rec.step("步骤2: 二次检查测试数据", "确保测试数据已清理"):
@@ -152,6 +334,13 @@ class TestVlanComprehensive:
                 rec.add_detail("  无需清理，数据已干净")
             else:
                 rec.add_detail(f"  共清理 {cleaned_count} 条残留数据")
+            page.page.reload()
+            page.page.wait_for_load_state("networkidle")
+            _wait_for_vlan_ui(page, [])
+            for vlan in test_vlans:
+                assert not page.vlan_exists(vlan["name"]), f"二次清理后仍存在: {vlan['name']}"
+                if backend_verifier is not None:
+                    verify_vlan_absent(vlan["name"], "步骤2环境检查")
 
         # ========== 步骤3: 批量添加8条VLAN ==========
         with rec.step("步骤3: 批量添加VLAN", f"添加 {len(test_vlans)} 条VLAN，覆盖各种数据组合场景"):
@@ -190,10 +379,19 @@ class TestVlanComprehensive:
                     rec.add_detail(f"【添加扩展IP】")
                     rec.add_detail(f"  扩展IP: {vlan['ext_ip']}")
                     # 重新编辑添加扩展IP
-                    page.edit_vlan(vlan["name"])
+                    assert page.edit_vlan(vlan["name"]), (
+                        f"未能进入VLAN {vlan['name']} 的精确编辑行"
+                    )
                     page.add_extended_ip(vlan["ext_ip"], vlan.get("subnet", "255.255.255.0"))
                     page.click_save()
-                    page.wait_for_success_message()
+                    assert page.wait_for_success_message(), (
+                        f"VLAN {vlan['name']} 扩展IP保存失败"
+                    )
+                    page.page.reload()
+                    page.page.wait_for_load_state("networkidle")
+                    _wait_for_vlan_ui(
+                        page, [item["name"] for item in test_vlans[:added_count]]
+                    )
                     print(f"    + 扩展IP: {vlan['ext_ip']}")
                     rec.add_detail(f"  ✓ 扩展IP添加成功")
 
@@ -220,36 +418,7 @@ class TestVlanComprehensive:
                     rec.add_detail(f"  ── 验证VLAN: {vlan_name} ──")
                     print(f"  验证VLAN: {vlan_name}")
 
-                    # L1: 数据库验证
-                    expected_fields = {"vlan_id": vlan["id"], "enabled": "yes"}
-                    l1 = ssh_verify(
-                        f"L1-数据库({vlan_name})",
-                        backend_verifier.verify_vlan_database,
-                        vlan_name,
-                        must_pass=True,
-                        expected_fields=expected_fields,
-                    )
-
-                    if l1 and l1.passed:
-                        db_rule = l1.details.get("rule", {})
-                        rec.add_detail(f"      数据库: id={db_rule.get('id')}, vlan_id={db_rule.get('vlan_id')}, enabled={db_rule.get('enabled')}")
-
-                        # L2: 网络接口验证
-                        ssh_verify(
-                            f"L2-网络接口({vlan_name})",
-                            backend_verifier.verify_vlan_interface,
-                            vlan_name,
-                            must_pass=True,
-                        )
-
-                        # L3: /proc/net/vlan验证
-                        ssh_verify(
-                            f"L3-proc({vlan_name})",
-                            backend_verifier.verify_vlan_proc,
-                            vlan_name,
-                            expected_vlan_id=vlan["id"],
-                        )
-
+                    if verify_vlan_active(vlan, "新增"):
                         verify_passed += 1
 
                 print(f"  [OK] 后台验证完成: {verify_passed}/{len(test_vlans)} 条VLAN验证通过")
@@ -261,6 +430,7 @@ class TestVlanComprehensive:
         with rec.step("步骤4: 编辑VLAN", "编辑第1条VLAN的名称"):
             print("\n[步骤4] 编辑第1条VLAN...")
             edit_vlan = test_vlans[0]
+            old_name = edit_vlan["name"]
             new_name = "vlan_edit_1"
             rec.add_detail(f"【编辑操作】")
             rec.add_detail(f"  目标VLAN: {edit_vlan['name']} (ID: {edit_vlan['id']})")
@@ -283,20 +453,21 @@ class TestVlanComprehensive:
             # 验证编辑成功
             page.page.reload()
             page.page.wait_for_timeout(500)
+            expected_names = {vlan["name"] for vlan in test_vlans}
+            expected_names.remove(old_name)
+            expected_names.add(new_name)
+            _wait_for_vlan_ui(page, expected_names)
             assert page.vlan_exists(new_name), "编辑后的VLAN未找到"
+            assert not page.vlan_exists(old_name), "编辑后旧VLAN名称仍存在"
             test_vlans[0]["name"] = new_name  # 更新测试数据
-            print(f"  [OK] VLAN编辑成功: {edit_vlan['name']} -> {new_name}")
+            print(f"  [OK] VLAN编辑成功: {old_name} -> {new_name}")
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ 编辑成功，新名称已生效")
 
             # SSH验证编辑后数据库更新
             if backend_verifier is not None:
-                ssh_verify(
-                    "L1-编辑验证",
-                    backend_verifier.verify_vlan_database,
-                    new_name,
-                    expected_fields={"vlan_id": edit_vlan["id"]},
-                )
+                verify_vlan_active(edit_vlan, "编辑后新名称")
+                verify_vlan_absent(old_name, "编辑后旧名称")
 
         # ========== 步骤5: 停用第2条VLAN ==========
         with rec.step("步骤5: 停用VLAN", "停用第2条VLAN"):
@@ -322,13 +493,7 @@ class TestVlanComprehensive:
 
             # SSH验证停用后数据库字段
             if backend_verifier is not None:
-                ssh_verify(
-                    "L1-停用验证",
-                    backend_verifier.verify_vlan_database,
-                    disable_vlan["name"],
-                    must_pass=True,
-                    expected_fields={"enabled": "no"},
-                )
+                verify_vlan_disabled(disable_vlan, "单条停用")
 
         # ========== 步骤6: 单独启用第2条VLAN ==========
         with rec.step("步骤6: 启用VLAN", "单独启用第2条VLAN（测试启用功能）"):
@@ -353,13 +518,7 @@ class TestVlanComprehensive:
 
             # SSH验证启用后数据库字段
             if backend_verifier is not None:
-                ssh_verify(
-                    "L1-启用验证",
-                    backend_verifier.verify_vlan_database,
-                    disable_vlan["name"],
-                    must_pass=True,
-                    expected_fields={"enabled": "yes"},
-                )
+                verify_vlan_active(disable_vlan, "单条启用")
 
         # ========== 步骤7: 删除第3条VLAN ==========
         with rec.step("步骤7: 删除VLAN", "删除第3条VLAN"):
@@ -378,33 +537,30 @@ class TestVlanComprehensive:
             assert result is True, f"删除VLAN {delete_vlan['name']} 失败"
             rec.add_detail(f"  2. 确认删除对话框")
 
-            # 通过条目数减少来验证删除成功
+            # 精确验证只删除目标一条；加载瞬间的“共0条”不能算成功。
             page.page.reload()
-            page.page.wait_for_timeout(500)
+            page.page.wait_for_load_state("networkidle")
+            surviving_vlans = [vlan for vlan in test_vlans if vlan is not delete_vlan]
+            _wait_for_vlan_ui(page, [vlan["name"] for vlan in surviving_vlans])
             count_after_delete = page.get_vlan_count()
             print(f"  删除后条目数: {count_after_delete}")
             rec.add_detail(f"  删除后条目数: {count_after_delete}")
 
-            assert count_after_delete < count_before_delete, f"删除后条目数未减少: {count_before_delete} -> {count_after_delete}"
+            assert count_after_delete == count_before_delete - 1, (
+                f"删除必须且只能减少1条: {count_before_delete} -> {count_after_delete}"
+            )
+            assert not page.vlan_exists(delete_vlan["name"]), f"删除目标仍存在: {delete_vlan['name']}"
+            for vlan in surviving_vlans:
+                assert page.vlan_exists(vlan["name"]), f"误删了非目标VLAN: {vlan['name']}"
 
             test_vlans.remove(delete_vlan)  # 从测试数据中移除
             print(f"  [OK] VLAN删除成功: {delete_vlan['name']}")
             rec.add_detail(f"【验证结果】")
             rec.add_detail(f"  ✓ 删除成功，条目数减少 {count_before_delete - count_after_delete}")
 
-            # SSH验证删除后数据库中规则不存在
+            # SSH逐层验证数据库、接口、/proc均无残留
             if backend_verifier is not None:
-                try:
-                    db_rule = backend_verifier.find_vlan_rule(tagname=delete_vlan["name"])
-                    if db_rule is None:
-                        print(f"    SSH-L1-删除验证: 通过 - 规则已从数据库删除")
-                        rec.add_detail(f"    SSH-L1-删除验证: ✓ 规则已从数据库删除")
-                    else:
-                        print(f"    SSH-L1-删除验证: 失败 - 规则仍在数据库中")
-                        ssh_failures.append(f"SSH-L1-删除验证: VLAN {delete_vlan['name']}仍在数据库中")
-                except Exception as e:
-                    print(f"    SSH-L1-删除验证: 跳过 - {str(e)[:80]}")
-                    rec.add_detail(f"    SSH-L1-删除验证: 跳过 - {str(e)[:80]}")
+                verify_vlan_absent(delete_vlan["name"], "单条删除")
 
         # ========== 步骤8: 搜索测试 ==========
         with rec.step("步骤8: 搜索功能测试", "测试搜索存在的VLAN和不存在的VLAN"):
@@ -416,8 +572,9 @@ class TestVlanComprehensive:
             rec.add_detail(f"  测试1: 搜索存在的VLAN")
             rec.add_detail(f"    搜索关键词: {search_target}")
             page.search_vlan(search_target)
-            page.page.wait_for_timeout(500)
+            _wait_for_vlan_ui(page, [search_target])
             assert page.vlan_exists(search_target), f"搜索不到存在的VLAN: {search_target}"
+            assert page.get_vlan_count() == 1, "精确名称搜索结果不止1条"
             print(f"  [OK] 搜索存在VLAN成功: {search_target}")
             rec.add_detail(f"    ✓ 搜索成功，VLAN已找到")
 
@@ -425,7 +582,7 @@ class TestVlanComprehensive:
             rec.add_detail(f"  测试2: 搜索不存在的VLAN")
             rec.add_detail(f"    搜索关键词: not_exist_vlan_xxx")
             page.search_vlan("not_exist_vlan_xxx")
-            page.page.wait_for_timeout(500)
+            _wait_for_vlan_ui(page, [])
             count = page.get_vlan_count()
             assert count == 0, f"搜索不存在的数据时，应该显示0条记录，实际显示{count}条"
             print("  [OK] 搜索不存在VLAN验证成功，显示0条记录")
@@ -434,8 +591,11 @@ class TestVlanComprehensive:
             # 8.3 清空搜索，验证数据恢复
             rec.add_detail(f"  测试3: 清空搜索条件")
             page.clear_search()
-            page.page.wait_for_timeout(500)
+            _wait_for_vlan_ui(page, [vlan["name"] for vlan in test_vlans])
             remaining_count = page.get_vlan_count()
+            assert remaining_count == len(test_vlans), (
+                f"清空搜索后应恢复{len(test_vlans)}条，实际{remaining_count}条"
+            )
             print(f"  [OK] 清空搜索成功，当前显示 {remaining_count} 条记录")
             rec.add_detail(f"    ✓ 清空成功，显示 {remaining_count} 条记录")
 
@@ -446,28 +606,28 @@ class TestVlanComprehensive:
             rec.add_detail(f"  测试字段: VLAN 名称、IP地址")
 
             sortable_columns = ["VLAN 名称", "IP地址"]
-            sort_results = {}
-
             for col in sortable_columns:
-                try:
-                    # 点击3次：正序→倒序→默认
-                    for click_idx, sort_label in enumerate(["正序", "倒序", "默认"]):
-                        result = page.sort_by_column(col)
-                        page.page.wait_for_timeout(300)
-                        if result:
-                            rec.add_detail(f"  ✓ {col} 排序({sort_label}): 成功")
-                        else:
-                            rec.add_detail(f"  ✗ {col} 排序({sort_label}): 失败")
-                    sort_results[col] = True
-                    print(f"  [OK] {col} 排序测试通过")
-                except Exception as e:
-                    sort_results[col] = False
-                    print(f"  [FAIL] {col} 排序测试失败: {e}")
-                    rec.add_detail(f"  ✗ {col} 排序异常: {e}")
+                baseline = page.get_column_values(col)
+                assert len(baseline) == len(test_vlans), (
+                    f"{col}排序前行数不正确: {len(baseline)}/{len(test_vlans)}"
+                )
+                assert page.sort_by_column(col), f"{col}第一次排序点击失败"
+                first_order = page.get_column_values(col)
+                assert page.sort_by_column(col), f"{col}第二次排序点击失败"
+                second_order = page.get_column_values(col)
+                assert second_order == list(reversed(first_order)), (
+                    f"{col}正倒序未互为反序: 第一次{first_order}, 第二次{second_order}"
+                )
+                assert page.sort_by_column(col), f"{col}恢复默认排序点击失败"
+                default_order = page.get_column_values(col)
+                assert default_order == baseline, (
+                    f"{col}第三次点击未恢复默认顺序: 期望{baseline}, 实际{default_order}"
+                )
+                rec.add_detail(f"  ✓ {col}: 正序/倒序互逆，第三次恢复默认，共{len(baseline)}条")
+                print(f"  [OK] {col}排序顺序验证通过")
 
-            passed = sum(1 for v in sort_results.values() if v)
-            print(f"  [OK] 排序测试完成: {passed}/{len(sortable_columns)} 个字段通过")
-            rec.add_detail(f"  ── 汇总: {passed}/{len(sortable_columns)} 个字段排序测试通过 ──")
+            print(f"  [OK] 排序测试完成: {len(sortable_columns)}/{len(sortable_columns)} 个字段通过")
+            rec.add_detail(f"  ── 汇总: {len(sortable_columns)}/{len(sortable_columns)} 个字段真实顺序验证通过 ──")
 
         # ========== 步骤9: 导出VLAN配置（两次导出：CSV和TXT） ==========
         with rec.step("步骤9: 导出VLAN配置", "导出CSV和TXT两种格式的配置文件"):
@@ -477,35 +637,25 @@ class TestVlanComprehensive:
             export_file_csv = config.test_data.get_export_path("vlan", config.get_project_root())
             export_file_txt = export_file_csv.replace(".csv", ".txt")
 
-            try:
-                # 第一次导出：CSV文件
-                rec.add_detail(f"  测试1: 导出CSV格式")
-                rec.add_detail(f"    目标文件: {os.path.basename(export_file_csv)}")
-                export_result_csv = page.export_vlans(export_format="csv")
-                if export_result_csv:
-                    print(f"  [OK] 导出CSV成功: {export_file_csv}")
-                    rec.add_detail(f"    ✓ CSV导出成功")
-                else:
-                    print(f"  [WARN] 导出CSV失败")
-                    rec.add_detail(f"    ✗ CSV导出失败")
+            # 第一次导出：CSV文件
+            rec.add_detail(f"  测试1: 导出CSV格式")
+            rec.add_detail(f"    目标文件: {os.path.basename(export_file_csv)}")
+            export_result_csv = page.export_vlans(export_format="csv")
+            assert export_result_csv is True, "CSV导出操作失败"
+            _assert_export_matches(export_file_csv, test_vlans)
+            print(f"  [OK] 导出CSV成功且内容一致: {export_file_csv}")
+            rec.add_detail(f"    ✓ CSV导出成功，{len(test_vlans)}条记录字段一致")
 
-                # 短暂等待后进行第二次导出
-                page.page.wait_for_timeout(500)
+            page.page.wait_for_timeout(500)
 
-                # 第二次导出：TXT文件
-                rec.add_detail(f"  测试2: 导出TXT格式")
-                rec.add_detail(f"    目标文件: {os.path.basename(export_file_txt)}")
-                export_result_txt = page.export_vlans(export_format="txt")
-                if export_result_txt:
-                    print(f"  [OK] 导出TXT成功: {export_file_txt}")
-                    rec.add_detail(f"    ✓ TXT导出成功")
-                else:
-                    print(f"  [WARN] 导出TXT失败")
-                    rec.add_detail(f"    ✗ TXT导出失败")
-
-            except Exception as e:
-                print(f"  [WARN] 导出测试异常: {e}")
-                rec.add_detail(f"  导出异常: {str(e)}")
+            # 第二次导出：TXT文件
+            rec.add_detail(f"  测试2: 导出TXT格式")
+            rec.add_detail(f"    目标文件: {os.path.basename(export_file_txt)}")
+            export_result_txt = page.export_vlans(export_format="txt")
+            assert export_result_txt is True, "TXT导出操作失败"
+            _assert_export_matches(export_file_txt, test_vlans)
+            print(f"  [OK] 导出TXT成功且内容一致: {export_file_txt}")
+            rec.add_detail(f"    ✓ TXT导出成功，{len(test_vlans)}条记录字段一致")
 
             # 确保关闭可能存在的模态框，刷新页面确保状态干净
             page.close_modal_if_exists()
@@ -516,6 +666,31 @@ class TestVlanComprehensive:
         # ========== 步骤10: 异常输入测试 ==========
         with rec.step("步骤10: 异常输入测试", "测试各种不合规输入的验证拦截"):
             print("\n[步骤10] 异常输入测试...")
+            validation_failures = []
+
+            def record_rejection(result, value, desc, target_name):
+                """异常用例必须是明确的表单/服务端校验拒绝，普通自动化异常不算通过。"""
+                rejected = bool(result.get("has_validation_error")) and not result.get("success")
+                error_msg = result.get("error_msg") or "未返回校验提示"
+                created = page.vlan_exists(target_name)
+                if created:
+                    page.delete_vlan(target_name)
+                    validation_failures.append(f"{desc}: 非法配置被写入页面({target_name})")
+                if not rejected:
+                    validation_failures.append(
+                        f"{desc}: 未得到明确校验拒绝(success={result.get('success')}, "
+                        f"has_validation_error={result.get('has_validation_error')})"
+                    )
+                if backend_verifier is not None:
+                    verify_vlan_absent(target_name, f"异常输入-{desc}")
+                if rejected and not created:
+                    print(f"    [OK] {desc}: 正确拦截 - {error_msg}")
+                    rec.add_detail(f"  ✓ 输入'{value}' ({desc})")
+                    rec.add_detail(f"    提示: {error_msg}")
+                    return True
+                print(f"    [FAIL] {desc}: {error_msg}")
+                rec.add_detail(f"  ✗ 输入'{value}' ({desc}): 未被可靠拦截")
+                return False
 
             # 10.1 MAC地址不合规测试（其他字段正常）
             print("\n  [10.1] MAC地址不合规测试...")
@@ -526,23 +701,17 @@ class TestVlanComprehensive:
                 ("00:11:22:33:44:GG", "MAC非法字符"),
             ]
             mac_passed = 0
-            for mac_value, desc in mac_test_cases:
+            for index, (mac_value, desc) in enumerate(mac_test_cases):
+                target_name = f"vlan_bad_mac_{index}"
                 result = page.try_add_vlan_invalid(
-                    vlan_id="201",
-                    vlan_name="vlan_test_mac",  # 正常的名称
+                    vlan_id=str(201 + index),
+                    vlan_name=target_name,
                     mac=mac_value,  # 不合规的MAC
                     ip="192.168.201.1",  # 正常的IP
                     subnet_mask="255.255.255.0"  # 正常的子网掩码
                 )
-                if result["has_validation_error"] or not result["success"]:
-                    error_msg = result.get('error_msg', '验证失败') or '验证失败'
-                    print(f"    [OK] {desc}: 正确拦截 - {error_msg}")
-                    rec.add_detail(f"  ✓ 输入'{mac_value}' ({desc})")
-                    rec.add_detail(f"    提示: {error_msg}")
+                if record_rejection(result, mac_value, desc, target_name):
                     mac_passed += 1
-                else:
-                    print(f"    [FAIL] {desc}: 未被拦截！")
-                    rec.add_detail(f"  ✗ 输入'{mac_value}' ({desc}): 拦截失败")
                 page.page.wait_for_timeout(300)
             rec.add_detail(f"  → MAC地址验证结果: {mac_passed}/{len(mac_test_cases)} 通过")
 
@@ -555,23 +724,17 @@ class TestVlanComprehensive:
                 ("192.168.1.abc", "IP非法字符"),
             ]
             ip_passed = 0
-            for ip_value, desc in ip_test_cases:
+            for index, (ip_value, desc) in enumerate(ip_test_cases):
+                target_name = f"vlan_bad_ip_{index}"
                 result = page.try_add_vlan_invalid(
-                    vlan_id="202",
-                    vlan_name="vlan_test_ip",  # 正常的名称
+                    vlan_id=str(211 + index),
+                    vlan_name=target_name,
                     mac="00:11:22:33:44:02",  # 正常的MAC
                     ip=ip_value,  # 不合规的IP
                     subnet_mask="255.255.255.0"
                 )
-                if result["has_validation_error"] or not result["success"]:
-                    error_msg = result.get('error_msg', '验证失败') or '验证失败'
-                    print(f"    [OK] {desc}: 正确拦截 - {error_msg}")
-                    rec.add_detail(f"  ✓ 输入'{ip_value}' ({desc})")
-                    rec.add_detail(f"    提示: {error_msg}")
+                if record_rejection(result, ip_value, desc, target_name):
                     ip_passed += 1
-                else:
-                    print(f"    [FAIL] {desc}: 未被拦截！")
-                    rec.add_detail(f"  ✗ 输入'{ip_value}' ({desc}): 拦截失败")
                 page.page.wait_for_timeout(300)
             rec.add_detail(f"  → IP地址验证结果: {ip_passed}/{len(ip_test_cases)} 通过")
 
@@ -583,23 +746,16 @@ class TestVlanComprehensive:
                 ("vlan-name", "名称包含连字符"),
             ]
             name_passed = 0
-            for name_value, desc in name_test_cases:
+            for index, (name_value, desc) in enumerate(name_test_cases):
                 result = page.try_add_vlan_invalid(
-                    vlan_id="203",  # 正常的ID
+                    vlan_id=str(221 + index),  # 正常的ID
                     vlan_name=name_value,  # 不合规的名称
                     mac="00:11:22:33:44:03",  # 正常的MAC
                     ip="192.168.203.1",  # 正常的IP
                     subnet_mask="255.255.255.0"
                 )
-                if result["has_validation_error"] or not result["success"]:
-                    error_msg = result.get('error_msg', '验证失败') or '验证失败'
-                    print(f"    [OK] {desc}: 正确拦截 - {error_msg}")
-                    rec.add_detail(f"  ✓ 输入'{name_value}' ({desc})")
-                    rec.add_detail(f"    提示: {error_msg}")
+                if record_rejection(result, name_value, desc, name_value):
                     name_passed += 1
-                else:
-                    print(f"    [FAIL] {desc}: 未被拦截！")
-                    rec.add_detail(f"  ✗ 输入'{name_value}' ({desc}): 拦截失败")
                 page.page.wait_for_timeout(300)
             rec.add_detail(f"  → VLAN名称验证结果: {name_passed}/{len(name_test_cases)} 通过")
 
@@ -613,23 +769,17 @@ class TestVlanComprehensive:
                 ("abc", "VLAN ID非数字"),
             ]
             id_passed = 0
-            for id_value, desc in id_test_cases:
+            for index, (id_value, desc) in enumerate(id_test_cases):
+                target_name = f"vlan_bad_id_{index}"
                 result = page.try_add_vlan_invalid(
                     vlan_id=id_value,  # 不合规的ID
-                    vlan_name="vlan_test_id",  # 正常的名称
+                    vlan_name=target_name,  # 正常的名称
                     mac="00:11:22:33:44:04",  # 正常的MAC
                     ip="192.168.204.1",  # 正常的IP
                     subnet_mask="255.255.255.0"
                 )
-                if result["has_validation_error"] or not result["success"]:
-                    error_msg = result.get('error_msg', '验证失败') or '验证失败'
-                    print(f"    [OK] {desc}: 正确拦截 - {error_msg}")
-                    rec.add_detail(f"  ✓ 输入'{id_value}' ({desc})")
-                    rec.add_detail(f"    提示: {error_msg}")
+                if record_rejection(result, id_value, desc, target_name):
                     id_passed += 1
-                else:
-                    print(f"    [FAIL] {desc}: 未被拦截！")
-                    rec.add_detail(f"  ✗ 输入'{id_value}' ({desc}): 拦截失败")
                 page.page.wait_for_timeout(300)
             rec.add_detail(f"  → VLAN ID验证结果: {id_passed}/{len(id_test_cases)} 通过")
 
@@ -646,14 +796,9 @@ class TestVlanComprehensive:
                 ip="192.168.205.1",  # 正常的IP
                 subnet_mask="255.255.255.0"
             )
-            if result["has_validation_error"] or not result["success"]:
-                error_msg = result.get('error_msg', '验证失败') or '验证失败'
-                print(f"    [OK] VLAN ID冲突({existing_vlan['id']}): 正确拦截 - {error_msg}")
-                rec.add_detail(f"  ✓ 重复ID '{existing_vlan['id']}'")
-                rec.add_detail(f"    提示: {error_msg}")
-            else:
-                print(f"    [FAIL] VLAN ID冲突({existing_vlan['id']}): 未被拦截！")
-                rec.add_detail(f"  ✗ 重复ID '{existing_vlan['id']}': 冲突检测失败，未拦截")
+            conflict_passed = record_rejection(
+                result, existing_vlan["id"], "VLAN ID冲突", "vlan_test_conflict"
+            )
 
             # 10.6 扩展IP不合规测试（其他字段正常）
             print("\n  [10.6] 扩展IP不合规测试...")
@@ -665,7 +810,8 @@ class TestVlanComprehensive:
             ext_ip_passed = 0
             for ip_value, desc in ext_ip_test_cases:
                 result = page.try_add_invalid_extended_ip(existing_vlan["name"], ip_value)
-                if result["has_validation_error"] or not result["success"]:
+                rejected = bool(result.get("has_validation_error")) and not result.get("success")
+                if rejected:
                     error_msg = result.get('error_msg', '验证失败') or '验证失败'
                     print(f"    [OK] {desc}: 正确拦截 - {error_msg}")
                     rec.add_detail(f"  ✓ 输入'{ip_value}' ({desc})")
@@ -674,10 +820,28 @@ class TestVlanComprehensive:
                 else:
                     print(f"    [FAIL] {desc}: 未被拦截！")
                     rec.add_detail(f"  ✗ 输入'{ip_value}' ({desc}): 拦截失败")
+                    validation_failures.append(
+                        f"{desc}: 未得到明确校验拒绝"
+                        f"(success={result.get('success')}, "
+                        f"has_validation_error={result.get('has_validation_error')}, "
+                        f"error={result.get('error_msg')!r})"
+                    )
+                if backend_verifier is not None:
+                    verify_vlan_active(existing_vlan, f"非法扩展IP拦截后-{desc}")
                 page.page.wait_for_timeout(300)
             rec.add_detail(f"  → 扩展IP验证结果: {ext_ip_passed}/{len(ext_ip_test_cases)} 通过")
 
             print("\n  [OK] 异常输入测试完成")
+
+            expected_total = (
+                len(mac_test_cases) + len(ip_test_cases) + len(name_test_cases) +
+                len(id_test_cases) + 1 + len(ext_ip_test_cases)
+            )
+            actual_total = mac_passed + ip_passed + name_passed + id_passed + int(conflict_passed) + ext_ip_passed
+            assert actual_total == expected_total and not validation_failures, (
+                f"异常输入验证仅{actual_total}/{expected_total}可靠通过: {validation_failures}"
+            )
+            _wait_for_vlan_ui(page, [vlan["name"] for vlan in test_vlans])
 
             # 刷新页面确保状态干净
             page.page.reload()
@@ -699,6 +863,14 @@ class TestVlanComprehensive:
                     rec.add_detail(f"  第{attempt+1}次: 全选未生效, 重试")
                     page.page.wait_for_timeout(500)
                     continue
+                selected_count = page.get_selected_count()
+                if selected_count != len(test_vlans):
+                    rec.add_detail(
+                        f"  第{attempt+1}次: 全选数量错误，期望{len(test_vlans)}，实际{selected_count}"
+                    )
+                    page.page.wait_for_timeout(500)
+                    continue
+                rec.add_detail(f"  第{attempt+1}次: 已精确选中{selected_count}条")
                 page.batch_disable(); page.page.wait_for_timeout(1500)
                 page.page.reload(); page.page.wait_for_timeout(500)
                 if all(page.is_vlan_disabled(v["name"]) for v in test_vlans):
@@ -714,16 +886,13 @@ class TestVlanComprehensive:
                 print(f"  [WARN] 3次重试后仍启用: {still_enabled}")
                 rec.add_detail(f"  ✗ 3次重试后仍启用: {still_enabled}")
             if backend_verifier is not None:
-                try:
-                    vlan_rules = backend_verifier.query_vlan_rules()
-                    test_names = {v["name"] for v in test_vlans}
-                    disabled_in_db = sum(1 for r in vlan_rules if r.get("tagname") in test_names and r.get("enabled") == "no")
-                    print(f"    SSH: {disabled_in_db}/{len(test_vlans)}条停用")
-                    rec.add_detail(f"    SSH: {disabled_in_db}/{len(test_vlans)}条停用")
-                    if disabled_in_db < len(test_vlans):
-                        ssh_failures.append(f"SSH-L1-批量停用: 仅{disabled_in_db}/{len(test_vlans)}条VLAN停用")
-                except Exception as e:
-                    rec.add_detail(f"    SSH-L1-批量停用: 跳过 - {str(e)[:80]}")
+                disabled_passed = sum(
+                    1 for vlan in test_vlans
+                    if verify_vlan_disabled(vlan, "批量停用")
+                )
+                rec.add_detail(
+                    f"  ── 批量停用后台汇总: {disabled_passed}/{len(test_vlans)}条三层验证通过 ──"
+                )
 
         # ========== 步骤12: 批量启用所有VLAN(3次重试) ==========
         with rec.step("步骤12: 批量启用VLAN", f"批量启用剩余的 {len(test_vlans)} 条VLAN"):
@@ -738,6 +907,14 @@ class TestVlanComprehensive:
                     rec.add_detail(f"  第{attempt+1}次: 全选未生效, 重试")
                     page.page.wait_for_timeout(500)
                     continue
+                selected_count = page.get_selected_count()
+                if selected_count != len(test_vlans):
+                    rec.add_detail(
+                        f"  第{attempt+1}次: 全选数量错误，期望{len(test_vlans)}，实际{selected_count}"
+                    )
+                    page.page.wait_for_timeout(500)
+                    continue
+                rec.add_detail(f"  第{attempt+1}次: 已精确选中{selected_count}条")
                 page.batch_enable(); page.page.wait_for_timeout(1500)
                 page.page.reload(); page.page.wait_for_timeout(500)
                 if all(page.is_vlan_enabled(v["name"]) for v in test_vlans):
@@ -753,16 +930,13 @@ class TestVlanComprehensive:
                 print(f"  [WARN] 3次重试后仍停用: {still_disabled}")
                 rec.add_detail(f"  ✗ 3次重试后仍停用: {still_disabled}")
             if backend_verifier is not None:
-                try:
-                    vlan_rules = backend_verifier.query_vlan_rules()
-                    test_names = {v["name"] for v in test_vlans}
-                    enabled_in_db = sum(1 for r in vlan_rules if r.get("tagname") in test_names and r.get("enabled") == "yes")
-                    print(f"    SSH: {enabled_in_db}/{len(test_vlans)}条启用")
-                    rec.add_detail(f"    SSH: {enabled_in_db}/{len(test_vlans)}条enabled=yes")
-                    if enabled_in_db < len(test_vlans):
-                        ssh_failures.append(f"SSH-L1-批量启用: 仅{enabled_in_db}/{len(test_vlans)}条VLAN启用")
-                except Exception as e:
-                    rec.add_detail(f"    SSH-L1-批量启用: 跳过 - {str(e)[:80]}")
+                enabled_passed = sum(
+                    1 for vlan in test_vlans
+                    if verify_vlan_active(vlan, "批量启用")
+                )
+                rec.add_detail(
+                    f"  ── 批量启用后台汇总: {enabled_passed}/{len(test_vlans)}条三层验证通过 ──"
+                )
 
         # ========== 步骤13: 批量删除所有VLAN(3次重试) ==========
         with rec.step("步骤13: 批量删除VLAN", f"批量删除剩余的 {len(test_vlans)} 条VLAN"):
@@ -777,10 +951,22 @@ class TestVlanComprehensive:
                     rec.add_detail(f"  第{attempt+1}次: 全选未生效, 重试")
                     page.page.wait_for_timeout(500)
                     continue
+                selected_count = page.get_selected_count()
+                if selected_count != len(test_vlans):
+                    rec.add_detail(
+                        f"  第{attempt+1}次: 全选数量错误，期望{len(test_vlans)}，实际{selected_count}"
+                    )
+                    page.page.wait_for_timeout(500)
+                    continue
+                rec.add_detail(f"  第{attempt+1}次: 已精确选中{selected_count}条")
                 page.batch_delete(); page.page.wait_for_timeout(1500)
                 page.page.reload(); page.page.wait_for_timeout(500)
-                if all(not page.vlan_exists(v["name"]) for v in test_vlans):
-                    delete_success = True; break
+                try:
+                    _wait_for_vlan_ui(page, [], timeout_ms=4000)
+                    delete_success = True
+                    break
+                except AssertionError:
+                    pass
                 print(f"  第{attempt+1}次批量删除后仍有残留, 重试...")
                 rec.add_detail(f"  第{attempt+1}次: 仍有残留, 重试")
             if delete_success:
@@ -792,17 +978,14 @@ class TestVlanComprehensive:
                 print(f"  [WARN] 3次重试后仍存在: {still_exist}")
                 rec.add_detail(f"  ✗ 3次重试后仍存在: {still_exist}")
             if backend_verifier is not None:
-                try:
-                    vlan_rules = backend_verifier.query_vlan_rules()
-                    test_names = {v["name"] for v in test_vlans}
-                    remaining = [r for r in vlan_rules if r.get("tagname") in test_names]
-                    if remaining:
-                        ssh_failures.append(f"SSH-L1-批量删除: 数据库中仍有{len(remaining)}条测试VLAN")
-                    else:
-                        print(f"    SSH: 测试VLAN已全部删除（总: {len(vlan_rules)}）")
-                        rec.add_detail(f"    SSH: 测试VLAN已全部删除")
-                except Exception as e:
-                    rec.add_detail(f"    SSH-L1-批量删除: 跳过 - {str(e)[:80]}")
+                deleted_passed = sum(
+                    1 for vlan in test_vlans
+                    if verify_vlan_absent(vlan["name"], "批量删除")
+                )
+                rec.add_detail(
+                    f"  ── 批量删除后台汇总: {deleted_passed}/{len(test_vlans)}条三层无残留 ──"
+                )
+            assert page.get_vlan_count() == 0, "步骤13批量删除后页面数量不为0"
 
         # ========== 步骤14: 导入VLAN配置测试 ==========
         with rec.step("步骤14: 导入VLAN配置", "使用导出的CSV和TXT文件进行导入测试"):
@@ -814,64 +997,72 @@ class TestVlanComprehensive:
             # ========== 14.1: CSV文件导入（无数据，不需要勾选清空） ==========
             print("\n[步骤14.1] CSV file import test (no existing data)...")
             rec.add_detail(f"  测试1: CSV文件导入（不清空现有数据）")
-            if os.path.exists(import_file_csv):
-                count_before = page.get_vlan_count()
-                print(f"  CSV file: {import_file_csv}")
-                print(f"  Count before: {count_before}")
-                rec.add_detail(f"    导入文件: {os.path.basename(import_file_csv)}")
-                rec.add_detail(f"    导入前VLAN数量: {count_before}")
-                rec.add_detail(f"    清空现有数据: 否")
+            assert os.path.exists(import_file_csv), f"CSV文件不存在: {import_file_csv}"
+            count_before = page.get_vlan_count()
+            assert count_before == 0, f"CSV导入前应无VLAN，实际{count_before}条"
+            print(f"  CSV file: {import_file_csv}")
+            rec.add_detail(f"    导入文件: {os.path.basename(import_file_csv)}")
+            rec.add_detail(f"    导入前VLAN数量: {count_before}")
+            rec.add_detail(f"    清空现有数据: 否")
+            rec.add_detail(f"    1. 点击导入按钮")
+            rec.add_detail(f"    2. 选择CSV文件")
+            result = page.import_vlans(import_file_csv, clear_existing=False)
+            assert result is True, "CSV导入操作失败"
+            rec.add_detail(f"    3. 确认导入: {result}")
 
-                # 不需要勾选清空现有配置（因为没有数据）
-                rec.add_detail(f"    1. 点击导入按钮")
-                rec.add_detail(f"    2. 选择CSV文件")
-                result = page.import_vlans(import_file_csv, clear_existing=False)
-                print(f"  Import result: {result}")
-                rec.add_detail(f"    3. 确认导入: {result}")
-
-                page.page.reload()
-                page.page.wait_for_timeout(500)
-                count_after = page.get_vlan_count()
-                print(f"  Count after: {count_after}")
-                rec.add_detail(f"    导入后VLAN数量: {count_after}")
-
-                if count_after > count_before:
-                    print(f"  [OK] CSV import successful, added {count_after - count_before} records")
-                    rec.add_detail(f"    ✓ 成功添加 {count_after - count_before} 条记录")
-            else:
-                print(f"  [WARN] CSV file not found: {import_file_csv}")
-                rec.add_detail(f"    ✗ CSV文件不存在")
+            page.page.reload()
+            page.page.wait_for_load_state("networkidle")
+            _wait_for_vlan_ui(page, [vlan["name"] for vlan in test_vlans])
+            count_after = page.get_vlan_count()
+            assert count_after == len(test_vlans), (
+                f"CSV导入后应有{len(test_vlans)}条，实际{count_after}条"
+            )
+            rec.add_detail(f"    导入后VLAN数量: {count_after}")
+            rec.add_detail(f"    ✓ CSV导入{count_after}条，页面集合精确一致")
+            if backend_verifier is not None:
+                csv_passed = sum(
+                    1 for vlan in test_vlans if verify_vlan_active(vlan, "CSV导入")
+                )
+                rec.add_detail(
+                    f"  ── CSV导入后台汇总: {csv_passed}/{len(test_vlans)}条三层验证通过 ──"
+                )
 
             # ========== 14.2: TXT文件导入（有数据，需要勾选清空） ==========
             print("\n[步骤14.2] TXT file import test (with existing data, clear first)...")
             rec.add_detail(f"  测试2: TXT文件导入（清空现有数据后导入）")
-            if os.path.exists(import_file_txt):
-                count_before = page.get_vlan_count()
-                print(f"  TXT file: {import_file_txt}")
-                print(f"  Count before: {count_before}")
-                rec.add_detail(f"    导入文件: {os.path.basename(import_file_txt)}")
-                rec.add_detail(f"    导入前VLAN数量: {count_before}")
-                rec.add_detail(f"    清空现有数据: 是")
-                rec.add_detail(f"    1. 点击导入按钮")
-                rec.add_detail(f"    2. 选择TXT文件")
-                rec.add_detail(f"    3. 勾选'清空现有配置'")
+            assert os.path.exists(import_file_txt), f"TXT文件不存在: {import_file_txt}"
+            count_before = page.get_vlan_count()
+            assert count_before == len(test_vlans), (
+                f"TXT导入前应保留CSV导入的{len(test_vlans)}条，实际{count_before}条"
+            )
+            print(f"  TXT file: {import_file_txt}")
+            rec.add_detail(f"    导入文件: {os.path.basename(import_file_txt)}")
+            rec.add_detail(f"    导入前VLAN数量: {count_before}")
+            rec.add_detail(f"    清空现有数据: 是")
+            rec.add_detail(f"    1. 点击导入按钮")
+            rec.add_detail(f"    2. 选择TXT文件")
+            rec.add_detail(f"    3. 勾选'清空现有配置'")
 
-                # 需要勾选清空现有配置（因为有CSV导入的数据）
-                result = page.import_vlans(import_file_txt, clear_existing=True)
-                print(f"  Import result: {result}")
-                rec.add_detail(f"    4. 确认导入: {result}")
+            result = page.import_vlans(import_file_txt, clear_existing=True)
+            assert result is True, "TXT清空导入操作失败"
+            rec.add_detail(f"    4. 确认导入: {result}")
 
-                page.page.reload()
-                page.page.wait_for_timeout(500)
-                count_after = page.get_vlan_count()
-                print(f"  Count after: {count_after}")
-                rec.add_detail(f"    导入后VLAN数量: {count_after}")
-
-                print(f"  [OK] TXT import with clear completed")
-                rec.add_detail(f"    ✓ TXT导入完成（已清空旧数据）")
-            else:
-                print(f"  [WARN] TXT file not found: {import_file_txt}")
-                rec.add_detail(f"    ✗ TXT文件不存在")
+            page.page.reload()
+            page.page.wait_for_load_state("networkidle")
+            _wait_for_vlan_ui(page, [vlan["name"] for vlan in test_vlans])
+            count_after = page.get_vlan_count()
+            assert count_after == len(test_vlans), (
+                f"TXT清空导入后应有{len(test_vlans)}条，实际{count_after}条"
+            )
+            rec.add_detail(f"    导入后VLAN数量: {count_after}")
+            rec.add_detail(f"    ✓ TXT清空导入完成，页面集合精确一致且无重复")
+            if backend_verifier is not None:
+                txt_passed = sum(
+                    1 for vlan in test_vlans if verify_vlan_active(vlan, "TXT清空导入")
+                )
+                rec.add_detail(
+                    f"  ── TXT导入后台汇总: {txt_passed}/{len(test_vlans)}条三层验证通过 ──"
+                )
 
         # ========== 步骤15: 清理导入的VLAN ==========
         with rec.step("步骤15: 清理环境", "清理导入测试产生的VLAN数据"):
@@ -888,13 +1079,14 @@ class TestVlanComprehensive:
 
             if current_count > 0:
                 rec.add_detail(f"【清理操作】")
-                # 使用全选功能
-                select_all_checkbox = page.page.locator("thead input[type='checkbox']").first
-                if select_all_checkbox.count() > 0 and select_all_checkbox.is_enabled():
+                # 使用带选中数量复读的全选功能
+                if page.select_all_rules():
+                    selected_count = page.get_selected_count()
+                    assert selected_count == current_count, (
+                        f"步骤15全选数量错误: 期望{current_count}, 实际{selected_count}"
+                    )
                     rec.add_detail(f"  1. 点击全选复选框")
-                    select_all_checkbox.click()
-                    page.page.wait_for_timeout(500)
-
+                    rec.add_detail(f"     已精确选中 {selected_count} 条")
                     rec.add_detail(f"  2. 点击批量删除按钮")
                     # 批量删除
                     page.batch_delete()
@@ -903,8 +1095,10 @@ class TestVlanComprehensive:
 
                     # 验证删除
                     page.page.reload()
-                    page.page.wait_for_timeout(500)
+                    page.page.wait_for_load_state("networkidle")
+                    _wait_for_vlan_ui(page, [])
                     final_count = page.get_vlan_count()
+                    assert final_count == 0, f"步骤15清理后仍有{final_count}条VLAN"
                     print(f"  [OK] 清理完成，剩余 {final_count} 条VLAN")
                     rec.add_detail(f"【清理结果】")
                     rec.add_detail(f"  ✓ 清理完成，剩余 {final_count} 条VLAN")
@@ -923,6 +1117,19 @@ class TestVlanComprehensive:
             else:
                 print("  [OK] 没有需要清理的VLAN")
                 rec.add_detail(f"  ✓ 环境已干净，无需清理")
+
+            _wait_for_vlan_ui(page, [])
+            assert page.get_vlan_count() == 0, "步骤15结束时页面仍有VLAN"
+            if backend_verifier is not None:
+                backend_rules = backend_verifier.query_vlan_rules(strict=True)
+                assert backend_rules == [], f"步骤15结束时数据库仍有VLAN: {backend_rules}"
+                cleanup_passed = sum(
+                    1 for vlan in test_vlans
+                    if verify_vlan_absent(vlan["name"], "导入后清理")
+                )
+                rec.add_detail(
+                    f"  ── 清理后台汇总: {cleanup_passed}/{len(test_vlans)}条三层无残留 ──"
+                )
 
         # ========== 步骤16: 帮助功能测试 ==========
         with rec.step("步骤16: 帮助功能测试", "测试右下角帮助图标的显示和跳转功能"):
@@ -979,6 +1186,21 @@ class TestVlanComprehensive:
                 print("  [WARN] 帮助图标未找到或不可点击")
                 rec.add_detail("帮助图标未找到或不可点击（可能页面结构不同）")
 
+            help_failures = []
+            if not help_result.get("icon_clickable"):
+                help_failures.append("帮助图标不可点击")
+            if not help_result.get("panel_visible"):
+                help_failures.append("帮助面板未显示")
+            if not help_result.get("has_content"):
+                help_failures.append("帮助面板无内容")
+            if not help_result.get("link_clickable"):
+                help_failures.append("帮助链接不可点击")
+            elif not (help_result.get("new_page_opened") or help_result.get("url_changed")):
+                help_failures.append("点击帮助链接后未发生跳转")
+            if not help_result.get("can_close"):
+                help_failures.append("帮助面板无法关闭")
+            assert not help_failures, f"帮助功能验证失败: {help_failures}"
+
         print("\n" + "=" * 60)
         print("VLAN综合测试完成")
         print("=" * 60)
@@ -1021,26 +1243,41 @@ class TestVlanComprehensive:
                         page.page.wait_for_timeout(500)
                     ok = page.add_vlan(vlan_id=fv_id, vlan_name=fv_name, ip=fv_ip, subnet_mask="255.255.255.0", line="lan1")
                     if not ok:
-                        rec.add_detail("  ✗ 建VLAN失败，跳过")
-                        print("  [WARN] 建VLAN失败")
+                        rec.add_detail("  ✗ 建VLAN失败")
+                        print("  [FAIL] 建VLAN失败")
+                        ui_failures.append("步骤17-普通VLAN: 页面建VLAN失败")
                     else:
                         rule_added = True
                         rec.add_detail(f"  ✓ 建VLAN: {fv_name}(id={fv_id}, ip={fv_ip}, line=lan1)")
                         page.page.wait_for_timeout(1500)
-                        ssh_verify(f"L1-数据库({fv_name})", backend_verifier.verify_vlan_database, fv_name, must_pass=True, expected_fields={"vlan_id": fv_id})
-                        ssh_verify(f"L2-接口({fv_name})", backend_verifier.verify_vlan_interface, fv_name, must_pass=True)
-                        ssh_verify(f"L3-proc({fv_name})", backend_verifier.verify_vlan_proc, fv_name, expected_vlan_id=fv_id)
-                        backend_verifier.client_add_vlan_subif(54, ip_cidr=c_ip)
+                        feature_vlan = {
+                            "id": fv_id, "name": fv_name, "ip": fv_ip,
+                            "subnet": "255.255.255.0", "line": "lan1",
+                        }
+                        verify_vlan_active(feature_vlan, "普通VLAN功能")
+                        created_subif = backend_verifier.client_add_vlan_subif(54, ip_cidr=c_ip)
+                        if created_subif != c_sub:
+                            ui_failures.append(
+                                f"步骤17-普通VLAN: 客户端子接口名期望{c_sub}实际{created_subif}"
+                            )
                         subif_added = True
                         rec.add_detail(f"  client建 {c_sub} + {c_ip}")
+                        ssh_verify(
+                            f"L4-客户端子接口({c_sub})",
+                            backend_verifier.verify_client_vlan_subinterface,
+                            c_sub, 54, "ens11", must_pass=True,
+                            expected_ip_cidr=c_ip,
+                        )
                         pr = backend_verifier.client_ping(c_sub, fv_ip)
-                        if pr["connected"]:
+                        if pr["connected"] and pr["received"] == 4:
                             rec.add_detail(f"  ✓ ping {fv_ip} 通: {pr['received']}/4 received, rtt={pr['detail']}")
                             print(f"  [OK] 普通VLAN连通: ping {fv_ip} {pr['received']}/4")
                         else:
                             rec.add_detail(f"  ✗ ping {fv_ip} 不通: {pr['raw'][:100]}")
                             print(f"  [FAIL] 普通VLAN不通")
-                            ssh_failures.append(f"VLAN功能验证-普通VLAN: ping {fv_ip} 不通")
+                            ssh_failures.append(
+                                f"VLAN功能验证-普通VLAN: ping {fv_ip}仅收到{pr['received']}/4"
+                            )
                 finally:
                     if subif_added:
                         backend_verifier.client_del_iface(c_sub)
@@ -1049,9 +1286,12 @@ class TestVlanComprehensive:
                             page.navigate_to_vlan_settings()
                             page.page.wait_for_timeout(500)
                             if page.vlan_exists(fv_name):
-                                page.delete_vlan(fv_name)
-                        except Exception:
-                            pass
+                                deleted = page.delete_vlan(fv_name)
+                                if not deleted:
+                                    ui_failures.append("步骤17清理: 普通VLAN删除失败")
+                            verify_vlan_absent(fv_name, "普通VLAN功能清理")
+                        except Exception as exc:
+                            ui_failures.append(f"步骤17清理异常: {str(exc)[:100]}")
 
         # ========== 步骤18: QINQ VLAN功能验证（client双层tag实测连通性） ==========
         # 建VLAN54(lan1外层) + VLAN55(line=vlan54内层QINQ) → client ens11.54.55双层tag → ping内层VLAN接口IP
@@ -1081,25 +1321,50 @@ class TestVlanComprehensive:
                             i_added = True
                             rec.add_detail(f"  ✓ 内层VLAN(QINQ): {i_name}(id={i_id}, line={o_name}, ip={i_ip})")
                             page.page.wait_for_timeout(1500)
-                            ssh_verify(f"L1-外层数据库({o_name})", backend_verifier.verify_vlan_database, o_name, must_pass=True, expected_fields={"vlan_id": o_id})
-                            ssh_verify(f"L1-内层数据库({i_name})", backend_verifier.verify_vlan_database, i_name, must_pass=True, expected_fields={"vlan_id": i_id, "interface": o_name})
-                            ssh_verify(f"L2-外层接口({o_name})", backend_verifier.verify_vlan_interface, o_name, must_pass=True)
-                            ssh_verify(f"L2-内层接口({i_name})", backend_verifier.verify_vlan_interface, i_name, must_pass=False)
-                            backend_verifier.client_add_qinq_subif(54, 55, ip_cidr=ci_ip)
+                            outer_vlan = {
+                                "id": o_id, "name": o_name, "ip": o_ip,
+                                "subnet": "255.255.255.0", "line": "lan1",
+                            }
+                            inner_vlan = {
+                                "id": i_id, "name": i_name, "ip": i_ip,
+                                "subnet": "255.255.255.0", "line": o_name,
+                            }
+                            verify_vlan_active(outer_vlan, "QINQ外层")
+                            verify_vlan_active(inner_vlan, "QINQ内层")
+                            created_subif = backend_verifier.client_add_qinq_subif(54, 55, ip_cidr=ci_ip)
+                            if created_subif != ci_sub:
+                                ui_failures.append(
+                                    f"步骤18-QINQ: 客户端子接口名期望{ci_sub}实际{created_subif}"
+                                )
                             subif_added = True
                             rec.add_detail(f"  client建双层tag {ci_sub} + {ci_ip}")
+                            ssh_verify(
+                                "L4-客户端QINQ外层(ens11.54)",
+                                backend_verifier.verify_client_vlan_subinterface,
+                                "ens11.54", 54, "ens11", must_pass=True,
+                            )
+                            ssh_verify(
+                                f"L4-客户端QINQ内层({ci_sub})",
+                                backend_verifier.verify_client_vlan_subinterface,
+                                ci_sub, 55, "ens11.54", must_pass=True,
+                                expected_ip_cidr=ci_ip,
+                            )
                             pr = backend_verifier.client_ping(ci_sub, i_ip)
-                            if pr["connected"]:
+                            if pr["connected"] and pr["received"] == 4:
                                 rec.add_detail(f"  ✓ QINQ ping {i_ip} 通: {pr['received']}/4, rtt={pr['detail']}")
                                 print(f"  [OK] QINQ连通: ping {i_ip} {pr['received']}/4")
                             else:
                                 rec.add_detail(f"  ✗ QINQ ping {i_ip} 不通: {pr['raw'][:100]}")
                                 print(f"  [FAIL] QINQ不通")
-                                ssh_failures.append(f"VLAN功能验证-QINQ: ping {i_ip} 不通")
+                                ssh_failures.append(
+                                    f"VLAN功能验证-QINQ: ping {i_ip}仅收到{pr['received']}/4"
+                                )
                         else:
                             rec.add_detail("  ✗ 内层VLAN(QINQ)建失败")
+                            ui_failures.append("步骤18-QINQ: 内层VLAN创建失败")
                     else:
                         rec.add_detail("  ✗ 外层VLAN建失败")
+                        ui_failures.append("步骤18-QINQ: 外层VLAN创建失败")
                 finally:
                     if subif_added:
                         backend_verifier.client_del_iface("ens11.54.55")
@@ -1109,10 +1374,13 @@ class TestVlanComprehensive:
                         page.page.wait_for_timeout(500)
                         for nm in (i_name, o_name):
                             if page.vlan_exists(nm):
-                                page.delete_vlan(nm)
+                                deleted = page.delete_vlan(nm)
+                                if not deleted:
+                                    ui_failures.append(f"步骤18清理: {nm}删除失败")
                                 page.page.wait_for_timeout(400)
-                    except Exception:
-                        pass
+                            verify_vlan_absent(nm, "QINQ功能清理")
+                    except Exception as exc:
+                        ui_failures.append(f"步骤18清理异常: {str(exc)[:100]}")
 
         # ========== SSH后台验证汇总断言 ==========
         all_failures = ssh_failures + ui_failures

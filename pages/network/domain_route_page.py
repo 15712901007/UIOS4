@@ -138,38 +138,40 @@ class DomainRoutePage(IkuaiTablePage):
         Args:
             line_name: 线路名称，如 "wan2", "wan3", "全部"
         """
-        for attempt in range(3):
-            try:
-                # 定位线路区域: 通过form-item label "线路" 定位
-                line_form_item = self.page.locator('.ant-form-item').filter(
-                    has=self.page.locator('[class*="label"]').filter(has_text="线路"))
-                if line_form_item.count() > 0:
-                    line_sel = line_form_item.first.locator('.ant-select').first
-                else:
-                    # 备用: 第一个select
-                    line_sel = self.page.locator('.ant-select').first
-                line_sel.wait_for(state="visible", timeout=5000)
-
-                line_sel.click()
-                self.page.wait_for_timeout(1000)
-
-                wrapper = self.page.locator('.ant-checkbox-wrapper').filter(has_text=line_name)
-                if wrapper.count() > 0:
-                    wrapper.first.click(force=True)
-                    self.page.wait_for_timeout(500)
-
-                if self.page.locator('.ant-select-selection-item').count() > 0:
-                    break
-
-                self.page.keyboard.press("Escape")
-                self.page.wait_for_timeout(500)
-            except Exception as e:
-                print(f"[DEBUG] select_line({line_name}) attempt {attempt+1}: {e}")
+        requested_lines = [item.strip() for item in line_name.split(",") if item.strip()]
+        for requested_line in requested_lines:
+            selected = False
+            for attempt in range(3):
                 try:
-                    self.page.keyboard.press("Escape")
-                    self.page.wait_for_timeout(300)
-                except Exception:
-                    pass
+                    line_form_item = self.page.locator('.ant-form-item').filter(
+                        has=self.page.locator('[class*="label"]').filter(has_text="线路"))
+                    line_sel = (line_form_item.first.locator('.ant-select').first
+                                if line_form_item.count() > 0
+                                else self.page.locator('.ant-select').first)
+                    line_sel.wait_for(state="visible", timeout=5000)
+                    line_sel.click()
+                    self.page.wait_for_timeout(600)
+
+                    wrappers = self.page.locator('.ant-checkbox-wrapper:visible')
+                    wrapper = wrappers.filter(has_text=requested_line)
+                    if wrapper.count() == 0:
+                        raise RuntimeError(f"线路选项不存在: {requested_line}")
+                    checkbox = wrapper.first.locator('input[type="checkbox"]')
+                    checked = checkbox.count() > 0 and checkbox.is_checked()
+                    if not checked:
+                        wrapper.first.click(force=True)
+                        self.page.wait_for_timeout(400)
+                    selected = True
+                    break
+                except Exception as e:
+                    print(f"[DEBUG] select_line({requested_line}) attempt {attempt+1}: {e}")
+                    try:
+                        self.page.keyboard.press("Escape")
+                        self.page.wait_for_timeout(300)
+                    except Exception:
+                        pass
+            if not selected:
+                print(f"[WARN] 线路选择失败: {requested_line}")
 
         try:
             self.page.keyboard.press("Escape")
@@ -406,32 +408,53 @@ class DomainRoutePage(IkuaiTablePage):
                 self.page.wait_for_timeout(300)
 
             if days is not None:
-                all_days = ["一", "二", "三", "四", "五", "六", "日"]
-                for day_text in all_days:
-                    day_el = self.page.get_by_text(day_text, exact=True)
-                    if day_el.count() > 0:
-                        is_active = day_el.first.evaluate(
-                            'el => el.classList.contains("ant-tag-checkable-checked")'
-                            ' || el.parentElement.classList.contains("ant-tag-checkable-checked")'
-                            ' || el.classList.contains("active")'
-                        )
-                        should_select = day_text in days
-                        if should_select != is_active:
-                            day_el.first.click()
-                            self.page.wait_for_timeout(100)
+                marked = self.page.evaluate("""() => {
+                    const candidates=[...document.querySelectorAll('*')].filter(e=>{
+                        if(e.offsetParent===null) return false;
+                        const t=(e.textContent||'').replace(/\\s/g,'');
+                        return t.length<=20 && '一二三四五六日'.split('').every(d=>t.includes(d));
+                    });
+                    for(const wrap of candidates){
+                        const items=[...wrap.querySelectorAll('*')].filter(e=>
+                            e.offsetParent!==null && /^[一二三四五六日]$/.test((e.textContent||'').trim())
+                            && e.children.length===0);
+                        const unique=[...new Map(items.map(e=>[(e.textContent||'').trim(),e])).values()];
+                        if(unique.length===7){
+                            unique.forEach(e=>e.setAttribute('data-domain-weekday',(e.textContent||'').trim()));
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if not marked:
+                    print("[WARN] 未定位域名分流星期选择区域")
+                for day_text in ["一", "二", "三", "四", "五", "六", "日"]:
+                    day_el = self.page.locator(f'[data-domain-weekday="{day_text}"]')
+                    if day_el.count() == 0:
+                        continue
+                    is_active = day_el.evaluate("""el => {
+                        const cls=(el.className||'')+' '+((el.parentElement||{}).className||'');
+                        return cls.includes('_weekItemActive') ||
+                               cls.includes('ant-tag-checkable-checked') ||
+                               cls.split(/\\s+/).includes('active') ||
+                               el.getAttribute('aria-pressed')==='true';
+                    }""")
+                    if (day_text in days) != is_active:
+                        day_el.click()
+                        self.page.wait_for_timeout(100)
 
-            start_input = self.page.get_by_role("textbox", name="开始时间")
+            start_input = self.page.locator('input[placeholder="开始时间"]')
             if start_input.count() > 0:
-                start_input.click()
-                start_input.press("Control+a")
-                start_input.type(start_time, delay=50)
+                start_input.first.click()
+                start_input.first.fill(start_time)
+                start_input.first.press("Enter")
                 self.page.wait_for_timeout(100)
 
-            end_input = self.page.get_by_role("textbox", name="结束时间")
+            end_input = self.page.locator('input[placeholder="结束时间"]')
             if end_input.count() > 0:
-                end_input.click()
-                end_input.press("Control+a")
-                end_input.type(end_time, delay=50)
+                end_input.first.click()
+                end_input.first.fill(end_time)
+                end_input.first.press("Enter")
                 self.page.wait_for_timeout(100)
 
         except Exception as e:
@@ -446,9 +469,17 @@ class DomainRoutePage(IkuaiTablePage):
                 radio.click()
                 self.page.wait_for_timeout(500)
 
-            combobox = self.page.locator('[role="combobox"]').last
+            # 切换模式时，只有一个时间计划的设备会自动选中它。先确认当前值，
+            # 避免再点击被 selection-item 覆盖的只读 combobox input 而等待超时。
+            selected = self.page.locator(
+                f'.ant-select:visible .ant-select-selection-item[title="{plan_name}"]'
+            )
+            if selected.count() > 0:
+                return self
+
+            combobox = self.page.locator('[role="combobox"]:visible').last
             if combobox.count() > 0:
-                combobox.click()
+                combobox.locator('xpath=ancestor::*[contains(@class,"ant-select-selector")]').click()
                 self.page.wait_for_timeout(500)
 
                 option = self.page.get_by_title(plan_name, exact=True)

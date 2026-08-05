@@ -5,6 +5,7 @@ import base64
 import json
 import traceback
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any, Dict, List
 
 import pytest
@@ -81,6 +82,8 @@ class TestIpsecVpnComprehensive:
         peer_policy_id = 0
         router_proposal_id = 0
         peer_proposal_id = 0
+        extended_topologies: List[Any] = []
+        extended_policy_ids: List[tuple[str, int, str, int]] = []
 
         def safe(value: Any) -> Any:
             return ipsec.sanitize_value(value)
@@ -146,6 +149,24 @@ class TestIpsecVpnComprehensive:
                 automation_failures.append(message)
                 add_section("页面验证", "失败", "自动化执行", message)
                 current_step_failures.append(message)
+                try:
+                    ui._dismiss_overlays()
+                    ui.navigate_to_ipsec()
+                    add_section(
+                        "清理结果", "通过", "异常后页面状态恢复",
+                        "已重新进入IPsec隧道策略列表",
+                    )
+                except Exception as recovery_exc:
+                    recovery_message = (
+                        f"{title}异常后页面恢复失败"
+                        f"({type(recovery_exc).__name__})"
+                    )
+                    automation_failures.append(recovery_message)
+                    current_step_failures.append(recovery_message)
+                    add_section(
+                        "清理结果", "失败", "异常后页面状态恢复",
+                        recovery_message,
+                    )
             finally:
                 rec.ensure_current_step_sections(REQUIRED_SECTIONS)
                 if current_step_failures:
@@ -231,33 +252,44 @@ class TestIpsecVpnComprehensive:
                 )
                 return None
 
-        def fill_complete_policy(*, dpd_enabled: bool):
+        def fill_complete_policy(
+            *, dpd_enabled: bool, scenario_topology=None,
+            role: str = "spoke", proposal_name: str = "",
+            encap_mode: str = "tunnel",
+        ):
+            selected = scenario_topology or topology
+            selected_proposal = proposal_name or selected.router_proposal
             ui.open_new_policy()
             ui.fill_policy_basic(
-                tagname=topology.router_policy,
-                role="spoke",
-                addr_type="v4",
-                interface=topology.router_interface,
-                local_ip=topology.router_underlay,
-                remote_addr=topology.peer_underlay,
-                alias=f"ipsec-ui-{topology.token}",
+                tagname=selected.router_policy,
+                role=role,
+                addr_type=selected.addr_type,
+                interface=selected.router_interface,
+                local_ip=selected.router_underlay,
+                remote_addr=selected.router_remote_endpoint,
+                alias=f"ipsec-ui-{selected.token}",
                 comment="automation",
             )
             ui.fill_policy_ike(
                 ike_version="ikev2",
-                proposal=topology.router_proposal,
+                proposal=selected_proposal,
                 secret=secret,
-                local_id=topology.router_underlay,
-                remote_id=topology.peer_underlay,
+                local_id=selected.router_underlay,
+                remote_id=selected.peer_underlay,
                 prf="SHA256",
+                local_id_type="IPv6地址" if selected.addr_type == "v6" else "IPv4地址",
+                remote_id_type="IPv6地址" if selected.addr_type == "v6" else "IPv4地址",
             )
             if not ui.add_protected_traffic(
-                src=topology.client_selector,
-                dst=topology.peer_selector,
-                protocol="icmp",
+                src=selected.router_selector,
+                dst=selected.peer_selector,
+                protocol=selected.protocol,
             ):
-                raise RuntimeError("保护数据流弹窗未正常关闭")
+                errors = ui._last_protected_traffic_errors
+                suffix = f"：{'；'.join(errors)}" if errors else ""
+                raise RuntimeError(f"保护数据流弹窗未正常关闭{suffix}")
             ui.fill_policy_advanced(
+                encap_mode=encap_mode,
                 pfs_group="MODP 2048（组14）",
                 ipsec_sa_time=600,
                 dpd_enabled=dpd_enabled,
@@ -266,7 +298,69 @@ class TestIpsecVpnComprehensive:
                 dpd_action="重启",
             )
 
-        def restore_tunnel(label: str) -> bool:
+        def register_policy_ids(selected, router_id: int, peer_id: int):
+            extended_topologies.append(selected)
+            extended_policy_ids.append(
+                (selected.token, int(router_id), "router", int(peer_id))
+            )
+
+        def teardown_scenario(selected, router_id: int, peer_id: int):
+            if router_id and peer_id:
+                ipsec.terminate_test_sas(router_id, peer_id)
+            for target, policy_id in (("router", router_id), ("peer", peer_id)):
+                if policy_id:
+                    ipsec.policy_action(target, "del", policy_id)
+
+        def create_scenario(
+            selected, *, router_overrides=None, peer_overrides=None,
+            use_ui_router: bool = True, encap_mode: str = "tunnel",
+        ):
+            if router_policy_id and peer_policy_id:
+                ipsec.terminate_test_sas(router_policy_id, peer_policy_id)
+            prepared = ipsec.prepare_data_plane(selected)
+            check(
+                f"{selected.token}-数据面准备", prepared.passed,
+                prepared.details, kind="automation", section="运行时验证",
+            )
+            if not prepared.passed:
+                raise RuntimeError(f"{selected.token}数据面准备失败")
+            router_id = 0
+            if use_ui_router:
+                fill_complete_policy(
+                    dpd_enabled=True, scenario_topology=selected,
+                    role=selected.router_role,
+                    proposal_name=topology.router_proposal,
+                    encap_mode=encap_mode,
+                )
+                saved = ui.save_policy()
+                check(
+                    f"{selected.token}-页面创建主路由策略",
+                    saved.get("success"), saved, kind="product",
+                )
+                row = ipsec.find_policy(selected.router_policy, "router")
+                router_id = int(row["id"]) if row else 0
+                if router_id:
+                    ipsec.register_created_object(
+                        "router", "policy", router_id, selected.router_policy
+                    )
+            else:
+                router_id = ipsec.add_policy(
+                    "router", selected, router_proposal_id, secret,
+                    router_overrides,
+                )
+            peer_id = ipsec.add_policy(
+                "peer", selected, peer_proposal_id, secret, peer_overrides
+            )
+            check(
+                f"{selected.token}-双端策略已落库",
+                bool(router_id and peer_id),
+                {"router_id": router_id, "peer_id": peer_id},
+                section="后端验证",
+            )
+            register_policy_ids(selected, router_id, peer_id)
+            return router_id, peer_id
+
+        def restore_tunnel(label: str, *, failure_kind: str = "automation") -> bool:
             nonlocal router_policy_id, peer_policy_id
             if not router_policy_id or not peer_policy_id:
                 return False
@@ -277,20 +371,20 @@ class TestIpsecVpnComprehensive:
                 check(
                     f"{label}-断开已有测试连接",
                     False, withdrawn.details,
-                    kind="automation", section="运行时验证",
+                    kind=failure_kind, section="运行时验证",
                 )
                 return False
             cleared = verify(
                 f"{label}-重新加载当前认证配置",
                 ipsec.reload_current_credentials,
-                kind="automation", section="运行时验证",
+                kind=failure_kind, section="运行时验证",
             )
             if not cleared or not cleared.passed:
                 return False
             initiated = verify(
-                f"{label}-从对端发起连接",
-                ipsec.initiate_child_from_peer, peer_policy_id,
-                kind="automation", section="协议验证",
+                f"{label}-从主路由发起连接",
+                ipsec.initiate_child_from_router, router_policy_id,
+                kind=failure_kind, section="协议验证",
             )
             if not initiated or not initiated.passed:
                 return False
@@ -298,7 +392,7 @@ class TestIpsecVpnComprehensive:
                 f"{label}-两端连接状态恢复",
                 ipsec.wait_for_sa,
                 topology, router_policy_id, peer_policy_id,
-                timeout=25, kind="automation", section="协议验证",
+                timeout=25, kind=failure_kind, section="协议验证",
             )
             return bool(converged and converged.passed)
 
@@ -322,7 +416,7 @@ class TestIpsecVpnComprehensive:
                 kind="automation", section="后端验证",
             )
             ipsec.reload_current_credentials()
-            rejected = ipsec.initiate_child_from_peer(peer_policy_id)
+            rejected = ipsec.initiate_child_from_router(router_policy_id)
             check(
                 f"{label}-不一致配置必须阻止连接", not rejected.passed,
                 rejected.details, kind="product", section="协议验证",
@@ -364,7 +458,7 @@ class TestIpsecVpnComprehensive:
         try:
             with recorded_step(
                 "步骤1: 保存测试前状态并确认测试环境可用",
-                "操作：记录三台设备的配置、地址、路由、连接状态和管理通道；"
+                "操作：记录主路由和对端设备的配置、地址、路由、连接状态和管理通道；"
                 "验证：测试所需的后台数据、处理脚本和备用管理通道均可用。",
             ):
                 snapshot = ipsec.snapshot_environment()
@@ -374,7 +468,7 @@ class TestIpsecVpnComprehensive:
                     "peer_policy": topology.peer_policy,
                     "router_proposal": topology.router_proposal,
                     "peer_proposal": topology.peer_proposal,
-                    "client_selector": topology.client_selector,
+                    "router_selector": topology.router_selector,
                     "peer_selector": topology.peer_selector,
                 })
                 verify("后台数据表结构", ipsec.verify_schema)
@@ -384,9 +478,28 @@ class TestIpsecVpnComprehensive:
                 check(
                     "测试对象名无冲突",
                     ipsec.find_policy(topology.router_policy, "router") is None
-                    and ipsec.find_policy(topology.peer_policy, "peer") is None,
+                    and ipsec.find_policy(topology.peer_policy, "peer") is None
+                    and ipsec.find_proposal(topology.router_proposal, "router") is None
+                    and ipsec.find_proposal(topology.peer_proposal, "peer") is None,
                     "动态名称已被占用", kind="environment",
                     section="后端验证",
+                )
+                check(
+                    "动态策略和提议名称符合当前1-15字符规则",
+                    all(
+                        1 <= len(name) <= 15
+                        for name in (
+                            topology.router_policy, topology.peer_policy,
+                            topology.router_proposal, topology.peer_proposal,
+                        )
+                    ),
+                    {
+                        "router_policy_length": len(topology.router_policy),
+                        "peer_policy_length": len(topology.peer_policy),
+                        "router_proposal_length": len(topology.router_proposal),
+                        "peer_proposal_length": len(topology.peer_proposal),
+                    },
+                    kind="automation", section="后端验证",
                 )
 
             with recorded_step(
@@ -459,6 +572,48 @@ class TestIpsecVpnComprehensive:
                         or any(item.get("id") == field for item in basic_obs["selects"]),
                         basic_obs, kind="automation",
                     )
+                tagname_input = policy_form.locator("#tagname")
+                ui._replace_input(tagname_input, "p" * 16)
+                tagname_input.press("Tab")
+                ui.page.wait_for_timeout(250)
+                tagname_errors = ui.field_errors("tagname")
+                check(
+                    "策略名称超过15字符时页面给出明确提示",
+                    bool(tagname_errors),
+                    {
+                        "maxlength": tagname_input.get_attribute("maxlength"),
+                        "field_errors": tagname_errors,
+                        "backend_limit": 15,
+                    },
+                    kind="product",
+                    failure_summary=(
+                        "策略名称后端只接受1-15字符，但页面仍允许继续输入且没有字段级提示。"
+                    ),
+                )
+                ui._replace_input(tagname_input, "")
+
+                ui.open_policy_section("traffic")
+                trigger_mode = ui.selected_radio_label("trigger_mode")
+                check(
+                    "保护数据流默认使用自动触发",
+                    "自动触发" in trigger_mode or trigger_mode == "auto",
+                    {"selected": trigger_mode},
+                    kind="product",
+                )
+                policy_form.get_by_role("button", name="添加", exact=True).click()
+                traffic_modal = ui._proposal_modal()
+                protocol_options = ui.select_options(traffic_modal, "protocol")
+                check(
+                    "保护数据流协议使用中文“任意”",
+                    "任意" in protocol_options and "any" not in protocol_options,
+                    protocol_options,
+                    kind="product",
+                )
+                traffic_modal.get_by_role(
+                    "button", name="取消", exact=True
+                ).click()
+                traffic_modal.wait_for(state="hidden", timeout=5000)
+
                 ui.open_policy_section("advanced")
                 advanced_obs = ui.safe_form_observation()
                 for field, field_label in POLICY_ADVANCED_FIELD_LABELS.items():
@@ -468,14 +623,16 @@ class TestIpsecVpnComprehensive:
                         or any(item.get("id") == field for item in advanced_obs["selects"]),
                         advanced_obs, kind="automation",
                     )
-                check(
-                    "页面提供“对端失效后的处理方式”选项",
-                    any(item.get("id") == "dpd_action" for item in advanced_obs["selects"]),
-                    "页面默认开启对端失效检测，但高级配置中没有“失效后处理方式”选项。",
-                    kind="product",
-                    failure_summary=(
-                        "新建策略时，页面默认开启对端失效检测，却没有“失效后如何处理”"
-                        "这一项，用户无法完成一套完整配置。"
+                dpd_action_visible = any(
+                    item.get("id") == "dpd_action"
+                    for item in advanced_obs["selects"]
+                )
+                add_section(
+                    "页面验证", "通过", "DPD失效处理方式",
+                    (
+                        "页面允许用户选择失效处理方式"
+                        if dpd_action_visible else
+                        "当前页面使用后台默认restart；步骤6继续验证默认保存与实际落库值"
                     ),
                 )
                 ui._replace_input(policy_form.locator("#tagname"), "dirty_probe")
@@ -498,15 +655,27 @@ class TestIpsecVpnComprehensive:
                         response["success"],
                         response, kind="product", section="后端验证",
                     )
-                resolve = ui.api_call(
-                    "ipsec2_policy", "show", {"TYPE": "resolve_check"}
-                )
+                resolve = ui.resolve_remote_address(topology.peer_underlay)
                 check(
-                    "地址检查请求能被后台识别", resolve["success"],
+                    "真实对端地址检查成功",
+                    resolve["success"]
+                    and str(resolve.get("resolved_status")) in {"1", "true", "True"},
                     resolve, kind="product", section="后端验证",
                     failure_summary=(
                         "页面会自动发出地址检查请求，但后台不认识这个请求，"
                         "说明页面与后台功能没有配套。"
+                    ),
+                )
+                unreachable = ui.resolve_remote_address("192.0.2.254")
+                check(
+                    "不可达对端地址不得提示检测成功",
+                    str(unreachable.get("resolved_status")) not in {
+                        "1", "true", "True",
+                    },
+                    unreachable, kind="product", section="后端验证",
+                    failure_summary=(
+                        "对端地址检查把明确不可达的测试网地址也判成成功，"
+                        "页面的检测结果不能反映真实可达性。"
                     ),
                 )
                 add_public_command(
@@ -520,9 +689,9 @@ class TestIpsecVpnComprehensive:
                     "grep -nE 'resolve_check|resolve_flush' /usr/ikuai/script/ipsec2_policy.sh",
                     "正常应显示resolve_check处理入口；当前缺陷只显示resolve_flush定时清理入口",
                     actual=(
-                        "页面请求TYPE=resolve_check时，后台返回业务码2007和“不认识该请求”"
+                        "页面请求TYPE=resolve_check时，后台返回失败或不认识该请求"
                         if not resolve["success"] else
-                        "页面地址检查请求已被后台正确处理"
+                        "页面地址检查请求已被后台处理；自动化同时核对了真实可达性语义"
                     ),
                 )
 
@@ -562,7 +731,36 @@ class TestIpsecVpnComprehensive:
                 row = ipsec.find_proposal(topology.router_proposal, "router")
                 router_proposal_id = int(row["id"]) if row else 0
                 check("后台已保存IKE提议", router_proposal_id > 0, row, section="后端验证")
+                if router_proposal_id:
+                    ipsec.register_created_object(
+                        "router", "proposal", router_proposal_id,
+                        topology.router_proposal,
+                    )
                 check("重新查看列表可以找到IKE提议", ui.row_exists(topology.router_proposal), topology.router_proposal)
+                proposal_count = len(ipsec.query_proposals("router"))
+                ui.open_new_proposal()
+                ui.fill_proposal(tagname=topology.router_proposal)
+                duplicate = ui.save_proposal()
+                duplicate_text = " ".join(
+                    [str(duplicate.get("message") or "")]
+                    + list(duplicate.get("form_errors") or [])
+                )
+                check(
+                    "重复IKE提议名称显示明确原因",
+                    not duplicate.get("success")
+                    and any(word in duplicate_text for word in ("存在", "重复", "占用")),
+                    duplicate,
+                    kind="product",
+                )
+                check(
+                    "重复IKE提议没有产生额外记录",
+                    len(ipsec.query_proposals("router")) == proposal_count,
+                    {"before": proposal_count,
+                     "after": len(ipsec.query_proposals("router"))},
+                    section="后端验证",
+                )
+                if ui.page.locator(".ant-modal:visible,.ant-drawer:visible").count():
+                    ui.cancel_proposal(discard=True)
                 add_public_command(
                     "router", "查看刚创建的IKE提议数据库字段",
                     "sqlite3 /etc/mnt/ikuai/config.db -line \"SELECT id,tagname,auth_alg,enc_alg,dh_group,sa_lifetime FROM ipsec2_proposal WHERE tagname IS '"
@@ -583,10 +781,32 @@ class TestIpsecVpnComprehensive:
                     result, kind="product",
                     failure_summary=(
                         "所有可见必填项都已填写，但点击保存仍提示“请求参数不合法”。"
-                        "页面缺少后台要求的“失效后处理方式”，用户无法从页面补齐。"
+                        "请根据报告中的具体字段和请求参数核对当前前后端规则。"
                     ),
                 )
-                if not result.get("success"):
+                if result.get("success"):
+                    row = ipsec.find_policy(topology.router_policy, "router")
+                    router_policy_id = int(row["id"]) if row else 0
+                    check(
+                        "默认策略已写入后台", router_policy_id > 0,
+                        row, section="后端验证",
+                    )
+                    if router_policy_id:
+                        ipsec.register_created_object(
+                            "router", "policy", router_policy_id,
+                            topology.router_policy,
+                        )
+                    verify(
+                        "默认DPD设置已完整落库",
+                        ipsec.verify_database,
+                        topology.router_policy,
+                        {
+                            "dpd_enabled": "yes", "dpd_interval": "10",
+                            "dpd_timeout": "30", "dpd_action": "restart",
+                        },
+                        "router", section="后端验证",
+                    )
+                else:
                     check(
                         "保存失败后没有残留无效策略",
                         ipsec.find_policy(topology.router_policy, "router") is None,
@@ -599,7 +819,7 @@ class TestIpsecVpnComprehensive:
                     "router", "查看默认设置保存后是否产生策略记录",
                     "sqlite3 /etc/mnt/ikuai/config.db -line \"SELECT id,tagname,enabled,dpd_enabled,dpd_interval,dpd_timeout,dpd_action FROM ipsec2_policy WHERE tagname IS '"
                     + topology.router_policy + "';\"",
-                    "正常情况下应存在完整记录；当前缺陷复现时无记录",
+                    "正常情况下应存在完整记录，dpd_action应使用页面值或后台明确默认值",
                 )
 
             with recorded_step(
@@ -645,15 +865,25 @@ class TestIpsecVpnComprehensive:
                     if not harness or not harness.passed:
                         raise RuntimeError("对端charon夹具初始化失败")
 
-                fill_complete_policy(dpd_enabled=False)
-                result = ui.save_policy()
-                if not check(
-                    "页面创建关闭失效检测的策略", result.get("success"), result,
-                    kind="automation",
-                ):
-                    raise RuntimeError("可用策略UI新增失败")
-                row = ipsec.find_policy(topology.router_policy, "router")
-                router_policy_id = int(row["id"]) if row else 0
+                expected_dpd = "yes"
+                if not router_policy_id:
+                    fill_complete_policy(dpd_enabled=False)
+                    result = ui.save_policy()
+                    if not check(
+                        "默认保存失败后的关闭DPD兼容建链", result.get("success"),
+                        result, kind="automation",
+                    ):
+                        raise RuntimeError("可用策略UI新增失败")
+                    row = ipsec.find_policy(topology.router_policy, "router")
+                    router_policy_id = int(row["id"]) if row else 0
+                    expected_dpd = "no"
+                    if router_policy_id:
+                        ipsec.register_created_object(
+                            "router", "policy", router_policy_id,
+                            topology.router_policy,
+                        )
+                else:
+                    row = ipsec.find_policy(topology.router_policy, "router")
                 check("后台已保存主路由策略", router_policy_id > 0, row, section="后端验证")
                 verify(
                     "页面设置与后台记录一致",
@@ -663,7 +893,7 @@ class TestIpsecVpnComprehensive:
                         "role": "spoke", "interface": topology.router_interface,
                         "ike_version": "ikev2", "security_proto": "esp",
                         "pfs_group": "modp2048", "trigger_mode": "auto",
-                        "dpd_enabled": "no",
+                        "dpd_enabled": expected_dpd,
                     },
                     "router", section="后端验证",
                 )
@@ -677,30 +907,43 @@ class TestIpsecVpnComprehensive:
                         "页面显示保存成功，但隧道不能直接使用。"
                     ),
                 )
-                verify(
-                    "主路由认证文件仅管理员可读",
-                    ipsec.verify_secret_permissions,
-                    router_policy_id, "router",
-                    kind="product", section="后端验证",
-                    failure_summary=(
-                        "主路由保存的认证文件可被普通本机用户读取，"
-                        "文件权限过宽，存在认证信息泄露风险。"
-                    ),
-                )
-                verify(
-                    "对端认证文件仅管理员可读",
-                    ipsec.verify_secret_permissions,
-                    peer_policy_id, "peer",
-                    kind="product", section="后端验证",
-                    failure_summary=(
-                        "对端保存的认证文件可被普通本机用户读取，"
-                        "文件权限过宽，存在认证信息泄露风险。"
-                    ),
-                )
+                for target, policy_id, label in (
+                    ("router", router_policy_id, "主路由"),
+                    ("peer", peer_policy_id, "对端"),
+                ):
+                    permissions = ipsec.verify_secret_permissions(
+                        policy_id, target
+                    )
+                    add_section(
+                        "后端验证",
+                        "通过" if permissions.passed else "安全加固提示",
+                        f"{label}认证文件权限",
+                        permissions.details,
+                    )
+                if expected_dpd == "yes":
+                    router_dpd = ipsec.verify_effective_dpd(
+                        router_policy_id, "router"
+                    )
+                    peer_dpd = ipsec.verify_effective_dpd(
+                        peer_policy_id, "peer"
+                    )
+                    check(
+                        "两端DPD保存值与实际下发值一致",
+                        router_dpd.passed and peer_dpd.passed,
+                        {
+                            "router": router_dpd.details,
+                            "peer": peer_dpd.details,
+                        },
+                        kind="product", section="运行时验证",
+                        failure_summary=(
+                            "两端页面均保存DPD 10/30秒，但strongSwan实际下发为"
+                            "10/100秒，保存值被静默改写。"
+                        ),
+                    )
 
             with recorded_step(
                 "步骤8: 检查两端连接和双向加密数据传输",
-                "操作：重新加载当前认证配置并从对端发起连接；"
+                "操作：重新加载当前认证配置并从主路由发起连接；"
                 "验证：两端连接成功，双向各发送4个测试报文并确认加密计数增长。",
             ):
                 if not restore_tunnel("首次建链"):
@@ -712,6 +955,60 @@ class TestIpsecVpnComprehensive:
                 )
                 if not traffic or not traffic.passed:
                     raise RuntimeError("双向IPsec业务流量失败")
+                observability = ipsec.query_tunnel_observability(
+                    router_policy_id, "router"
+                )
+                check(
+                    "隧道列表能找到本次已建立连接",
+                    observability.get("row_found")
+                    and str(observability.get("list", {}).get("status", "")).lower()
+                    in {"established", "connected", "up", "已建立"},
+                    observability, kind="product", section="页面验证",
+                )
+                list_counters = observability.get("list", {})
+                check(
+                    "隧道列表收发字节随真实流量增长",
+                    int(list_counters.get("in_bytes") or 0) > 0
+                    and int(list_counters.get("out_bytes") or 0) > 0,
+                    list_counters, kind="product", section="运行时验证",
+                    failure_summary=(
+                        "隧道已有双向加密流量，但列表页收发字节仍为0。"
+                    ),
+                )
+                detail = observability.get("detail", {})
+                statistics = detail.get("statistics", {})
+                check(
+                    "隧道详情返回受保护报文和字节统计",
+                    all(
+                        int(statistics.get(name) or 0) > 0
+                        for name in (
+                            "in_protected_packets", "out_protected_packets",
+                            "in_protected_bytes", "out_protected_bytes",
+                        )
+                    ),
+                    detail, kind="product", section="运行时验证",
+                )
+                check(
+                    "隧道日志包含标题、诊断和技术日志结构",
+                    all(
+                        observability.get("log", {}).get(name)
+                        for name in (
+                            "has_title", "has_diagnosis", "has_technical_logs",
+                        )
+                    ),
+                    observability.get("log", {}),
+                    kind="product", section="页面验证",
+                )
+                sa = detail.get("sa", {})
+                check(
+                    "SA流量上限为0时详情按不限展示",
+                    str(sa.get("ipsec_sa_lifetime_bytes", "0"))
+                    in {"0", "不限", "unlimited", "None"},
+                    sa, kind="product", section="页面验证",
+                    failure_summary=(
+                        "策略配置的SA流量上限为不限，但详情页显示了虚构的固定上限。"
+                    ),
+                )
                 rec.add_verification_commands([
                     {
                         "target": "router", "target_label": "主路由器",
@@ -732,12 +1029,12 @@ class TestIpsecVpnComprehensive:
                         "contains_secret": False,
                     },
                     {
-                        "target": "client", "target_label": "测试客户端",
-                        "host": str(backend._ssh_config.client.host),
-                        "command": f"ip route get {topology.peer_service} from {topology.client_source}",
-                        "purpose": "确认内层测试目标经LAN1业务路径",
-                        "expected": f"经{topology.client_iface}和指定网关选路",
-                        "effect": "只读", "copy_ready": True,
+                        "target": "router", "target_label": "主路由器",
+                        "host": topology.router_underlay,
+                        "command": f"ping -I {topology.router_service} -c 4 -W 2 {topology.peer_service}",
+                        "purpose": "从主路由独立loopback发送实际加密流量",
+                        "expected": "4个报文全部成功且XFRM计数增长",
+                        "effect": "发送4个测试报文", "copy_ready": True,
                         "contains_secret": False,
                     },
                 ])
@@ -757,10 +1054,15 @@ class TestIpsecVpnComprehensive:
                     router_initiated.details,
                     kind="product", section="协议验证",
                     failure_summary=(
-                        "相同配置下，从对端发起可以连接成功，"
-                        "但从主路由发起却失败，连接结果错误地依赖发起方向。"
+                        "相同配置下，从主路由发起连接失败，隧道无法建立。"
                     ),
                 )
+                if router_initiated.passed:
+                    verify(
+                        "主路由发起后双向数据可通过",
+                        ipsec.verify_bidirectional_traffic,
+                        topology, section="协议验证",
+                    )
                 add_public_command(
                     "router", "查看从主路由发起后的连接状态",
                     "swanctl --list-sas",
@@ -768,7 +1070,25 @@ class TestIpsecVpnComprehensive:
                     actual="自动化已记录本次发起结果",
                 )
                 ipsec.terminate_test_sas(router_policy_id, peer_policy_id)
-                restore_tunnel("切回对端发起")
+                ipsec.reload_current_credentials()
+                peer_initiated = ipsec.initiate_child_from_peer(peer_policy_id)
+                check(
+                    "从对端发起连接", peer_initiated.passed,
+                    peer_initiated.details,
+                    kind="product", section="协议验证",
+                    failure_summary=(
+                        "相同配置下，主路由发起可成功，但从对端发起返回认证失败，"
+                        "连接结果错误地依赖发起方向。"
+                    ),
+                )
+                if peer_initiated.passed:
+                    verify(
+                        "对端发起后双向数据可通过",
+                        ipsec.verify_bidirectional_traffic,
+                        topology, section="协议验证",
+                    )
+                ipsec.terminate_test_sas(router_policy_id, peer_policy_id)
+                restore_tunnel("方向验证后恢复")
 
             with recorded_step(
                 "步骤10: 检查策略停用后重新启用能否自动恢复连接",
@@ -801,6 +1121,12 @@ class TestIpsecVpnComprehensive:
                 if not auto or not auto.passed:
                     ipsec.terminate_test_sas(router_policy_id, peer_policy_id)
                     restore_tunnel("启用后夹具恢复")
+                else:
+                    verify(
+                        "重新启用后双向数据可通过",
+                        ipsec.verify_bidirectional_traffic,
+                        topology, section="协议验证",
+                    )
 
             with recorded_step(
                 "步骤11: 检查编辑策略后连接能否正常更新和续期",
@@ -825,8 +1151,8 @@ class TestIpsecVpnComprehensive:
                 restore_tunnel("编辑后")
                 rekey = verify(
                     "连接续期",
-                    ipsec.rekey_child_from_peer,
-                    peer_policy_id, section="协议验证",
+                    ipsec.rekey_child,
+                    "router", router_policy_id, section="协议验证",
                 )
                 if rekey and rekey.passed:
                     verify(
@@ -880,13 +1206,15 @@ class TestIpsecVpnComprehensive:
                     pfs_changed.details, kind="automation", section="后端验证",
                 )
                 ipsec.reload_current_credentials()
-                initial_child = ipsec.initiate_child_from_peer(peer_policy_id)
+                initial_child = ipsec.initiate_child_from_router(
+                    router_policy_id
+                )
                 check(
                     "密钥组不一致时首次连接已建立",
                     initial_child.passed, initial_child.details,
                     kind="automation", section="协议验证",
                 )
-                pfs_rekey = ipsec.rekey_child_from_peer(peer_policy_id)
+                pfs_rekey = ipsec.rekey_child("router", router_policy_id)
                 check(
                     "两端密钥组不一致时重新建立连接必须失败",
                     not pfs_rekey.passed, pfs_rekey.details,
@@ -944,10 +1272,386 @@ class TestIpsecVpnComprehensive:
                 )
 
             with recorded_step(
-                "步骤13: 检查删除策略和IKE提议后数据是否清理",
+                "步骤13: 补充IPv6对等节点建链和双向流量",
+                "操作：使用两台设备wan1真实IPv6外层地址，创建IPv6 /128保护流量并从主路由发起；"
+                "验证：IPv6策略落库、IPv6 XFRM/Child收敛、ping6双向流量通过。",
+            ):
+                ui.navigate_to_ipsec()
+                selected = ipsec.choose_topology(addr_type="v6")
+                selected = replace(
+                    selected,
+                    router_proposal=topology.router_proposal,
+                    peer_proposal=topology.peer_proposal,
+                )
+                router_id, peer_id = create_scenario(selected)
+                verify(
+                    "IPv6主路由策略字段",
+                    ipsec.verify_database,
+                    selected.router_policy,
+                    {"addr_type": "v6", "role": "spoke"},
+                    "router", section="后端验证",
+                )
+                verify(
+                    "IPv6对端策略字段",
+                    ipsec.verify_database,
+                    selected.peer_policy,
+                    {"addr_type": "v6", "role": "spoke"},
+                    "peer", section="后端验证",
+                )
+                initiated = verify(
+                    "IPv6主路由发起Child",
+                    ipsec.initiate_child,
+                    "router", router_id, section="协议验证",
+                )
+                converged = verify(
+                    "IPv6双端SA/XFRM收敛",
+                    ipsec.wait_for_sa,
+                    selected, router_id, peer_id, timeout=35,
+                    section="协议验证",
+                )
+                traffic = verify(
+                    "IPv6 ping6双向加密流量",
+                    ipsec.verify_bidirectional_traffic,
+                    selected, kind="product", section="协议验证",
+                )
+                check(
+                    "IPv6场景建链前置结果",
+                    bool(initiated and initiated.passed and converged and converged.passed),
+                    {"initiated": getattr(initiated, "details", {}),
+                     "converged": getattr(converged, "details", {})},
+                    kind="product", section="运行时验证",
+                )
+                teardown_scenario(selected, router_id, peer_id)
+                restore_tunnel("IPv6场景结束后")
+
+            with recorded_step(
+                "步骤14: 补充域名对端解析和建链",
+                "操作：给主路由临时写入唯一hosts映射，策略对端使用域名而非IP；"
+                "验证：域名落库、解析文件/运行配置使用解析地址，真实隧道和双向流量通过，映射精确删除。",
+            ):
+                ui.navigate_to_ipsec()
+                selected = ipsec.choose_topology()
+                alias = f"peer-{selected.token}.test"
+                marker = f"ipsec-host-{selected.token}"
+                selected = replace(
+                    selected,
+                    router_proposal=topology.router_proposal,
+                    peer_proposal=topology.peer_proposal,
+                    router_remote_addr=alias,
+                )
+                router_id = peer_id = 0
+                try:
+                    installed = verify(
+                        "临时域名映射",
+                        ipsec.install_domain_alias,
+                        "router", alias, selected.peer_underlay, marker,
+                        kind="automation", section="运行时验证",
+                    )
+                    if installed and installed.passed:
+                        router_id, peer_id = create_scenario(selected)
+                        verify(
+                            "域名对端字段和运行解析",
+                            ipsec.verify_domain_policy_resolution,
+                            router_id, alias, selected.peer_underlay,
+                            "router", section="后端验证",
+                        )
+                        initiated = verify(
+                            "域名对端主路由发起Child",
+                            ipsec.initiate_child,
+                            "router", router_id, section="协议验证",
+                        )
+                        verify(
+                            "域名对端双向流量",
+                            ipsec.verify_bidirectional_traffic,
+                            selected, kind="product", section="协议验证",
+                        )
+                        check(
+                            "域名对端Child已建立",
+                            bool(initiated and initiated.passed),
+                            getattr(initiated, "details", {}),
+                            kind="product", section="运行时验证",
+                        )
+                finally:
+                    if router_id or peer_id:
+                        teardown_scenario(selected, router_id, peer_id)
+                    removed = verify(
+                        "唯一hosts映射精确清理",
+                        ipsec.remove_domain_alias,
+                        "router", marker, kind="automation",
+                        section="清理结果",
+                    )
+                    check(
+                        "域名映射清理成功",
+                        bool(removed and removed.passed),
+                        getattr(removed, "details", {}), kind="automation",
+                        section="清理结果",
+                    )
+                    restore_tunnel("域名场景结束后")
+
+            with recorded_step(
+                "步骤15: 补充中心节点Hub拓扑",
+                "操作：对端设备配置中心节点Hub，主路由配置spoke并发起连接；"
+                "验证：Hub表单隐藏固定对端身份控件，后台使用%any/unique=never，双向流量通过。",
+            ):
+                ui.navigate_to_ipsec()
+                probe = ui.open_new_policy()
+                ui.fill_policy_basic(
+                    tagname=f"hub{topology.token}", role="hub", addr_type="v4",
+                    interface=topology.router_interface,
+                    local_ip=topology.router_underlay, remote_addr="",
+                    alias="hub-ui-probe", comment="automation",
+                )
+                ui.open_policy_section("ike")
+                hub_form = ui.safe_form_observation()
+                check(
+                    "中心节点表单隐藏固定对端身份控件",
+                    not any(item.get("id") == "remote_id" for item in hub_form["fields"])
+                    and not any(item.get("id") == "remote_id_type" for item in hub_form["selects"]),
+                    hub_form, kind="product",
+                )
+                ui.cancel_policy(discard=True)
+                selected = ipsec.choose_topology(peer_role="hub")
+                selected = replace(
+                    selected,
+                    router_proposal=topology.router_proposal,
+                    peer_proposal=topology.peer_proposal,
+                )
+                router_id, peer_id = create_scenario(selected)
+                verify(
+                    "Hub策略运行契约",
+                    ipsec.verify_hub_runtime_contract,
+                    peer_id, "peer", section="运行时验证",
+                )
+                initiated = verify(
+                    "Hub拓扑spoke发起Child",
+                    ipsec.initiate_child,
+                    "router", router_id, section="协议验证",
+                )
+                verify(
+                    "Hub拓扑双向加密流量",
+                    ipsec.verify_bidirectional_traffic,
+                    selected, kind="product", section="协议验证",
+                )
+                check(
+                    "Hub拓扑Child已建立",
+                    bool(initiated and initiated.passed),
+                    getattr(initiated, "details", {}),
+                    kind="product", section="运行时验证",
+                )
+                teardown_scenario(selected, router_id, peer_id)
+                restore_tunnel("Hub场景结束后")
+
+            with recorded_step(
+                "步骤16: 补充传输模式和非法Hub传输组合",
+                "操作：使用真实外层主机/32作为唯一保护流量，创建transport模式并验证ICMP/XFRM；"
+                "同时提交Hub+transport非法组合，确认后台拒绝。",
+            ):
+                ui.navigate_to_ipsec()
+                selected = ipsec.choose_topology(encap_mode="transport")
+                selected = replace(
+                    selected,
+                    router_proposal=topology.router_proposal,
+                    peer_proposal=topology.peer_proposal,
+                )
+                router_id, peer_id = create_scenario(
+                    selected, encap_mode="transport"
+                )
+                verify(
+                    "主路由传输模式运行契约",
+                    ipsec.verify_transport_runtime_contract,
+                    router_id, selected, "router", section="运行时验证",
+                )
+                verify(
+                    "对端传输模式运行契约",
+                    ipsec.verify_transport_runtime_contract,
+                    peer_id, selected, "peer", section="运行时验证",
+                )
+                initiated = verify(
+                    "传输模式主机到主机Child",
+                    ipsec.initiate_child,
+                    "router", router_id, section="协议验证",
+                )
+                verify(
+                    "传输模式双向ICMP流量",
+                    ipsec.verify_bidirectional_traffic,
+                    selected, kind="product", section="协议验证",
+                )
+                check(
+                    "传输模式Child已建立",
+                    bool(initiated and initiated.passed),
+                    getattr(initiated, "details", {}),
+                    kind="product", section="运行时验证",
+                )
+                teardown_scenario(selected, router_id, peer_id)
+                invalid = replace(
+                    ipsec.choose_topology(),
+                    router_role="hub", encap_mode="transport",
+                    router_proposal=topology.router_proposal,
+                    peer_proposal=topology.peer_proposal,
+                )
+                invalid_id = 0
+                rejected = False
+                try:
+                    invalid_id = ipsec.add_policy(
+                        "router", invalid, router_proposal_id, secret
+                    )
+                except Exception as exc:
+                    rejected = True
+                    add_section(
+                        "协议验证", "通过", "Hub+transport非法组合被拒绝",
+                        {"exception": type(exc).__name__},
+                    )
+                check(
+                    "Hub+transport非法组合必须拒绝",
+                    rejected,
+                    {"created_policy_id": invalid_id}, kind="product",
+                    section="协议验证",
+                )
+                if invalid_id:
+                    ipsec.policy_action("router", "del", invalid_id)
+                restore_tunnel("传输模式场景结束后")
+
+            with recorded_step(
+                "步骤17: 补充多隧道、多Child和全量统计",
+                "操作：同时创建两个不同业务选择器的隧道，分别建链、打流、连续rekey；"
+                "验证：隧道列表有两个独立对象，所有Child和所有详情统计均被汇总，不取空闲Child。",
+            ):
+                first = replace(
+                    ipsec.choose_topology(),
+                    router_proposal=topology.router_proposal,
+                    peer_proposal=topology.peer_proposal,
+                )
+                second = replace(
+                    ipsec.choose_topology(),
+                    router_proposal=topology.router_proposal,
+                    peer_proposal=topology.peer_proposal,
+                )
+                first_ids = create_scenario(first, use_ui_router=False)
+                second_ids = create_scenario(second, use_ui_router=False)
+                for selected, (router_id, peer_id) in (
+                    (first, first_ids), (second, second_ids)
+                ):
+                    initiated = verify(
+                        f"{selected.token}-多隧道建链",
+                        ipsec.initiate_child,
+                        "router", router_id, section="协议验证",
+                    )
+                    verify(
+                        f"{selected.token}-多隧道双向流量",
+                        ipsec.verify_bidirectional_traffic,
+                        selected, kind="product", section="协议验证",
+                    )
+                    check(
+                        f"{selected.token}-多隧道Child建立",
+                        bool(initiated and initiated.passed),
+                        getattr(initiated, "details", {}),
+                        kind="product", section="运行时验证",
+                    )
+                for _ in range(2):
+                    verify("第一条隧道连续rekey", ipsec.rekey_child,
+                           "router", first_ids[0], section="协议验证")
+                    verify("第二条隧道连续rekey", ipsec.rekey_child,
+                           "router", second_ids[0], section="协议验证")
+                inventory = ipsec.query_multi_tunnel_observability(
+                    [first_ids[0], second_ids[0]], "router"
+                )
+                aggregate = inventory.get("aggregate_statistics", {})
+                check(
+                    "多隧道列表包含两个独立对象",
+                    inventory.get("matched_rows", 0) >= 2
+                    and inventory.get("distinct_tunnel_keys", 0) >= 2,
+                    inventory, kind="product", section="后端验证",
+                )
+                check(
+                    "多Child清单和保护字节统计不为空",
+                    inventory.get("child_inventory", {}).get("total_installed", 0) >= 2
+                    and aggregate.get("in_protected_bytes", 0) > 0
+                    and aggregate.get("out_protected_bytes", 0) > 0,
+                    inventory, kind="product", section="后端验证",
+                    failure_summary=(
+                        "多隧道详情只返回空闲Child或保护字节统计为0，"
+                        "无法证明统计覆盖全部活动Child。"
+                    ),
+                )
+                teardown_scenario(first, first_ids[0], first_ids[1])
+                teardown_scenario(second, second_ids[0], second_ids[1])
+                restore_tunnel("多隧道场景结束后")
+
+            with recorded_step(
+                "步骤18: 补充长时间DPD黑洞检测和恢复",
+                "操作：建立独立DPD隧道，在对端仅丢弃来自主路由的UDP500/4500和ESP，等待实际DPD收敛；"
+                "验证：记录状态变化时间、撤销规则、恢复隧道并再次双向打流。",
+            ):
+                selected = replace(
+                    ipsec.choose_topology(),
+                    router_proposal=topology.router_proposal,
+                    peer_proposal=topology.peer_proposal,
+                )
+                router_id, peer_id = create_scenario(
+                    selected, use_ui_router=False,
+                    router_overrides={
+                        "dpd_enabled": "yes", "dpd_interval": 10,
+                        "dpd_timeout": 30, "dpd_action": "restart",
+                    },
+                    peer_overrides={
+                        "dpd_enabled": "yes", "dpd_interval": 10,
+                        "dpd_timeout": 30, "dpd_action": "restart",
+                    },
+                )
+                initiated = verify(
+                    "DPD黑洞场景首次建链",
+                    ipsec.initiate_child,
+                    "router", router_id, section="协议验证",
+                )
+                verify(
+                    "DPD黑洞场景双向流量基线",
+                    ipsec.verify_bidirectional_traffic,
+                    selected, kind="product", section="协议验证",
+                )
+                marker = f"ipsec-dpd-{selected.token}"
+                blackhole = verify(
+                    "长时间DPD黑洞识别",
+                    ipsec.verify_dpd_blackhole_detection,
+                    selected, router_id, peer_id, marker=marker,
+                    section="协议验证",
+                )
+                check(
+                    "DPD黑洞夹具最终撤销",
+                    bool(blackhole and blackhole.details.get("blackhole_removed")),
+                    getattr(blackhole, "details", {}),
+                    kind="automation", section="清理结果",
+                )
+                ipsec.terminate_test_sas(router_id, peer_id)
+                verify(
+                    "DPD黑洞撤销后重载凭据",
+                    ipsec.reload_current_credentials,
+                    kind="product", section="运行时验证",
+                )
+                recovered = verify(
+                    "DPD黑洞撤销后重新建链",
+                    ipsec.initiate_child,
+                    "router", router_id, section="协议验证",
+                )
+                verify(
+                    "DPD黑洞恢复后双向流量",
+                    ipsec.verify_bidirectional_traffic,
+                    selected, kind="product", section="协议验证",
+                )
+                check(
+                    "DPD黑洞恢复Child已建立",
+                    bool(recovered and recovered.passed),
+                    getattr(recovered, "details", {}),
+                    kind="product", section="运行时验证",
+                )
+                teardown_scenario(selected, router_id, peer_id)
+                restore_tunnel("DPD场景结束后", failure_kind="product")
+
+            with recorded_step(
+                "步骤19: 检查删除策略和IKE提议后数据是否清理",
                 "操作：从页面删除策略，修改IKE提议生存周期后再删除提议；"
                 "验证：页面和后台只删除本次目标对象，不影响其他配置。",
             ):
+                ui.navigate_to_ipsec()
                 ipsec.terminate_test_sas(router_policy_id, peer_policy_id)
                 deleted = ui.delete_policy(topology.router_policy)
                 check("页面删除策略", deleted.get("success"), deleted)
@@ -985,10 +1689,13 @@ class TestIpsecVpnComprehensive:
 
         finally:
             with recorded_step(
-                "步骤14: 恢复测试前状态并确认没有残留",
+                "步骤20: 恢复测试前状态并确认没有残留",
                 "操作：停止本次测试连接，删除本次创建的策略、提议、路由和临时地址，"
-                "恢复测试前的连接服务状态；验证：三台设备状态与测试前一致，管理通道可用。",
+                "恢复测试前的连接服务状态；验证：两台设备状态与测试前一致，管理通道可用。",
             ):
+                for _, owned_router_id, _, owned_peer_id in list(extended_policy_ids):
+                    if owned_router_id and owned_peer_id:
+                        ipsec.terminate_test_sas(owned_router_id, owned_peer_id)
                 if router_policy_id and peer_policy_id:
                     ipsec.terminate_test_sas(router_policy_id, peer_policy_id)
                 cleanup = ipsec.cleanup(topology) if topology else None
@@ -1012,14 +1719,14 @@ class TestIpsecVpnComprehensive:
                     verify(
                         "独立检查是否存在测试残留",
                         ipsec.exact_residual_audit,
-                        topology, snapshot,
+                        [topology] + extended_topologies, snapshot,
                         kind="automation", section="清理结果",
                     )
                     if topology is not None else None
                 )
                 if snapshot is not None:
                     restored = verify(
-                        "三台设备状态恢复到测试前",
+                        "两台设备状态恢复到测试前",
                         ipsec.verify_restored, snapshot,
                         kind="environment", section="清理结果",
                         failure_summary=(

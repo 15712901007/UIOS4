@@ -1,8 +1,8 @@
 # 爱快路由器4.0自动化测试配置文件
 
-# 设备配置（主身份保持10.66.0.150；OSPF实机定位时可用DEVICE_IP临时覆盖为LAN1）
+# 设备配置（当前主身份为10.66.0.45；可用DEVICE_IP临时覆盖）
 device:
-  ip: "10.66.0.150"
+  ip: "10.66.0.45"
   username: "admin"
   password: "admin123"
   port: 80
@@ -14,7 +14,7 @@ browser:
   headless: false  # headed模式: 物理混合子接入drawer在headless下关闭动画不完成(UI残留连锁), headed正常
   slow_mo: 0
   timeout: 30000
-  screenshot_on_failure: true
+  screenshot_on_failure: false  # 默认关闭: 截图base64内嵌会撑大HTML报告(单张~244KB), 全量跑易超10M; 需要时GUI勾选
   video_on_failure: false
 
 # 报告配置
@@ -34,9 +34,12 @@ ssh:
   router_recovery_port: 22
   router_lan_management_host: "192.168.148.1"
   router_lan_management_port: 22
+  # 内核设置L5流量对端（Ubuntu；SSH认证复用client）
+  kernel_peer_host: "10.66.0.57"
+  kernel_peer_port: 22
   # 路由器SSH主身份；LAN1独立恢复通道见router_lan_management_host
   router:
-    host: "10.66.0.150"
+    host: "10.66.0.45"
     username: "sshd"
     password: "ikuai8.com"
     port: 22
@@ -183,6 +186,14 @@ test_data:
     protocol_control:
       export_filename: "protocol_control_config.csv"
       import_filename: "protocol_control_import.csv"
+    # 设备设置>高级管理>内核设置（单例表单无导入导出）
+    kernel_setting:
+      export_filename: "kernel_setting_config.csv"
+      import_filename: "kernel_setting_import.csv"
+    # 设备设置>云服务绑定（绑定云账号管理, 无导入导出, 占位保持配置一致）
+    cloud_service_binding:
+      export_filename: "cloud_service_binding_config.csv"
+      import_filename: "cloud_service_binding_import.csv"
     # 高级服务>本地服务>FTP服务
     ftp_server:
       export_filename: "ftp_server_config.csv"
@@ -223,6 +234,22 @@ test_data:
     mac_access_control:
       export_filename: "mac_access_control_config.csv"
       import_filename: "mac_access_control_import.csv"
+    # 认证服务>认证账号管理>套餐管理
+    ppp_package:
+      export_filename: "ppp_package_config.csv"
+      import_filename: "ppp_package_import.csv"
+    # 认证服务>认证账号管理>账号管理
+    pppuser:
+      export_filename: "pppuser_config.csv"
+      import_filename: "pppuser_import.csv"
+    # 认证服务>认证账号管理>总账管理(缴费记录, 日志库)
+    ppp_paylog:
+      export_filename: "ppp_paylog_config.csv"
+      import_filename: "ppp_paylog_import.csv"
+    # 认证服务>认证账号管理>上网码
+    coupon:
+      export_filename: "coupon_config.csv"
+      import_filename: "coupon_import.csv"
     # 后续可扩展其他模块
     # dhcp:
     #   export_filename: "dhcp_config.csv"

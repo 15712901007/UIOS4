@@ -44,6 +44,7 @@ dist\iKuai自动化测试工具\
 | 设备设置-基础设置 | `--collect-basic-setting-smoke` | `IKUAI_PACKAGED_BASIC_SETTING_SMOKE_RESULT` |
 | 设备设置-高级管理-ALG设置 | `--collect-alg-setting-smoke` | `IKUAI_PACKAGED_ALG_SETTING_SMOKE_RESULT` |
 | 设备设置-高级管理-协议控制 | `--collect-protocol-control-smoke` | `IKUAI_PACKAGED_PROTOCOL_CONTROL_SMOKE_RESULT` |
+| 设备设置-高级管理-内核设置 | `--collect-kernel-setting-smoke` | `IKUAI_PACKAGED_KERNEL_SETTING_SMOKE_RESULT` |
 | 网络配置-OSPF | `--collect-ospf-smoke` | `IKUAI_PACKAGED_OSPF_SMOKE_RESULT` |
 | 虚拟专网-IPsec VPN | `--collect-ipsec-smoke` | `IKUAI_PACKAGED_IPSEC_SMOKE_RESULT` |
 

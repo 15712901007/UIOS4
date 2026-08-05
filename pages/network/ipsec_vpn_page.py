@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlsplit
 
@@ -50,6 +51,7 @@ class IpsecVpnPage(IkuaiTablePage):
     def __init__(self, page: Page, base_url: str = ""):
         super().__init__(page, base_url)
         self._runtime_secrets: set[str] = set()
+        self._last_protected_traffic_errors: List[str] = []
 
     @staticmethod
     def _visible_unique_text(locator: Locator) -> List[str]:
@@ -76,21 +78,49 @@ class IpsecVpnPage(IkuaiTablePage):
     def _replace_input(locator: Locator, value: Any):
         locator.fill(str(value), force=True)
 
-    def _dismiss_overlays(self):
+    def _dismiss_overlays(self) -> bool:
+        """Best-effort close modal/drawer state left by an interrupted step."""
         try:
             self.page.keyboard.press("Escape")
         except Exception:
             pass
-        for selector in (
-            ".ant-modal:visible .ant-modal-close",
-            ".ant-drawer:visible .ant-drawer-close",
-        ):
-            locator = self.page.locator(selector)
-            while locator.count():
+
+        for _ in range(4):
+            changed = False
+            for selector in (
+                ".ant-modal:visible .ant-modal-close",
+                ".ant-modal:not(.ant-modal-confirm):visible "
+                "button:has-text('取消')",
+                ".ant-drawer:visible .ant-drawer-close",
+            ):
+                locator = self.page.locator(selector)
+                if not locator.count():
+                    continue
                 try:
                     locator.last.click(force=True, timeout=800)
+                    changed = True
+                    self.page.wait_for_timeout(120)
                 except Exception:
-                    break
+                    continue
+
+            # Closing a dirty policy drawer opens a discard confirmation.
+            confirm = self.page.locator(".ant-modal-confirm:visible")
+            if confirm.count():
+                button = confirm.last.get_by_role(
+                    "button", name="确定", exact=True
+                )
+                try:
+                    button.click(force=True, timeout=800)
+                    changed = True
+                    self.page.wait_for_timeout(120)
+                except Exception:
+                    pass
+            if not changed:
+                break
+
+        return not self.page.locator(
+            ".ant-modal:visible,.ant-drawer:visible"
+        ).count()
 
     @staticmethod
     def _response_matches(response, func_name: str, action: str) -> bool:
@@ -226,6 +256,54 @@ class IpsecVpnPage(IkuaiTablePage):
             "success": response.get("http_status") == 200 and response.get("code") == 0,
         })
         return response
+
+    def resolve_remote_address(
+        self, remote_addr: str, interface: str = "auto"
+    ) -> Dict[str, Any]:
+        """Call the same address-check endpoint used by the policy form."""
+        result = self.page.evaluate(
+            """async args => {
+                const response = await fetch('/Action/call', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        func_name: 'ipsec2_policy',
+                        action: 'show',
+                        param: {
+                            TYPE: 'resolve_check',
+                            remote_addr: args.remote_addr,
+                            iface: args.interface,
+                        },
+                    }),
+                });
+                let body = {};
+                try { body = await response.json(); } catch (_) {}
+                const results = body && typeof body.results === 'object'
+                    ? body.results : {};
+                return {
+                    http_status: response.status,
+                    code: body.code,
+                    message: String(body.message || '').slice(0, 240),
+                    resolved_status: results.status,
+                    result_keys: Object.keys(results).sort(),
+                };
+            }""",
+            {"remote_addr": str(remote_addr), "interface": str(interface)},
+        )
+        result.update({
+            "endpoint": "/Action/call",
+            "func_name": "ipsec2_policy",
+            "action": "show",
+            "type": "resolve_check",
+            "remote_addr": str(remote_addr),
+            "interface": str(interface),
+            "success": (
+                result.get("http_status") == 200
+                and result.get("code") in (0, "0", None)
+            ),
+        })
+        return result
 
     @classmethod
     def _safe_parameter_semantics(cls, value: Any, field: str = "") -> Any:
@@ -368,6 +446,13 @@ class IpsecVpnPage(IkuaiTablePage):
                 continue
         return False
 
+    @staticmethod
+    def _option_key(value: Any) -> str:
+        """Normalize display typography without weakening value matching."""
+        return " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).split()
+        ).casefold()
+
     def _select_by_id(self, root: Locator, field_id: str,
                       option_text: str) -> bool:
         input_locator = root.locator(f"#{field_id}")
@@ -434,17 +519,16 @@ class IpsecVpnPage(IkuaiTablePage):
             )
         self.page.wait_for_timeout(180)
         options = dropdown.locator(".ant-select-item-option:visible")
+        expected_key = self._option_key(option_text)
         for index in range(options.count()):
             option = options.nth(index)
             rendered = " ".join((option.inner_text() or "").split())
+            rendered_key = self._option_key(rendered)
             if (
-                rendered == option_text
-                or rendered.casefold() == str(option_text).casefold()
+                rendered_key == expected_key
                 # The interface selector renders value and device together,
                 # for example ``wan1(wan1)``.
-                or rendered.casefold().startswith(
-                    f"{str(option_text).casefold()}("
-                )
+                or rendered_key.startswith(f"{expected_key}(")
             ):
                 option.click(force=True, timeout=3000)
                 try:
@@ -467,7 +551,9 @@ class IpsecVpnPage(IkuaiTablePage):
         try:
             selected = self._select_by_id(root, field_id, option_text)
         except Exception as exc:
-            raise RuntimeError(f"IPsec字段选择失败: {field_id}") from exc
+            raise RuntimeError(
+                f"IPsec字段选择失败: {field_id}; {exc}"
+            ) from exc
         if not selected:
             raise RuntimeError(f"IPsec字段选择失败: {field_id}")
 
@@ -561,30 +647,50 @@ class IpsecVpnPage(IkuaiTablePage):
     def add_protected_traffic(self, *, src: str, dst: str,
                               protocol: str = "any",
                               src_port: str = "", dst_port: str = "") -> bool:
+        self._last_protected_traffic_errors = []
         drawer = self.open_policy_section("traffic")
         drawer.get_by_role("button", name="添加", exact=True).click()
-        modal = self._proposal_modal()
+        modal = self.page.locator(".ant-modal:visible").last
+        modal.wait_for(state="visible", timeout=5000)
         self.page.wait_for_timeout(180)
         self._replace_input(modal.locator("#src"), src)
         self._replace_input(modal.locator("#dst"), dst)
         protocol_labels = {
-            "any": "any", "ip": "IP", "tcp": "TCP",
-            "udp": "UDP", "icmp": "ICMP",
+            "any": ("任意", "any"), "ip": ("IP",), "tcp": ("TCP",),
+            "udp": ("UDP",), "icmp": ("ICMP",),
         }
-        self._require_select(
-            modal, "protocol", protocol_labels.get(protocol, protocol)
-        )
+        selected = False
+        last_error: Optional[Exception] = None
+        for label in protocol_labels.get(protocol, (protocol,)):
+            try:
+                self._require_select(modal, "protocol", label)
+                selected = True
+                break
+            except Exception as exc:
+                last_error = exc
+        if not selected:
+            raise RuntimeError("IPsec保护数据流协议选择失败") from last_error
         if protocol in {"tcp", "udp"}:
             if modal.locator("#src_port").count():
                 self._replace_input(modal.locator("#src_port"), src_port)
             if modal.locator("#dst_port").count():
                 self._replace_input(modal.locator("#dst_port"), dst_port)
-        modal.get_by_role("button", name="确定", exact=True).click()
-        try:
-            modal.wait_for(state="hidden", timeout=5000)
-        except Exception:
-            return False
-        return True
+        confirm = modal.get_by_role("button", name="确定", exact=True)
+        for _ in range(3):
+            try:
+                confirm.click(force=True, timeout=1500)
+                modal.wait_for(state="hidden", timeout=2500)
+                return True
+            except Exception:
+                self._last_protected_traffic_errors = self._visible_unique_text(
+                    modal.locator(".ant-form-item-explain-error:visible")
+                )
+                if self._last_protected_traffic_errors:
+                    break
+                self.page.wait_for_timeout(250)
+
+        self._dismiss_overlays()
+        return False
 
     def fill_policy_advanced(self, *, trigger_mode: str = "auto",
                              encap_mode: str = "tunnel",
@@ -717,6 +823,54 @@ class IpsecVpnPage(IkuaiTablePage):
             ".ant-notification-notice-message:visible"
         ))
 
+    def field_errors(self, field_id: str) -> List[str]:
+        field = self.page.locator(f"#{field_id}:visible").first
+        if not field.count():
+            return []
+        item = field.locator(
+            "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '),"
+            " ' ant-form-item ')][1]"
+        )
+        return self._visible_unique_text(
+            item.locator(".ant-form-item-explain-error:visible")
+        )
+
+    def selected_radio_label(self, field_id: str) -> str:
+        root = self._policy_drawer()
+        radios = root.locator(f"input#{field_id},input[name='{field_id}']")
+        for index in range(radios.count()):
+            radio = radios.nth(index)
+            try:
+                if not radio.is_checked():
+                    continue
+                wrapper = radio.locator(
+                    "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '),"
+                    " ' ant-radio-wrapper ')][1]"
+                )
+                if wrapper.count():
+                    return " ".join((wrapper.inner_text() or "").split())
+                return str(radio.get_attribute("value") or "")
+            except Exception:
+                continue
+        label_hint = {"trigger_mode": "触发模式"}.get(field_id, "")
+        if label_hint:
+            items = root.locator(".ant-form-item:visible")
+            for index in range(items.count()):
+                item = items.nth(index)
+                labels = self._visible_unique_text(
+                    item.locator(".ant-form-item-label:visible")
+                )
+                if not labels or label_hint not in labels[0]:
+                    continue
+                selected = item.locator(
+                    ".ant-radio-wrapper-checked:visible,"
+                    ".ant-segmented-item-selected:visible,"
+                    "[role=radio][aria-checked=true]:visible"
+                )
+                if selected.count():
+                    return " ".join((selected.first.inner_text() or "").split())
+        return ""
+
     def find_row(self, value: str) -> Locator:
         return self.page.locator(".ant-table-tbody .ant-table-row").filter(
             has_text=value
@@ -729,6 +883,13 @@ class IpsecVpnPage(IkuaiTablePage):
     def row_action(self, value: str, action_text: str,
                    func_name: str, action: str) -> Dict[str, Any]:
         row = self.find_row(value)
+        if not row.count() or not row.is_visible():
+            return {
+                "success": False,
+                "error": "row_not_found",
+                "value": value,
+                "action": action,
+            }
         row.get_by_text(action_text, exact=True).click()
         modal = self.page.locator(".ant-modal-confirm:visible,.ant-modal:visible")
         button = (

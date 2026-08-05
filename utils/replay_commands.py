@@ -1254,7 +1254,12 @@ def build_verification_commands(
         module.endswith("ipsec_verifier") or
         module.endswith("ospf_verifier") or
         "ospf" in name or
+        name.startswith("verify_vlan_") or
         "alg" in name.lower() or "protocol_control" in name.lower() or
+        name.startswith((
+            "get_kernel_", "verify_kernel_", "run_kernel_",
+            "restore_kernel_", "cleanup_kernel_", "choose_kernel_",
+        )) or
         "ftp" in name or "samba" in name or "http" in name or
         ("snmp" in name and "netsnmpc" not in name)
     ):
@@ -1393,22 +1398,25 @@ def build_verification_commands(
             topology = params.get("topology")
             if topology is None:
                 return []
-            client_source = str(getattr(topology, "client_source", ""))
+            router_service = str(
+                getattr(topology, "router_service", "")
+                or getattr(topology, "client_source", "")
+            )
             peer_service = str(getattr(topology, "peer_service", ""))
             try:
-                ipaddress.ip_address(client_source)
+                ipaddress.ip_address(router_service)
                 ipaddress.ip_address(peer_service)
             except ValueError:
                 return []
             expect_success = name == "verify_bidirectional_traffic"
-            _add_client(
-                bv, out, "查看客户端到测试目标的选路",
-                f"ip route get {peer_service} from {client_source}",
-                "显示流量经业务接口进入主路由", actual=actual,
+            _add_router(
+                bv, out, "查看主路由测试地址到对端测试地址的选路",
+                f"ip route get {peer_service} from {router_service}",
+                "显示本次独立loopback业务流量的选路", actual=actual,
             )
-            _add_client(
-                bv, out, "从客户端发送实际测试流量",
-                f"ping -I {client_source} -c 4 -W 2 {peer_service}",
+            _add_router(
+                bv, out, "从主路由loopback发送实际测试流量",
+                f"ping -I {router_service} -c 4 -W 2 {peer_service}",
                 "4个报文全部成功" if expect_success else "报文无法到达，符合负向场景",
                 actual=actual, effect="发送4个测试报文",
             )
@@ -1843,6 +1851,151 @@ def build_verification_commands(
             ),
             actual=actual,
             effect="向被测路由器UDP/123发送一个48字节SNTP请求",
+        )
+
+    elif name == "verify_kernel_script_contract":
+        _add_router(
+            bv, out, "查看内核设置脚本校验值",
+            "sha256sum /usr/ikuai/script/ik_sysctl.sh",
+            "显示当前实机ik_sysctl.sh的SHA256",
+        )
+        _add_router(
+            bv, out, "查看内核设置API软链接",
+            "readlink -f /usr/ikuai/function/ik_sysctl",
+            "输出/usr/ikuai/script/ik_sysctl.sh",
+        )
+        _add_router(
+            bv, out, "查看内核设置单例表结构",
+            f"sqlite3 {DB_PATH} {_double_quote('.schema sysctl')}",
+            "显示id、bbr和11个conntrack超时字段",
+        )
+        _add_router(
+            bv, out, "查看API、范围和运行态写入入口",
+            "grep -nE '(url=system/kernel-params|__check_param|tcp_congestion_control|nf_conntrack_.*timeout)' /usr/ikuai/script/ik_sysctl.sh",
+            "输出show/save/default、字段范围及每个/proc写入映射",
+        )
+    elif name == "verify_kernel_database":
+        _add_sql(
+            bv, out, "查看内核设置单例数据库",
+            "SELECT id,bbr,syn_recv_timeout,syn_send_timeout,established_timeout,"
+            "fin_wait_timeout,last_ack_timeout,close_wait_timeout,time_wait_timeout,"
+            "close_timeout,udp_timeout,udp_stream_timeout,icmp_timeout FROM sysctl WHERE id=1",
+            "十二个配置字段与报告期望一致",
+        )
+    elif name in {
+        "verify_kernel_runtime", "verify_kernel_full_chain",
+        "verify_kernel_reinit", "verify_kernel_environment_unchanged",
+    }:
+        _add_sql(
+            bv, out, "查看内核设置单例数据库",
+            "SELECT id,bbr,syn_recv_timeout,syn_send_timeout,established_timeout,"
+            "fin_wait_timeout,last_ack_timeout,close_wait_timeout,time_wait_timeout,"
+            "close_timeout,udp_timeout,udp_stream_timeout,icmp_timeout FROM sysctl WHERE id=1",
+            "字段与报告中的当前配置一致",
+        )
+        proc_names = (
+            "nf_conntrack_tcp_timeout_syn_recv",
+            "nf_conntrack_tcp_timeout_syn_sent",
+            "nf_conntrack_tcp_timeout_established",
+            "nf_conntrack_tcp_timeout_fin_wait",
+            "nf_conntrack_tcp_timeout_last_ack",
+            "nf_conntrack_tcp_timeout_close_wait",
+            "nf_conntrack_tcp_timeout_time_wait",
+            "nf_conntrack_tcp_timeout_close",
+            "nf_conntrack_udp_timeout",
+            "nf_conntrack_udp_timeout_stream",
+            "nf_conntrack_icmp_timeout",
+        )
+        for proc_name in proc_names:
+            _add_router(
+                bv, out, f"查看{proc_name}运行值",
+                f"cat /proc/sys/net/netfilter/{proc_name}",
+                "输出值与sysctl表对应字段一致",
+            )
+        _add_router(
+            bv, out, "查看TCP拥塞算法",
+            "cat /proc/sys/net/ipv4/tcp_congestion_control",
+            "bbr=1时输出bbr，bbr=0时输出cubic",
+        )
+        _add_router(
+            bv, out, "查看可用TCP拥塞算法",
+            "cat /proc/sys/net/ipv4/tcp_available_congestion_control",
+            "列表包含bbr和cubic",
+        )
+        if name == "verify_kernel_environment_unchanged":
+            _add_router(
+                bv, out, "审计路由器内核设置测试临时文件",
+                "find /tmp -maxdepth 1 -name 'ikuai_kernel_*' -print",
+                "无输出",
+                valid_when="测试结束后仍有效",
+            )
+            _add_client(
+                bv, out, "审计客户端内核设置测试临时文件",
+                "find /tmp -maxdepth 1 -name 'ikuai_kernel_*' -print",
+                "无输出",
+                valid_when="测试结束后仍有效",
+            )
+    elif name == "verify_kernel_path_health":
+        details = getattr(result, "details", {}) or {}
+        target = str(details.get("target") or params.get("target") or "10.66.0.57")
+        _add_client(
+            bv, out, "确认内核设置L5流量走ens11",
+            f"ip route get {target} from 192.168.148.2",
+            "探测期间输出via 192.168.148.1、dev ens11和src 192.168.148.2",
+            valid_when="自动化临时主机路由生效期间执行；测试结束后路由会恢复",
+        )
+        _add_client(
+            bv, out, "发送L5路径健康报文",
+            f"ping -I 192.168.148.2 -c 1 -W 2 {target}",
+            "收到1个ICMP回包",
+            effect="向L5对端发送一个ICMP健康检查报文",
+        )
+        _add_router(
+            bv, out, "确认L5路径发生SNAT",
+            f"conntrack -L -p icmp 2>/dev/null | grep 'src=192.168.148.2 dst={target}'",
+            "反向元组目的地址为路由器WAN地址",
+            valid_when="健康探针发出后立即执行",
+        )
+    elif name == "run_kernel_conntrack_probe":
+        details = getattr(result, "details", {}) or {}
+        peer = str(details.get("peer") or "10.66.0.57")
+        ports = details.get("ports") or {}
+        tcp_source = int(ports.get("tcp_source") or 30001)
+        udp_source = int(ports.get("udp_source") or 30002)
+        _add_client(
+            bv, out, "确认L5真实流量经被测路由",
+            f"ip route get {peer} from 192.168.148.2",
+            "探测期间输出via 192.168.148.1、dev ens11和src 192.168.148.2",
+            valid_when="自动化临时主机路由生效期间执行；测试结束后路由会恢复",
+        )
+        _add_router(
+            bv, out, "查看本轮TCP ESTABLISHED超时",
+            f"conntrack -L -p tcp 2>/dev/null | grep 'src=192.168.148.2 dst={peer}' | grep 'sport={tcp_source}'",
+            "状态为ESTABLISHED，超时秒数接近页面established_timeout",
+            valid_when="L5探针保持TCP连接期间执行",
+        )
+        _add_router(
+            bv, out, "查看本轮单向UDP超时",
+            f"conntrack -L -p udp 2>/dev/null | grep 'src=192.168.148.2 dst={peer}' | grep 'sport={udp_source}'",
+            "初始超时不大于udp_timeout，到期后无输出",
+            valid_when="L5探针发包后、udp_timeout到期前后各执行一次",
+        )
+        _add_router(
+            bv, out, "查看本轮双向UDP stream超时",
+            f"conntrack -L -p udp 2>/dev/null | grep 'src=192.168.148.2 dst={peer}' | grep 'sport={udp_source + 1}'",
+            "显示[ASSURED]且超时不大于udp_stream_timeout",
+            valid_when="L5对端回包后、udp_stream_timeout到期前执行",
+        )
+        _add_router(
+            bv, out, "查看本轮ICMP超时",
+            f"conntrack -L -p icmp 2>/dev/null | grep 'src=192.168.148.2 dst={peer}'",
+            "初始超时不大于icmp_timeout，到期后无输出",
+            valid_when="L5 ping后、icmp_timeout到期前后各执行一次",
+        )
+        _add_router(
+            bv, out, "查看L5期间TCP拥塞算法",
+            "cat /proc/sys/net/ipv4/tcp_congestion_control",
+            "与报告中的bbr开关一致",
         )
 
     elif name == "verify_protocol_control_script_contract":
@@ -2739,6 +2892,62 @@ def build_verification_commands(
             actual=actual,
             valid_when="本条协议命令完成后",
         )
+
+    elif name.startswith("verify_vlan_"):
+        actual = _basic_result_actual(result, params)
+
+        def safe_iface(value, label):
+            raw = str(value or "").strip()
+            safe = _safe_probe_component(raw, "invalid")
+            if not raw or safe != raw:
+                raise ValueError(f"人工VLAN复验必须提供安全的{label}")
+            return safe
+
+        if name in {"verify_vlan_database", "verify_vlan_database_absent"}:
+            vlan_name = safe_iface(params.get("vlan_name"), "VLAN名称")
+            expected = (
+                "返回JSON，目标VLAN不存在"
+                if name.endswith("_absent") else
+                "返回JSON，目标VLAN存在且全部期望字段与页面一致"
+            )
+            _add_router(
+                bv, out, f"查看VLAN {vlan_name} 的数据库配置",
+                '/usr/ikuai/function/vlan show "limit=0,500" "TYPE=total,data"',
+                expected, actual=actual,
+            )
+        elif name in {"verify_vlan_interface", "verify_vlan_interface_absent"}:
+            vlan_name = safe_iface(params.get("vlan_name"), "VLAN名称")
+            absent = name.endswith("_absent")
+            expected_state = str(params.get("expected_state") or "UP").upper()
+            for iface in (f"_{vlan_name}", vlan_name):
+                _add_router(
+                    bv, out, f"查看VLAN接口 {iface}",
+                    f"ip -d link show dev {iface}",
+                    ("命令提示接口不存在" if absent else
+                     f"实际使用的候选接口存在，flags/state明确为{expected_state}，父接口及同名bridge状态正确"),
+                    actual=actual,
+                )
+        elif name in {"verify_vlan_proc", "verify_vlan_proc_absent"}:
+            vlan_name = safe_iface(params.get("vlan_name"), "VLAN名称")
+            _add_router(
+                bv, out, f"查看内核802.1Q映射中的 {vlan_name}",
+                "cat /proc/net/vlan/config",
+                (f"首列无精确名称_{vlan_name}或{vlan_name}" if name.endswith("_absent") else
+                 "首列精确名称、VLAN ID和父接口均与页面一致"),
+                actual=actual,
+            )
+        elif name == "verify_client_vlan_subinterface":
+            iface = safe_iface(params.get("iface"), "客户端接口名")
+            _add_client(
+                bv, out, f"查看客户端VLAN接口 {iface}",
+                f"ip -d -o link show dev {iface}",
+                "接口UP，父接口和VLAN ID与本步骤一致", actual=actual,
+            )
+            _add_client(
+                bv, out, f"查看客户端VLAN接口 {iface} 的IPv4地址",
+                f"ip -o -4 addr show dev {iface}",
+                "地址和掩码与本步骤一致", actual=actual,
+            )
 
     elif name == "verify_http_rule_database":
         tagname, rule_id = params.get("tagname"), params.get("rule_id")

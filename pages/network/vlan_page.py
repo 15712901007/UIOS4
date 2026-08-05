@@ -4,6 +4,9 @@ VLAN设置页面类
 处理VLAN配置的增删改查、启用停用、导入导出等操作
 继承 IkuaiTablePage 获取通用表格操作
 """
+import re
+import time
+
 from playwright.sync_api import Page, Locator
 from pages.ikuai_table_page import IkuaiTablePage
 from typing import Optional, List
@@ -28,6 +31,80 @@ class VlanPage(IkuaiTablePage):
         "备注": "comment",
     }
 
+    def _find_vlan_row(self, vlan_name: str) -> Optional[Locator]:
+        """按 VLAN 名称列的完整文本定位数据行，避免前缀名称互相命中。"""
+        rows = self.page.locator("div.ant-table-tbody div.ant-table-row")
+        for index in range(rows.count()):
+            row = rows.nth(index)
+            name_cell = row.locator("div.ant-table-cell#vlan_name")
+            if name_cell.count() and (name_cell.first.inner_text() or "").strip() == vlan_name:
+                return row
+        return None
+
+    @staticmethod
+    def _row_has_button(row: Locator, button_name: str) -> bool:
+        buttons = row.locator("button")
+        for index in range(buttons.count()):
+            if (buttons.nth(index).inner_text() or "").strip() == button_name:
+                return True
+        return False
+
+    def _click_rule_button(self, rule_name: str, button_name: str) -> bool:
+        """只点击 VLAN 精确名称所在行的操作按钮。"""
+        self.page.wait_for_load_state("networkidle")
+        self.page.wait_for_timeout(300)
+        try:
+            deadline = time.monotonic() + 5
+            row = None
+            while time.monotonic() < deadline:
+                row = self._find_vlan_row(rule_name)
+                if row is not None:
+                    break
+                self.page.wait_for_timeout(200)
+            if row is None:
+                print(f"[DEBUG] VLAN精确行不存在: {rule_name}")
+                return False
+            buttons = row.locator("button")
+            for index in range(buttons.count()):
+                button = buttons.nth(index)
+                if (button.inner_text() or "").strip() == button_name:
+                    button.click()
+                    return True
+            print(f"[DEBUG] VLAN {rule_name} 行中未找到按钮 {button_name}")
+            return False
+        except Exception as exc:
+            print(f"[DEBUG] VLAN精确行按钮点击失败: {str(exc)[:100]}")
+            return False
+
+    def rule_exists(self, rule_name: str) -> bool:
+        """检查 VLAN 精确名称的数据行是否存在。"""
+        try:
+            self.page.wait_for_load_state("networkidle")
+            self.page.wait_for_timeout(200)
+            return self._find_vlan_row(rule_name) is not None
+        except Exception:
+            return False
+
+    def is_rule_enabled(self, rule_name: str) -> bool:
+        """精确检查目标 VLAN 行是否提供“停用”操作。"""
+        try:
+            self.page.wait_for_load_state("networkidle")
+            self.page.wait_for_timeout(200)
+            row = self._find_vlan_row(rule_name)
+            return row is not None and self._row_has_button(row, "停用")
+        except Exception:
+            return False
+
+    def is_rule_disabled(self, rule_name: str) -> bool:
+        """精确检查目标 VLAN 行是否提供“启用”操作。"""
+        try:
+            self.page.wait_for_load_state("networkidle")
+            self.page.wait_for_timeout(200)
+            row = self._find_vlan_row(rule_name)
+            return row is not None and self._row_has_button(row, "启用")
+        except Exception:
+            return False
+
     # ==================== 导航 ====================
     def navigate_to_vlan_settings(self):
         """导航到VLAN设置页面"""
@@ -41,6 +118,17 @@ class VlanPage(IkuaiTablePage):
         self.page.goto(f"{self.base_url}{self.VLAN_URL}")
         self.page.wait_for_load_state("networkidle")
         return self
+
+    def _ensure_vlan_list(self) -> None:
+        """单一导航回 VLAN 列表，并确认列表操作栏已实际渲染。"""
+        self.page.goto(f"{self.base_url}/#/networkConfiguration/vlanSettings")
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        self.page.get_by_role("button", name="添加").first.wait_for(
+            state="visible", timeout=8000
+        )
 
     # ==================== 表单字段填写 ====================
     def fill_vlan_id(self, vlan_id: str):
@@ -70,18 +158,38 @@ class VlanPage(IkuaiTablePage):
 
     def select_subnet_mask(self, mask: str):
         """选择子网掩码"""
-        self.page.get_by_role("combobox", name="子网掩码").click(force=True)
-        self.page.wait_for_timeout(300)
-        # 同select_line: nth(1)在异常表单场景可能找不到, 默认30秒超时会累积卡死整个测试, 加短超时降级
-        title_items = self.page.get_by_title(mask, exact=True)
-        try:
-            title_items.nth(1).click(force=True, timeout=5000)
-        except Exception:
-            try:
-                title_items.first.click(force=True, timeout=5000)
-            except Exception:
-                print(f"[DEBUG] select_subnet_mask: 未能选中掩码'{mask}'(异常表单状态), 跳过")
+        self._select_combobox_value_by_id("netmask", mask)
         return self
+
+    def _select_combobox_value_by_id(self, input_id: str, value: str) -> None:
+        """在指定 Ant Select 上选择值，并复读实际选择结果。"""
+        combobox = self.page.locator(f"#{input_id}")
+        if combobox.count() != 1:
+            raise AssertionError(f"下拉框#{input_id}数量不为1: {combobox.count()}")
+        selected_value = (
+            "el => el.closest('.ant-select-selector')"
+            "?.querySelector('.ant-select-selection-item')?.textContent?.trim() || ''"
+        )
+        if combobox.evaluate(selected_value) == value:
+            return
+        selector = combobox.locator(
+            "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), "
+            "' ant-select-selector ')]"
+        ).first
+        if selector.count() != 1:
+            raise AssertionError(f"下拉框#{input_id}缺少唯一Ant Select容器")
+        selector.click(timeout=5000)
+        dropdown = self.page.locator(".ant-select-dropdown:visible").last
+        dropdown.wait_for(state="visible", timeout=5000)
+        option = dropdown.get_by_title(value, exact=True)
+        if option.count() != 1:
+            raise AssertionError(
+                f"下拉框#{input_id}中选项{value!r}数量不为1: {option.count()}"
+            )
+        option.click(force=True, timeout=5000)
+        actual = combobox.evaluate(selected_value)
+        if actual != value:
+            raise AssertionError(f"下拉框#{input_id}选择失败: 期望{value}, 实际{actual}")
 
     def select_line(self, line: str):
         """选择线路(lan1/wan1等物理口, 或已建VLAN名用于QINQ内层).
@@ -169,6 +277,7 @@ class VlanPage(IkuaiTablePage):
         result = {"success": False, "error_msg": "", "has_validation_error": False}
 
         try:
+            self._ensure_vlan_list()
             self.click_add_button()
             self.fill_vlan_id(vlan_id)
             self.fill_vlan_name(vlan_name)
@@ -208,39 +317,18 @@ class VlanPage(IkuaiTablePage):
                     result["error_msg"] = error_msg.first.text_content() or "操作失败"
                     result["has_validation_error"] = True
 
-            # 检查对话框是否还在
-            dialog = self.page.locator("dialog, [role='dialog']")
-            if dialog.count() > 0 and dialog.is_visible():
-                result["success"] = False
-                if not result["error_msg"]:
-                    dialog_error = dialog.locator(".ant-form-item-explain-error, .ant-alert-error")
-                    if dialog_error.count() > 0:
-                        result["error_msg"] = dialog_error.first.text_content() or result["error_msg"]
-                        result["has_validation_error"] = True
-            else:
-                result["success"] = True
+            # VLAN 添加是路由页面而不是 dialog。保存后表单仍在，或已出现明确校验错误，
+            # 都不能报告 success=True。
+            form_still_open = self.page.locator("#vlan_id").count() > 0
+            result["success"] = not result["has_validation_error"] and not form_still_open
 
         except Exception as e:
             result["error_msg"] = str(e)[:100]
             result["success"] = False
 
         finally:
-            try:
-                self.page.keyboard.press("Escape")
-                self.page.wait_for_timeout(200)
-                cancel_btn = self.page.get_by_role("button", name="取消")
-                if cancel_btn.count() > 0 and cancel_btn.is_visible():
-                    cancel_btn.click()
-                    self.page.wait_for_timeout(200)
-            except:
-                pass
-            self.page.reload()
-            # networkidle在路由器页面(有状态轮询)常不达到, 默认30秒超时×步骤10的13项会累积卡死, 加短超时容忍
-            try:
-                self.page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
-            self.page.wait_for_timeout(300)
+            # 必须显式回列表；刷新当前 /add 路由会让下一用例把扩展IP“添加”误当主添加按钮。
+            self._ensure_vlan_list()
 
         return result
 
@@ -249,16 +337,21 @@ class VlanPage(IkuaiTablePage):
         result = {"success": False, "error_msg": "", "has_validation_error": False}
 
         try:
-            self.edit_vlan(vlan_name)
-            self.page.wait_for_timeout(500)
-
-            add_ext_btn = self.page.get_by_role("button", name="添加").last
-            if add_ext_btn.count() > 0:
+            self._ensure_vlan_list()
+            if not self.edit_vlan(vlan_name):
+                result["error_msg"] = f"未找到VLAN精确编辑行: {vlan_name}"
+            else:
+                inputs = self.page.locator("input[id^='ip_mask_'][id$='_ipAddress']")
+                count_before = inputs.count()
+                add_ext_btn = self.page.get_by_role("button", name="添加", exact=True)
+                if add_ext_btn.count() != 1:
+                    result["error_msg"] = f"扩展IP添加按钮数量不为1: {add_ext_btn.count()}"
+                    return result
                 add_ext_btn.click()
                 self.page.wait_for_timeout(500)
 
-                ext_ip_input = self.page.get_by_role("textbox", name="请输入IP地址")
-                if ext_ip_input.count() > 0:
+                if inputs.count() == count_before + 1:
+                    ext_ip_input = inputs.last
                     ext_ip_input.fill(invalid_ip)
 
                     self.click_save()
@@ -291,42 +384,24 @@ class VlanPage(IkuaiTablePage):
                             if not result["error_msg"]:
                                 result["error_msg"] = msg_text
 
-                    dialog_still_open = self.page.locator("dialog, [role='dialog']").count() > 0
-                    if dialog_still_open:
-                        result["success"] = False
-                        if not result["has_validation_error"]:
-                            result["has_validation_error"] = True
-                            result["error_msg"] = "保存被阻止"
-                    else:
-                        result["success"] = True
+                    form_still_open = self.page.locator("#vlan_id").count() > 0
+                    result["success"] = (
+                        not result["has_validation_error"] and not form_still_open
+                    )
                 else:
-                    result["error_msg"] = "未找到扩展IP输入框"
-            else:
-                result["error_msg"] = "未找到扩展IP添加按钮"
+                    result["error_msg"] = (
+                        f"点击扩展IP添加后输入框数量未增加: "
+                        f"{count_before} -> {inputs.count()}"
+                    )
 
         except Exception as e:
             result["error_msg"] = str(e)[:100]
 
         finally:
             try:
-                cancel_btn = self.page.get_by_role("button", name="取消")
-                if cancel_btn.count() > 0 and cancel_btn.is_visible():
-                    cancel_btn.click()
-                    self.page.wait_for_timeout(500)
-                    confirm_btn = self.page.get_by_role("button", name="确定")
-                    if confirm_btn.count() > 0 and confirm_btn.is_visible():
-                        confirm_btn.click()
-                        self.page.wait_for_timeout(300)
-            except:
+                self._ensure_vlan_list()
+            except Exception:
                 pass
-            try:
-                self.page.goto(f"{self.base_url}/#/networkConfiguration/vlanSettings")
-                self.page.wait_for_load_state("networkidle")
-                self.page.wait_for_timeout(500)
-            except:
-                pass
-            self.page.wait_for_load_state("networkidle")
-            self.page.wait_for_timeout(300)
 
         return result
 
@@ -366,14 +441,28 @@ class VlanPage(IkuaiTablePage):
     # ==================== 扩展IP操作 ====================
     def add_extended_ip(self, ip: str, subnet_mask: str = "255.255.255.0"):
         """添加扩展IP（在添加/编辑VLAN页面）"""
-        add_ext_btn = self.page.get_by_role("button", name="添加").last
-        if add_ext_btn.count() > 0:
-            add_ext_btn.click()
-            self.page.wait_for_timeout(500)
+        inputs = self.page.locator("input[id^='ip_mask_'][id$='_ipAddress']")
+        count_before = inputs.count()
+        add_ext_btn = self.page.get_by_role("button", name="添加", exact=True)
+        if add_ext_btn.count() != 1:
+            raise AssertionError(f"扩展IP添加按钮数量不为1: {add_ext_btn.count()}")
+        add_ext_btn.click()
 
-        ext_ip_input = self.page.get_by_role("textbox", name="请输入IP地址")
-        if ext_ip_input.count() > 0:
-            ext_ip_input.fill(ip)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and inputs.count() != count_before + 1:
+            self.page.wait_for_timeout(200)
+        if inputs.count() != count_before + 1:
+            raise AssertionError(
+                f"点击扩展IP添加后输入框数量未增加: {count_before} -> {inputs.count()}"
+            )
+
+        ext_ip_input = inputs.last
+        ext_ip_input.fill(ip)
+        input_id = ext_ip_input.get_attribute("id") or ""
+        mask_id = input_id.replace("_ipAddress", "_netmask")
+        if not mask_id or mask_id == input_id:
+            raise AssertionError(f"无法从扩展IP输入框推导掩码ID: {input_id}")
+        self._select_combobox_value_by_id(mask_id, subnet_mask)
 
         return self
 
@@ -388,25 +477,37 @@ class VlanPage(IkuaiTablePage):
     def get_selected_count(self) -> int:
         """获取当前选中的VLAN数量"""
         try:
-            selected_text = self.page.locator("text=/已选 \\d+ 条/")
+            selected_text = self.page.locator("text=/已选\\s*\\d+\\s*条/")
             if selected_text.count() > 0:
                 text = selected_text.first.inner_text()
-                return int(text.replace("已选 ", "").replace(" 条", ""))
+                match = re.search(r"已选\s*(\d+)\s*条", text)
+                if match:
+                    return int(match.group(1))
         except Exception:
             pass
         return 0
 
+    def get_column_values(self, column_name: str) -> List[str]:
+        """读取当前表格顺序下某一列的可见值，用于验证排序结果而非只验证点击。"""
+        column_id = self.COLUMN_ID_MAP.get(column_name)
+        if not column_id:
+            raise ValueError(f"未知VLAN列: {column_name}")
+        values = []
+        # 4.0页面使用Ant Design虚拟表格，数据行/单元格都是div，不存在tbody/tr/td。
+        # 数据单元格沿用表头列id，可按虚拟行精确读取当前显示顺序。
+        rows = self.page.locator("div.ant-table-tbody div.ant-table-row")
+        if rows.count() == 0 and self.get_vlan_count() > 0:
+            rows.first.wait_for(state="visible", timeout=5000)
+        for index in range(rows.count()):
+            cell = rows.nth(index).locator(f"div.ant-table-cell#{column_id}")
+            if cell.count() == 0:
+                continue
+            values.append((cell.first.inner_text() or "").strip())
+        return values
+
     def get_vlan_list(self) -> List[str]:
         """获取所有VLAN名称列表"""
-        vlan_names = []
-        rows = self.page.locator("tbody tr")
-        for i in range(rows.count()):
-            try:
-                name_cell = rows.nth(i).locator("td").nth(1)
-                vlan_names.append(name_cell.inner_text())
-            except Exception:
-                continue
-        return vlan_names
+        return self.get_column_values("VLAN 名称")
 
     # ==================== 错误信息获取 ====================
     def get_error_message(self) -> Optional[str]:
@@ -488,8 +589,11 @@ class VlanPage(IkuaiTablePage):
     def enable_vlan(self, vlan_name: str) -> bool:
         return self.enable_rule(vlan_name)
 
-    def edit_vlan(self, vlan_name: str):
-        return self.edit_rule(vlan_name)
+    def edit_vlan(self, vlan_name: str) -> bool:
+        clicked = self._click_rule_button(vlan_name, "编辑")
+        if clicked:
+            self.page.wait_for_timeout(500)
+        return clicked
 
     def delete_vlan(self, vlan_name: str) -> bool:
         return self.delete_rule(vlan_name)

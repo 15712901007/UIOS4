@@ -51,7 +51,7 @@ def get_config_path() -> str:
 @dataclass
 class DeviceConfig:
     """设备配置"""
-    ip: str = "10.66.0.150"
+    ip: str = "10.66.0.45"
     username: str = "admin"
     password: str = "admin123"
     port: int = 80
@@ -65,7 +65,7 @@ class BrowserConfig:
     headless: bool = False
     slow_mo: int = 0  # 毫秒，用于调试时减慢操作
     timeout: int = 30000
-    screenshot_on_failure: bool = True
+    screenshot_on_failure: bool = False
     video_on_failure: bool = False
     # 浏览器视口分辨率（仅在auto_adapt_screen=False时使用）
     viewport_width: int = 1400
@@ -146,6 +146,9 @@ class SSHConfig:
     router_recovery_port: int = 22
     router_lan_management_host: str = ""
     router_lan_management_port: int = 22
+    # 内核设置 L5 流量对端只保存地址，认证复用测试客户端。
+    kernel_peer_host: str = "10.66.0.57"
+    kernel_peer_port: int = 22
     iperf3_server: str = "10.66.0.40"
     iperf3_duration: int = 10
     iperf3_tolerance: float = 0.20
@@ -180,7 +183,7 @@ class Config:
                 headless=browser_data.get("headless", False),
                 slow_mo=browser_data.get("slow_mo", 0),
                 timeout=browser_data.get("timeout", 30000),
-                screenshot_on_failure=browser_data.get("screenshot_on_failure", True),
+                screenshot_on_failure=browser_data.get("screenshot_on_failure", False),
                 video_on_failure=browser_data.get("video_on_failure", False),
                 viewport_width=browser_data.get("viewport_width", 1400),
                 viewport_height=browser_data.get("viewport_height", 850),
@@ -228,6 +231,8 @@ class Config:
             ssh_config.router_recovery_port = int(ssh_data.get("router_recovery_port", 22))
             ssh_config.router_lan_management_host = ssh_data.get("router_lan_management_host", "")
             ssh_config.router_lan_management_port = int(ssh_data.get("router_lan_management_port", 22))
+            ssh_config.kernel_peer_host = ssh_data.get("kernel_peer_host", "10.66.0.57")
+            ssh_config.kernel_peer_port = int(ssh_data.get("kernel_peer_port", 22))
             ssh_config.iperf3_server = ssh_data.get("iperf3_server", "10.66.0.40")
             ssh_config.iperf3_duration = ssh_data.get("iperf3_duration", 10)
             ssh_config.iperf3_tolerance = ssh_data.get("iperf3_tolerance", 0.20)
@@ -306,6 +311,8 @@ class Config:
                 "router_recovery_port": self.ssh.router_recovery_port,
                 "router_lan_management_host": self.ssh.router_lan_management_host,
                 "router_lan_management_port": self.ssh.router_lan_management_port,
+                "kernel_peer_host": self.ssh.kernel_peer_host,
+                "kernel_peer_port": self.ssh.kernel_peer_port,
                 "iperf3_server": self.ssh.iperf3_server,
                 "iperf3_duration": self.ssh.iperf3_duration,
                 "iperf3_tolerance": self.ssh.iperf3_tolerance,
@@ -367,6 +374,7 @@ def apply_env_overrides(config: Config) -> Config:
     - SSH_CLIENT_HOST / SSH_CLIENT_USERNAME / SSH_CLIENT_PASSWORD / SSH_CLIENT_PORT: SSH测试客户端配置
     - SSH_CONSOLE_USERNAME / SSH_CONSOLE_PASSWORD: 控制台登录凭据
     - SSH_OSPF_PEER_HOST / SSH_OSPF_PEER_PORT: OSPF 对端（仅地址）
+    - SSH_KERNEL_PEER_HOST / SSH_KERNEL_PEER_PORT: 内核设置L5对端（复用客户端凭据）
     - IPERF3_SERVER / IPERF3_DURATION / IPERF3_TOLERANCE: 实流验证配置
     - TESTER / TEST_VERSION: 报告配置
     """
@@ -427,6 +435,10 @@ def apply_env_overrides(config: Config) -> Config:
         config.ssh.router_lan_management_host = os.environ["SSH_ROUTER_LAN_MANAGEMENT_HOST"]
     if os.environ.get("SSH_ROUTER_LAN_MANAGEMENT_PORT"):
         config.ssh.router_lan_management_port = int(os.environ["SSH_ROUTER_LAN_MANAGEMENT_PORT"])
+    if os.environ.get("SSH_KERNEL_PEER_HOST"):
+        config.ssh.kernel_peer_host = os.environ["SSH_KERNEL_PEER_HOST"]
+    if os.environ.get("SSH_KERNEL_PEER_PORT"):
+        config.ssh.kernel_peer_port = int(os.environ["SSH_KERNEL_PEER_PORT"])
 
     # 控制台登录凭据覆盖
     if os.environ.get("SSH_CONSOLE_USERNAME"):

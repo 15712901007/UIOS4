@@ -29,6 +29,8 @@
 import pytest
 import time
 import os
+import ipaddress
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -745,12 +747,40 @@ class TestUpdownRouteComprehensive:
 @pytest.mark.updown_route
 @pytest.mark.network
 class TestUpdownRouteFlowVerification:
-    """上下行分流功能验证(双向, 硬断言): 建upload=wan1/download=wan3→conntrack remote_if=wan1(上)+rev_remote_if=wan3(下).
+    """上下行分流启用/停用对照验证。
 
-    上下行走ik_cntl wans-snat(不走iptables); 选路铁证=conntrack扩展行 remote_if=上行口/rev_remote_if=下行口.
-    用wan1上/wan3下(同手机实测可行; wan2=192.168.112.x孤立网段作上行不可靠). 轮询打流解短连接条目时机. 未观测到→FAIL."""
+    4.0固件可能不直接提供rev_remote_if，因此下行证据必须同时保留reply tuple
+    的SNAT目的地址和WAN地址映射来源。用固定公网HTTP目标、精确五元组过滤及
+    无规则/停用态对照，避免把客户端后台连接或默认WAN误判为规则命中。
+    """
 
     PREFIX = "udflow_"
+    PROBE_DOMAIN = "www.baidu.com"
+    PROBE_PORT = 80
+
+    @staticmethod
+    def _wait_rule_state(bv, rule_name, enabled, attempts=8):
+        for _ in range(attempts):
+            rule = bv.find_stream_updown_rule(rule_name)
+            if rule and str(rule.get("enabled")) == enabled:
+                return rule
+            time.sleep(0.5)
+        return bv.find_stream_updown_rule(rule_name)
+
+    @classmethod
+    def curl_probe_command(cls, probe_ip, client_iface):
+        probe_ip = str(ipaddress.ip_address(probe_ip))
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", str(client_iface)):
+            raise ValueError(f"非法客户端接口名: {client_iface!r}")
+        return (
+            f"curl -4 -sS -o /dev/null --interface {client_iface} "
+            "--connect-timeout 5 -m 12 "
+            f"--resolve {cls.PROBE_DOMAIN}:{cls.PROBE_PORT}:{probe_ip} "
+            "-w 'http_code=%{http_code} remote_ip=%{remote_ip} "
+            "local_ip=%{local_ip} local_port=%{local_port} "
+            "size_download=%{size_download} speed_download=%{speed_download}' "
+            f"http://{cls.PROBE_DOMAIN}/; printf ' curl_rc=%s\\n' \"$?\""
+        )
 
     def test_updown_route_flow(self, updown_route_page_logged_in, step_recorder, request):
         page = updown_route_page_logged_in
@@ -759,100 +789,352 @@ class TestUpdownRouteFlowVerification:
             bv = request.getfixturevalue('backend_verifier')
         except Exception:
             pytest.skip("无SSH验证器, 跳过上下行分流功能验证")
-        client_ip = "192.168.148.2"
-        up_wan, down_wan = "wan1", "wan3"  # 上行wan1/下行wan3(同手机实测可行; wan2孤立网段作上行不可靠)
+        bv.connect_router()
+        bv.connect_client()
+        client_info = bv.get_client_lan_info()
+        client_ip = client_info.get("ip") or "192.168.148.2"
+        client_iface = client_info.get("iface") or "ens11"
+        probe_ip = ""
+        up_wan, down_wan = "wan1", "wan3"
         rule_name = f"{self.PREFIX}sep"
         failures = []
+        rule = None
+        rule_id = None
+        baseline = None
+        active = None
+        disabled = None
+        reenabled = None
         print("\n" + "=" * 50)
-        print("上下行分流功能验证(双向)")
+        print("上下行分流功能验证(启用/停用对照)")
         print("=" * 50)
 
-        def _force_clean():
+        def _add_failure(message):
+            if message not in failures:
+                failures.append(message)
+            rec.add_detail(f"  ✗ {message}")
+
+        def _cleanup_test_rules():
             try:
-                bv._router.exec(f"sqlite3 {bv.IK_DB} \"DELETE FROM stream_updown WHERE tagname LIKE '{self.PREFIX}%'\"")
-                bv._router.exec("/usr/ikuai/script/stream_updown.sh init 2>/dev/null")
-            except Exception:
-                pass
+                return bv.cleanup_stream_updown_test(self.PREFIX)
+            except Exception as exc:
+                _add_failure(f"测试规则清理异常: {str(exc)[:120]}")
+                return None
+
+        def _record_probe_commands(label, flow):
+            rec.add_verification_command(
+                flow.get("command", ""),
+                target_label="测试客户端",
+                target=bv._ssh_config.client.host,
+                shell="bash",
+                purpose=f"{label}: 产生固定公网目标并回读实际源端口的真实HTTP响应流量",
+                expected="curl_rc=0、http_code非000、remote_ip为固定探针IP",
+                effect="traffic_probe",
+                actual=flow.get("curl_output", ""),
+            )
+            rec.add_verification_command(
+                "conntrack -L -o extended 2>/dev/null | "
+                f"grep -F 'src={client_ip} ' | grep -F 'dst={probe_ip} ' | "
+                f"grep -F 'sport={flow.get('local_port')} ' | "
+                f"grep -F 'dport={self.PROBE_PORT} '",
+                target_label="被测路由器",
+                target=bv._ssh_config.router.host,
+                shell="bash",
+                purpose=f"{label}: 复核精确目标连接的上下行证据",
+                expected=(
+                    f"remote_if={flow.get('expected_up', '?')}; reply tuple目的地址映射到"
+                    f"{flow.get('expected_down', '?')}"
+                ),
+                effect="read_only",
+                actual=flow.get("egress", {}).get("raw", "")[:1200],
+            )
+
+        def _probe(label, expected_up, expected_down):
+            bv.clear_client_conntrack(client_ip)
+            command = self.curl_probe_command(
+                probe_ip, client_iface
+            )
+            curl_output = bv._client.exec(command, timeout=20).strip()
+            observed = dict(re.findall(
+                r"\b(http_code|remote_ip|local_ip|local_port|size_download|"
+                r"speed_download|curl_rc)=([^\s]+)",
+                curl_output,
+            ))
+            http_ok = (
+                observed.get("curl_rc") == "0"
+                and observed.get("http_code", "000") != "000"
+                and observed.get("remote_ip") == probe_ip
+            )
+            if not http_ok:
+                _add_failure(f"{label} HTTP探针失败: {curl_output[:240]}")
+            try:
+                local_port = int(observed.get("local_port", ""))
+            except ValueError:
+                local_port = 0
+                _add_failure(f"{label}未回读到curl实际源端口")
+            egress = (
+                bv.conntrack_egress(
+                    client_ip,
+                    proto="tcp",
+                    dst_ip=probe_ip,
+                    src_port=local_port,
+                    dst_port=self.PROBE_PORT,
+                )
+                if local_port else
+                {"found": False, "remote_if": "", "rev_remote_if": "",
+                 "down_iface_source": "", "reply_dst_ip": "", "raw": ""}
+            )
+            flow = {
+                "command": command,
+                "curl_output": curl_output,
+                "http": observed,
+                "local_port": local_port,
+                "expected_up": expected_up,
+                "expected_down": expected_down,
+                "egress": egress,
+            }
+            rec.add_detail(
+                f"  {label}: http={observed.get('http_code', '无')}; "
+                f"bytes={observed.get('size_download', '无')}; "
+                f"speed={observed.get('speed_download', '无')} B/s; "
+                f"remote_if={egress.get('remote_if') or '无'}; "
+                f"down_if={egress.get('rev_remote_if') or '无'}; "
+                f"reply_snat_ip={egress.get('reply_dst_ip') or '无'}; "
+                f"down证据来源={egress.get('down_iface_source') or '无'}"
+            )
+            if egress.get("raw"):
+                rec.add_detail(f"  原始conntrack: {egress['raw']}")
+            if not egress.get("found"):
+                _add_failure(f"{label}未找到精确HTTP conntrack")
+            elif (egress.get("remote_if") != expected_up or
+                  egress.get("rev_remote_if") != expected_down):
+                _add_failure(
+                    f"{label}路径不符: 实际{egress.get('remote_if')}/"
+                    f"{egress.get('rev_remote_if')},期望{expected_up}/{expected_down}"
+                )
+            if not egress.get("down_iface_source"):
+                _add_failure(f"{label}缺少可审计的下行线路证据来源")
+            _record_probe_commands(label, flow)
+            return flow
 
         try:
-            with rec.step("清理残留", f"删{self.PREFIX}规则"):
-                page.navigate_to_updown_route()
-                page.page.wait_for_timeout(1000)
+            with rec.step("环境与无规则基线", "固定公网HTTP目标并回读实际源端口; 无规则应为wan1/wan1"):
+                cleanup = _cleanup_test_rules()
+                if cleanup and not cleanup.passed:
+                    _add_failure(cleanup.message)
+
+                wan_ip_map = bv._wan_ip_to_iface()
+                iface_to_ip = {iface: ip for ip, iface in wan_ip_map.items()}
+                if up_wan not in iface_to_ip or down_wan not in iface_to_ip:
+                    _add_failure(
+                        f"环境缺少目标WAN地址: 已发现{sorted(iface_to_ip)}"
+                    )
+                elif iface_to_ip[up_wan] == iface_to_ip[down_wan]:
+                    _add_failure("wan1与wan3地址相同, 无法区分下行SNAT证据")
+
+                foreign_rules = [
+                    item for item in bv.query_stream_updown_rules()
+                    if not str(item.get("tagname", "")).startswith(self.PREFIX)
+                ]
+                resolved = bv._client.exec(
+                    f"getent ahostsv4 {self.PROBE_DOMAIN} | "
+                    "awk '$2==\"STREAM\"{print $1; exit}'"
+                ).strip()
                 try:
-                    page.delete_rule(rule_name)
-                    page.page.wait_for_timeout(800)
-                except Exception:
-                    pass
-                _force_clean()
-            with rec.step("建上下行分离规则", f"upload={up_wan}/download={down_wan}/tcp/src={client_ip}"):
+                    probe_ip = str(ipaddress.ip_address(resolved))
+                except ValueError:
+                    _add_failure(
+                        f"公网探针域名未解析出单一IPv4: {resolved or '空'}"
+                    )
+                rec.add_detail(
+                    f"  client={client_ip}/{client_iface}; "
+                    f"probe={self.PROBE_DOMAIN}->{probe_ip or '无'}:{self.PROBE_PORT}; "
+                    f"WAN地址={iface_to_ip}; "
+                    f"非测试规则={len(foreign_rules)}条"
+                )
+
+                if probe_ip:
+                    baseline = _probe("无规则基线", up_wan, up_wan)
+                    rec.set_actual(
+                        f"基线{baseline['egress'].get('remote_if')}/"
+                        f"{baseline['egress'].get('rev_remote_if')}, "
+                        f"HTTP {baseline['http'].get('http_code', '无')}, "
+                        f"{baseline['http'].get('size_download', '无')} bytes"
+                    )
+
+            with rec.step("创建规则并校验页面结果",
+                          f"upload={up_wan}/download={down_wan}/tcp/src={client_ip}"):
                 page.navigate_to_updown_route()
                 page.page.wait_for_timeout(800)
                 ok = page.add_rule(rule_name, upload_line=up_wan, download_line=down_wan,
                                    protocol="tcp", src_addr=client_ip)
                 if not ok:
-                    failures.append(f"建规则失败: {rule_name}")
-                    rec.add_detail("  ✗ 建规则失败")
+                    _add_failure(f"建规则失败: {rule_name}")
                 else:
-                    page.page.wait_for_timeout(2000)
-                    rule = bv.find_stream_updown_rule(rule_name)
-                    rec.add_detail(f"  ✓ 建规则 id={rule.get('id') if rule else '?'}")
-            # L1-L4 SSH验证(建规则后, 报告体现全链路落库+内核)
-            if not failures:
-                with rec.step("L1-L4后端验证", "数据库+ipset+内核wans-snat落地+ik_core模块"):
-                    rid = rule.get("id") if rule else None
-                    r1 = bv.verify_stream_updown_database(rule_name, expected_fields={"enabled": "yes"})
+                    rule = self._wait_rule_state(bv, rule_name, "yes")
+                    rule_id = int(rule["id"]) if rule and rule.get("id") else None
+                    if rule_id is None:
+                        _add_failure("页面提示成功但后台未找到规则")
+                    rec.add_detail(f"  页面添加成功; 后台rule_id={rule_id or '无'}")
+                    rec.set_actual(
+                        f"页面保存成功，后台规则ID={rule_id or '未找到'}"
+                    )
+
+            if rule_id is not None:
+                with rec.step("L1-L4精确落地验证",
+                              "数据库字段+源地址ipset+本规则wans-snat+ik_core"):
+                    r1 = bv.verify_stream_updown_database(
+                        rule_name,
+                        expected_fields={
+                            "enabled": "yes",
+                            "upiface": up_wan,
+                            "downiface": down_wan,
+                            "protocol": "tcp",
+                        },
+                    )
                     rec.add_detail(f"  L1-数据库: {'[OK]' if r1.passed else '[FAIL]'} {r1.message}")
+                    if r1.raw_output:
+                        rec.add_detail(f"    数据库原始行: {r1.raw_output}")
                     if not r1.passed:
-                        failures.append(f"L1数据库: {r1.message}")
-                    r2 = bv.verify_stream_updown_ipset(rid, src_addr=client_ip) if rid else None
-                    if r2:
-                        rec.add_detail(f"  L2-ipset: {'[OK]' if r2.passed else '[FAIL]'} {r2.message}")
-                        if r2.raw_output:
-                            rec.add_detail(f"    {r2.raw_output}")
-                        if not r2.passed:
-                            failures.append(f"L2 ipset: {r2.message}")
-                    r3 = bv.verify_stream_updown_kernel_status()
+                        _add_failure(f"L1数据库: {r1.message}")
+                    r2 = bv.verify_stream_updown_ipset(rule_id, src_addr=client_ip)
+                    rec.add_detail(f"  L2-ipset: {'[OK]' if r2.passed else '[FAIL]'} {r2.message}")
+                    if r2.raw_output:
+                        rec.add_detail(f"    {r2.raw_output}")
+                    if not r2.passed:
+                        _add_failure(f"L2 ipset: {r2.message}")
+                    r3 = bv.verify_stream_updown_kernel_status(
+                        rule_id,
+                        expected_upiface=up_wan,
+                        expected_downiface=down_wan,
+                        expected_present=True,
+                    )
                     rec.add_detail(f"  L3-内核状态: {'[OK]' if r3.passed else '[FAIL]'} {r3.message}")
+                    if r3.raw_output:
+                        rec.add_detail(f"    运行时原始行: {r3.raw_output}")
                     if not r3.passed:
-                        failures.append(f"L3内核状态: {r3.message}")
+                        _add_failure(f"L3内核状态: {r3.message}")
                     r4 = bv.verify_stream_updown_kernel()
                     rec.add_detail(f"  L4-内核模块: {'[OK]' if r4.passed else '[FAIL]'} {r4.message}")
                     if not r4.passed:
-                        failures.append(f"L4内核模块: {r4.message}")
-            with rec.step("L5双向验证", f"轮询打流+conntrack remote_if={up_wan}(上)+rev_remote_if={down_wan}(下)"):
-                bv.clear_client_conntrack(client_ip)
-                bv.connect_client()
-                # 上下行走ik_cntl wans-snat(不走iptables); 选路铁证=conntrack扩展行remote_if/rev_remote_if.
-                # HTTP短连接打完即TIME_WAIT→条目易消失; 用轮询"打流2次+抓conntrack"多次重试解时机问题.
-                observed = False
-                last_eg = {"found": False, "remote_if": "", "rev_remote_if": "", "mark": "", "raw": ""}
-                for attempt in range(8):
-                    for _ in range(2):
-                        try:
-                            bv._client.exec("curl -s -o /dev/null --interface ens11 --connect-timeout 5 -m 8 http://www.baidu.com/", timeout=15)
-                        except Exception:
-                            pass
-                    eg = bv.conntrack_egress(client_ip, proto="tcp")
-                    last_eg = eg
-                    if eg["found"] and eg["remote_if"] == up_wan and eg["rev_remote_if"] == down_wan:
-                        observed = True
-                        rec.add_detail(f"  第{attempt + 1}轮观测到分离: remote_if={eg['remote_if']}/rev={eg['rev_remote_if']}")
-                        break
-                    time.sleep(0.5)
-                rec.add_detail(f"  conntrack(末次): found={last_eg['found']} remote_if={last_eg['remote_if']} rev_remote_if={last_eg['rev_remote_if']}")
-                # 上下行走ik_cntl wans-snat; 硬断言: conntrack双向remote_if须=上行口/下行口, 未观测到即FAIL
-                if observed:
-                    rec.add_detail(f"  ✓ 上下行分离观测到(remote_if={up_wan}/rev={down_wan})")
-                else:
-                    rec.add_detail(f"  ✗ 上下行分离未观测到 remote_if={last_eg['remote_if']}/rev={last_eg['rev_remote_if']}(期望 {up_wan}/{down_wan})")
-                    failures.append(f"上下行分离未生效: remote_if={last_eg['remote_if']}/rev={last_eg['rev_remote_if']}(期望 {up_wan}/{down_wan})")
+                        _add_failure(f"L4内核模块: {r4.message}")
+                    rec.add_verification_command(
+                        "cat /tmp/iktmp/stream_updown.txt 2>/dev/null",
+                        target_label="被测路由器",
+                        target=bv._ssh_config.router.host,
+                        shell="bash",
+                        purpose="复核本规则的wans-snat上下行落地",
+                        expected=f"id={rule_id}: out={up_wan}, in={down_wan}",
+                        effect="read_only",
+                        actual=r3.raw_output,
+                    )
+
+                with rec.step("L5启用态真实下行流",
+                              f"固定{probe_ip}:{self.PROBE_PORT}; 期望{up_wan}/{down_wan}"):
+                    active = _probe("启用态", up_wan, down_wan)
+                    if baseline and (
+                            active["egress"].get("reply_dst_ip") ==
+                            baseline["egress"].get("reply_dst_ip")):
+                        _add_failure("启用规则后reply SNAT地址未相对基线变化")
+                    rec.set_actual(
+                        f"启用态{active['egress'].get('remote_if')}/"
+                        f"{active['egress'].get('rev_remote_if')}, "
+                        f"HTTP {active['http'].get('http_code', '无')}, "
+                        f"{active['http'].get('size_download', '无')} bytes"
+                    )
+
+                with rec.step("停用态负向对照",
+                              f"停用同一规则后应从{up_wan}/{down_wan}回到基线{up_wan}/{up_wan}"):
+                    if not page.disable_rule(rule_name):
+                        _add_failure("页面未能发起停用操作")
+                    stopped = self._wait_rule_state(bv, rule_name, "no")
+                    if not stopped or str(stopped.get("enabled")) != "no":
+                        _add_failure("停用后数据库enabled未变为no")
+                    r3_off = bv.verify_stream_updown_kernel_status(
+                        rule_id, expected_present=False
+                    )
+                    rec.add_detail(
+                        f"  L3-停用: {'[OK]' if r3_off.passed else '[FAIL]'} "
+                        f"{r3_off.message}"
+                    )
+                    if not r3_off.passed:
+                        _add_failure(f"停用后运行时仍有规则: {r3_off.message}")
+                    disabled = _probe("停用态", up_wan, up_wan)
+                    if baseline:
+                        base_sig = (
+                            baseline["egress"].get("remote_if"),
+                            baseline["egress"].get("rev_remote_if"),
+                            baseline["egress"].get("reply_dst_ip"),
+                        )
+                        off_sig = (
+                            disabled["egress"].get("remote_if"),
+                            disabled["egress"].get("rev_remote_if"),
+                            disabled["egress"].get("reply_dst_ip"),
+                        )
+                        if off_sig != base_sig:
+                            _add_failure(
+                                f"停用态未恢复无规则基线: 实际{off_sig},基线{base_sig}"
+                            )
+                    rec.set_actual(
+                        f"停用态{disabled['egress'].get('remote_if')}/"
+                        f"{disabled['egress'].get('rev_remote_if')}, "
+                        f"HTTP {disabled['http'].get('http_code', '无')}, "
+                        f"{disabled['http'].get('size_download', '无')} bytes"
+                    )
+
+                with rec.step("重新启用复现",
+                              f"再次启用后应稳定恢复{up_wan}/{down_wan}"):
+                    page.navigate_to_updown_route()
+                    if not page.enable_rule(rule_name):
+                        _add_failure("页面未能发起重新启用操作")
+                    started = self._wait_rule_state(bv, rule_name, "yes")
+                    if not started or str(started.get("enabled")) != "yes":
+                        _add_failure("重新启用后数据库enabled未变为yes")
+                    r3_on = bv.verify_stream_updown_kernel_status(
+                        rule_id,
+                        expected_upiface=up_wan,
+                        expected_downiface=down_wan,
+                        expected_present=True,
+                    )
+                    rec.add_detail(
+                        f"  L3-重启用: {'[OK]' if r3_on.passed else '[FAIL]'} "
+                        f"{r3_on.message}"
+                    )
+                    if not r3_on.passed:
+                        _add_failure(f"重新启用运行时未恢复: {r3_on.message}")
+                    reenabled = _probe("重新启用态", up_wan, down_wan)
+                    if active:
+                        active_sig = (
+                            active["egress"].get("remote_if"),
+                            active["egress"].get("rev_remote_if"),
+                            active["egress"].get("reply_dst_ip"),
+                        )
+                        again_sig = (
+                            reenabled["egress"].get("remote_if"),
+                            reenabled["egress"].get("rev_remote_if"),
+                            reenabled["egress"].get("reply_dst_ip"),
+                        )
+                        if again_sig != active_sig:
+                            _add_failure(
+                                f"重新启用结果不可重复: 首次{active_sig},再次{again_sig}"
+                            )
+                    rec.set_actual(
+                        f"重启用{reenabled['egress'].get('remote_if')}/"
+                        f"{reenabled['egress'].get('rev_remote_if')}, "
+                        f"HTTP {reenabled['http'].get('http_code', '无')}, "
+                        f"{reenabled['http'].get('size_download', '无')} bytes"
+                    )
+        except Exception as exc:
+            _add_failure(f"未处理异常: {type(exc).__name__}: {str(exc)[:180]}")
         finally:
-            try:
-                page.navigate_to_updown_route()
-                page.page.wait_for_timeout(500)
-                page.delete_rule(rule_name)
-            except Exception:
-                pass
-            _force_clean()
+            with rec.step("清理与残留检查", "正式API删除测试规则; 检查DB、运行时和有效ipset"):
+                cleanup = _cleanup_test_rules()
+                if cleanup:
+                    rec.add_detail(f"  {cleanup.message}")
+                    if not cleanup.passed:
+                        _add_failure(cleanup.message)
+                rec.set_actual(
+                    f"有效规则/运行时残留={'无' if cleanup and cleanup.passed else '需检查'}; "
+                    f"空父集合={cleanup.details.get('empty_carrier_ipsets', []) if cleanup else '未知'}"
+                )
         print(f"\n[上下行分流功能验证] {'通过' if not failures else '失败'+str(len(failures))+'项'}")
         assert not failures, f"上下行分流功能验证失败({len(failures)}项): {'; '.join(failures)}"

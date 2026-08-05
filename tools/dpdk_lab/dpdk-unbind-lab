@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( EUID != 0 )); then
+    echo "Run as root: sudo $0 [PCI ...]" >&2
+    exit 1
+fi
+
+devbind=/opt/dpdk/bin/dpdk-devbind.py
+if [[ ! -x "${devbind}" ]]; then
+    echo "DPDK device binding tool not found: ${devbind}" >&2
+    exit 1
+fi
+
+if (( $# == 0 )); then
+    set -- 0000:03:00.0 0000:07:00.0
+fi
+
+for requested in "$@"; do
+    if [[ "${requested}" =~ ^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]]; then
+        requested="0000:${requested}"
+    fi
+    requested=${requested,,}
+    case "$(cat "/sys/bus/pci/devices/${requested}/device")" in
+        0x157b) driver=igb ;;
+        0x125c) driver=igc ;;
+        *)
+            echo "No approved kernel driver mapping for ${requested}." >&2
+            exit 1
+            ;;
+    esac
+    "${devbind}" --bind="${driver}" "${requested}"
+done
+
+"${devbind}" --status-dev net

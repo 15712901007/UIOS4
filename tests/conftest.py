@@ -217,6 +217,11 @@ from pages.security.conn_limit_page import ConnLimitPage
 from pages.security.mac_access_control_page import MacAccessControlPage
 from pages.security.arp_setting_page import ArpSettingPage
 from pages.security.terminal_name_page import TerminalNamePage
+from pages.authentication.ppp_package_page import PppPackagePage
+from pages.authentication.pppuser_page import PppuserPage
+from pages.authentication.ppp_passwd_page import PppPasswdPage
+from pages.authentication.ppp_paylog_page import PppPaylogPage
+from pages.authentication.coupon_page import CouponPage
 from pages.security.threat_intelligence_page import ThreatIntelligencePage
 from pages.security.app_protocol_page import AppProtocolPage
 from pages.security.advanced_page import AdvancedPage
@@ -224,6 +229,8 @@ from pages.security.other_control_page import OtherControlPage
 from pages.device_setting.basic_setting_page import BasicSettingPage
 from pages.device_setting.alg_setting_page import AlgSettingPage
 from pages.device_setting.protocol_control_page import ProtocolControlPage
+from pages.device_setting.kernel_setting_page import KernelSettingPage
+from pages.device_setting.cloud_service_binding_page import CloudServiceBindingPage
 from pages.advanced_service.ftp_server_page import FtpServerPage
 from pages.advanced_service.samba_server_page import SambaServerPage
 from pages.advanced_service.http_server_page import HttpServerPage
@@ -304,9 +311,14 @@ TEST_NAME_MAPPING = {
     'test_updown_route_flow': '上下行分流功能验证(双向)',
     'test_domain_route_flow': '域名分流功能验证(选路)',
     'test_upnp_setting_comprehensive': 'UPnP/NAT设置综合测试',
+    'test_upnp_real_port_mapping': 'UPnP真实端口映射功能测试',
     'test_igmp_proxy_comprehensive': 'IGMP代理综合测试',
+    'test_igmp_proxy_real_multicast': 'IGMP代理真实组播功能测试',
     'test_iptv_comprehensive': 'IPTV透传综合测试',
+    'test_iptv_real_passthrough': 'IPTV网口与VLAN真实透传功能测试',
     'test_udp_proxy_comprehensive': 'UDPXY设置综合测试',
+    'test_udpxy_real_multicast_to_http': 'UDPXY真实组播转HTTP功能测试',
+    'test_cross_layer_service_real_snmp_mac_learning': '跨三层服务真实SNMP MAC学习功能测试',
     'test_nat_rule_comprehensive': 'NAT规则综合测试',
     'test_snat_flow': 'NAT规则-源地址NAT功能验证(命中打流)',
     'test_port_map_comprehensive': '端口映射综合测试',
@@ -337,13 +349,20 @@ TEST_NAME_MAPPING = {
     'test_advanced_comprehensive': '安全中心-高级设置综合测试',
     'test_other_control_comprehensive': '安全中心-其他控制综合测试',
     'test_terminal_name_comprehensive': '安全中心-终端名称管理综合测试',
+    'test_ppp_package_comprehensive': '认证服务-套餐管理综合测试',
+    'test_pppuser_comprehensive': '认证服务-账号管理综合测试',
+    'test_ppp_passwd_comprehensive': '认证服务-自助密码管理综合测试',
+    'test_ppp_paylog_comprehensive': '认证服务-总账管理综合测试',
+    'test_coupon_comprehensive': '认证服务-上网码综合测试',
     'test_threat_intelligence_comprehensive': '安全中心-威胁情报中心综合测试',
     'test_ipv6_static_comprehensive': 'IPv6前缀静态分配综合测试',
     'test_ipv6_wan_comprehensive': 'IPv6外网设置综合测试',
     'test_ipv6_lan_comprehensive': 'IPv6内网设置综合测试',
     'test_interface_settings_comprehensive': '内外网设置综合测试',
     'test_custom_protocol_comprehensive': '自定义协议综合测试',
+    'test_custom_protocol_real_tcp_flow': '自定义协议功能验证(真实TCP流量命中)',
     'test_advanced_custom_protocol_comprehensive': '高级自定义协议综合测试',
+    'test_advanced_custom_protocol_real_l7_flow': '高级自定义协议功能验证(真实L7载荷命中)',
     'test_ip_group_comprehensive': 'IP分组综合测试',
     'test_mac_group_comprehensive': 'MAC分组综合测试',
     'test_port_group_comprehensive': '端口分组综合测试',
@@ -361,15 +380,13 @@ TEST_NAME_MAPPING = {
     'test_http_server_comprehensive': '高级服务-本地服务-HTTP服务',
     'test_snmp_server_comprehensive': '高级服务-本地服务-SNMP服务',
     'test_virtual_machine_comprehensive': '高级服务-虚拟机',
-    'test_gre_tunnel_comprehensive': '虚拟专网-GRE隧道-综合测试',
-    'test_gre_config_effect': '虚拟专网-GRE隧道-配置真生效(内核ip -d)',
-    'test_gre_boundary': '虚拟专网-GRE隧道-边界值校验',
-    'test_gre_lifecycle': '虚拟专网-GRE隧道-生命周期/残留',
-    'test_gre_ui_prompts': '虚拟专网-GRE隧道-UI提示规范',
-    'test_gre_dataplane_capture': '虚拟专网-GRE隧道-数据面抓包',
+    'test_gre_comprehensive': '虚拟专网-GRE隧道-综合测试',
+    'test_gre_functional': '虚拟专网-GRE隧道-功能测试',
     'test_basic_setting_comprehensive': '设备设置-基础设置',
     'test_alg_setting_comprehensive': '设备设置-高级管理-ALG设置',
     'test_protocol_control_comprehensive': '设备设置-高级管理-协议控制',
+    'test_kernel_setting_comprehensive': '设备设置-高级管理-内核设置',
+    'test_cloud_service_binding_comprehensive': '设备设置-云服务绑定综合测试',
 }
 
 
@@ -1096,6 +1113,76 @@ def terminal_name_page_logged_in(logged_in_page: Page, config: Config) -> Termin
 
 
 @pytest.fixture(scope="function")
+def ppp_package_page(page: Page, config: Config) -> PppPackagePage:
+    """创建套餐管理页面实例(认证服务>认证账号管理>套餐管理)"""
+    return PppPackagePage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def ppp_package_page_logged_in(logged_in_page: Page, config: Config) -> PppPackagePage:
+    """已登录并导航到套餐管理列表页的实例(认证服务>认证账号管理>套餐管理)"""
+    pg = PppPackagePage(logged_in_page, config.get_base_url())
+    pg.navigate_to_ppp_package()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def pppuser_page(page: Page, config: Config) -> PppuserPage:
+    """创建账号管理页面实例(认证服务>认证账号管理>账号管理)"""
+    return PppuserPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def pppuser_page_logged_in(logged_in_page: Page, config: Config) -> PppuserPage:
+    """已登录并导航到账号管理列表页的实例(认证服务>认证账号管理>账号管理)"""
+    pg = PppuserPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_pppuser()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def ppp_passwd_page(page: Page, config: Config) -> PppPasswdPage:
+    """创建自助密码管理页面实例(认证服务>认证账号管理>自助密码管理)"""
+    return PppPasswdPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def ppp_passwd_page_logged_in(logged_in_page: Page, config: Config) -> PppPasswdPage:
+    """已登录并导航到自助密码管理页的实例(认证服务>认证账号管理>自助密码管理)"""
+    pg = PppPasswdPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_ppp_passwd()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def ppp_paylog_page(page: Page, config: Config) -> PppPaylogPage:
+    """创建总账管理页面实例(认证服务>认证账号管理>总账管理)"""
+    return PppPaylogPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def ppp_paylog_page_logged_in(logged_in_page: Page, config: Config) -> PppPaylogPage:
+    """已登录并导航到总账管理列表页的实例(认证服务>认证账号管理>总账管理)"""
+    pg = PppPaylogPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_ppp_paylog()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def coupon_page(page: Page, config: Config) -> CouponPage:
+    """创建上网码页面实例(认证服务>认证账号管理>上网码)"""
+    return CouponPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def coupon_page_logged_in(logged_in_page: Page, config: Config) -> CouponPage:
+    """已登录并导航到上网码列表页的实例(认证服务>认证账号管理>上网码)"""
+    pg = CouponPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_coupon()
+    return pg
+
+
+@pytest.fixture(scope="function")
 def threat_intelligence_page(page: Page, config: Config) -> ThreatIntelligencePage:
     """创建安全中心-威胁情报中心页面实例（默认可能关闭）。"""
     return ThreatIntelligencePage(page, config.get_base_url())
@@ -1301,6 +1388,40 @@ def protocol_control_page_logged_in(
     if not protocol_page.navigate_to_protocol_control():
         pytest.fail("无法导航到设备设置-高级管理-协议控制")
     return protocol_page
+
+
+@pytest.fixture(scope="function")
+def kernel_setting_page(page: Page, config: Config) -> KernelSettingPage:
+    """创建设备设置-高级管理-内核设置页面实例。"""
+    return KernelSettingPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def kernel_setting_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> KernelSettingPage:
+    """返回已登录并进入设备设置-高级管理-内核设置的页面实例。"""
+    kernel_page = KernelSettingPage(logged_in_page, config.get_base_url())
+    if not kernel_page.navigate_to_kernel_setting():
+        pytest.fail("无法导航到设备设置-高级管理-内核设置")
+    return kernel_page
+
+
+@pytest.fixture(scope="function")
+def cloud_service_binding_page(page: Page, config: Config) -> CloudServiceBindingPage:
+    """创建设备设置-云服务绑定页面实例。"""
+    return CloudServiceBindingPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def cloud_service_binding_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> CloudServiceBindingPage:
+    """返回已登录并进入设备设置-云服务绑定的页面实例。"""
+    cs_page = CloudServiceBindingPage(logged_in_page, config.get_base_url())
+    if not cs_page.navigate_to_cloud_service_binding():
+        pytest.fail("无法导航到设备设置-云服务绑定")
+    return cs_page
 
 
 @pytest.fixture(scope="function")
@@ -1617,7 +1738,7 @@ def pytest_runtest_makereport(item, call):
     report = outcome.get_result()
 
     # call/setup 失败都尽量截图；登录或页面fixture失败同样需要证据。
-    if call.when in ("setup", "call") and report.failed:
+    if call.when in ("setup", "call") and report.failed and get_config().browser.screenshot_on_failure:
         # 基础设置页面会显示原设备名称和自定义NTP地址。失败截图以
         # base64直接嵌入HTML，无法可靠逐像素脱敏，因此该高风险单例模块
         # 明确禁用截图，改用六段结构化证据、API契约与后端运行态定位。
@@ -1821,6 +1942,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "basic_setting: 设备设置-基础设置模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "cloud_service_binding: 设备设置-云服务绑定模块测试"
     )
     config.addinivalue_line(
         "markers", "alg_setting: 设备设置-高级管理-ALG设置模块测试"

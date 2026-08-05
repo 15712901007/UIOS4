@@ -662,14 +662,13 @@ class TestStreamControlFlowVerification:
 
     机制: alone_limit走ik_core QoS(sch_htb令牌桶+imq), 限速=整形(丢包retransmit), 非iptables DROP.
     验证链: 开启流控(htb_rate_est=1硬) → 基线测速(无规则跑满) → 建终端限速规则(绑client内网IP, DB+ipset硬落地)
-    → iperf3上下行打流 → 验吞吐被限(实测≤限速值*(1+tolerance)=生效PASS; 未限速/部分限速/未取值→FAIL硬断言)
+    → iperf3上下行打流 → 验吞吐落在限速值双边容差区间; 未限速/过度限速/未取值→FAIL硬断言
     → 删规则恢复(实测恢复跑满硬验证).
     6.12: QoS(sch_htb)路径≠peerconns(宕机)/L7 DPI(坏), 预期不宕机; 限速不生效→FAIL硬断言(产品bug报禅道).
     """
 
     PREFIX = "alflow_"
     LIMIT_KBPS = 2000  # 限速值KB/s(≈16Mbps), 明显低于基线(~900Mbps)便于观测
-    BASELINE_MIN_MBPS = 200  # 基线最低阈值Mbps(跑不满=环境异常软skip)
 
     def test_alone_limit_flow(self, stream_control_page_logged_in,
                               stream_control_flow_env,
@@ -688,15 +687,15 @@ class TestStreamControlFlowVerification:
 
         limit_mbps = self.LIMIT_KBPS * 8 / 1000  # 16Mbps
         tolerance = bv._ssh_config.iperf3_tolerance
+        lower = limit_mbps * (1 - tolerance)  # 容差下界
         upper = limit_mbps * (1 + tolerance)  # 容差上界
 
         def _throughput(direction, ipf):
-            """从iperf3 JSON提吞吐Mbps(参照verify_iperf3内部逻辑)."""
-            if not ipf or "error" in ipf or "end" not in ipf:
+            """复用统一iperf3解析，拒绝缺失或0吞吐。"""
+            try:
+                return bv.extract_iperf3_mbps(ipf, direction)[0]
+            except (TypeError, ValueError):
                 return None
-            end = ipf["end"]
-            key = "sum_sent" if direction == "upload" else "sum_received"
-            return end.get(key, {}).get("bits_per_second", 0) / 1_000_000
 
         def _force_clean():
             """SQL兜底删alflow_规则(精确前缀, 不删别人规则)."""
@@ -741,11 +740,13 @@ class TestStreamControlFlowVerification:
                 base_up = _throughput("upload", bv.run_iperf3(direction="upload", duration=8))
                 base_down = _throughput("download", bv.run_iperf3(direction="download", duration=8))
                 rec.add_detail(f"  基线: 上行={base_up} / 下行={base_down} Mbps")
-                if base_up is None or base_up < self.BASELINE_MIN_MBPS:
+                required_baseline = upper * 1.10
+                if (base_up is None or base_down is None
+                        or base_up <= required_baseline or base_down <= required_baseline):
                     rec.add_detail(
-                        f"  [环境] 基线上行跑不满({base_up}Mbps<{self.BASELINE_MIN_MBPS}), 软skip")
+                        f"  [环境] 基线不足以验证限速(要求上下行均>{required_baseline:.1f}Mbps), 软skip")
                     pytest.skip(
-                        f"基线上行跑不满({base_up}Mbps), 环境异常跳过")
+                        f"基线不足: 上行={base_up}, 下行={base_down}Mbps")
 
             # ===== 步骤2: 建终端独立限速规则(绑client内网IP) + SSH硬落地 =====
             with rec.step("步骤2: 建终端限速规则",
@@ -781,22 +782,27 @@ class TestStreamControlFlowVerification:
 
             # ===== 步骤3: 打流验证限速生效(核心, 上下行; 生效[OK]/不生效软记录) =====
             with rec.step("步骤3: 打流验证限速生效",
-                          f"限速{limit_mbps:.0f}Mbps(上界{upper:.1f}) vs 基线上行{base_up:.0f}Mbps"):
+                          f"限速{limit_mbps:.0f}Mbps(合格{lower:.1f}-{upper:.1f}) vs 基线上行{base_up:.0f}Mbps"):
                 # 上行(确定性QoS)
                 up_ipf = bv.run_iperf3(direction="upload", duration=10)
                 up_mbps = _throughput("upload", up_ipf)
                 rec.add_detail(
-                    f"  上行实测: {up_mbps}Mbps (基线{base_up:.0f}/上界{upper:.1f})")
+                    f"  上行实测: {up_mbps}Mbps (基线{base_up:.0f}/合格{lower:.1f}-{upper:.1f})")
                 # iperf3返回error时记录原始信息(原_throughput吞掉error致None无法诊断)
                 if up_mbps is None and up_ipf and "error" in up_ipf:
                     rec.add_detail(
                         f"  iperf3上行error(诊断): {str(up_ipf['error'])[:200]}")
-                if up_mbps is not None and up_mbps <= upper:
-                    rec.add_detail(f"  [OK] 上行限速生效(被限, 远低于基线{base_up:.0f})")
+                if up_mbps is not None and lower <= up_mbps <= upper:
+                    rec.add_detail(f"  [OK] 上行限速准确(落在双边容差区间, 基线{base_up:.0f})")
                 else:
                     if up_mbps is None:
                         rec.add_detail("  ✗ 上行iperf3未取到实测值(异常)")
-                        failures.append(f"上行限速未验证: iperf3未取到实测值(基线{base_up:.0f}/上界{upper:.1f})")
+                        failures.append(f"上行限速未验证: iperf3未取到实测值(基线{base_up:.0f})")
+                    elif up_mbps < lower:
+                        rec.add_detail(
+                            f"  ✗ 上行过度限速(实测{up_mbps:.1f}<下界{lower:.1f})")
+                        failures.append(
+                            f"上行过度限速: 实测{up_mbps:.1f}Mbps(合格{lower:.1f}-{upper:.1f})")
                     elif up_mbps >= base_up * 0.5:
                         rec.add_detail(
                             f"  ✗ 上行未限速(实测{up_mbps:.0f}≈基线{base_up:.0f}, "
@@ -813,16 +819,21 @@ class TestStreamControlFlowVerification:
                 down_mbps = _throughput("download", down_ipf)
                 base_d = base_down if base_down else base_up
                 rec.add_detail(
-                    f"  下行实测: {down_mbps}Mbps (基线{base_d:.0f}/上界{upper:.1f})")
+                    f"  下行实测: {down_mbps}Mbps (基线{base_d:.0f}/合格{lower:.1f}-{upper:.1f})")
                 if down_mbps is None and down_ipf and "error" in down_ipf:
                     rec.add_detail(
                         f"  iperf3下行error(诊断): {str(down_ipf['error'])[:200]}")
-                if down_mbps is not None and down_mbps <= upper:
-                    rec.add_detail("  [OK] 下行限速生效(被限)")
+                if down_mbps is not None and lower <= down_mbps <= upper:
+                    rec.add_detail("  [OK] 下行限速准确(落在双边容差区间)")
                 else:
                     if down_mbps is None:
                         rec.add_detail("  ✗ 下行iperf3未取到实测值(异常)")
-                        failures.append(f"下行限速未验证: iperf3未取到实测值(基线{base_d:.0f}/上界{upper:.1f})")
+                        failures.append(f"下行限速未验证: iperf3未取到实测值(基线{base_d:.0f})")
+                    elif down_mbps < lower:
+                        rec.add_detail(
+                            f"  ✗ 下行过度限速(实测{down_mbps:.1f}<下界{lower:.1f})")
+                        failures.append(
+                            f"下行过度限速: 实测{down_mbps:.1f}Mbps(合格{lower:.1f}-{upper:.1f})")
                     elif down_mbps >= base_d * 0.5:
                         rec.add_detail(
                             f"  ✗ 下行未限速(实测{down_mbps:.0f}≈基线{base_d:.0f}, "

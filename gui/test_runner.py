@@ -52,6 +52,10 @@ PROTOCOL_CONTROL_TESTCASE = (
     "device_setting/test_protocol_control_comprehensive.py::"
     "TestProtocolControlComprehensive::test_protocol_control_comprehensive"
 )
+KERNEL_SETTING_TESTCASE = (
+    "device_setting/test_kernel_setting_comprehensive.py::"
+    "TestKernelSettingComprehensive::test_kernel_setting_comprehensive"
+)
 OSPF_TESTCASE = (
     "network/test_ospf_comprehensive.py::"
     "TestOspfComprehensive::test_ospf_comprehensive"
@@ -67,6 +71,7 @@ PACKAGED_SNMP_COLLECT_FLAG = "--collect-snmp-smoke"
 PACKAGED_BASIC_SETTING_COLLECT_FLAG = "--collect-basic-setting-smoke"
 PACKAGED_ALG_SETTING_COLLECT_FLAG = "--collect-alg-setting-smoke"
 PACKAGED_PROTOCOL_CONTROL_COLLECT_FLAG = "--collect-protocol-control-smoke"
+PACKAGED_KERNEL_SETTING_COLLECT_FLAG = "--collect-kernel-setting-smoke"
 PACKAGED_OSPF_COLLECT_FLAG = "--collect-ospf-smoke"
 PACKAGED_IPSEC_COLLECT_FLAG = "--collect-ipsec-smoke"
 
@@ -413,6 +418,7 @@ class TestRunner(QThread):
         """设置环境变量"""
         env = os.environ
         env["DEVICE_IP"] = self.config.device.ip
+        env["IPTV_DUT_MANAGEMENT_IP"] = self.config.device.ip
         env["DEVICE_USERNAME"] = self.config.device.username
         env["DEVICE_PASSWORD"] = self.config.device.password
         env["HEADLESS"] = "true" if self.config.browser.headless else "false"
@@ -448,6 +454,8 @@ class TestRunner(QThread):
             env["SSH_ROUTER_RECOVERY_PORT"] = str(getattr(self.config.ssh, 'router_recovery_port', 22))
             env["SSH_ROUTER_LAN_MANAGEMENT_HOST"] = getattr(self.config.ssh, 'router_lan_management_host', '') or ""
             env["SSH_ROUTER_LAN_MANAGEMENT_PORT"] = str(getattr(self.config.ssh, 'router_lan_management_port', 22))
+            env["SSH_KERNEL_PEER_HOST"] = getattr(self.config.ssh, 'kernel_peer_host', '') or ""
+            env["SSH_KERNEL_PEER_PORT"] = str(getattr(self.config.ssh, 'kernel_peer_port', 22))
             env["IPERF3_SERVER"] = self.config.ssh.iperf3_server or ""
             env["IPERF3_DURATION"] = str(self.config.ssh.iperf3_duration)
             env["IPERF3_TOLERANCE"] = str(self.config.ssh.iperf3_tolerance)
@@ -1001,6 +1009,20 @@ def run_packaged_protocol_control_collect_smoke(
     )
 
 
+def run_packaged_kernel_setting_collect_smoke(
+    result_path: Optional[str] = None,
+) -> int:
+    """Collect the packaged kernel-setting node without device I/O."""
+    return _run_packaged_collect_smoke(
+        testcase=KERNEL_SETTING_TESTCASE,
+        page_module="pages.device_setting.kernel_setting_page",
+        service_name="kernel_setting",
+        default_result_name="kernel_setting_collect_smoke.json",
+        result_path=result_path,
+        result_env_name="IKUAI_PACKAGED_KERNEL_SETTING_SMOKE_RESULT",
+    )
+
+
 def run_packaged_ospf_collect_smoke(result_path: Optional[str] = None) -> int:
     """Collect the packaged OSPF node without browser or device I/O."""
     return _run_packaged_collect_smoke(
@@ -1026,6 +1048,8 @@ def run_packaged_ipsec_collect_smoke(result_path: Optional[str] = None) -> int:
 
 
 if is_frozen():
+    if PACKAGED_KERNEL_SETTING_COLLECT_FLAG in sys.argv:
+        raise SystemExit(run_packaged_kernel_setting_collect_smoke())
     if PACKAGED_PROTOCOL_CONTROL_COLLECT_FLAG in sys.argv:
         raise SystemExit(run_packaged_protocol_control_collect_smoke())
     if PACKAGED_ALG_SETTING_COLLECT_FLAG in sys.argv:

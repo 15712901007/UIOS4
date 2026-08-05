@@ -481,12 +481,14 @@ class PortRoutePage(IkuaiTablePage):
                 all_add_btns.nth(1).click()
                 self.page.wait_for_timeout(500)
 
+            # 点击“添加”后只会新增一个当前可编辑行。旧实现硬取nth(1)，
+            # 当页面只有一个动态输入框时什么也不填，保存报“请输入IP或MAC”。
             dst_input = self.page.get_by_placeholder('请输入IP或MAC')
-            if dst_input.count() >= 2:
-                dst_input.nth(1).click()
-                dst_input.nth(1).type(addr, delay=30)
+            if dst_input.count() > 0:
+                dst_input.last.click()
+                dst_input.last.type(addr, delay=30)
                 self.page.wait_for_timeout(200)
-                dst_input.nth(1).press("Enter")
+                dst_input.last.press("Enter")
                 self.page.wait_for_timeout(300)
         except Exception as e:
             print(f"[DEBUG] fill_dst_addr error: {e}")
@@ -551,11 +553,17 @@ class PortRoutePage(IkuaiTablePage):
             port: 端口号或端口范围(如 "80" 或 "80-443")
         """
         try:
-            src_port_input = self.page.get_by_role("textbox", name="源端口")
+            add_buttons = self.page.get_by_role('button', name='添加')
+            if add_buttons.count() < 3:
+                print(f"[WARN] 未找到源端口添加按钮, count={add_buttons.count()}")
+                return self
+            add_buttons.nth(2).click()
+            self.page.wait_for_timeout(400)
+            src_port_input = self.page.get_by_placeholder('端口或端口范围')
             if src_port_input.count() > 0:
-                src_port_input.click()
-                src_port_input.clear()
-                src_port_input.type(port, delay=30)
+                src_port_input.last.click()
+                src_port_input.last.type(port, delay=30)
+                src_port_input.last.press("Enter")
                 self.page.wait_for_timeout(200)
         except Exception as e:
             print(f"[DEBUG] fill_src_port error: {e}")
@@ -568,11 +576,17 @@ class PortRoutePage(IkuaiTablePage):
             port: 端口号或端口范围(如 "80" 或 "80-443")
         """
         try:
-            dst_port_input = self.page.get_by_role("textbox", name="目的端口")
+            add_buttons = self.page.get_by_role('button', name='添加')
+            if add_buttons.count() < 4:
+                print(f"[WARN] 未找到目的端口添加按钮, count={add_buttons.count()}")
+                return self
+            add_buttons.nth(3).click()
+            self.page.wait_for_timeout(400)
+            dst_port_input = self.page.get_by_placeholder('端口或端口范围')
             if dst_port_input.count() > 0:
-                dst_port_input.click()
-                dst_port_input.clear()
-                dst_port_input.type(port, delay=30)
+                dst_port_input.last.click()
+                dst_port_input.last.type(port, delay=30)
+                dst_port_input.last.press("Enter")
                 self.page.wait_for_timeout(200)
         except Exception as e:
             print(f"[DEBUG] fill_dst_port error: {e}")
@@ -623,32 +637,55 @@ class PortRoutePage(IkuaiTablePage):
                 self.page.wait_for_timeout(300)
 
             if days is not None:
-                all_days = ["一", "二", "三", "四", "五", "六", "日"]
-                for day_text in all_days:
-                    day_el = self.page.get_by_text(day_text, exact=True)
-                    if day_el.count() > 0:
-                        is_active = day_el.first.evaluate(
-                            'el => el.classList.contains("ant-tag-checkable-checked")'
-                            ' || el.parentElement.classList.contains("ant-tag-checkable-checked")'
-                            ' || el.classList.contains("active")'
-                        )
-                        should_select = day_text in days
-                        if should_select != is_active:
-                            day_el.first.click()
-                            self.page.wait_for_timeout(100)
+                # 4.0页面星期项使用CSS-module类“*_weekItemActive”，不是旧版
+                # ant-tag-checkable-checked。先在唯一的七星期容器内注入稳定属性。
+                marked = self.page.evaluate("""() => {
+                    const candidates=[...document.querySelectorAll('*')].filter(e=>{
+                        if(e.offsetParent===null) return false;
+                        const t=(e.textContent||'').replace(/\\s/g,'');
+                        return t.length<=20 && '一二三四五六日'.split('').every(d=>t.includes(d));
+                    });
+                    for(const wrap of candidates){
+                        const items=[...wrap.querySelectorAll('*')].filter(e=>
+                            e.offsetParent!==null && /^[一二三四五六日]$/.test((e.textContent||'').trim())
+                            && e.children.length===0);
+                        const unique=[...new Map(items.map(e=>[(e.textContent||'').trim(),e])).values()];
+                        if(unique.length===7){
+                            unique.forEach(e=>e.setAttribute('data-port-weekday',(e.textContent||'').trim()));
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if not marked:
+                    print("[WARN] 未定位端口分流星期选择区域")
+                for day_text in ["一", "二", "三", "四", "五", "六", "日"]:
+                    day_el = self.page.locator(f'[data-port-weekday="{day_text}"]')
+                    if day_el.count() == 0:
+                        continue
+                    is_active = day_el.evaluate("""el => {
+                        const cls=(el.className||'')+' '+((el.parentElement||{}).className||'');
+                        return cls.includes('_weekItemActive') ||
+                               cls.includes('ant-tag-checkable-checked') ||
+                               cls.split(/\\s+/).includes('active') ||
+                               el.getAttribute('aria-pressed')==='true';
+                    }""")
+                    if (day_text in days) != is_active:
+                        day_el.click()
+                        self.page.wait_for_timeout(100)
 
-            start_input = self.page.get_by_role("textbox", name="开始时间")
+            start_input = self.page.locator('input[placeholder="开始时间"]')
             if start_input.count() > 0:
-                start_input.click()
-                start_input.press("Control+a")
-                start_input.type(start_time, delay=50)
+                start_input.first.click()
+                start_input.first.fill(start_time)
+                start_input.first.press("Enter")
                 self.page.wait_for_timeout(100)
 
-            end_input = self.page.get_by_role("textbox", name="结束时间")
+            end_input = self.page.locator('input[placeholder="结束时间"]')
             if end_input.count() > 0:
-                end_input.click()
-                end_input.press("Control+a")
-                end_input.type(end_time, delay=50)
+                end_input.first.click()
+                end_input.first.fill(end_time)
+                end_input.first.press("Enter")
                 self.page.wait_for_timeout(100)
 
         except Exception as e:

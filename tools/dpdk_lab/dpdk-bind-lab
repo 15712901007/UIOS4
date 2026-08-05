@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( EUID != 0 )); then
+    echo "Run as root: sudo $0 [PCI ...]" >&2
+    exit 1
+fi
+
+devbind=/opt/dpdk/bin/dpdk-devbind.py
+if [[ ! -x "${devbind}" ]]; then
+    echo "DPDK device binding tool not found: ${devbind}" >&2
+    exit 1
+fi
+
+if (( $# == 0 )); then
+    set -- 0000:03:00.0 0000:07:00.0
+fi
+
+management_if=$(ip -4 route show default | awk 'NR == 1 { print $5 }')
+management_pci=""
+if [[ -n "${management_if}" && -e "/sys/class/net/${management_if}/device" ]]; then
+    management_pci=$(basename "$(readlink -f "/sys/class/net/${management_if}/device")")
+fi
+
+devices=()
+for requested in "$@"; do
+    if [[ "${requested}" =~ ^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]]; then
+        requested="0000:${requested}"
+    fi
+    requested=${requested,,}
+    if [[ ! -e "/sys/bus/pci/devices/${requested}" ]]; then
+        echo "PCI device does not exist: ${requested}" >&2
+        exit 1
+    fi
+    if [[ "${requested}" == "${management_pci}" ]]; then
+        echo "Refusing to bind ${requested}: it carries the default route on ${management_if}." >&2
+        exit 1
+    fi
+    devices+=("${requested}")
+done
+
+modprobe vfio-pci
+for device in "${devices[@]}"; do
+    for netdev in "/sys/bus/pci/devices/${device}"/net/*; do
+        [[ -e "${netdev}" ]] || continue
+        ip link set "$(basename "${netdev}")" down
+    done
+done
+
+"${devbind}" --bind=vfio-pci "${devices[@]}"
+"${devbind}" --status-dev net

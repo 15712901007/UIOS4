@@ -34,7 +34,7 @@ pytestmark = [pytest.mark.advanced_service, pytest.mark.ftp_server]
 TEST_PORT = 2121
 PARTITION = "666"
 LAN_HOST, LAN_IFACE = "192.168.148.1", "ens11"
-WAN_HOST, WAN_IFACE = "10.66.0.150", "enp2s0"
+WAN_IFACE = "enp2s0"
 EXPORT_HEADERS = [
     "id", "enabled", "username", "passwd", "permission", "home_dir", "upload", "download"
 ]
@@ -539,6 +539,15 @@ class TestFtpServerComprehensive:
                            cleanup_password=rw_password, must_pass=True)
 
             with rec.step("步骤19: 验证FTP外网访问开关", "操作：关闭外网访问后分别从内外网连接，再重新允许外网；验证：关闭时外网被拒绝但内网仍可用，恢复后外网可正常列目录"):
+                wan_target = require_ssh(
+                    "L0-WAN探测拓扑", backend.verify_local_service_wan_target,
+                    WAN_IFACE,
+                )
+                wan_host = wan_target.details["host"]
+                require_ssh(
+                    "L5-WAN允许基线", backend.run_ftp_probe,
+                    RW_USER, rw_password, TEST_PORT, wan_host, WAN_IFACE, "list",
+                )
                 page.navigate_to_ftp_server()
                 restricted = page.set_settings(TEST_PORT, False)
                 require_ui("关闭外网访问", restricted.get("success"), restricted.get("error", ""))
@@ -552,7 +561,7 @@ class TestFtpServerComprehensive:
                            RW_USER, rw_password, TEST_PORT, LAN_HOST, LAN_IFACE, "list",
                            must_pass=True)
                 ssh_verify("L5-WAN拒绝", backend.run_ftp_probe,
-                           RW_USER, rw_password, TEST_PORT, WAN_HOST, WAN_IFACE,
+                           RW_USER, rw_password, TEST_PORT, wan_host, WAN_IFACE,
                            "connect_fail", must_pass=True)
                 allowed = page.set_settings(TEST_PORT, True)
                 require_ui("恢复外网访问", allowed.get("success"), allowed.get("error", ""))
@@ -561,7 +570,7 @@ class TestFtpServerComprehensive:
                 require_ssh("L2-允许设置后服务稳定", backend.verify_ftp_daemon,
                             True, port=TEST_PORT)
                 ssh_verify("L5-WAN LIST恢复", backend.run_ftp_probe,
-                           RW_USER, rw_password, TEST_PORT, WAN_HOST, WAN_IFACE, "list",
+                           RW_USER, rw_password, TEST_PORT, wan_host, WAN_IFACE, "list",
                            must_pass=True)
 
             with rec.step("步骤20: 验证FTP总开关关闭后拒绝连接", "操作：关闭FTP服务并从内网发起真实连接；验证：数据库开关关闭、ik_ftpd进程与2121监听消失，内网连接明确失败"):

@@ -1153,19 +1153,19 @@
                 <div class="number">{{ total_steps }}</div>
                 <div class="label">测试步骤</div>
             </div>
-            <div class="stat-card passed">
+            <div class="stat-card passed" onclick="clickStatFilter('passed')" style="cursor:pointer" title="点击查看通过用例">
                 <div class="number">{{ passed }}</div>
                 <div class="label">通过用例</div>
             </div>
-            <div class="stat-card failed">
+            <div class="stat-card failed" onclick="clickStatFilter('failed')" style="cursor:pointer" title="点击查看失败用例">
                 <div class="number">{{ failed }}</div>
                 <div class="label">失败用例</div>
             </div>
-            <div class="stat-card warning">
+            <div class="stat-card warning" onclick="clickStatFilter('warning')" style="cursor:pointer" title="点击查看警告用例">
                 <div class="number">{{ warning_count }}</div>
                 <div class="label">警告用例</div>
             </div>
-            <div class="stat-card not-applicable">
+            <div class="stat-card not-applicable" onclick="clickStatFilter('not_applicable')" style="cursor:pointer" title="点击查看不适用用例">
                 <div class="number">{{ not_applicable_count }}</div>
                 <div class="label">不适用用例</div>
             </div>
@@ -1289,15 +1289,19 @@
                                     <div class="step-number">{{ loop.index }}</div>
                                     <div class="step-content">
                                         <div class="step-name">{{ step.name }}</div>
-                                        {% if step.description %}
-                                        <div class="step-description">{{ step.description }}</div>
-                                        {% endif %}
-                                        {% if '操作：' in step.name and '；验证：' in step.name %}
+                                        {% set _desc_is_split = ('操作：' in (step.description or '') and '；验证：' in (step.description or '')) %}
+                                        {% if _desc_is_split %}
+                                        {% set action_text = step.description.split('操作：', 1)[1].split('；验证：', 1)[0] %}
+                                        {% set expected_text = step.description.split('；验证：', 1)[1] %}
+                                        {% elif '操作：' in (step.name or '') and '；验证：' in (step.name or '') %}
                                         {% set action_text = step.name.split('操作：', 1)[1].split('；验证：', 1)[0] %}
                                         {% set expected_text = step.name.split('；验证：', 1)[1] %}
                                         {% else %}
                                         {% set action_text = step.description or step.name %}
                                         {% set expected_text = step.description or '按本步骤检查项判定' %}
+                                        {% endif %}
+                                        {% if step.description and not _desc_is_split %}
+                                        <div class="step-description">{{ step.description }}</div>
                                         {% endif %}
                                         <div class="step-details" style="margin-top:10px;">
                                             <div class="step-detail-item detail-test-action"><strong>操作：</strong>{{ action_text }}</div>
@@ -1664,6 +1668,60 @@
                     tc.style.display = 'none';
                 }
             });
+
+            // 筛选后定位: 展开用例 + 滚动到用例内"需关注"的步骤(BUG记录/失败/警告), 而非用例顶部
+            setTimeout(function() {
+                var firstMatch = null;
+                document.querySelectorAll('.test-case[data-status]').forEach(function(tc) {
+                    if (!firstMatch) {
+                        var cs = tc.getAttribute('data-status');
+                        var m = (status === 'all') || (cs === status) ||
+                            (status === 'not_applicable' && (cs === 'not_applicable' || cs === 'skipped')) ||
+                            (status === 'failed' && (cs === 'failed' || cs === 'error'));
+                        if (m) firstMatch = tc;
+                    }
+                });
+                if (firstMatch) {
+                    var details = firstMatch.querySelector('.test-case-details');
+                    if (details) details.classList.add('show');
+                    // 优先定位到含BUG记录/警告的具体证据条目(精确到行), 其次失败步骤, 最后用例顶部
+                    var targetEl = null;
+                    // 1) 精确找 BUG记录/警告 证据条目(step-detail-item 叶子, 避免只定位到步骤顶部)
+                    firstMatch.querySelectorAll('.step-detail-item').forEach(function(d) {
+                        if (!targetEl) {
+                            var t = d.textContent || '';
+                            if (t.indexOf('BUG记录') !== -1 || t.indexOf('【⚠') !== -1) {
+                                targetEl = d;
+                            }
+                        }
+                    });
+                    // 2) 退而求其次: 失败/警告步骤整体
+                    if (!targetEl) {
+                        firstMatch.querySelectorAll('.step-item').forEach(function(s) {
+                            if (!targetEl) {
+                                if (s.querySelector('.step-status.failed, .step-status.warning, .detail-verification-failed, .detail-verification-warning')) {
+                                    targetEl = s;
+                                }
+                            }
+                        });
+                    }
+                    var scrollEl = targetEl || firstMatch;
+                    var top = scrollEl.getBoundingClientRect().top + window.pageYOffset - 20;
+                    window.scrollTo({ top: top, behavior: 'smooth' });
+                }
+            }, 80);
+        }
+
+        // 点击顶部统计卡片 -> 触发对应筛选(等价于点击筛选栏按钮, 含定位)
+        function clickStatFilter(status) {
+            var keywords = { passed: '通过', failed: '失败', warning: '警告', not_applicable: '不适用' };
+            var btns = document.querySelectorAll('.filter-btn');
+            for (var i = 0; i < btns.length; i++) {
+                if (btns[i].textContent.includes(keywords[status])) {
+                    btns[i].click();
+                    return;
+                }
+            }
         }
     </script>
 </body>
