@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import shlex
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,6 +28,12 @@ from typing import Optional, Dict, List, Any, Iterable
 import paramiko
 
 from config.config import get_config, get_config_with_env, SSHConfig, SSHHostConfig
+from utils.interface_topology import (
+    choose_reassignable_nics,
+    interface_rows_equal,
+    natural_interface_key,
+    split_interface_names,
+)
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -86,39 +93,36 @@ class SSHClient:
         self._used_console_login = False  # 是否使用了控制台登录流程
         self._cmd_log: List[str] = []  # 执行过的命令录制(供验证报告显示验证命令, mark/collect差量)
         self._cmd_io_log: List[Dict[str, str]] = []  # 命令+输出配对录制(GRE等模块生成"真实命令+结果"可复制卡, mark_io/collect_io差量)
+        self._connection_lock = threading.RLock()
 
     def connect(self):
-        if self._client is not None:
-            # 检查连接是否仍然活跃
-            try:
-                transport = self._client.get_transport()
-                if transport is None or not transport.is_active():
+        with self._connection_lock:
+            if self._client is not None:
+                try:
+                    transport = self._client.get_transport()
+                    if transport is not None and transport.is_active():
+                        return
                     logger.info(f"SSH connection lost, reconnecting: {self._config.host}")
-                    self._client = None
-                    self._console_logged_in = False
-                else:
-                    return
-            except Exception:
+                    self._client.close()
+                except Exception:
+                    pass
                 self._client = None
                 self._console_logged_in = False
-        self._client = paramiko.SSHClient()
-        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self._client.connect(
-            hostname=self._config.host,
-            port=self._config.port,
-            username=self._config.username,
-            password=self._config.password,
-            timeout=10,
-        )
-        # 设置keepalive防止长时间空闲断连（每30秒发送一次心跳）
-        transport = self._client.get_transport()
-        if transport:
-            transport.set_keepalive(30)
-        # 用户名属于认证信息；日志只保留目标主机，避免进入终端和报告。
-        logger.info(f"SSH connected: {self._config.host}")
-
-        # 检测是否需要控制台登录
-        self._check_and_login_console()
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                hostname=self._config.host,
+                port=self._config.port,
+                username=self._config.username,
+                password=self._config.password,
+                timeout=10,
+            )
+            self._client = client
+            transport = client.get_transport()
+            if transport:
+                transport.set_keepalive(30)
+            logger.info(f"SSH connected: {self._config.host}")
+            self._check_and_login_console()
 
     def _check_and_login_console(self):
         """检测是否进入交互式菜单，如果是则自动登录"""
@@ -467,15 +471,18 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
         """
         for attempt in range(2):
             try:
-                if self._client is None:
-                    self.connect()
+                self.connect()
+                client = self._client
+                transport = client.get_transport() if client is not None else None
+                if client is None or transport is None or not transport.is_active():
+                    raise paramiko.SSHException("SSH transport is not active")
                 # probe_console=True: 首次10秒短超时快速检测控制台模式; 第二次用正常超时
                 # probe_console=False: 两次都用完整timeout(长命令专用, 避免超时制造孤儿)
                 if probe_console:
                     exec_timeout = 10 if attempt == 0 else timeout
                 else:
                     exec_timeout = timeout
-                _, stdout, stderr = self._client.exec_command(command, timeout=exec_timeout)
+                _, stdout, stderr = client.exec_command(command, timeout=exec_timeout)
                 stdout.channel.settimeout(exec_timeout)  # 确保read也遵守超时
                 output = stdout.read().decode("utf-8", errors="replace")
                 err = stderr.read().decode("utf-8", errors="replace")
@@ -497,10 +504,15 @@ chmod +x /etc/mnt/ikuai/fix_sshd_shell.sh'''
                         output = stdout2.read().decode("utf-8", errors="replace")
 
                 return output
-            except (paramiko.SSHException, OSError, TimeoutError) as e:
+            except (paramiko.SSHException, OSError, TimeoutError, EOFError, AttributeError) as e:
                 if attempt == 0:
                     logger.info(f"SSH exec failed ({e}), reconnecting...")
                     self._console_logged_in = False  # 重置标记, 重连时重新检测控制台
+                    try:
+                        if self._client is not None:
+                            self._client.close()
+                    except Exception:
+                        pass
                     self._client = None
                 else:
                     raise
@@ -12592,6 +12604,151 @@ class BackendVerifier:
     # 数据查询走 /Action/call func_name=lan/wan action=show(需HTTP), SSH层直接读sqlite3
 
     IK_DB = "/etc/mnt/ikuai/config.db"
+    INTERFACE_TABLES = {"lan_config", "wan_config"}
+    INTERFACE_SECRET_FIELDS = {"passwd", "wifi_psk"}
+
+    @classmethod
+    def _safe_interface_row(cls, row: Optional[Dict]) -> Dict:
+        """Return report-safe interface data without PPPoE/Wi-Fi secrets."""
+        safe = dict(row or {})
+        for field in cls.INTERFACE_SECRET_FIELDS:
+            if field in safe:
+                safe[field] = "[已隐藏]" if safe[field] else ""
+        return safe
+
+    @classmethod
+    def interface_config_matches(cls, expected: Dict, actual: Dict) -> bool:
+        """Compare complete DB rows; restoration must not normalize old values."""
+        return interface_rows_equal(expected or {}, actual or {})
+
+    @staticmethod
+    def _field_value_matches(expected: Any, actual: Any, *, contains: bool = False) -> bool:
+        """Compare fields without allowing an empty actual value to match anything."""
+        expected_text = str(expected if expected is not None else "")
+        actual_text = str(actual if actual is not None else "")
+        if expected_text == actual_text:
+            return True
+        return bool(contains and expected_text and actual_text and (
+            expected_text in actual_text or actual_text in expected_text
+        ))
+
+    def discover_interface_topology(self, source_lan: str = "lan1") -> Dict[str, Any]:
+        """Discover logical bindings and physical NIC state on eth/veth devices."""
+        self.connect_router()
+        lan_rows = self.query_lan_config()
+        wan_rows = self.query_wan_config()
+        command = (
+            "for p in /sys/class/net/*; do "
+            "n=${p##*/}; "
+            "case \"$n\" in eth[0-9]*|veth[0-9]*|enp*|ens*|eno*|em[0-9]*) ;; *) continue;; esac; "
+            "state=$(cat \"$p/operstate\" 2>/dev/null); "
+            "carrier=$(cat \"$p/carrier\" 2>/dev/null); "
+            "mac=$(cat \"$p/address\" 2>/dev/null); "
+            "flags=$(ip -o link show \"$n\" 2>/dev/null | sed -n 's/^[^<]*<\\([^>]*\\)>.*/\\1/p'); "
+            "printf '%s|%s|%s|%s|%s\\n' \"$n\" \"$state\" \"$carrier\" \"$mac\" \"$flags\"; "
+            "done"
+        )
+        raw = self._router.exec(command)
+        physical: Dict[str, Dict[str, Any]] = {}
+        for line in raw.splitlines():
+            parts = line.split("|", 4)
+            if len(parts) != 5:
+                continue
+            name, state, carrier, mac, flags = parts
+            physical[name] = {
+                "name": name,
+                "state": state,
+                "carrier": carrier,
+                "mac": mac,
+                "flags": [item for item in flags.split(",") if item],
+            }
+
+        canonical_names = {name.casefold(): name for name in physical}
+        by_mac: Dict[str, List[str]] = {}
+        for name, item in physical.items():
+            mac = str(item.get("mac", "")).strip().casefold()
+            if mac and mac != "00:00:00:00:00:00":
+                by_mac.setdefault(mac, []).append(name)
+
+        def row_bound_names(row: Dict[str, Any]) -> List[str]:
+            names = [
+                canonical_names.get(name.casefold(), name)
+                for name in split_interface_names(row.get("bandeth", ""))
+            ]
+            if not names:
+                for mac in split_interface_names(row.get("bandif", "")):
+                    matches = by_mac.get(mac.casefold(), [])
+                    if matches:
+                        names.append(sorted(matches, key=natural_interface_key)[0])
+            return list(dict.fromkeys(names))
+
+        source = next((row for row in lan_rows if row.get("tagname") == source_lan), {})
+        bound = row_bound_names(source)
+
+        assigned: List[str] = []
+        for row in [*lan_rows, *wan_rows]:
+            for name in row_bound_names(row):
+                if name.casefold() not in {item.casefold() for item in assigned}:
+                    assigned.append(name)
+        assigned_keys = {name.casefold() for name in assigned}
+
+        # Some virtual appliances expose both a veth and its backing eth with
+        # the same MAC.  The UI exposes only the veth family in that topology;
+        # treating the backing eth as free would select the wrong checkbox.
+        duplicate_aliases = set()
+        for names in by_mac.values():
+            if len(names) < 2:
+                continue
+            assigned_members = [name for name in names if name.casefold() in assigned_keys]
+            if assigned_members:
+                duplicate_aliases.update(
+                    name for name in names if name.casefold() not in assigned_keys
+                )
+
+        unassigned = sorted(
+            (
+                name for name in physical
+                if name.casefold() not in assigned_keys and name not in duplicate_aliases
+            ),
+            key=natural_interface_key,
+        )
+        return {
+            "lan": lan_rows,
+            "wan": wan_rows,
+            "physical": physical,
+            "source_lan": source_lan,
+            "source_bound_nics": bound,
+            "assigned_nics": sorted(assigned, key=natural_interface_key),
+            "unassigned_nics": unassigned,
+            "duplicate_aliases": sorted(duplicate_aliases, key=natural_interface_key),
+            "reassignable_nics": choose_reassignable_nics(bound, physical, count=2),
+        }
+
+    def select_test_nics(self, source_lan: str = "lan1", count: int = 1) -> Dict[str, Any]:
+        """Plan NIC use for interface tests, preferring already-free NICs."""
+        topology = self.discover_interface_topology(source_lan)
+        wanted = max(0, int(count))
+        free_nics = list(topology.get("unassigned_nics", []))[:wanted]
+        released_nics = choose_reassignable_nics(
+            topology.get("source_bound_nics", []),
+            topology.get("physical", {}),
+            count=max(0, wanted - len(free_nics)),
+        )
+        return {
+            "test_nics": free_nics + released_nics,
+            "released_nics": released_nics,
+            "free_nics": free_nics,
+            "topology": topology,
+        }
+
+    def select_reassignable_nics(self, source_lan: str = "lan1", count: int = 1) -> List[str]:
+        """Select safe NICs dynamically while retaining one source-LAN member."""
+        topology = self.discover_interface_topology(source_lan)
+        return choose_reassignable_nics(
+            topology.get("source_bound_nics", []),
+            topology.get("physical", {}),
+            count=count,
+        )
 
     def _db_query_all(self, table: str, where: str = "") -> List[Dict]:
         """直接sqlite3查询表所有行(返回dict列表). table: lan_config/wan_config
@@ -12656,14 +12813,14 @@ class BackendVerifier:
         if not must_exist:
             return VerifyResult(level="L1-数据库", passed=False,
                                 message=f"LAN {tagname} 仍存在(应已删除)",
-                                raw_output=json.dumps(row, ensure_ascii=False))
+                                raw_output=json.dumps(self._safe_interface_row(row), ensure_ascii=False))
         if expected_fields:
             mismatches = {}
             for k, exp in expected_fields.items():
                 act = str(row.get(k, ""))
                 # ip_mask等可能是包含关系, bandif可能是逗号分隔
                 if k in ("ip_mask", "bandif", "bandeth"):
-                    if str(exp) not in act and act not in str(exp):
+                    if not self._field_value_matches(exp, act, contains=True):
                         mismatches[k] = {"expected": exp, "actual": act}
                 elif k == "mac":
                     # MAC大小写不敏感(数据库存小写, UI填大写)
@@ -12674,10 +12831,10 @@ class BackendVerifier:
             if mismatches:
                 return VerifyResult(level="L1-数据库", passed=False,
                                     message=f"LAN字段不匹配: {mismatches}",
-                                    raw_output=json.dumps(row, ensure_ascii=False))
+                                    raw_output=json.dumps(self._safe_interface_row(row), ensure_ascii=False))
         return VerifyResult(level="L1-数据库", passed=True,
                             message=f"LAN {tagname} 字段正确 (id={row.get('id')}, ip_mask={row.get('ip_mask')})",
-                            raw_output=json.dumps(row, ensure_ascii=False))
+                            raw_output=json.dumps(self._safe_interface_row(row), ensure_ascii=False))
 
     def verify_wan_database(self, tagname: str, expected_fields: Dict = None,
                             must_exist: bool = True) -> VerifyResult:
@@ -12693,13 +12850,13 @@ class BackendVerifier:
         if not must_exist:
             return VerifyResult(level="L1-数据库", passed=False,
                                 message=f"WAN {tagname} 仍存在(应已删除)",
-                                raw_output=json.dumps(row, ensure_ascii=False))
+                                raw_output=json.dumps(self._safe_interface_row(row), ensure_ascii=False))
         if expected_fields:
             mismatches = {}
             for k, exp in expected_fields.items():
                 act = str(row.get(k, ""))
                 if k in ("ip_mask", "bandif", "bandeth"):
-                    if str(exp) not in act and act not in str(exp):
+                    if not self._field_value_matches(exp, act, contains=True):
                         mismatches[k] = {"expected": exp, "actual": act}
                 elif k == "mac":
                     # MAC大小写不敏感(数据库存小写, UI填大写)
@@ -12710,10 +12867,10 @@ class BackendVerifier:
             if mismatches:
                 return VerifyResult(level="L1-数据库", passed=False,
                                     message=f"WAN字段不匹配: {mismatches}",
-                                    raw_output=json.dumps(row, ensure_ascii=False))
+                                    raw_output=json.dumps(self._safe_interface_row(row), ensure_ascii=False))
         return VerifyResult(level="L1-数据库", passed=True,
                             message=f"WAN {tagname} 字段正确 (id={row.get('id')}, internet={row.get('internet')})",
-                            raw_output=json.dumps(row, ensure_ascii=False))
+                            raw_output=json.dumps(self._safe_interface_row(row), ensure_ascii=False))
 
     def verify_interface_ip(self, interface: str, expected_ip: str = None,
                             should_have_ip: bool = True) -> VerifyResult:
@@ -12767,19 +12924,35 @@ class BackendVerifier:
     # WAN接口id→fwmark映射: wan1=0x2711, wan2=0x2712, wan3=0x2713, wan4=0x2714...
     WAN_FWMARK_BASE = 0x2711
 
-    def verify_wan_policy_routing(self, wan_id: int, should_exist: bool = True) -> VerifyResult:
-        """L3: 验证WAN策略路由(ip rule fwmark). wan_id: 1/2/3/4"""
+    def verify_wan_policy_routing(self, wan_id, should_exist: bool = True,
+                                  *, settle_seconds: int = 10) -> VerifyResult:
+        """L3: 按实际lookup表验证WAN策略路由，不假定fwmark与DB id连续。
+
+        删除逻辑口后固件会异步清理 ``ip rule``；短暂轮询避免把正常的
+        teardown 延迟报告成残留，同时仍在超时后严格失败。
+        """
         self.connect_router()
-        fwmark = self.WAN_FWMARK_BASE + wan_id - 1
-        out = self._router.exec("ip rule show 2>/dev/null")
-        # 格式: 10000: from all fwmark 0x2712 lookup wan2
-        exists = f"0x{fwmark:x}" in out and f"lookup wan{wan_id}" in out
-        if exists == should_exist:
-            return VerifyResult(level="L3-策略路由", passed=True,
-                                message=f"wan{wan_id} fwmark 0x{fwmark:x} 策略路由={'存在' if exists else '不存在'}(符合预期)",
-                                raw_output=out[:300])
+        text = str(wan_id)
+        interface = text if re.fullmatch(r"wan\d+", text) else f"wan{int(wan_id)}"
+        deadline = time.time() + (max(0, int(settle_seconds)) if not should_exist else 0)
+        out = ""
+        matches: List[str] = []
+        while True:
+            out = self._router.exec("ip rule show 2>/dev/null")
+            matches = [
+                line for line in out.splitlines()
+                if re.search(rf"\blookup\s+{re.escape(interface)}(?:\s|$)", line)
+            ]
+            exists = bool(matches)
+            if exists == should_exist:
+                return VerifyResult(level="L3-策略路由", passed=True,
+                                    message=f"{interface} 策略路由={'存在' if exists else '不存在'}(符合预期)",
+                                    raw_output="\n".join(matches)[:500])
+            if time.time() >= deadline:
+                break
+            time.sleep(min(1, max(0, deadline - time.time())))
         return VerifyResult(level="L3-策略路由", passed=False,
-                            message=f"wan{wan_id} 策略路由不符: 期望{'存在' if should_exist else '不存在'}",
+                            message=f"{interface} 策略路由不符: 期望{'存在' if should_exist else '不存在'}",
                             raw_output=out[:300])
 
     def verify_lan_visit_iptables(self, interface: str, allow_visit: bool = True) -> VerifyResult:
@@ -12809,6 +12982,72 @@ class BackendVerifier:
                                 message=f"{interface} 应禁止互访但LAN_VISIT无DROP规则",
                                 raw_output=out[:300])
 
+    def _reinitialize_interface_runtime(self, table: str, timeout: int = 75) -> Dict[str, Any]:
+        """Run lan/wan init detached, then reconnect and collect its exit code."""
+        if table not in self.INTERFACE_TABLES:
+            raise ValueError(f"不支持的接口配置表: {table}")
+        self.connect_router()
+        script = "lan.sh" if table == "lan_config" else "wan.sh"
+        token = secrets.token_hex(6)
+        marker = f"/tmp/ikuai-ui-{script}-{token}.rc"
+        log_path = f"/tmp/ikuai-ui-{script}-{token}.log"
+        child_command = (
+            f"exec >{log_path} 2>&1; "
+            f"/usr/ikuai/script/{script} init; rc=$?; echo $rc > {marker}"
+        )
+        start_cmd = (
+            f"rm -f {marker} {log_path}; "
+            "if command -v start-stop-daemon >/dev/null 2>&1; then "
+            f"start-stop-daemon -S -b -x /bin/sh -- -c '{child_command}'; "
+            "else "
+            f"(sh -c '{child_command}') </dev/null & "
+            "fi; echo STARTED"
+        )
+        started = self._router.exec(start_cmd, timeout=15)
+        if "STARTED" not in started:
+            return {"passed": False, "message": f"{script} init未启动", "output": started}
+
+        # wan.sh may rebuild the current transport. Drop it deliberately so the
+        # next poll cannot race a half-closed Paramiko transport.
+        self._router.close()
+        deadline = time.time() + max(10, int(timeout))
+        last_error = ""
+        while time.time() < deadline:
+            time.sleep(2)
+            try:
+                status = self._router.exec(f"cat {marker} 2>/dev/null", timeout=12).strip()
+                if re.fullmatch(r"\d+", status):
+                    output = self._router.exec(f"cat {log_path} 2>/dev/null; rm -f {marker} {log_path}")
+                    return {
+                        "passed": status == "0",
+                        "message": f"{script} init退出码={status}",
+                        "output": output[:1200],
+                    }
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+        return {
+            "passed": False,
+            "message": f"{script} init后{timeout}s内未恢复SSH或未完成: {last_error}",
+            "output": last_error,
+        }
+
+    def _stop_pppoe_runtime(self, tagname: str) -> Dict[str, Any]:
+        """Stop only top-level PPPoE processes for one WAN before snapshot reapply."""
+        tagname = self._validated_interface_name(tagname)
+        self.connect_router()
+        processes = self._router.exec("ps w 2>/dev/null | grep '[p]ppd'")
+        pattern = re.compile(
+            rf"^\s*(\d+)\s+.*\blinkname\s+{re.escape(tagname)}(?:_ad)?\s+"
+            rf"ifname\s+{re.escape(tagname)}(?:_ad)?(?:\s|$)"
+        )
+        pids = [match.group(1) for line in processes.splitlines() if (match := pattern.search(line))]
+        if pids:
+            self._router.exec("kill " + " ".join(pids) + " 2>/dev/null; true")
+            time.sleep(2)
+        remaining = self._router.exec("ps w 2>/dev/null | grep '[p]ppd'")
+        leftovers = [line for line in remaining.splitlines() if pattern.search(line)]
+        return {"passed": not leftovers, "pids": pids, "remaining": len(leftovers)}
+
     def verify_interface_reboot(self, table: str, tagname: str,
                                 expected_fields: Dict = None) -> VerifyResult:
         """L重启验证: 模拟重启后配置是否持久化
@@ -12816,19 +13055,19 @@ class BackendVerifier:
         table: 'lan_config'/'wan_config'"""
         self.connect_router()
         try:
-            script = "lan.sh" if table == "lan_config" else "wan.sh"
-            # 调脚本init(模拟重启加载)
-            self._router.exec(f"/usr/ikuai/script/{script} init 2>&1", timeout=60)
-            # 等待接口重建
-            import time as _time
-            _time.sleep(3)
+            init_result = self._reinitialize_interface_runtime(table)
+            if not init_result["passed"]:
+                return VerifyResult(
+                    level="L4-运行态重建", passed=False,
+                    message=init_result["message"], raw_output=init_result["output"],
+                )
             # 验证数据库配置仍在
             if table == "lan_config":
                 db_res = self.verify_lan_database(tagname, expected_fields, must_exist=True)
             else:
                 db_res = self.verify_wan_database(tagname, expected_fields, must_exist=True)
             if not db_res.passed:
-                return VerifyResult(level="L重启", passed=False,
+                return VerifyResult(level="L4-运行态重建", passed=False,
                                     message=f"重启后{tagname}配置丢失或不一致: {db_res.message}",
                                     raw_output=db_res.raw_output)
             # 验证接口IP仍在
@@ -12837,14 +13076,14 @@ class BackendVerifier:
             if ip and expected_fields and "ip_mask" in (expected_fields or {}):
                 ip_res = self.verify_interface_ip(tagname, expected_ip=ip, should_have_ip=True)
                 if not ip_res.passed:
-                    return VerifyResult(level="L重启", passed=False,
+                    return VerifyResult(level="L4-运行态重建", passed=False,
                                         message=f"重启后{tagname}接口IP丢失: {ip_res.message}",
                                         raw_output=ip_res.raw_output)
-            return VerifyResult(level="L重启", passed=True,
+            return VerifyResult(level="L4-运行态重建", passed=True,
                                 message=f"重启后{tagname}配置持久化验证通过",
-                                raw_output=db_res.raw_output)
+                                raw_output=(init_result["output"] + "\n" + db_res.raw_output)[:1600])
         except Exception as e:
-            return VerifyResult(level="L重启", passed=False,
+            return VerifyResult(level="L4-运行态重建", passed=False,
                                 message=f"重启验证异常: {e}",
                                 raw_output=str(e)[:300])
 
@@ -12869,6 +13108,8 @@ class BackendVerifier:
         关键: bandif等字段含逗号, 用sqlite3单引号值包裹; 对值内单引号转义"""
         self.connect_router()
         try:
+            if table not in self.INTERFACE_TABLES:
+                raise ValueError(f"不支持的接口配置表: {table}")
             if not original_row:
                 return False
             sets = []
@@ -12881,22 +13122,166 @@ class BackendVerifier:
             # 优先用id定位(稳定; tagname可能被测试改名致where tagname=失效), 降级tagname
             row_id = original_row.get("id")
             where_clause = f"id='{row_id}'" if row_id else f"tagname='{tagname}'"
-            sql = f"update {table} set {','.join(sets)} where {where_clause}"
-            self._router.exec(f'sqlite3 {self.IK_DB} "{sql}"')
-            # 触发脚本重新apply(重建接口/iptables)
-            script = "lan.sh" if table == "lan_config" else "wan.sh"
-            self._router.exec(f"/usr/ikuai/script/{script} init 2>&1", timeout=60)
-            import time as _time
-            _time.sleep(2)
-            return True
+            sql = f"update {table} set {','.join(sets)} where {where_clause};"
+            encoded = base64.b64encode(sql.encode("utf-8")).decode("ascii")
+            self._router.exec(f"echo {encoded} | base64 -d | sqlite3 {self.IK_DB}")
+            if table == "wan_config":
+                self._stop_pppoe_runtime(tagname)
+            init_result = self._reinitialize_interface_runtime(table)
+            current = self.find_lan(tagname) if table == "lan_config" else self.find_wan(tagname)
+            restored = self.interface_config_matches(original_row, current or {})
+            if not init_result["passed"]:
+                logger.error(f"restore_interface_by_sql({table},{tagname}) runtime: {init_result['message']}")
+            return bool(restored and init_result["passed"])
         except Exception as e:
             logger.error(f"restore_interface_by_sql({table},{tagname}) error: {e}")
             return False
+
+    def restore_interface_snapshot(
+        self,
+        entries: Iterable[tuple],
+        *,
+        force_rebuild_tables: Iterable[str] = (),
+        wan_vlan_rows: Optional[Iterable[Dict]] = None,
+    ) -> VerifyResult:
+        """Restore several interface rows transactionally, then rebuild once/table."""
+        entries = list(entries)
+        prepared = []
+        statements = []
+        changed_tables = set(force_rebuild_tables or ())
+        if not changed_tables.issubset(self.INTERFACE_TABLES):
+            raise ValueError(f"不支持的接口配置表: {sorted(changed_tables - self.INTERFACE_TABLES)}")
+        for table, tagname, original in entries:
+            if table not in self.INTERFACE_TABLES:
+                raise ValueError(f"不支持的接口配置表: {table}")
+            if not original:
+                continue
+            current = self.find_lan(tagname) if table == "lan_config" else self.find_wan(tagname)
+            if self.interface_config_matches(original, current or {}):
+                continue
+            sets = []
+            for key, value in original.items():
+                if key == "id":
+                    continue
+                escaped = str(value).replace("'", "''")
+                sets.append(f"{key}='{escaped}'")
+            row_id = original.get("id")
+            where = f"id='{row_id}'" if row_id else f"tagname='{tagname}'"
+            statement = f"UPDATE {table} SET {','.join(sets)} WHERE {where};"
+            prepared.append((table, tagname, original, statement))
+            statements.append(statement)
+            changed_tables.add(table)
+
+        restore_children = wan_vlan_rows is not None
+        child_interfaces = {
+            str(tagname) for table, tagname, original in entries
+            if table == "wan_config" and original
+        } if restore_children else set()
+        expected_children = [
+            dict(row) for row in (wan_vlan_rows or [])
+            if str(row.get("interface", "")) in child_interfaces
+        ]
+        current_children = []
+        for interface in sorted(child_interfaces):
+            current_children.extend(self.query_hybrid_subif(interface))
+
+        def child_key(row):
+            value = str(row.get("id", ""))
+            return (int(value) if value.isdigit() else 10**9, str(row.get("interface", "")), str(row.get("vlan_name", "")))
+
+        expected_children.sort(key=child_key)
+        current_children.sort(key=child_key)
+        children_changed = (
+            len(expected_children) != len(current_children)
+            or any(
+                not self.interface_config_matches(expected, current)
+                for expected, current in zip(expected_children, current_children)
+            )
+        )
+        if children_changed and child_interfaces:
+            quoted_interfaces = ",".join(
+                "'" + value.replace("'", "''") + "'" for value in sorted(child_interfaces)
+            )
+            statements.append(f"DELETE FROM wan_vlan WHERE interface IN ({quoted_interfaces});")
+            for row in expected_children:
+                columns = list(row)
+                values = ["'" + str(row[column]).replace("'", "''") + "'" for column in columns]
+                statements.append(
+                    f"INSERT INTO wan_vlan ({','.join(columns)}) VALUES ({','.join(values)});"
+                )
+            changed_tables.add("wan_config")
+
+        init_results = {}
+        if statements:
+            self.connect_router()
+            sql = "BEGIN IMMEDIATE;" + "".join(statements) + "COMMIT;"
+            encoded = base64.b64encode(sql.encode("utf-8")).decode("ascii")
+            self._router.exec(f"echo {encoded} | base64 -d | sqlite3 {self.IK_DB}")
+        runtime_cleanup = {}
+        if "wan_config" in changed_tables:
+            for interface in sorted(child_interfaces or {
+                str(tagname) for table, tagname, original in entries
+                if table == "wan_config" and original
+            }):
+                runtime_cleanup[interface] = self._stop_pppoe_runtime(interface)
+        for table in ("lan_config", "wan_config"):
+            if table in changed_tables:
+                init_results[table] = self._reinitialize_interface_runtime(table)
+
+        mismatches = []
+        for table, tagname, original in entries:
+            if not original:
+                continue
+            current = self.find_lan(tagname) if table == "lan_config" else self.find_wan(tagname)
+            if not self.interface_config_matches(original, current or {}):
+                mismatches.append(f"{table}/{tagname}")
+        runtime_failures = [
+            f"{table}: {result.get('message')}"
+            for table, result in init_results.items()
+            if not result.get("passed")
+        ]
+        runtime_failures.extend(
+            f"{interface}: PPPoE测试进程未清理"
+            for interface, result in runtime_cleanup.items()
+            if not result.get("passed")
+        )
+        restored_children = []
+        for interface in sorted(child_interfaces):
+            restored_children.extend(self.query_hybrid_subif(interface))
+        restored_children.sort(key=child_key)
+        child_mismatch = (
+            len(expected_children) != len(restored_children)
+            or any(
+                not self.interface_config_matches(expected, current)
+                for expected, current in zip(expected_children, restored_children)
+            )
+        )
+        passed = not mismatches and not runtime_failures and not child_mismatch
+        details = {
+            "restored": [f"{table}/{name}" for table, name, _, _ in prepared],
+            "mismatches": mismatches,
+            "runtime_failures": runtime_failures,
+            "wan_vlan_expected_count": len(expected_children),
+            "wan_vlan_restored_count": len(restored_children),
+            "wan_vlan_mismatch": child_mismatch,
+        }
+        return VerifyResult(
+            "L1-L4-配置恢复",
+            passed,
+            (
+                "lan1/wan2/wan3全字段快照及运行态已恢复"
+                if passed else f"接口恢复不完整: {details}"
+            ),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False),
+        )
 
     def delete_interface_by_sql(self, table: str, tagname: str) -> bool:
         """用SQL删除接口配置(测试残留兜底删除)"""
         self.connect_router()
         try:
+            if table not in self.INTERFACE_TABLES:
+                raise ValueError(f"不支持的接口配置表: {table}")
             self._router.exec(f'sqlite3 {self.IK_DB} "delete from {table} where tagname=\'{tagname}\'"')
             return True
         except Exception as e:
@@ -12949,7 +13334,7 @@ class BackendVerifier:
                 act = str(row.get(k, ""))
                 # ip_mask/gateway/mac/vlan_name 用包含关系
                 if k in ("ip_mask", "gateway", "mac", "vlan_name", "bandif"):
-                    if str(exp) not in act and act not in str(exp):
+                    if not self._field_value_matches(exp, act, contains=True):
                         mismatches[k] = {"expected": exp, "actual": act}
                 elif act != str(exp):
                     mismatches[k] = {"expected": exp, "actual": act}
@@ -12966,6 +13351,187 @@ class BackendVerifier:
         expected_internet 可传 '0'/'1'/'2'/'3'/'4' 或别名 static/dhcp/pppoe/hybrid_phy/hybrid_vlan."""
         val = self.INTERNET_MODE.get(str(expected_internet), str(expected_internet))
         return self.verify_wan_database(tagname, expected_fields={"internet": val})
+
+    @staticmethod
+    def _validated_interface_name(interface: str) -> str:
+        value = str(interface or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+            raise ValueError(f"非法接口名: {value!r}")
+        return value
+
+    def verify_wan_physical_binding(self, tagname: str) -> VerifyResult:
+        """L2: verify every DB-bound eth/veth NIC exists in the kernel."""
+        tagname = self._validated_interface_name(tagname)
+        row = self.find_wan(tagname)
+        if not row:
+            return VerifyResult("L2-物理绑定", False, f"WAN不存在: {tagname}")
+        names = split_interface_names(row.get("bandeth", ""))
+        if not names:
+            return VerifyResult(
+                "L2-物理绑定", False, f"{tagname}未记录bandeth",
+                raw_output=json.dumps(self._safe_interface_row(row), ensure_ascii=False),
+            )
+        outputs = {}
+        missing = []
+        self.connect_router()
+        for name in names:
+            safe_name = self._validated_interface_name(name)
+            output = self._router.exec(f"ip -o link show {shlex.quote(safe_name)} 2>/dev/null")
+            outputs[safe_name] = output.strip()
+            if not output.strip():
+                missing.append(safe_name)
+        return VerifyResult(
+            "L2-物理绑定",
+            not missing,
+            (
+                f"{tagname}物理绑定存在: {names}"
+                if not missing else f"{tagname}物理绑定缺失: {missing}"
+            ),
+            details={"tagname": tagname, "bandeth": names, "missing": missing},
+            raw_output="\n".join(outputs.values())[:1200],
+        )
+
+    def verify_pppoe_session(self, tagname: str) -> VerifyResult:
+        """L3: verify pppd ownership plus an IPv4 point-to-point session."""
+        tagname = self._validated_interface_name(tagname)
+        self.connect_router()
+        processes = self._router.exec("ps w 2>/dev/null | grep '[p]ppd'")
+        match = re.search(
+            rf"\blinkname\s+{re.escape(tagname)}(?:_ad)?\s+ifname\s+([A-Za-z0-9_.:-]+)",
+            processes,
+        )
+        runtime_interface = match.group(1) if match else tagname
+        runtime_interface = self._validated_interface_name(runtime_interface)
+        address = self._router.exec(
+            f"ip -o -4 addr show dev {shlex.quote(runtime_interface)} 2>/dev/null"
+        )
+        has_process = match is not None
+        has_address = bool(re.search(r"\binet\s+\d+\.\d+\.\d+\.\d+", address))
+        return VerifyResult(
+            "L3-PPPoE会话",
+            has_process and has_address,
+            (
+                f"{tagname} PPPoE会话已建立({runtime_interface})并获得IPv4地址"
+                if has_process and has_address
+                else f"{tagname} PPPoE会话未就绪(interface={runtime_interface}, process={has_process}, address={has_address})"
+            ),
+            details={
+                "runtime_interface": runtime_interface,
+                "process": has_process,
+                "address": has_address,
+            },
+            raw_output=(
+                f"runtime_interface={runtime_interface}\nprocess_present={has_process}\n"
+                + address.strip()
+            )[:1200],
+        )
+
+    def verify_pppoe_policy_route(self, tagname: str) -> VerifyResult:
+        """L4: verify PPPoE policy routing with the configured default-route mode.
+
+        iKuai can intentionally keep ``default_route=0`` while installing a
+        per-WAN policy rule.  In that mode the table need not contain a
+        default route; L5 still validates that traffic can use the session.
+        """
+        tagname = self._validated_interface_name(tagname)
+        self.connect_router()
+        rules = self._router.exec("ip rule show 2>/dev/null")
+        routes = self._router.exec(f"ip route show table {shlex.quote(tagname)} 2>/dev/null")
+        rule_lines = [
+            line for line in rules.splitlines()
+            if re.search(rf"\blookup\s+{re.escape(tagname)}(?:\s|$)", line)
+        ]
+        default_lines = [line for line in routes.splitlines() if line.startswith("default")]
+        row = self.find_wan(tagname) or {}
+        default_route_enabled = str(row.get("default_route", "1")) == "1"
+        passed = bool(rule_lines) and (bool(default_lines) or not default_route_enabled)
+        if passed and rule_lines and not default_lines:
+            message = f"{tagname}策略规则已下发(配置关闭默认路由, 符合预期)"
+        elif passed:
+            message = f"{tagname}策略规则和默认路由已下发"
+        else:
+            message = f"{tagname}路由未就绪(rule={bool(rule_lines)}, default={bool(default_lines)}, default_route={row.get('default_route')})"
+        return VerifyResult(
+            "L4-PPPoE路由",
+            passed,
+            message,
+            details={
+                "rules": rule_lines,
+                "defaults": default_lines,
+                "default_route_config": row.get("default_route"),
+            },
+            raw_output=("\n".join(rule_lines + default_lines))[:1200],
+        )
+
+    def verify_wan_reachability(self, tagname: str, target: str = "223.5.5.5") -> VerifyResult:
+        """L5: send real ICMP traffic through the selected WAN interface."""
+        tagname = self._validated_interface_name(tagname)
+        target = str(ipaddress.ip_address(str(target)))
+        self.connect_router()
+        session = self.verify_pppoe_session(tagname)
+        runtime_interface = self._validated_interface_name(
+            str(session.details.get("runtime_interface") or tagname)
+        )
+        output = self._router.exec(
+            f"ping -I {shlex.quote(runtime_interface)} -c 3 -W 3 {shlex.quote(target)} 2>&1; "
+            "printf '\\n__PING_RC__=%s\\n' $?",
+            timeout=20,
+            probe_console=False,
+        )
+        match = re.search(r"__PING_RC__=(\d+)", output)
+        passed = bool(match and match.group(1) == "0")
+        return VerifyResult(
+            "L5-真实流量",
+            passed,
+            (
+                f"{tagname}经{runtime_interface}到{target}真实流量连通"
+                if passed else f"{tagname}经{runtime_interface}到{target}真实流量不通"
+            ),
+            details={"interface": tagname, "runtime_interface": runtime_interface, "target": target},
+            raw_output=output[:1600],
+        )
+
+    def verify_pppoe_full_chain(
+        self,
+        tagname: str,
+        username: str,
+        password: str,
+        *,
+        wait_seconds: int = 45,
+        probe_host: str = "223.5.5.5",
+    ) -> FullChainResult:
+        """Validate top-level PPPoE from persistence through real traffic."""
+        tagname = self._validated_interface_name(tagname)
+        row = self.find_wan(tagname)
+        credential_ok = bool(
+            row
+            and str(row.get("internet", "")) == "2"
+            and str(row.get("username", "")) == str(username)
+            and str(row.get("passwd", "")) == str(password)
+        )
+        l1 = VerifyResult(
+            "L1-PPPoE配置",
+            credential_ok,
+            (
+                f"{tagname} PPPoE模式及账号凭据已持久化"
+                if credential_ok else f"{tagname} PPPoE模式或账号凭据未正确持久化"
+            ),
+            details={
+                "internet": (row or {}).get("internet"),
+                "username_matches": bool(row and str(row.get("username", "")) == str(username)),
+                "password_matches": bool(row and str(row.get("passwd", "")) == str(password)),
+            },
+            raw_output=json.dumps(self._safe_interface_row(row), ensure_ascii=False),
+        )
+        l2 = self.verify_wan_physical_binding(tagname)
+        deadline = time.time() + max(0, int(wait_seconds))
+        l3 = self.verify_pppoe_session(tagname)
+        while not l3.passed and time.time() < deadline:
+            time.sleep(min(2, max(0, deadline - time.time())))
+            l3 = self.verify_pppoe_session(tagname)
+        l4 = self.verify_pppoe_policy_route(tagname)
+        l5 = self.verify_wan_reachability(tagname, probe_host)
+        return FullChainResult(results=[l1, l2, l3, l4, l5])
 
     def delete_hybrid_subif_by_sql(self, wan_name: str, sub_name: str = None,
                                    name_prefix: str = None) -> int:
@@ -14837,6 +15403,159 @@ class BackendVerifier:
             _time.sleep(interval)
         return self.read_register_status() == str(expected)
 
+    # ==================== SD-WAN (网络配置 > SD-WAN) ====================
+    # SD-WAN 是云端主导功能: 组网成员增删在云端(business/sd/group/update, 见 utils/icc_cloud.py);
+    # 路由器侧 ik_web_sdwan.sh 代理 yun.ikuai8.com/api/v3/sdwan/local/*, 签名:
+    #   sign = md5(timestamp + KEY)[:32], KEY="3fed9451233658a2f7e7fe948c97230b"
+    #   GET sdwan/local/list?timestamp=&gwid=&sign=  -> 本设备所属组网列表
+    #   GET sdwan/local/info?timestamp=&gwid=&sign=  -> 本设备 SD-WAN 信息
+    # 状态文件: /tmp/iktmp/ik_web_sdwan.token(开通后写入), /tmp/iktmp/register_status(绑云状态)。
+    # 本处只做路由器侧状态验证; 云端成员核对用 IccCloudHelper.member_in_group。
+    SDWAN_SIGN_KEY = "3fed9451233658a2f7e7fe948c97230b"
+
+    def _sdwan_sign_cmd(self, endpoint: str, with_gwid: bool = True) -> str:
+        """构造路由器侧 ik_web_sdwan local 签名 curl(复刻 ik_web_sdwan.sh)。"""
+        return (
+            'ts=$(date +%s); '
+            'sign=$(echo -n "${ts}' + self.SDWAN_SIGN_KEY + '" | md5sum | cut -c1-32); '
+            + ('gwid=$(grep -i "^GWID=" /etc/release 2>/dev/null | cut -d= -f2); ' if with_gwid else '')
+            + 'curl -4 -s --connect-timeout 10 "https://yun.ikuai8.com/api/v3/sdwan/local/'
+            + endpoint + '?timestamp=${ts}' + ('&gwid=${gwid}' if with_gwid else '') + '&sign=${sign}"'
+        )
+
+    def read_sdwan_token(self) -> str:
+        """读取 /tmp/iktmp/ik_web_sdwan.token(SD-WAN 开通后写入; 空=未开通)。"""
+        self.connect_router()
+        try:
+            return (self._router.exec("cat /tmp/iktmp/ik_web_sdwan.token 2>/dev/null") or "").strip()
+        except Exception:
+            return ""
+
+    def verify_sdwan_token_empty(self) -> VerifyResult:
+        tok = self.read_sdwan_token()
+        if tok:
+            return VerifyResult(level="L1-底层", passed=False,
+                                message=f"ik_web_sdwan.token 非空(期望空): {tok[:20]}..",
+                                raw_output=tok[:100])
+        return VerifyResult(level="L1-底层", passed=True, message="ik_web_sdwan.token 为空(未开通态)")
+
+    def verify_sdwan_token_present(self) -> VerifyResult:
+        tok = self.read_sdwan_token()
+        if tok:
+            return VerifyResult(level="L1-底层", passed=True,
+                                message=f"ik_web_sdwan.token 已写入: {tok[:20]}..",
+                                raw_output=tok[:100])
+        return VerifyResult(level="L1-底层", passed=False, message="ik_web_sdwan.token 为空(期望已开通)")
+
+    def sdwan_local_list(self) -> str:
+        """路由器视角: 本设备所属 SD-WAN 组网列表(local_list 原始 JSON)。"""
+        self.connect_router()
+        try:
+            return self._router.exec(self._sdwan_sign_cmd("list")) or ""
+        except Exception as e:
+            return f"error: {e}"
+
+    def sdwan_local_info(self) -> str:
+        """路由器视角: 本设备 SD-WAN 信息(local_info 原始 JSON)。"""
+        self.connect_router()
+        try:
+            return self._router.exec(self._sdwan_sign_cmd("info")) or ""
+        except Exception as e:
+            return f"error: {e}"
+
+    def _parse_local_network_count(self, raw: str) -> int:
+        """从 local_list/info 原始返回解析本设备所属组网数(容忍各种 JSON 包装)。
+
+        yun 行为: 设备在组网时 local_list 返回 code=2000 + data 网络列表;
+        设备未在任一组网(或未开通/无权限)时返回 code=4003(禁止访问) 或 data 全 null。
+        故 code 非 2000/0 一律视为"未加入"(0), 仅 code=2000 时才数 data 里的网络列表。
+        """
+        if not raw or raw.startswith("error"):
+            return -1
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # 非 JSON: 用启发式(出现网络对象特征计数)
+            return raw.count('"id"') if '"id"' in raw else 0
+        if not isinstance(data, dict):
+            return len(data) if isinstance(data, list) else 0
+        code = data.get("code")
+        if code is not None and str(code) not in ("2000", "0"):
+            # 4003(禁止访问)/其它非成功 = 设备未在组网或无 SD-WAN 权限
+            return 0
+        payload = data.get("data", data)
+        for key in ("data", "sdwan_list", "networks", "list", "groups"):
+            v = payload.get(key) if isinstance(payload, dict) else None
+            if isinstance(v, list):
+                return len(v)
+        if isinstance(payload, list):
+            return len(payload)
+        # data 为空 dict 或字段全 null(local_info 未加入态) -> 0
+        return 0
+
+    def _parse_local_info_membership(self, raw: str):
+        """从 local_info 解析本设备是否在组网(data.sdwan_name/members_counts 非空=在组网)。
+
+        local_info 无需 SD-WAN 开通(token), 绑云+加入网络即反映:
+          在组网 -> {code:2000,data:{sdwan_name:"xxx",members_counts:N,...}}
+          未加入 -> {code:2000,data:{sdwan_name:null,members_counts:null,...}}
+        返回 True/False, 或 None(解析失败)。
+        """
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+        if str(data.get("code")) not in ("2000", "0"):
+            return False
+        d = data.get("data") or {}
+        name = d.get("sdwan_name")
+        cnt = d.get("members_counts")
+        return bool(name) or (cnt not in (None, 0, "0", ""))
+
+    def verify_sdwan_device_in_network(self) -> VerifyResult:
+        """L3: 本设备是否已加入云端组网(local_info.sdwan_name/members_counts 非空)。
+
+        注: 用 local_info(无需开通 token), 不用 local_list(local_list 需 SMS 开通, 未开通返回 4003)。
+        """
+        raw = self.sdwan_local_info()
+        m = self._parse_local_info_membership(raw)
+        if m is None:
+            return VerifyResult(level="L3-云端联动", passed=False,
+                                message=f"local_info 解析失败: {raw[:120]}",
+                                raw_output=raw[:300])
+        if m:
+            return VerifyResult(level="L3-云端联动", passed=True,
+                                message="本设备已加入云端组网(local_info 有 sdwan_name/members_counts)",
+                                raw_output=raw[:300])
+        return VerifyResult(level="L3-云端联动", passed=False,
+                            message="本设备未加入任何组网(local_info data 全 null)",
+                            raw_output=raw[:300])
+
+    def verify_sdwan_device_not_in_network(self) -> VerifyResult:
+        """L3: 本设备未加入任何组网(local_info data 全 null)。"""
+        raw = self.sdwan_local_info()
+        m = self._parse_local_info_membership(raw)
+        if m is None:
+            return VerifyResult(level="L3-云端联动", passed=False,
+                                message=f"local_info 解析失败: {raw[:120]}",
+                                raw_output=raw[:300])
+        if not m:
+            return VerifyResult(level="L3-云端联动", passed=True,
+                                message="本设备未加入任何组网(local_info data 全 null)",
+                                raw_output=raw[:300])
+        return VerifyResult(level="L3-云端联动", passed=False,
+                            message="本设备仍在云端组网中(local_info 有 sdwan_name, 期望已移除)",
+                            raw_output=raw[:300])
+
+    def cleanup_sdwan_router_state(self) -> str:
+        """清理路由器侧 SD-WAN 残留状态(token 文件); 云端成员移除用 IccCloudHelper。"""
+        self.connect_router()
+        try:
+            self._router.exec("rm -f /tmp/iktmp/ik_web_sdwan.token 2>/dev/null; true")
+            return "sdwan router state cleaned (token removed)"
+        except Exception as e:
+            return f"error: {e}"
+
     # ==================== 账号管理 (认证服务 > 认证账号管理 > 账号管理) ====================
     # 表 pppuser(id/username/tagname(=username)/passwd(加密)/enabled(yes|no)/ppptype(8种)/
     # packages(套餐id, 0=自定义)/expires(unix, 0=永不过期)/upload|download(上下行,UI=up_speed|down_speed)/
@@ -15089,6 +15808,1012 @@ class BackendVerifier:
             return f"deleted {cnt} coupon records"
         except Exception as e:
             return f"error: {e}"
+
+    # ==================== 网址黑白名单 (安全中心 > 网址浏览控制) ====================
+    # url_black.sh 将启用规则写入 05-02-url_black_white.txt，再由
+    # ikcntl_http_load 下发 ik_core。域名黑白名单同时匹配HTTP Host与TLS SNI；
+    # global_config.url_white_refer 仅控制HTTP Referer外链放行。
+    URL_BLACK_RUNTIME_FILE = "/tmp/iktmp/url_filter/05-02-url_black_white.txt"
+
+    @staticmethod
+    def _url_black_sql_literal(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def find_url_black_rule(self, tagname: str) -> Optional[Dict]:
+        literal = self._url_black_sql_literal(tagname)
+        return self._sqlite_query_line(
+            f"SELECT * FROM url_black WHERE tagname={literal} LIMIT 1"
+        )
+
+    @staticmethod
+    def _url_black_json_custom(value: Any) -> List[str]:
+        try:
+            payload = json.loads(str(value or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        custom = payload.get("custom", []) if isinstance(payload, dict) else []
+        return [str(item) for item in custom] if isinstance(custom, list) else []
+
+    def verify_url_black_database(
+        self,
+        tagname: str,
+        *,
+        mode: int = None,
+        enabled: str = None,
+        domains: Iterable[str] = (),
+        sources: Iterable[str] = (),
+    ) -> VerifyResult:
+        """L1: 验证规则数据库字段和嵌套JSON。"""
+        rule = self.find_url_black_rule(tagname)
+        if rule is None:
+            return VerifyResult("L1-数据库", False, f"网址黑白名单规则不存在: {tagname}")
+        problems = []
+        if mode is not None and str(rule.get("mode")) != str(int(mode)):
+            problems.append(f"mode期望{int(mode)}实际{rule.get('mode')}")
+        if enabled is not None and str(rule.get("enabled")) != str(enabled):
+            problems.append(f"enabled期望{enabled}实际{rule.get('enabled')}")
+        actual_domains = self._url_black_json_custom(rule.get("domain"))
+        actual_sources = self._url_black_json_custom(rule.get("src_addr"))
+        for domain in domains or ():
+            if str(domain) not in actual_domains:
+                problems.append(f"domain缺少{domain}")
+        for source in sources or ():
+            if str(source) not in actual_sources:
+                problems.append(f"src_addr缺少{source}")
+        raw = json.dumps(rule, ensure_ascii=False, sort_keys=True)
+        return VerifyResult(
+            "L1-数据库",
+            not problems,
+            "数据库字段与页面配置一致" if not problems else "；".join(problems),
+            details={"rule": rule, "problems": problems},
+            raw_output=raw[:1600],
+        )
+
+    def verify_url_black_not_exists(self, tagname: str) -> VerifyResult:
+        rule = self.find_url_black_rule(tagname)
+        return VerifyResult(
+            "L1-删除",
+            rule is None,
+            f"规则{'已删除' if rule is None else '仍存在'}: {tagname}",
+            raw_output="" if rule is None else json.dumps(rule, ensure_ascii=False)[:800],
+        )
+
+    def verify_url_black_rule_set(
+        self,
+        expected_names: Iterable[str],
+        *,
+        prefix: str = None,
+    ) -> VerifyResult:
+        """L1: verify an exact rule-name multiset, including duplicate detection."""
+        predicate = ""
+        if prefix is not None:
+            predicate = (
+                " WHERE substr(tagname,1," + str(len(prefix)) + ")="
+                + self._url_black_sql_literal(prefix)
+            )
+        rows = self._sqlite_query_list(
+            "SELECT id,tagname,enabled,mode FROM url_black"
+            + predicate
+            + " ORDER BY id"
+        )
+        actual_names = [str(row.get("tagname", "")) for row in rows]
+        expected = sorted(str(name) for name in expected_names)
+        actual = sorted(actual_names)
+        passed = actual == expected
+        return VerifyResult(
+            "L1-规则集合",
+            passed,
+            (
+                f"规则集合精确一致，共{len(actual)}条"
+                if passed
+                else f"规则集合不一致，期望={expected}，实际={actual}"
+            ),
+            details={"expected": expected, "actual": actual, "rows": rows},
+            raw_output=json.dumps(rows, ensure_ascii=False, sort_keys=True)[:2000],
+        )
+
+    def verify_url_black_generated_rule(
+        self,
+        tagname: str,
+        *,
+        expect_present: bool = True,
+        mode: int = None,
+        domains: Iterable[str] = (),
+    ) -> VerifyResult:
+        """L2: 验证url_black.sh生成的HTTP/TLS DPI规则。"""
+        self.connect_router()
+        rule = self.find_url_black_rule(tagname)
+        output = self._router.exec(f"cat {self.URL_BLACK_RUNTIME_FILE} 2>/dev/null")
+        action = "WHITE_DOMAIN" if int(mode if mode is not None else (rule or {}).get("mode", 0)) == 1 else "BLACK_DOMAIN"
+        expected_domains = list(domains or ())
+        if not expected_domains and rule:
+            expected_domains = self._url_black_json_custom(rule.get("domain"))
+        markers = [f"action: {action}"] + [
+            str(item).replace(".", r"\\.") for item in expected_domains
+        ]
+        if rule and self._url_black_json_custom(rule.get("src_addr")):
+            markers.append(f'src_ipset: "urlblack_src_{int(rule.get("id"))}"')
+        blocks = re.findall(r"filter\s*\{.*?\}", output or "", re.DOTALL)
+        present = bool(expected_domains) and any(
+            all(marker in block for marker in markers) for block in blocks
+        )
+        passed = present if expect_present else not present
+        expectation = "存在" if expect_present else "不存在"
+        return VerifyResult(
+            "L2-DPI配置",
+            passed,
+            f"{action}域名规则按预期{expectation}",
+            details={"action": action, "domains": expected_domains, "present": present},
+            raw_output=output[:2400],
+        )
+
+    def verify_url_black_artifacts_absent(self, rule_id: int) -> VerifyResult:
+        """L3/L4: 验证已删除规则的三类源地址集合均已回收。"""
+        self.connect_router()
+        safe_id = int(rule_id)
+        names = (
+            f"urlblack_src_{safe_id}",
+            f"_urlblack_src_{safe_id}",
+            f"_urlblack_src_{safe_id}_mac",
+        )
+        output = self._router.exec("ipset list -n 2>/dev/null")
+        remaining = [name for name in names if name in set((output or "").splitlines())]
+        return VerifyResult(
+            "L3/L4-删除残留",
+            not remaining,
+            "规则源地址集合已全部回收" if not remaining else f"残留集合: {remaining}",
+            details={"rule_id": safe_id, "checked": list(names), "remaining": remaining},
+            raw_output="\n".join(remaining),
+        )
+
+    def verify_url_black_ipset(
+        self,
+        tagname: str,
+        source: str,
+        *,
+        expect_present: bool = True,
+    ) -> VerifyResult:
+        """L3: 验证源IP进入该规则的urlblack_src ipset。"""
+        self.connect_router()
+        rule = self.find_url_black_rule(tagname)
+        if rule is None:
+            return VerifyResult("L3-ipset", False, f"无法定位规则ID: {tagname}")
+        rule_id = int(rule.get("id"))
+        set_name = f"_urlblack_src_{rule_id}"
+        safe_source = str(ipaddress.ip_address(str(source)))
+        output = self._router.exec(
+            f"ipset test {set_name} {safe_source} >/dev/null 2>&1; echo __IPSET_RC__=$?"
+        )
+        match = re.search(r"__IPSET_RC__=(\d+)", output or "")
+        member = bool(match and int(match.group(1)) == 0)
+        passed = member if expect_present else not member
+        return VerifyResult(
+            "L3-ipset",
+            passed,
+            f"{safe_source}{'属于' if member else '不属于'} {set_name}",
+            details={"set": set_name, "source": safe_source, "member": member},
+            raw_output=output[:800],
+        )
+
+    def verify_url_black_consistency(self, prefix: str = None) -> VerifyResult:
+        """L4: 对比DB启用规则、DPI生成块及urlblack ipset残留。"""
+        self.connect_router()
+        predicate = ""
+        if prefix:
+            predicate = (
+                " WHERE substr(tagname,1," + str(len(prefix)) + ")="
+                + self._url_black_sql_literal(prefix)
+            )
+        rows = self._sqlite_query_list(
+            "SELECT id,enabled,tagname,mode,domain,src_addr FROM url_black"
+            + predicate + " ORDER BY id"
+        )
+        runtime = self._router.exec(f"cat {self.URL_BLACK_RUNTIME_FILE} 2>/dev/null")
+        set_output = self._router.exec("ipset list -n 2>/dev/null | grep -E '^_?urlblack_src_[0-9]+'")
+        set_names = set((set_output or "").splitlines())
+        blocks = re.findall(r"filter\s*\{.*?\}", runtime or "", re.DOTALL)
+        enabled = [row for row in rows if row.get("enabled") == "yes"]
+        problems = []
+        for row in rows:
+            rule_id = int(row.get("id"))
+            action = "WHITE_DOMAIN" if str(row.get("mode")) == "1" else "BLACK_DOMAIN"
+            domains = self._url_black_json_custom(row.get("domain"))
+            markers = [f"action: {action}"] + [
+                domain.replace(".", r"\\.") for domain in domains
+            ]
+            sources = self._url_black_json_custom(row.get("src_addr"))
+            if sources:
+                markers.append(f'src_ipset: "urlblack_src_{rule_id}"')
+            block_present = bool(domains) and any(
+                all(marker in block for marker in markers) for block in blocks
+            )
+            should_exist = row.get("enabled") == "yes"
+            if block_present != should_exist:
+                state = "漏下发" if should_exist else "停用后仍下发"
+                problems.append(f"规则{rule_id}{state}{action}/{domains}")
+            expected_sets = {
+                f"urlblack_src_{rule_id}",
+                f"_urlblack_src_{rule_id}",
+            } if sources else set()
+            present_sets = {
+                name for name in set_names
+                if name in {
+                    f"urlblack_src_{rule_id}",
+                    f"_urlblack_src_{rule_id}",
+                    f"_urlblack_src_{rule_id}_mac",
+                }
+            }
+            if should_exist and sources and not expected_sets.issubset(present_sets):
+                problems.append(
+                    f"规则{rule_id}源地址集合缺失{sorted(expected_sets - present_sets)}"
+                )
+            if not should_exist and present_sets:
+                problems.append(f"规则{rule_id}停用后集合残留{sorted(present_sets)}")
+        filter_count = runtime.count('name: "black_white_domain"')
+        total_enabled = self._sqlite_query_line(
+            "SELECT count(*) AS cnt FROM url_black WHERE enabled='yes'"
+        )
+        expected_count = int((total_enabled or {}).get("cnt", 0))
+        if filter_count != expected_count:
+            problems.append(f"启用规则{expected_count}条但DPI配置{filter_count}块")
+        raw = f"DB={json.dumps(rows, ensure_ascii=False)}\nDPI_FILTERS={filter_count}\nIPSETS={set_output}"
+        return VerifyResult(
+            "L4-底层一致性",
+            not problems,
+            "DB、DPI配置和源地址集合一致" if not problems else "；".join(problems),
+            details={"db_rows": len(rows), "enabled": len(enabled), "problems": problems},
+            raw_output=raw[:2800],
+        )
+
+    def verify_url_black_setting(self, expected: int = None) -> VerifyResult:
+        """L1/L4: 验证白名单HTTP Referer外链开关持久化值。"""
+        row = self._sqlite_query_line(
+            "SELECT url_white_refer FROM global_config WHERE id=1"
+        )
+        actual = int((row or {}).get("url_white_refer", -1))
+        passed = actual in {0, 1} if expected is None else actual == int(expected)
+        return VerifyResult(
+            "L1/L4-白名单外链设置",
+            passed,
+            f"url_white_refer={actual}"
+            + ("" if expected is None else f"，期望={int(expected)}"),
+            details={"actual": actual, "expected": expected, "scope": "HTTP Referer only"},
+            raw_output=f"url_white_refer = {actual}",
+        )
+
+    def verify_url_black_flow(
+        self,
+        domain: str,
+        *,
+        protocol: str = "http",
+        expect_allowed: bool,
+        referer: str = None,
+        iface: str = "ens11",
+        timeout: int = 12,
+    ) -> VerifyResult:
+        """L5: 从10.66.0.18指定ens11发HTTP/HTTPS真实流量。"""
+        self.connect_client()
+        protocol = str(protocol).lower()
+        if protocol not in {"http", "https"}:
+            raise ValueError("protocol仅支持http或https")
+        if not re.fullmatch(r"[A-Za-z0-9.-]+", str(domain)):
+            raise ValueError("domain格式不安全")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", str(iface)):
+            raise ValueError("iface格式不安全")
+        header = ""
+        if referer:
+            if not re.fullmatch(r"https?://[A-Za-z0-9.:-]+/?", str(referer)):
+                raise ValueError("referer格式不安全")
+            header = f" -H {shlex.quote('Referer: ' + str(referer))}"
+        url = f"{protocol}://{domain}/"
+        command = (
+            f"curl --noproxy '*' --interface {shlex.quote(str(iface))} "
+            f"--connect-timeout 6 --max-time {int(timeout)}{header} "
+            "-sS -o /dev/null -w '__HTTP_CODE__=%{http_code}' "
+            f"{shlex.quote(url)} 2>&1; url_black_curl_rc=$?; "
+            "echo; echo __CURL_RC__=$url_black_curl_rc"
+        )
+        output = self._client.exec(command, timeout=int(timeout) + 12)
+        code_match = re.search(r"__HTTP_CODE__=(\d{3})", output or "")
+        rc_match = re.search(r"__CURL_RC__=(\d+)", output or "")
+        http_code = int(code_match.group(1)) if code_match else 0
+        rc = int(rc_match.group(1)) if rc_match else -1
+        allowed = rc == 0 and 100 <= http_code <= 599
+        passed = allowed == bool(expect_allowed)
+        actual_text = "可访问" if allowed else "被阻断"
+        expected_text = "可访问" if expect_allowed else "被阻断"
+        return VerifyResult(
+            "L5-真实流量",
+            passed,
+            f"{protocol.upper()} {domain} 实际{actual_text}，期望{expected_text}"
+            + (f"，Referer={referer}" if referer else ""),
+            details={
+                "protocol": protocol,
+                "domain": domain,
+                "iface": iface,
+                "referer": referer or "",
+                "http_code": http_code,
+                "curl_rc": rc,
+                "allowed": allowed,
+            },
+            raw_output=output[:1600],
+        )
+
+    def cleanup_url_black_test(self, prefix: str = "urlbw_t_") -> str:
+        """仅通过底层del入口清理本轮前缀规则，确保ipset/timeset同步回收。"""
+        self.connect_router()
+        literal = self._url_black_sql_literal(prefix)
+        rows = self._sqlite_query_list(
+            "SELECT id,tagname FROM url_black WHERE substr(tagname,1,"
+            f"{len(prefix)})={literal} ORDER BY id"
+        )
+        ids = [str(int(row["id"])) for row in rows if str(row.get("id", "")).isdigit()]
+        if ids:
+            self._router.exec(
+                f"/usr/ikuai/script/url_black.sh del id={','.join(ids)}",
+                timeout=40,
+            )
+            time.sleep(1.2)
+            self.cleanup_url_black_artifacts(ids)
+        return f"deleted {len(ids)} url_black rules"
+
+    def cleanup_url_black_artifacts(self, rule_ids: Iterable[int]) -> str:
+        """按本轮已记录ID回收产品del遗漏的零引用空集合。"""
+        self.connect_router()
+        safe_ids = sorted({int(rule_id) for rule_id in rule_ids if int(rule_id) > 0})
+        if not safe_ids:
+            return "destroyed artifacts for 0 url_black rules"
+        set_names = " ".join(
+            name
+            for rule_id in safe_ids
+            for name in (
+                f"urlblack_src_{rule_id}",
+                f"_urlblack_src_{rule_id}",
+                f"_urlblack_src_{rule_id}_mac",
+            )
+        )
+        self._router.exec(
+            "for url_black_set in " + set_names
+            + "; do ipset flush \"$url_black_set\" 2>/dev/null || true; done; "
+            + "for url_black_set in " + set_names
+            + "; do ipset destroy \"$url_black_set\" 2>/dev/null || true; done"
+        )
+        return f"destroyed artifacts for {len(safe_ids)} url_black rules"
+
+    # ==================== 自定义网址库 (安全中心 > 网址浏览控制) ====================
+    # domain_group.sh 持久化 custom_domain_group，并由
+    # ``retrieve_domain_groups`` 把自定义域名合并进禁止娱乐网站的系统分类。
+    CUSTOM_DOMAIN_GROUP_SCRIPT = "/usr/ikuai/script/domain_group.sh"
+
+    @staticmethod
+    def _custom_domain_sql_literal(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def _custom_domain_values(value: Any) -> List[str]:
+        return [
+            item.strip() for item in str(value or "").split(",") if item.strip()
+        ]
+
+    def find_custom_domain_group(self, tagname: str) -> Optional[Dict]:
+        literal = self._custom_domain_sql_literal(tagname)
+        return self._sqlite_query_line(
+            "SELECT id,tagname,name,domains FROM custom_domain_group "
+            f"WHERE tagname={literal} LIMIT 1"
+        )
+
+    def verify_custom_domain_group_database(
+        self,
+        tagname: str,
+        *,
+        group: str = None,
+        domains: Iterable[str] = (),
+    ) -> VerifyResult:
+        """L1: verify the custom library row and its comma-separated domains."""
+        row = self.find_custom_domain_group(tagname)
+        if row is None:
+            return VerifyResult(
+                "L1-数据库", False, f"自定义网址库记录不存在: {tagname}"
+            )
+        problems = []
+        if group is not None and str(row.get("name")) != str(group):
+            problems.append(f"分类期望{group}实际{row.get('name')}")
+        actual_domains = self._custom_domain_values(row.get("domains"))
+        expected_domains = [str(item).strip() for item in domains if str(item).strip()]
+        if expected_domains and actual_domains != expected_domains:
+            problems.append(
+                f"域名期望{expected_domains}实际{actual_domains}"
+            )
+        return VerifyResult(
+            "L1-数据库",
+            not problems,
+            "自定义网址库字段与页面一致" if not problems else "；".join(problems),
+            details={"row": row, "problems": problems},
+            raw_output=json.dumps(row, ensure_ascii=False, sort_keys=True),
+        )
+
+    def verify_custom_domain_group_not_exists(self, tagname: str) -> VerifyResult:
+        row = self.find_custom_domain_group(tagname)
+        return VerifyResult(
+            "L1-删除",
+            row is None,
+            f"自定义网址库记录{'已删除' if row is None else '仍存在'}: {tagname}",
+            raw_output="" if row is None else json.dumps(row, ensure_ascii=False),
+        )
+
+    def verify_custom_domain_group_rule_set(
+        self,
+        expected_names: Iterable[str],
+        *,
+        prefix: str = None,
+    ) -> VerifyResult:
+        predicate = ""
+        if prefix is not None:
+            predicate = (
+                " WHERE substr(tagname,1," + str(len(prefix)) + ")="
+                + self._custom_domain_sql_literal(prefix)
+            )
+        rows = self._sqlite_query_list(
+            "SELECT id,tagname,name,domains FROM custom_domain_group"
+            + predicate + " ORDER BY id"
+        )
+        expected = sorted(str(item) for item in expected_names)
+        actual = sorted(str(row.get("tagname", "")) for row in rows)
+        return VerifyResult(
+            "L1-规则集合",
+            actual == expected,
+            (
+                f"自定义网址库集合精确一致，共{len(actual)}条"
+                if actual == expected
+                else f"自定义网址库集合不一致，期望={expected}，实际={actual}"
+            ),
+            details={"expected": expected, "actual": actual, "rows": rows},
+            raw_output=json.dumps(rows, ensure_ascii=False, sort_keys=True),
+        )
+
+    def verify_custom_domain_group_script_contract(self) -> VerifyResult:
+        """L2: audit the device script entry points and storage contract."""
+        self.connect_router()
+        output = self._router.exec(
+            f"sed -n '1,360p' {self.CUSTOM_DOMAIN_GROUP_SCRIPT} 2>/dev/null"
+        )
+        required = (
+            "custom_domain_group",
+            "retrieve_domain_groups",
+            "domaintogroups",
+            "add()",
+            "edit()",
+            "del()",
+            "IMPORT()",
+            "EXPORT()",
+            "__show_url_type",
+            "__show_sys_url",
+        )
+        missing = [token for token in required if token not in (output or "")]
+        return VerifyResult(
+            "L2-脚本契约",
+            not missing,
+            "domain_group.sh生命周期与分类展开入口完整"
+            if not missing else f"domain_group.sh缺少入口: {missing}",
+            details={"script": self.CUSTOM_DOMAIN_GROUP_SCRIPT, "missing": missing},
+            raw_output=(output or "")[:3200],
+        )
+
+    def verify_custom_domain_group_category_domains(
+        self,
+        group: str,
+        domains: Iterable[str],
+        *,
+        expect_present: bool = True,
+    ) -> VerifyResult:
+        """L2: verify the domains returned to domain_blacklist for one category."""
+        self.connect_router()
+        safe_group = str(group)
+        if not re.fullmatch(r"[A-Za-z0-9_\u4e00-\u9fff-]+", safe_group):
+            raise ValueError("自定义网址分类包含非法字符")
+        # domain_blacklist stores a selected leaf as its child name (for
+        # example ``新闻报刊``), while custom_domain_group stores the full
+        # ``新闻媒体-新闻报刊`` catalog path. Use the same effective selector
+        # that the policy generator passes to retrieve_domain_groups.
+        effective_group = safe_group.rsplit("-", 1)[-1]
+        output = self._router.exec(
+            f"{self.CUSTOM_DOMAIN_GROUP_SCRIPT} retrieve_domain_groups "
+            f"groups={effective_group}",
+            timeout=40,
+        )
+        actual = set((output or "").splitlines())
+        expected = [str(item).strip() for item in domains if str(item).strip()]
+        matches = {domain: domain in actual for domain in expected}
+        passed = all(matches.values()) if expect_present else not any(matches.values())
+        expectation = "存在" if expect_present else "不存在"
+        return VerifyResult(
+            "L2-分类展开",
+            passed,
+            f"分类{group}中的目标域名按预期{expectation}",
+            details={
+                "group": group,
+                "effective_group": effective_group,
+                "domains": expected,
+                "matches": matches,
+                "expect_present": expect_present,
+            },
+            raw_output="\n".join(
+                line for line in (output or "").splitlines()
+                if line in set(expected)
+            ),
+        )
+
+    def verify_custom_domain_group_resolution(self, tagname: str) -> VerifyResult:
+        row = self.find_custom_domain_group(tagname)
+        if row is None:
+            return VerifyResult(
+                "L2-分类展开", False, f"无法定位自定义网址库记录: {tagname}"
+            )
+        return self.verify_custom_domain_group_category_domains(
+            str(row.get("name", "")),
+            self._custom_domain_values(row.get("domains")),
+        )
+
+    def verify_custom_domain_group_consistency(
+        self,
+        prefix: str = None,
+    ) -> VerifyResult:
+        """L1/L2: every selected DB row must be visible through category expansion."""
+        predicate = ""
+        if prefix:
+            predicate = (
+                " WHERE substr(tagname,1," + str(len(prefix)) + ")="
+                + self._custom_domain_sql_literal(prefix)
+            )
+        rows = self._sqlite_query_list(
+            "SELECT id,tagname,name,domains FROM custom_domain_group"
+            + predicate + " ORDER BY id"
+        )
+        problems = []
+        evidence = []
+        for row in rows:
+            result = self.verify_custom_domain_group_category_domains(
+                str(row.get("name", "")),
+                self._custom_domain_values(row.get("domains")),
+            )
+            evidence.append({
+                "tagname": row.get("tagname"),
+                "group": row.get("name"),
+                "passed": result.passed,
+            })
+            if not result.passed:
+                problems.append(str(row.get("tagname")))
+        return VerifyResult(
+            "L1/L2-一致性",
+            not problems,
+            "数据库记录均被分类展开接口返回"
+            if not problems else f"分类展开缺失: {problems}",
+            details={"rows": len(rows), "evidence": evidence, "problems": problems},
+            raw_output=json.dumps(
+                {"rows": rows, "evidence": evidence},
+                ensure_ascii=False,
+                sort_keys=True,
+            )[:3000],
+        )
+
+    def cleanup_custom_domain_group_test(
+        self,
+        prefix: str = "custurl_t_",
+    ) -> str:
+        """Delete only this test's records through domain_group.sh."""
+        self.connect_router()
+        literal = self._custom_domain_sql_literal(prefix)
+        rows = self._sqlite_query_list(
+            "SELECT id,tagname FROM custom_domain_group WHERE substr(tagname,1,"
+            f"{len(prefix)})={literal} ORDER BY id"
+        )
+        ids = [str(int(row["id"])) for row in rows if str(row.get("id", "")).isdigit()]
+        if ids:
+            self._router.exec(
+                f"{self.CUSTOM_DOMAIN_GROUP_SCRIPT} del id={','.join(ids)}",
+                timeout=40,
+            )
+            time.sleep(0.8)
+        return f"deleted {len(ids)} custom_domain_group records"
+
+    # ==================== 禁止娱乐网站 (安全中心 > 网址浏览控制) ====================
+    # domain_blacklist.sh 把系统网站分类展开为域名后写入独立DPI配置；源地址
+    # 和生效时间分别下发domain_blacklist_src_<id>与domain_blacklist_time_<id>。
+    DOMAIN_BLACKLIST_SCRIPT = "/usr/ikuai/script/domain_blacklist.sh"
+    DOMAIN_BLACKLIST_RUNTIME_FILE = "/tmp/iktmp/url_filter/05-01-domain_blacklist.txt"
+    DOMAIN_GROUP_DIR = "/usr/libproto/domaingroup"
+    ENTERTAINMENT_DOMAIN_SAMPLES = {
+        "休闲娱乐-动漫网站": "dmzj.com",
+        "休闲娱乐-娱乐时尚": "pclady.com.cn",
+        "休闲娱乐-小说网站": "qidian.com",
+        "休闲娱乐-幽默笑话": "qiushibaike.com",
+        "休闲娱乐-收藏爱好": "juzimi.com",
+        "休闲娱乐-星座运势": "d1xz.net",
+        "休闲娱乐-游戏网站": "4399.com",
+        "休闲娱乐-社交网站": "weibo.com",
+        "休闲娱乐-视频电影": "iqiyi.com",
+        "休闲娱乐-音乐网站": "9ku.com",
+    }
+
+    def find_domain_blacklist_rule(self, tagname: str) -> Optional[Dict]:
+        literal = self._url_black_sql_literal(tagname)
+        return self._sqlite_query_line(
+            f"SELECT * FROM domain_blacklist WHERE tagname={literal} LIMIT 1"
+        )
+
+    @staticmethod
+    def _domain_blacklist_groups(value: Any) -> List[str]:
+        return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+    @staticmethod
+    def _domain_blacklist_json_custom(value: Any) -> List[Any]:
+        try:
+            payload = json.loads(str(value or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        custom = payload.get("custom", []) if isinstance(payload, dict) else []
+        return custom if isinstance(custom, list) else []
+
+    def verify_domain_blacklist_database(
+        self,
+        tagname: str,
+        *,
+        enabled: str = None,
+        groups: Iterable[str] = (),
+        sources: Iterable[str] = (),
+        weekly_schedule: bool = True,
+    ) -> VerifyResult:
+        """L1: 验证domain_blacklist表、分类、源地址和默认时间计划。"""
+        rule = self.find_domain_blacklist_rule(tagname)
+        if rule is None:
+            return VerifyResult("L1-数据库", False, f"禁止娱乐网站规则不存在: {tagname}")
+        problems = []
+        if enabled is not None and str(rule.get("enabled")) != str(enabled):
+            problems.append(f"enabled期望{enabled}实际{rule.get('enabled')}")
+        actual_groups = self._domain_blacklist_groups(rule.get("domain_group"))
+        for group in groups or ():
+            if str(group) not in actual_groups:
+                problems.append(f"domain_group缺少{group}")
+        actual_sources = [
+            str(item) for item in self._domain_blacklist_json_custom(rule.get("src_addr"))
+        ]
+        for source in sources or ():
+            if str(source) not in actual_sources:
+                problems.append(f"src_addr缺少{source}")
+        schedules = self._domain_blacklist_json_custom(rule.get("time"))
+        if weekly_schedule:
+            valid_schedule = any(
+                isinstance(item, dict)
+                and str(item.get("type")) == "weekly"
+                and str(item.get("weekdays")) == "1234567"
+                and str(item.get("start_time")) == "00:00"
+                and str(item.get("end_time")) == "23:59"
+                for item in schedules
+            )
+            if not valid_schedule:
+                problems.append("time缺少00:00-23:59全周计划")
+        raw = json.dumps(rule, ensure_ascii=False, sort_keys=True)
+        return VerifyResult(
+            "L1-数据库",
+            not problems,
+            "数据库字段与页面配置一致" if not problems else "；".join(problems),
+            details={"rule": rule, "problems": problems},
+            raw_output=raw[:1800],
+        )
+
+    def verify_domain_blacklist_not_exists(self, tagname: str) -> VerifyResult:
+        rule = self.find_domain_blacklist_rule(tagname)
+        return VerifyResult(
+            "L1-删除",
+            rule is None,
+            f"规则{'已删除' if rule is None else '仍存在'}: {tagname}",
+            raw_output="" if rule is None else json.dumps(rule, ensure_ascii=False)[:800],
+        )
+
+    def verify_domain_blacklist_rule_set(
+        self,
+        expected_names: Iterable[str],
+        *,
+        prefix: str = None,
+    ) -> VerifyResult:
+        predicate = ""
+        if prefix is not None:
+            predicate = (
+                " WHERE substr(tagname,1," + str(len(prefix)) + ")="
+                + self._url_black_sql_literal(prefix)
+            )
+        rows = self._sqlite_query_list(
+            "SELECT id,tagname,enabled,domain_group FROM domain_blacklist"
+            + predicate + " ORDER BY id"
+        )
+        expected = sorted(str(name) for name in expected_names)
+        actual = sorted(str(row.get("tagname", "")) for row in rows)
+        passed = actual == expected
+        return VerifyResult(
+            "L1-规则集合",
+            passed,
+            f"规则集合精确一致，共{len(actual)}条" if passed
+            else f"规则集合不一致，期望={expected}，实际={actual}",
+            details={"expected": expected, "actual": actual, "rows": rows},
+            raw_output=json.dumps(rows, ensure_ascii=False, sort_keys=True)[:2200],
+        )
+
+    def verify_domain_blacklist_script_contract(self) -> VerifyResult:
+        """L2: 验证固件脚本的表、REST注册、生命周期和下发入口。"""
+        self.connect_router()
+        output = self._router.exec(
+            f"sed -n '1,420p' {self.DOMAIN_BLACKLIST_SCRIPT} 2>/dev/null"
+        )
+        required = (
+            "name_prefix=\"domain_blacklist\"",
+            "05-01-domain_blacklist.txt",
+            "url=security/domain-blacklist/rules",
+            "from domain_blacklist",
+            "action: BLACK_DOMAIN",
+            "retrieve_domain_groups",
+            "src_ipset:",
+            "time_set:",
+            "add()",
+            "edit()",
+            "del()",
+            "up()",
+            "down()",
+            "EXPORT()",
+            "IMPORT()",
+        )
+        missing = [marker for marker in required if marker not in output]
+        return VerifyResult(
+            "L2-脚本契约",
+            not missing,
+            "domain_blacklist.sh生命周期与下发契约完整"
+            if not missing else f"脚本缺少关键入口: {missing}",
+            details={"script": self.DOMAIN_BLACKLIST_SCRIPT, "missing": missing},
+            raw_output=output[:2600],
+        )
+
+    def verify_domain_blacklist_group_catalog(self) -> VerifyResult:
+        """L2: 验证休闲娱乐10个子分类文件及各自代表域名。"""
+        self.connect_router()
+        commands = []
+        for group, domain in self.ENTERTAINMENT_DOMAIN_SAMPLES.items():
+            path = f"{self.DOMAIN_GROUP_DIR}/{group}.txt"
+            commands.append(
+                f"test -f {shlex.quote(path)} && "
+                f"grep -F -m1 {shlex.quote(domain + ' ')} {shlex.quote(path)}"
+            )
+        output = self._router.exec("; ".join(commands), timeout=40)
+        missing = [
+            f"{group}:{domain}"
+            for group, domain in self.ENTERTAINMENT_DOMAIN_SAMPLES.items()
+            if domain not in output
+        ]
+        return VerifyResult(
+            "L2-网站分类库",
+            not missing,
+            "休闲娱乐10个子分类及代表域名完整"
+            if not missing else f"分类文件或代表域名缺失: {missing}",
+            details={
+                "expected_count": len(self.ENTERTAINMENT_DOMAIN_SAMPLES),
+                "missing": missing,
+                "samples": dict(self.ENTERTAINMENT_DOMAIN_SAMPLES),
+            },
+            raw_output=output[:2400],
+        )
+
+    def verify_domain_blacklist_generated_rule(
+        self,
+        tagname: str,
+        *,
+        expect_present: bool = True,
+        sample_domains: Iterable[str] = (),
+    ) -> VerifyResult:
+        """L2/L4: 验证分类展开后的BLACK_DOMAIN、源集合和timeset标记。"""
+        self.connect_router()
+        rule = self.find_domain_blacklist_rule(tagname)
+        if rule is None and expect_present:
+            return VerifyResult("L2-DPI配置", False, f"无法定位规则ID: {tagname}")
+        domains = [str(item) for item in sample_domains or ()]
+        if not domains and rule:
+            for group in self._domain_blacklist_groups(rule.get("domain_group")):
+                domain = self.ENTERTAINMENT_DOMAIN_SAMPLES.get(group)
+                if domain:
+                    domains.append(domain)
+            if "休闲娱乐" in self._domain_blacklist_groups(rule.get("domain_group")):
+                domains = list(self.ENTERTAINMENT_DOMAIN_SAMPLES.values())
+        rule_id = int((rule or {}).get("id", 0))
+        markers = [
+            'name: "domain_blacklist"',
+            "action: BLACK_DOMAIN",
+            f'time_set: "domain_blacklist_time_{rule_id}"',
+        ]
+        if rule and self._url_black_json_custom(rule.get("src_addr")):
+            markers.append(f'src_ipset: "domain_blacklist_src_{rule_id}"')
+        markers.extend(f'mul_hosts: "{domain}"' for domain in domains)
+        commands = [
+            f"grep -F -m1 {shlex.quote(marker)} "
+            f"{self.DOMAIN_BLACKLIST_RUNTIME_FILE} 2>/dev/null || true"
+            for marker in markers
+        ]
+        output = self._router.exec("; ".join(commands), timeout=40)
+        present = bool(rule_id) and all(marker in output for marker in markers)
+        passed = present if expect_present else not present
+        return VerifyResult(
+            "L2-DPI配置",
+            passed,
+            f"分类BLACK_DOMAIN规则按预期{'存在' if expect_present else '不存在'}",
+            details={
+                "rule_id": rule_id,
+                "domains": domains,
+                "present": present,
+                "markers": markers,
+            },
+            raw_output=output[:2600],
+        )
+
+    def verify_domain_blacklist_ipset(
+        self,
+        tagname: str,
+        source: str,
+        *,
+        expect_present: bool = True,
+    ) -> VerifyResult:
+        self.connect_router()
+        rule = self.find_domain_blacklist_rule(tagname)
+        if rule is None:
+            return VerifyResult("L3-ipset", False, f"无法定位规则ID: {tagname}")
+        rule_id = int(rule.get("id"))
+        set_name = f"_domain_blacklist_src_{rule_id}"
+        safe_source = str(ipaddress.ip_address(str(source)))
+        output = self._router.exec(
+            f"ipset test {set_name} {safe_source} >/dev/null 2>&1; echo __IPSET_RC__=$?"
+        )
+        match = re.search(r"__IPSET_RC__=(\d+)", output or "")
+        member = bool(match and int(match.group(1)) == 0)
+        passed = member if expect_present else not member
+        return VerifyResult(
+            "L3-ipset",
+            passed,
+            f"{safe_source}{'属于' if member else '不属于'} {set_name}",
+            details={"set": set_name, "source": safe_source, "member": member},
+            raw_output=output[:800],
+        )
+
+    def verify_domain_blacklist_consistency(self, prefix: str = None) -> VerifyResult:
+        """L4: 对比DB启用数、DPI块及每条规则的src/time运行态。"""
+        self.connect_router()
+        predicate = ""
+        if prefix:
+            predicate = (
+                " WHERE substr(tagname,1," + str(len(prefix)) + ")="
+                + self._url_black_sql_literal(prefix)
+            )
+        rows = self._sqlite_query_list(
+            "SELECT id,enabled,tagname,domain_group,src_addr,time "
+            "FROM domain_blacklist" + predicate + " ORDER BY id"
+        )
+        marker_output = self._router.exec(
+            f"grep -E 'name: \"domain_blacklist\"|src_ipset: \"domain_blacklist_src_[0-9]+\"|"
+            f"time_set: \"domain_blacklist_time_[0-9]+\"' "
+            f"{self.DOMAIN_BLACKLIST_RUNTIME_FILE} 2>/dev/null || true"
+        )
+        count_output = self._router.exec(
+            f"grep -c 'name: \"domain_blacklist\"' "
+            f"{self.DOMAIN_BLACKLIST_RUNTIME_FILE} 2>/dev/null || true"
+        )
+        try:
+            runtime_count = int((count_output or "0").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            runtime_count = -1
+        total_enabled_row = self._sqlite_query_line(
+            "SELECT count(*) AS cnt FROM domain_blacklist WHERE enabled='yes'"
+        )
+        total_enabled = int((total_enabled_row or {}).get("cnt", 0))
+        problems = []
+        if runtime_count != total_enabled:
+            problems.append(f"启用规则{total_enabled}条但DPI配置{runtime_count}块")
+        for row in rows:
+            rule_id = int(row.get("id"))
+            should_exist = row.get("enabled") == "yes"
+            time_marker = f'time_set: "domain_blacklist_time_{rule_id}"'
+            source_marker = f'src_ipset: "domain_blacklist_src_{rule_id}"'
+            marker_present = time_marker in marker_output
+            if marker_present != should_exist:
+                problems.append(f"规则{rule_id}{'漏下发' if should_exist else '停用后仍下发'}timeset")
+            if self._url_black_json_custom(row.get("src_addr")):
+                source_present = source_marker in marker_output
+                if source_present != should_exist:
+                    problems.append(f"规则{rule_id}{'漏下发' if should_exist else '停用后仍下发'}src_ipset")
+        raw = (
+            f"DB={json.dumps(rows, ensure_ascii=False)}\n"
+            f"DPI_FILTERS={runtime_count}\nMARKERS={marker_output}"
+        )
+        return VerifyResult(
+            "L4-底层一致性",
+            not problems,
+            "DB、DPI、源地址集合和时间计划一致" if not problems else "；".join(problems),
+            details={"db_rows": len(rows), "runtime_count": runtime_count, "problems": problems},
+            raw_output=raw[:3000],
+        )
+
+    def verify_domain_blacklist_artifacts_absent(self, rule_id: int) -> VerifyResult:
+        self.connect_router()
+        safe_id = int(rule_id)
+        set_names = (
+            f"domain_blacklist_src_{safe_id}",
+            f"_domain_blacklist_src_{safe_id}",
+            f"_domain_blacklist_src_{safe_id}_mac",
+        )
+        output = self._router.exec("ipset list -n 2>/dev/null")
+        remaining = [name for name in set_names if name in set((output or "").splitlines())]
+        runtime = self._router.exec(
+            f"grep -F {shlex.quote('domain_blacklist_time_' + str(safe_id))} "
+            f"{self.DOMAIN_BLACKLIST_RUNTIME_FILE} 2>/dev/null || true"
+        )
+        passed = not remaining and not runtime.strip()
+        return VerifyResult(
+            "L3/L4-删除残留",
+            passed,
+            "源地址集合、DPI引用和时间计划已回收" if passed
+            else f"残留集合={remaining}，运行态={runtime.strip()[:200]}",
+            details={"rule_id": safe_id, "remaining_sets": remaining, "runtime": runtime.strip()},
+            raw_output=("\n".join(remaining) + "\n" + runtime)[:1200],
+        )
+
+    def verify_domain_blacklist_flow(
+        self,
+        domain: str,
+        *,
+        protocol: str = "http",
+        expect_allowed: bool,
+        iface: str = "ens11",
+        timeout: int = 12,
+    ) -> VerifyResult:
+        result = self.verify_url_black_flow(
+            domain,
+            protocol=protocol,
+            expect_allowed=expect_allowed,
+            iface=iface,
+            timeout=timeout,
+        )
+        result.level = "L5-禁止娱乐网站真实流量"
+        return result
+
+    def cleanup_domain_blacklist_test(self, prefix: str = "dblk_t_") -> str:
+        """仅删除本轮前缀规则，并回收脚本残留的src/time对象。"""
+        self.connect_router()
+        literal = self._url_black_sql_literal(prefix)
+        rows = self._sqlite_query_list(
+            "SELECT id,tagname FROM domain_blacklist WHERE substr(tagname,1,"
+            f"{len(prefix)})={literal} ORDER BY id"
+        )
+        ids = [str(int(row["id"])) for row in rows if str(row.get("id", "")).isdigit()]
+        if ids:
+            self._router.exec(
+                f"{self.DOMAIN_BLACKLIST_SCRIPT} del id={','.join(ids)}",
+                timeout=40,
+            )
+            time.sleep(1.2)
+            self.cleanup_domain_blacklist_artifacts(ids)
+        return f"deleted {len(ids)} domain_blacklist rules"
+
+    def cleanup_domain_blacklist_artifacts(self, rule_ids: Iterable[int]) -> str:
+        self.connect_router()
+        safe_ids = sorted({int(rule_id) for rule_id in rule_ids if int(rule_id) > 0})
+        for rule_id in safe_ids:
+            names = (
+                f"domain_blacklist_src_{rule_id}",
+                f"_domain_blacklist_src_{rule_id}",
+                f"_domain_blacklist_src_{rule_id}_mac",
+            )
+            quoted_names = " ".join(shlex.quote(name) for name in names)
+            self._router.exec(
+                f"for domain_blacklist_set in {quoted_names}; do "
+                "ipset flush \"$domain_blacklist_set\" 2>/dev/null || true; "
+                "ipset destroy \"$domain_blacklist_set\" 2>/dev/null || true; done; "
+                f"ik_cntl timeset clear _domain_blacklist_time_{rule_id} >/dev/null 2>&1 || true; "
+                f"ik_cntl timeset clear domain_blacklist_time_{rule_id} >/dev/null 2>&1 || true"
+            )
+        return f"destroyed artifacts for {len(safe_ids)} domain_blacklist rules"
 
     # ==================== 应用协议控制 (安全中心 > 应用协议控制) ====================
     # 专业模式(global_config.parental_mode=0). 表 acl_l7.
@@ -29583,3 +31308,448 @@ print('echo_count=' + str(len(received)))
                 "L4-内核设置环境一致性", False,
                 f"内核设置环境审计异常: {type(exc).__name__}",
             )
+
+    # ==================== 账号设置 (设备设置 > 登录管理 > 账号设置) ====================
+    # webuser保存账号、密码摘要、启停、会话超时和强制改密周期；usergroup保存
+    # 允许访问IP和页面读/写权限。webuser.sh init会刷新homepage_custom缓存、
+    # 重载OpenResty并重建全局搜索权限哈希。该模块没有iptables/ipset数据面，
+    # L2-L5分别按Web运行态、权限展开、脚本重建和真实登录/授权链路验证。
+
+    @staticmethod
+    def _validate_webuser_key(value: str, *, prefix: bool = False) -> str:
+        text = str(value or "")
+        pattern = r"^[A-Za-z0-9_.@:+-]+$"
+        if not text or not re.fullmatch(pattern, text):
+            kind = "账号前缀" if prefix else "用户名"
+            raise ValueError(f"{kind}含不安全字符")
+        return text
+
+    def find_webuser_account(self, username: str) -> Optional[Dict[str, Any]]:
+        """按用户名读取账号和权限组，不返回密码摘要。"""
+        username = self._validate_webuser_key(username)
+        return self._sqlite_query_line(
+            "SELECT w.id,w.comment,w.enabled,w.username,w.force,w.interval,"
+            "w.passwd_timeout,w.sesstimeout,w.group_id,length(w.passwd) AS passwd_len,"
+            "g.group_name,g.ip_addr,g.perm_default,g.perm_config "
+            "FROM webuser w LEFT JOIN usergroup g ON g.id=w.group_id "
+            f"WHERE w.username='{username}'"
+        )
+
+    def get_webuser_environment_snapshot(
+        self, prefix: str = "acct_l15_"
+    ) -> Dict[str, Any]:
+        """保存测试前账号环境，快照中不包含密码或摘要。"""
+        prefix = self._validate_webuser_key(prefix, prefix=True)
+        self.connect_router()
+        admin = self.find_webuser_account("admin")
+        counts = self._sqlite_query_line(
+            "SELECT (SELECT count(*) FROM webuser) AS webuser_count,"
+            "(SELECT count(*) FROM usergroup) AS usergroup_count,"
+            "(SELECT count(*) FROM api_tokens) AS token_count"
+        ) or {}
+        test_accounts = self._sqlite_query_list(
+            "SELECT username,group_id,enabled FROM webuser "
+            f"WHERE username LIKE '{prefix}%' ORDER BY id"
+        )
+        test_groups = self._sqlite_query_list(
+            "SELECT id,group_name FROM usergroup "
+            f"WHERE group_name LIKE '{prefix}%' ORDER BY id"
+        )
+        cache = self._router.exec(
+            "cat /tmp/iktmp/cache/homepage_custom 2>/dev/null"
+        )
+        master = self._router.exec(
+            "ps | grep '[n]ginx: master process openresty' | awk '{print $1}'"
+        ).strip()
+        status = self._router.exec(
+            "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 "
+            "http://127.0.0.1/login"
+        ).strip()
+        return {
+            "version": 1,
+            "prefix": prefix,
+            "admin": admin or {},
+            "counts": counts,
+            "test_accounts": test_accounts,
+            "test_groups": test_groups,
+            "homepage_cache_has_admin": "username=admin " in (cache or ""),
+            "openresty_master": master,
+            "http_status": status,
+        }
+
+    def verify_webuser_script_contract(self) -> VerifyResult:
+        """L1/L4: 核对脚本、REST动作、字段约束和数据库契约。"""
+        self.connect_router()
+        web_script = self._router.exec(
+            "cat /usr/ikuai/script/webuser.sh", timeout=30
+        )
+        group_script = self._router.exec(
+            "cat /usr/ikuai/script/usergroup.sh", timeout=30
+        )
+        schemas = self._router.exec(
+            "sqlite3 /etc/mnt/ikuai/config.db \".schema webuser\"; "
+            "sqlite3 /etc/mnt/ikuai/config.db \".schema usergroup\""
+        )
+        checks = {
+            "accounts_rest": "url=system/web-admin/accounts" in web_script,
+            "password_rest": "url=system/web-admin/password" in web_script,
+            "add_edit_delete": all(
+                f"\n{name}()" in web_script for name in ("add", "edit", "del")
+            ),
+            "enable_disable": "\ndown()" in web_script and "\nup()" in web_script,
+            "admin_protection": (
+                "Cannot delete Administrator account" in web_script
+                and "Cannot operate Administrator account" in web_script
+            ),
+            "username_contract": "length <= 128" in web_script,
+            "password_digest_contract": "passwd\t\tlength == 32" in web_script,
+            "session_contract": "sesstimeout\t>= 5" in web_script,
+            "group_rest": "url=system/web-admin/groups" in group_script,
+            "ip_contract": "ip_addr       ipall" in group_script,
+            "permission_contract": "perm_config" in group_script,
+            "webuser_schema": all(
+                token in schemas for token in (
+                    "CREATE TABLE webuser", "username", "passwd_timeout",
+                    "sesstimeout", "group_id",
+                )
+            ),
+            "usergroup_schema": all(
+                token in schemas for token in (
+                    "CREATE TABLE usergroup", "perm_config", "ip_addr",
+                    "perm_default",
+                )
+            ),
+            "runtime_rebuild": (
+                "openresty -s reload" in web_script
+                and "global_search.sh permisson_hash_create" in web_script
+                and "__create_homepage_cache" in web_script
+            ),
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        return VerifyResult(
+            level="L1/L4-账号脚本契约",
+            passed=not failed,
+            message=(
+                "webuser/usergroup REST、字段校验、管理员保护和运行态重建契约完整"
+                if not failed else f"账号脚本契约缺失: {failed}"
+            ),
+            details={"checks": checks},
+            raw_output=json.dumps(checks, ensure_ascii=False),
+        )
+
+    def verify_webuser_database(
+        self, username: str, expected: Optional[Dict[str, Any]] = None
+    ) -> VerifyResult:
+        """L1: 验证账号、权限组、摘要长度和期望字段。"""
+        row = self.find_webuser_account(username)
+        if row is None:
+            return VerifyResult(
+                "L1-账号数据库", False, f"账号不存在: {username}"
+            )
+        expected = dict(expected or {})
+        mismatches: Dict[str, Any] = {}
+        for key, value in expected.items():
+            actual = row.get(key)
+            if str(actual) != str(value):
+                mismatches[key] = {"expected": value, "actual": actual}
+        if str(row.get("passwd_len")) != "32":
+            mismatches["passwd_len"] = {
+                "expected": 32, "actual": row.get("passwd_len")
+            }
+        if str(row.get("group_id")) == "1" and username != "admin":
+            mismatches["group_id"] = {
+                "expected": "custom group", "actual": row.get("group_id")
+            }
+        if str(row.get("force")) == "1":
+            try:
+                timeout_value = int(str(row.get("passwd_timeout") or "0"))
+            except ValueError:
+                timeout_value = 0
+            if timeout_value <= int(time.time()):
+                mismatches["passwd_timeout"] = {
+                    "expected": "future timestamp", "actual": row.get("passwd_timeout")
+                }
+        safe_row = {
+            key: value for key, value in row.items() if key != "perm_config"
+        }
+        safe_row["perm_config_len"] = len(str(row.get("perm_config") or ""))
+        return VerifyResult(
+            level="L1-账号数据库",
+            passed=not mismatches,
+            message=(
+                f"账号及权限组字段正确(id={row.get('id')}, group_id={row.get('group_id')})"
+                if not mismatches else f"账号字段不匹配: {mismatches}"
+            ),
+            details={"row": safe_row, "mismatches": mismatches},
+            raw_output=json.dumps(safe_row, ensure_ascii=False),
+        )
+
+    def verify_webuser_default_permission(
+        self, username: str, expected: str
+    ) -> VerifyResult:
+        """L1: 验证新功能默认权限策略已写入关联权限组。"""
+        username = self._validate_webuser_key(username)
+        expected = str(expected or "")
+        allowed = {"none", "r", "rx"}
+        if expected not in allowed:
+            raise ValueError(f"不支持的默认权限值: {expected}")
+        row = self.find_webuser_account(username)
+        if row is None:
+            return VerifyResult(
+                "L1-默认权限", False, f"账号不存在: {username}"
+            )
+        actual = str(row.get("perm_default") or "")
+        passed = actual == expected
+        details = {
+            "username": username,
+            "group_id": row.get("group_id"),
+            "group_name": row.get("group_name"),
+            "expected": expected,
+            "actual": actual,
+            "perm_config_len": len(str(row.get("perm_config") or "")),
+        }
+        return VerifyResult(
+            "L1-默认权限",
+            passed,
+            (
+                f"默认权限策略正确({expected})"
+                if passed else f"默认权限策略不匹配: 期望={expected}, 实际={actual}"
+            ),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def verify_webuser_permission(
+        self,
+        username: str,
+        mode: str = "read",
+        required_scopes: Optional[Iterable[str]] = None,
+    ) -> VerifyResult:
+        """L3: 验证权限串展开、格式和关键页面读写级别。"""
+        row = self.find_webuser_account(username)
+        if row is None:
+            return VerifyResult("L3-账号权限", False, f"账号不存在: {username}")
+        raw = str(row.get("perm_config") or "")
+        tokens = [item for item in raw.split(",") if item]
+        malformed = [item for item in tokens if not re.fullmatch(r"[\w-]+:[rx]+", item)]
+        scopes = {}
+        for item in tokens:
+            if ":" in item:
+                key, value = item.rsplit(":", 1)
+                scopes[key] = value
+        required = list(required_scopes or (
+            "monitoring_center", "network_configuration", "security_center",
+            "authentication_service", "advanced_service", "device_settings",
+            "login_management", "webuser",
+        ))
+        missing = [name for name in required if name not in scopes]
+        wrong = []
+        if mode == "read":
+            wrong = [name for name, value in scopes.items() if "x" in value]
+            wrong.extend(name for name in required if scopes.get(name) != "r")
+        elif mode == "write":
+            wrong = [name for name in required if "x" not in scopes.get(name, "")]
+        passed = bool(tokens and not malformed and not missing and not wrong)
+        details = {
+            "token_count": len(tokens),
+            "malformed": malformed[:10],
+            "missing": missing,
+            "wrong_count": len(set(wrong)),
+            "required": {name: scopes.get(name) for name in required},
+            "mode": mode,
+        }
+        return VerifyResult(
+            "L3-账号权限", passed,
+            (
+                f"权限展开正确({mode}, {len(tokens)}项)"
+                if passed else f"权限展开异常: {details}"
+            ),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def verify_webuser_runtime(
+        self, username: str, expected_enabled: str = "yes"
+    ) -> VerifyResult:
+        """L2: 验证账号运行缓存、OpenResty进程和本机HTTP入口。"""
+        username = self._validate_webuser_key(username)
+        row = self.find_webuser_account(username)
+        if row is None:
+            return VerifyResult("L2-Web运行态", False, f"账号不存在: {username}")
+        self.connect_router()
+        cache_line = self._router.exec(
+            "grep -F 'username=" + username + " ' "
+            "/tmp/iktmp/cache/homepage_custom 2>/dev/null"
+        ).strip()
+        master = self._router.exec(
+            "ps | grep -c '[n]ginx: master process openresty'"
+        ).strip()
+        workers = self._router.exec(
+            "ps | grep -c '[n]ginx: worker process'"
+        ).strip()
+        status = self._router.exec(
+            "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 "
+            "http://127.0.0.1/login"
+        ).strip()
+        checks = {
+            "enabled": str(row.get("enabled")) == str(expected_enabled),
+            "homepage_cache": f"username={username} " in cache_line,
+            "openresty_master": master == "1",
+            "openresty_workers": workers.isdigit() and int(workers) >= 1,
+            "http_login": status in {"200", "301", "302"},
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        details = {
+            "checks": checks,
+            "worker_count": workers,
+            "http_status": status,
+            "cache_entry_present": bool(cache_line),
+        }
+        return VerifyResult(
+            "L2-Web运行态", not failed,
+            (
+                f"账号缓存、OpenResty及HTTP入口健康(enabled={expected_enabled})"
+                if not failed else f"账号Web运行态异常: {failed}"
+            ),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def verify_webuser_reinit(self, username: str) -> VerifyResult:
+        """L4: 执行产品init并验证配置不丢失、缓存重建和HTTP健康。"""
+        before = self.find_webuser_account(username)
+        if before is None:
+            return VerifyResult("L4-账号脚本重建", False, f"账号不存在: {username}")
+        self.connect_router()
+        output = self._router.exec(
+            "/usr/ikuai/script/webuser.sh init 2>&1", timeout=30
+        )
+        time.sleep(0.5)
+        after = self.find_webuser_account(username)
+        runtime = self.verify_webuser_runtime(
+            username, str(before.get("enabled") or "yes")
+        )
+        passed = before == after and runtime.passed
+        details = {
+            "database_unchanged": before == after,
+            "runtime": runtime.details,
+            "init_output_empty_or_success": not bool((output or "").strip()),
+        }
+        return VerifyResult(
+            "L4-账号脚本重建", passed,
+            (
+                "webuser.sh init后数据库、权限缓存和OpenResty完整"
+                if passed else "webuser.sh init后配置或运行态不一致"
+            ),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def verify_webuser_not_exists(self, username: str) -> VerifyResult:
+        """L1/L4: 验证账号、同名权限组和API令牌均已清理。"""
+        username = self._validate_webuser_key(username)
+        row = self.find_webuser_account(username)
+        group = self._sqlite_query_line(
+            f"SELECT id FROM usergroup WHERE group_name='{username}'"
+        )
+        token = self._sqlite_query_line(
+            "SELECT count(*) AS cnt FROM api_tokens WHERE username="
+            f"'{username}'"
+        )
+        token_count = int((token or {}).get("cnt", 0) or 0)
+        passed = row is None and group is None and token_count == 0
+        details = {
+            "account_absent": row is None,
+            "group_absent": group is None,
+            "token_count": token_count,
+        }
+        return VerifyResult(
+            "L1/L4-账号删除", passed,
+            (
+                f"账号、权限组和令牌已删除: {username}"
+                if passed else f"账号删除存在残留: {details}"
+            ),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False),
+        )
+
+    def cleanup_webuser_test(self, prefix: str = "acct_l15_") -> str:
+        """按测试前缀清理账号、令牌和权限组，并重建产品运行态。"""
+        prefix = self._validate_webuser_key(prefix, prefix=True)
+        self.connect_router()
+        accounts = self._sqlite_query_list(
+            "SELECT id,username,group_id FROM webuser "
+            f"WHERE username LIKE '{prefix}%'"
+        )
+        account_ids = [
+            str(item.get("id")) for item in accounts
+            if str(item.get("id") or "").isdigit() and str(item.get("id")) != "1"
+        ]
+        group_ids = [
+            str(item.get("group_id")) for item in accounts
+            if str(item.get("group_id") or "").isdigit()
+            and str(item.get("group_id")) != "1"
+        ]
+        statements = []
+        if account_ids:
+            joined = ",".join(sorted(set(account_ids), key=int))
+            statements.extend((
+                f"DELETE FROM api_tokens WHERE user_id IN ({joined});",
+                f"DELETE FROM webuser WHERE id IN ({joined}) AND id != 1;",
+            ))
+        if group_ids:
+            joined = ",".join(sorted(set(group_ids), key=int))
+            statements.append(
+                f"DELETE FROM usergroup WHERE id IN ({joined}) AND id != 1;"
+            )
+        statements.append(
+            f"DELETE FROM usergroup WHERE group_name LIKE '{prefix}%' AND id != 1;"
+        )
+        sql = " ".join(statements)
+        encoded = base64.b64encode(sql.encode("utf-8")).decode("ascii")
+        self._router.exec(
+            f"echo {encoded} | base64 -d | sqlite3 {self.DNS_DB}; "
+            "/usr/ikuai/script/webuser.sh init >/dev/null 2>&1",
+            timeout=30,
+        )
+        remain_accounts = self._sqlite_query_list(
+            "SELECT username FROM webuser "
+            f"WHERE username LIKE '{prefix}%'"
+        )
+        remain_groups = self._sqlite_query_list(
+            "SELECT group_name FROM usergroup "
+            f"WHERE group_name LIKE '{prefix}%'"
+        )
+        return (
+            f"deleted accounts={len(accounts)}, groups={len(set(group_ids))}; "
+            f"remaining accounts={len(remain_accounts)}, groups={len(remain_groups)}"
+        )
+
+    def verify_webuser_environment_unchanged(
+        self, snapshot: Dict[str, Any]
+    ) -> VerifyResult:
+        """L4: 核对管理员、表计数、运行态和测试前缀均回到快照。"""
+        prefix = self._validate_webuser_key(
+            str(snapshot.get("prefix") or "acct_l15_"), prefix=True
+        )
+        current = self.get_webuser_environment_snapshot(prefix)
+        checks = {
+            "admin_unchanged": current.get("admin") == snapshot.get("admin"),
+            "counts_unchanged": current.get("counts") == snapshot.get("counts"),
+            "no_test_accounts": not current.get("test_accounts"),
+            "no_test_groups": not current.get("test_groups"),
+            "homepage_cache": current.get("homepage_cache_has_admin") is True,
+            "openresty_master_stable": bool(current.get("openresty_master")),
+            "http_healthy": current.get("http_status") in {"200", "301", "302"},
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        details = {"checks": checks, "current_counts": current.get("counts")}
+        return VerifyResult(
+            "L4-账号环境一致性", not failed,
+            (
+                "管理员、账号/权限组计数、缓存及Web运行态与测试前一致"
+                if not failed else f"账号环境未完全恢复: {failed}"
+            ),
+            details=details,
+            raw_output=json.dumps(details, ensure_ascii=False),
+        )

@@ -1,4 +1,4 @@
-"""OpenVPN客户端页面类 (网络配置→内外网设置→VPN客户端→OpenVPN)
+"""OpenVPN客户端页面类 (虚拟专网→OpenVPN→OpenVPN客户端)
 
 数据库表: openvpn_client (底层脚本 openvpn-client.sh, 进程openvpn, 拨号生成tun接口)
 表单字段(id): name*(ovpn开头) | remote_addr*(服务器) | remote_port*(1194) |
@@ -21,6 +21,8 @@ class OpenvpnClientPage(VpnClientBasePage):
     """OpenVPN客户端(拨号名称ovpn开头, 默认1194/UDP/TUN, CA证书必填)"""
 
     MODULE_NAME = "openvpn_client"
+    LIST_URL = "/#/vpn/openVpn"
+    CLIENT_TAB = "OpenVPN客户端"
     SUBTAB = "OpenVPN"
     ADD_URL_TYPE = "openvpn"
     NAME_PREFIX = "ovpn"

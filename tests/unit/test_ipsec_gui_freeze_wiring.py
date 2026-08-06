@@ -31,7 +31,7 @@ def test_gui_tree_contains_one_exact_ipsec_node():
     ]
     assert ipsec["testcases"] == expected
     assert ipsec["groups"]["综合测试（推荐）"] == expected
-    assert "VPN客户端" not in modules
+    assert "VPN客户端" not in modules["网络配置"]["children"]
 
 
 def test_ipsec_runner_targets_the_exact_node():

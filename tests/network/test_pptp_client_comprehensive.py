@@ -1,6 +1,6 @@
 """PPTP客户端综合测试用例
 
-网络配置→内外网设置→VPN客户端→PPTP
+虚拟专网→PPTP→PPTP客户端
 SSH后台: L1数据库(pptp_client表, must_pass硬断言) + L2连接(ppp接口/拨号状态, 软断言)
 VPN客户端特性: 启用=自动拨号; 无segmented筛选; 无复制按钮; 本地IP列反映拨号状态
 服务端: 10.66.0.40 (L2TP/PPTP账号 test/test)

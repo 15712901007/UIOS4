@@ -397,6 +397,128 @@
             font-size: 12px;
         }
 
+        .step-record-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+
+        .step-record-title {
+            color: #1f1f1f;
+            font-size: 14px;
+            font-weight: 700;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+
+        .step-record-grid {
+            overflow: hidden;
+            border: 1px solid #d9d9d9;
+            border-radius: 6px;
+            background: #fff;
+        }
+
+        .step-record-row {
+            display: grid;
+            grid-template-columns: 108px minmax(0, 1fr);
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        .step-record-row:last-child {
+            border-bottom: 0;
+        }
+
+        .step-record-label {
+            padding: 10px 12px;
+            color: #434343;
+            background: #fafafa;
+            border-right: 1px solid #f0f0f0;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .step-record-value {
+            min-width: 0;
+            padding: 10px 12px;
+            color: #262626;
+            font-size: 12px;
+            line-height: 1.65;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
+        .step-record-row.expected .step-record-value {
+            color: #135200;
+            background: #fcfff8;
+        }
+
+        .step-record-row.actual .step-record-value {
+            color: #003a8c;
+            background: #f7fbff;
+        }
+
+        .step-record-row.result.failed .step-record-value,
+        .step-record-row.result.error .step-record-value {
+            color: #a8071a;
+            background: #fff1f0;
+            font-weight: 700;
+        }
+
+        .step-record-row.result.passed .step-record-value {
+            color: #237804;
+            background: #f6ffed;
+            font-weight: 700;
+        }
+
+        .step-record-row.result.warning .step-record-value {
+            color: #874d00;
+            background: #fffbe6;
+            font-weight: 700;
+        }
+
+        .execution-evidence {
+            display: grid;
+            gap: 8px;
+            min-width: 0;
+            white-space: normal;
+            text-align: left;
+        }
+
+        .step-record-row.evidence .step-record-value {
+            white-space: normal;
+        }
+
+        .execution-evidence-empty {
+            color: #8c8c8c;
+        }
+
+        .command-verdict {
+            display: inline-flex;
+            align-items: center;
+            min-height: 22px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            color: #595959;
+            background: #f5f5f5;
+            border: 1px solid #d9d9d9;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .command-verdict.passed {
+            color: #237804;
+            background: #f6ffed;
+            border-color: #b7eb8f;
+        }
+
+        .command-verdict.failed {
+            color: #a8071a;
+            background: #fff1f0;
+            border-color: #ffa39e;
+        }
+
         .step-duration {
             color: #999;
         }
@@ -709,6 +831,11 @@
             border-radius: 6px;
             background: white;
             break-inside: auto;
+            min-width: 0;
+            max-width: 100%;
+            overflow: hidden;
+            white-space: normal;
+            text-align: left;
         }
 
         .verification-command-card:first-of-type {
@@ -803,6 +930,8 @@
             color: #595959;
             font-size: 12px;
             line-height: 1.55;
+            white-space: normal;
+            text-align: left;
         }
 
         .verification-command-purpose strong,
@@ -820,6 +949,22 @@
             color: #135200;
             background: #f6ffed;
             overflow-wrap: anywhere;
+        }
+
+        .verification-command-actual {
+            white-space: normal;
+        }
+
+        .verification-command-output {
+            margin: 4px 0 0;
+            color: inherit;
+            background: transparent;
+            font-family: Consolas, "Courier New", monospace;
+            font-size: 11px;
+            line-height: 1.55;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
 
         .step-actual-result {
@@ -845,9 +990,13 @@
             font-family: Consolas, "Courier New", monospace;
             font-size: 11px;
             line-height: 1.55;
-            white-space: pre;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: break-word;
             overflow-x: auto;
             tab-size: 4;
+            min-width: 0;
+            max-width: 100%;
         }
 
         .verification-command-code code {
@@ -1034,6 +1183,31 @@
                 flex-direction: column;
                 align-items: flex-start;
                 gap: 10px;
+            }
+
+            .step-record-header {
+                flex-direction: column;
+                gap: 6px;
+            }
+
+            .step-record-row {
+                grid-template-columns: minmax(0, 1fr);
+            }
+
+            .step-record-label {
+                padding: 7px 10px;
+                border-right: 0;
+                border-bottom: 1px solid #f0f0f0;
+            }
+
+            .step-record-value {
+                padding: 9px 10px;
+            }
+
+            .verification-command-header,
+            .verification-commands-title {
+                align-items: flex-start;
+                flex-wrap: wrap;
             }
 
             .copy-verification-command {
@@ -1288,82 +1462,50 @@
                                 <div class="step-item" id="step-{{ case_idx }}-{{ loop.index }}">
                                     <div class="step-number">{{ loop.index }}</div>
                                     <div class="step-content">
-                                        <div class="step-name">{{ step.name }}</div>
-                                        {% set _desc_is_split = ('操作：' in (step.description or '') and '；验证：' in (step.description or '')) %}
-                                        {% if _desc_is_split %}
-                                        {% set action_text = step.description.split('操作：', 1)[1].split('；验证：', 1)[0] %}
-                                        {% set expected_text = step.description.split('；验证：', 1)[1] %}
-                                        {% elif '操作：' in (step.name or '') and '；验证：' in (step.name or '') %}
-                                        {% set action_text = step.name.split('操作：', 1)[1].split('；验证：', 1)[0] %}
-                                        {% set expected_text = step.name.split('；验证：', 1)[1] %}
-                                        {% else %}
-                                        {% set action_text = step.description or step.name %}
-                                        {% set expected_text = step.description or '按本步骤检查项判定' %}
-                                        {% endif %}
-                                        {% if step.description and not _desc_is_split %}
-                                        <div class="step-description">{{ step.description }}</div>
-                                        {% endif %}
-                                        <div class="step-details" style="margin-top:10px;">
-                                            <div class="step-detail-item detail-test-action"><strong>操作：</strong>{{ action_text }}</div>
-                                            <div class="step-detail-item detail-page-verification"><strong>期望结果：</strong>{{ expected_text }}</div>
-                                            <div class="step-detail-item{% if step.status in ['failed', 'error'] %} detail-verification-failed{% elif step.status == 'warning' %} detail-verification-warning{% endif %}"><strong>实际现象：</strong>{% if step.status in ['failed', 'error'] %}{{ step.error_message or '存在检查项未达到期望，详见下方证据' }}{% elif step.status == 'warning' %}当前环境存在不适用项或限制，详见下方证据{% elif step.status in ['not_applicable', 'skipped'] %}前置条件不满足或当前环境不适用{% else %}本步骤各项检查达到期望{% endif %}</div>
-                                            <div class="step-detail-item detail-backend-verification"><strong>后端证据：</strong>下方共 {{ step.details|length }} 条页面、后台、运行时及协议检查记录</div>
-                                            <div class="step-detail-item"><strong>人工复验命令：</strong>{{ step.verification_commands|length if step.verification_commands else 0 }} 条，失败步骤默认展开</div>
+                                        <div class="step-record-header">
+                                            <div class="step-record-title">{{ step.test_item }}</div>
+                                            <div class="step-meta">
+                                                <span class="step-duration">耗时: {{ step.duration }}</span>
+                                                <span class="step-status {{ step.status }}">{{ step.verdict }}</span>
+                                            </div>
                                         </div>
-                                        <div class="step-meta">
-                                            <span class="step-duration">耗时: {{ step.duration }}</span>
-                                            <span class="step-status {{ step.status }}">
-                                                {% if step.status == 'passed' %}✓ 通过{% elif step.status in ['failed', 'error'] %}✗ 失败{% elif step.status in ['not_applicable', 'skipped'] %}○ 不适用{% else %}⚠ 警告{% endif %}
-                                            </span>
-                                        </div>
-                                        {% if step.details and step.details|length > 0 %}
-                                        <div class="step-details">
-                                            {% for detail in step.details %}
-                                            {% if '【后端数据】' in detail %}
-                                            <details class="backend-data-detail">
-                                                <summary>
-                                                    后端数据
-                                                    <span class="backend-data-toggle-hint">默认折叠，点击展开</span>
-                                                </summary>
-                                                <pre class="backend-data-content">{{ detail|replace('【后端数据】', '') }}</pre>
-                                            </details>
-                                            {% elif '【测试操作' in detail %}
-                                            <div class="step-detail-item detail-test-action{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
-                                            {% elif '【页面验证' in detail %}
-                                            <div class="step-detail-item detail-page-verification{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
-                                            {% elif '【后端验证' in detail %}
-                                            <div class="step-detail-item detail-backend-verification{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
-                                            {% elif '【运行时验证' in detail %}
-                                            <div class="step-detail-item detail-runtime-verification{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
-                                            {% elif '【协议验证' in detail %}
-                                            <div class="step-detail-item detail-protocol-verification{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
-                                            {% elif '【清理结果' in detail %}
-                                            <div class="step-detail-item detail-cleanup-result{% if '✗' in detail or 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif '⚠' in detail or 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
-                                            {% elif '【不适用' in detail %}
-                                            <div class="step-detail-item detail-not-applicable">{{ detail }}</div>
-                                            {% else %}
-                                            <div class="step-detail-item">{{ detail }}</div>
-                                            {% endif %}
-                                            {% endfor %}
-                                        </div>
-                                        {% endif %}
-                                        {% if step.actual %}
-                                        <div class="step-actual-result">
-                                            <strong>实际结果:</strong>
-                                            {% set step_actual_text = step.actual|string %}
-                                            {% if 'community=' in step_actual_text or 'auth_pass=' in step_actual_text or 'priv_pass=' in step_actual_text or 'password=' in step_actual_text or '"community"' in step_actual_text or '"auth_pass"' in step_actual_text or '"priv_pass"' in step_actual_text %}
-                                                [实际结果已隐藏：包含敏感信息]
-                                            {% else %}
-                                                {{ step.actual }}
-                                            {% endif %}
-                                        </div>
-                                        {% endif %}
-                                        {% if step.verification_commands and step.verification_commands|length > 0 %}
-                                        <details class="verification-commands"{% if step.status in ['failed', 'error'] %} open{% endif %}>
-                                            <summary class="verification-commands-title">
-                                                <span>后端人工复验命令（逐条复制执行）</span>
-                                                <span class="verification-command-count">{{ step.verification_commands|length }} 条</span>
-                                            </summary>
+                                        <div class="step-record-grid">
+                                            <div class="step-record-row">
+                                                <div class="step-record-label">测试项</div>
+                                                <div class="step-record-value">{{ step.test_item }}</div>
+                                            </div>
+                                            <div class="step-record-row">
+                                                <div class="step-record-label">测试步骤</div>
+                                                <div class="step-record-value"><strong>操作：</strong>{{ step.action }}</div>
+                                            </div>
+                                            <div class="step-record-row expected">
+                                                <div class="step-record-label">预期结果</div>
+                                                <div class="step-record-value"><strong>预期结果：</strong>{{ step.expected }}</div>
+                                            </div>
+                                            <div class="step-record-row evidence">
+                                                <div class="step-record-label">执行命令与证据</div>
+                                                <div class="step-record-value">
+                                                    <div class="execution-evidence">
+                                                    <div><strong>后端证据：</strong>页面、后台、运行时和协议检查均归入本步骤。</div>
+                                                    {% if step.details and step.details|length > 0 %}
+                                                        {% for detail in step.details %}
+                                                        {% if '【后端JSON】' in detail %}
+                                                        <details class="backend-data-detail backend-json-detail">
+                                                            <summary>SSH结构化数据（JSON） <span class="backend-data-toggle-hint">点击展开</span></summary>
+                                                            <pre class="backend-data-content backend-json-content">{{ detail|replace('【后端JSON】', '') }}</pre>
+                                                        </details>
+                                                        {% elif '【后端数据】' in detail %}
+                                                        <details class="backend-data-detail">
+                                                            <summary>后端原始数据 <span class="backend-data-toggle-hint">点击展开</span></summary>
+                                                            <pre class="backend-data-content">{{ detail|replace('【后端数据】', '') }}</pre>
+                                                        </details>
+                                                        {% else %}
+                                                        <div class="step-detail-item{% if 'FAIL' in detail or '失败' in detail %} detail-verification-failed{% elif 'WARN' in detail or '警告' in detail %} detail-verification-warning{% endif %}">{{ detail }}</div>
+                                                        {% endif %}
+                                                        {% endfor %}
+                                                    {% endif %}
+                                                    {% if step.verification_commands and step.verification_commands|length > 0 %}
+                                            <div class="verification-commands-title"><span>后端人工复验命令（逐条复制执行）</span><span class="verification-command-count">{{ step.verification_commands|length }} 条</span></div>
                                             {% for verification_command in step.verification_commands %}
                                             {% set command_id = 'verification-command-' ~ case_idx ~ '-' ~ step_idx ~ '-' ~ loop.index %}
                                             {% set command_text = verification_command.command or '' %}
@@ -1379,6 +1521,9 @@
                                                     {% if verification_command.shell %}
                                                     <span class="verification-shell">{{ verification_command.shell }}</span>
                                                     {% endif %}
+                                                    {% if verification_command.execution_source == 'actual' %}
+                                                    <span class="verification-shell">真实执行</span>
+                                                    {% endif %}
                                                     <span class="verification-effect{% if not command_read_only %} verification-effect-write{% endif %}">影响:
                                                         {% if command_read_only %}
                                                             只读（不修改配置）
@@ -1389,6 +1534,7 @@
                                                     {% if command_contains_secret %}
                                                     <span class="verification-sensitive">涉及敏感输入</span>
                                                     {% endif %}
+                                                    <span class="command-verdict{% if verification_command.verdict is sameas true %} passed{% elif verification_command.verdict is sameas false %} failed{% endif %}">{{ verification_command.verdict_label }}</span>
                                                     {% if verification_command.copy_ready is sameas true and not command_contains_secret %}
                                                     <button
                                                         type="button"
@@ -1425,38 +1571,30 @@
                                                 <pre class="verification-command-code"><code id="{{ command_id }}">{{ verification_command.command }}</code></pre>
                                                 {% endif %}
                                                 <div class="verification-command-expected">
-                                                    <strong>预期:</strong> {{ verification_command.expected or '未说明' }}
+                                                    <strong>命令预期:</strong> {{ verification_command.expected or '未说明' }}
                                                 </div>
                                                 <div class="verification-command-actual">
-                                                    <strong>实际:</strong>
-                                                    {% if actual_contains_secret %}
-                                                        [命令已隐藏：包含敏感信息]
-                                                    {% else %}
-                                                        {{ verification_command.actual or '未记录' }}
-                                                    {% endif %}
+                                                    <strong>命令实际返回:</strong>
+                                                    <pre class="verification-command-output">{% if actual_contains_secret %}[命令已隐藏：包含敏感信息]{% else %}{{ verification_command.actual or '未记录' }}{% endif %}</pre>
                                                 </div>
                                             </div>
                                             {% endfor %}
-                                        </details>
-                                        {% endif %}
-                                        {% if step.error_message %}
-                                        {% if step.status in ['failed', 'error'] %}
-                                            {% set step_message_border = '#ff4d4f' %}
-                                            {% set step_message_color = '#ff4d4f' %}
-                                            {% set step_message_label = '错误' %}
-                                        {% elif step.status == 'warning' %}
-                                            {% set step_message_border = '#fa8c16' %}
-                                            {% set step_message_color = '#d46b08' %}
-                                            {% set step_message_label = '警告' %}
-                                        {% else %}
-                                            {% set step_message_border = '#8c8c8c' %}
-                                            {% set step_message_color = '#595959' %}
-                                            {% set step_message_label = '说明' %}
-                                        {% endif %}
-                                        <div class="step-details" style="border-left-color: {{ step_message_border }};">
-                                            <div class="step-detail-item" style="color: {{ step_message_color }};">{{ step_message_label }}: {{ step.error_message }}</div>
+                                                    {% endif %}
+                                                    {% if (not step.details or step.details|length == 0) and (not step.verification_commands or step.verification_commands|length == 0) %}
+                                                    <div class="execution-evidence-empty">本步骤无独立后端命令，以页面操作结果判定。</div>
+                                                    {% endif %}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div class="step-record-row actual">
+                                                <div class="step-record-label">实际结果</div>
+                                                <div class="step-record-value"><strong>实际现象：</strong>{% if step.status == 'warning' %}警告: {{ step.error_message or step.actual_result }}{% elif step.status in ['not_applicable', 'skipped'] %}说明: {{ step.error_message or step.actual_result }}{% else %}{{ step.actual_result }}{% endif %}</div>
+                                            </div>
+                                            <div class="step-record-row result {{ step.status }}">
+                                                <div class="step-record-label">测试结果</div>
+                                                <div class="step-record-value"><strong>人工复验命令：</strong>{{ step.verification_commands|length if step.verification_commands else 0 }} 条；判定={{ step.verdict }}{% if step.error_message %}：{{ step.error_message }}{% endif %}</div>
+                                            </div>
                                         </div>
-                                        {% endif %}
                                     </div>
                                 </div>
                                 {% endfor %}

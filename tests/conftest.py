@@ -209,9 +209,11 @@ from pages.network.route_object_page import (
 from pages.network.pptp_client_page import PptpClientPage
 from pages.network.l2tp_client_page import L2tpClientPage
 from pages.network.openvpn_client_page import OpenvpnClientPage
+from pages.network.old_ipsec_vpn_page import OldIpsecVpnPage
 from pages.network.ipsec_vpn_page import IpsecVpnPage
 from pages.network.ike_client_page import IkeClientPage
 from pages.network.wireguard_page import WireguardPage
+from pages.network.sdwan_page import SdwanPage
 from pages.security.acl_page import AclPage
 from pages.security.conn_limit_page import ConnLimitPage
 from pages.security.mac_access_control_page import MacAccessControlPage
@@ -226,10 +228,14 @@ from pages.security.threat_intelligence_page import ThreatIntelligencePage
 from pages.security.app_protocol_page import AppProtocolPage
 from pages.security.advanced_page import AdvancedPage
 from pages.security.other_control_page import OtherControlPage
+from pages.security.url_black_page import UrlBlackPage
+from pages.security.domain_blacklist_page import DomainBlacklistPage
+from pages.security.custom_domain_group_page import CustomDomainGroupPage
 from pages.device_setting.basic_setting_page import BasicSettingPage
 from pages.device_setting.alg_setting_page import AlgSettingPage
 from pages.device_setting.protocol_control_page import ProtocolControlPage
 from pages.device_setting.kernel_setting_page import KernelSettingPage
+from pages.device_setting.account_setting_page import AccountSettingPage
 from pages.device_setting.cloud_service_binding_page import CloudServiceBindingPage
 from pages.advanced_service.ftp_server_page import FtpServerPage
 from pages.advanced_service.samba_server_page import SambaServerPage
@@ -245,6 +251,7 @@ from utils.step_recorder import (
     register_sensitive_values,
     get_registered_sensitive_values,
     clear_registered_sensitive_values,
+    _PUBLIC_DOMAIN_ALLOWLIST,
 )
 
 
@@ -346,6 +353,12 @@ TEST_NAME_MAPPING = {
     'test_arp_setting_comprehensive': '安全中心-ARP设置综合测试',
     'test_app_protocol_comprehensive': '安全中心-应用协议控制综合测试',
     'test_app_protocol_flow_verification': '安全中心-应用协议控制功能验证(端到端drop+停用BUG三重信号)',
+    'test_url_black_comprehensive': '安全中心-网址浏览控制-网址黑白名单综合测试(L1-L4)',
+    'test_url_black_http_https_flow': '安全中心-网址黑白名单功能测试(HTTP/HTTPS与白名单外链开关L5)',
+    'test_domain_blacklist_comprehensive': '安全中心-网址浏览控制-禁止娱乐网站综合测试(L1-L4)',
+    'test_domain_blacklist_http_https_flow': '安全中心-禁止娱乐网站功能测试(HTTP/HTTPS真实阻断L5)',
+    'test_custom_domain_group_comprehensive': '安全中心-网址浏览控制-自定义网址库综合测试(L1-L2)',
+    'test_custom_domain_group_http_https_flow': '安全中心-自定义网址库功能测试(禁止娱乐网站联动HTTP/HTTPS L5)',
     'test_advanced_comprehensive': '安全中心-高级设置综合测试',
     'test_other_control_comprehensive': '安全中心-其他控制综合测试',
     'test_terminal_name_comprehensive': '安全中心-终端名称管理综合测试',
@@ -372,6 +385,7 @@ TEST_NAME_MAPPING = {
     'test_pptp_client_comprehensive': 'PPTP客户端综合测试',
     'test_l2tp_client_comprehensive': 'L2TP客户端综合测试',
     'test_openvpn_client_comprehensive': 'OpenVPN客户端综合测试',
+    'test_old_ipsec_vpn_comprehensive': '旧版IPsec综合测试',
     'test_ipsec_vpn_comprehensive': 'IPSec VPN综合测试',
     'test_ike_client_comprehensive': 'IKEv2/IPSec客户端综合测试',
     'test_wireguard_comprehensive': 'WireGuard客户端综合测试',
@@ -386,7 +400,9 @@ TEST_NAME_MAPPING = {
     'test_alg_setting_comprehensive': '设备设置-高级管理-ALG设置',
     'test_protocol_control_comprehensive': '设备设置-高级管理-协议控制',
     'test_kernel_setting_comprehensive': '设备设置-高级管理-内核设置',
+    'test_account_setting_comprehensive': '设备设置-登录管理-账号设置',
     'test_cloud_service_binding_comprehensive': '设备设置-云服务绑定综合测试',
+    'test_sdwan_comprehensive': '网络配置-SD-WAN综合测试',
 }
 
 
@@ -1035,6 +1051,57 @@ def acl_page_logged_in(logged_in_page: Page, config: Config) -> AclPage:
 
 
 @pytest.fixture(scope="function")
+def url_black_page(page: Page, config: Config) -> UrlBlackPage:
+    """创建网址黑白名单页面实例。"""
+    return UrlBlackPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def url_black_page_logged_in(logged_in_page: Page, config: Config) -> UrlBlackPage:
+    """已登录并导航到网址黑白名单列表页。"""
+    pg = UrlBlackPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_url_black()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def domain_blacklist_page(page: Page, config: Config) -> DomainBlacklistPage:
+    """创建禁止娱乐网站页面实例。"""
+    return DomainBlacklistPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def domain_blacklist_page_logged_in(
+    logged_in_page: Page,
+    config: Config,
+) -> DomainBlacklistPage:
+    """已登录并导航到禁止娱乐网站列表页。"""
+    pg = DomainBlacklistPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_domain_blacklist()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def custom_domain_group_page(
+    page: Page,
+    config: Config,
+) -> CustomDomainGroupPage:
+    """创建自定义网址库页面实例。"""
+    return CustomDomainGroupPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def custom_domain_group_page_logged_in(
+    logged_in_page: Page,
+    config: Config,
+) -> CustomDomainGroupPage:
+    """已登录并导航到自定义网址库列表页。"""
+    pg = CustomDomainGroupPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_custom_domain_group()
+    return pg
+
+
+@pytest.fixture(scope="function")
 def conn_limit_page(page: Page, config: Config) -> ConnLimitPage:
     """创建连接数限制页面实例(安全中心>连接数限制)"""
     return ConnLimitPage(page, config.get_base_url())
@@ -1290,7 +1357,7 @@ def protocol_group_page_logged_in(logged_in_page: Page, config: Config) -> 'Prot
     return pg
 
 
-# ==================== VPN客户端(PPTP/L2TP/OpenVPN/IPSec/IKEv2/WireGuard) fixtures ====================
+# ==================== 虚拟专网客户端及旧版IPsec fixtures ====================
 
 @pytest.fixture(scope="function")
 def pptp_client_page_logged_in(logged_in_page: Page, config: Config) -> 'PptpClientPage':
@@ -1313,6 +1380,16 @@ def openvpn_client_page_logged_in(logged_in_page: Page, config: Config) -> 'Open
     """已登录并导航到OpenVPN客户端页面的实例"""
     pg = OpenvpnClientPage(logged_in_page, config.get_base_url())
     pg.navigate_to_openvpn()
+    return pg
+
+
+@pytest.fixture(scope="function")
+def old_ipsec_vpn_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> 'OldIpsecVpnPage':
+    """已登录并导航到旧版IPsec页面的实例。"""
+    pg = OldIpsecVpnPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_old_ipsec()
     return pg
 
 
@@ -1408,6 +1485,23 @@ def kernel_setting_page_logged_in(
 
 
 @pytest.fixture(scope="function")
+def account_setting_page(page: Page, config: Config) -> AccountSettingPage:
+    """创建设备设置-登录管理-账号设置页面实例。"""
+    return AccountSettingPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def account_setting_page_logged_in(
+    logged_in_page: Page, config: Config
+) -> AccountSettingPage:
+    """返回已登录并进入设备设置-登录管理-账号设置的页面实例。"""
+    account_page = AccountSettingPage(logged_in_page, config.get_base_url())
+    if not account_page.navigate_to_account_setting():
+        pytest.fail("无法导航到设备设置-登录管理-账号设置")
+    return account_page
+
+
+@pytest.fixture(scope="function")
 def cloud_service_binding_page(page: Page, config: Config) -> CloudServiceBindingPage:
     """创建设备设置-云服务绑定页面实例。"""
     return CloudServiceBindingPage(page, config.get_base_url())
@@ -1436,6 +1530,20 @@ def ospf_page_logged_in(logged_in_page: Page, config: Config) -> OspfPage:
     ospf = OspfPage(logged_in_page, config.get_base_url())
     ospf.navigate_to_ospf()
     return ospf
+
+
+@pytest.fixture(scope="function")
+def sdwan_page(page: Page, config: Config) -> SdwanPage:
+    """创建网络配置-SD-WAN页面实例。"""
+    return SdwanPage(page, config.get_base_url())
+
+
+@pytest.fixture(scope="function")
+def sdwan_page_logged_in(logged_in_page: Page, config: Config) -> SdwanPage:
+    """返回已登录并进入网络配置-SD-WAN的页面实例。"""
+    pg = SdwanPage(logged_in_page, config.get_base_url())
+    pg.navigate_to_sdwan()
+    return pg
 
 
 @pytest.fixture(scope="function")
@@ -1932,6 +2040,9 @@ def pytest_configure(config):
         "markers", "ipsec_vpn: IPSec VPN模块测试"
     )
     config.addinivalue_line(
+        "markers", "old_ipsec_vpn: 旧版IPsec模块测试"
+    )
+    config.addinivalue_line(
         "markers", "ike_client: IKEv2/IPSec客户端模块测试"
     )
     config.addinivalue_line(
@@ -1945,6 +2056,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "cloud_service_binding: 设备设置-云服务绑定模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "sdwan: 网络配置-SD-WAN模块测试"
     )
     config.addinivalue_line(
         "markers", "alg_setting: 设备设置-高级管理-ALG设置模块测试"
@@ -1972,6 +2086,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "threat_intelligence: 安全中心-威胁情报中心模块测试"
+    )
+    config.addinivalue_line(
+        "markers", "custom_domain_group: 网址浏览控制-自定义网址库模块测试"
     )
     config.addinivalue_line("markers", "p0: P0冒烟-核心CRUD/导入导出/批量(必跑)")
     config.addinivalue_line("markers", "p1: P1功能-全协议/全动作/优先级排序(常规回归)")
@@ -2186,7 +2303,8 @@ def pytest_sessionfinish(session, exitstatus):
                 )
                 artifact_paths = [json_path, output_path]
                 leaked_artifacts = []
-                registered = get_registered_sensitive_values()
+                registered = [s for s in get_registered_sensitive_values()
+                              if s not in _PUBLIC_DOMAIN_ALLOWLIST]
                 for artifact_path in artifact_paths:
                     with open(artifact_path, "r", encoding="utf-8") as artifact_file:
                         artifact_text = artifact_file.read()

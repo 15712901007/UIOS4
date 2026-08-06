@@ -1,4 +1,4 @@
-"""IKEv2/IPSec客户端页面类 (网络配置→内外网设置→VPN客户端→IKEv2/IPSec)
+"""IKEv2/IPsec客户端页面类 (虚拟专网→IKEv2/IPsec→IKEv2/IPsec客户端)
 
 数据库表: ike_client (底层脚本 ike_client.sh, strongswan/charon进程, ipsec sa)
 表单字段(id): name*(iked开头) | authby*(类型,select "IKEv2/IPsec MSCHAPv2"=mschapv2 / 预共享密钥=secret) |
@@ -14,10 +14,12 @@ from pages.network.vpn_client_base import VpnClientBasePage
 
 
 class IkeClientPage(VpnClientBasePage):
-    """IKEv2/IPSec客户端(拨号名称iked开头, 默认MSCHAPv2认证, leftid唯一)"""
+    """IKEv2/IPsec客户端(拨号名称iked开头, 默认MSCHAPv2认证, leftid唯一)"""
 
     MODULE_NAME = "ike_client"
-    SUBTAB = "IKEv2/IPSec"
+    LIST_URL = "/#/vpn/ikev2"
+    CLIENT_TAB = "IKEv2/IPsec客户端"
+    SUBTAB = "IKEv2/IPsec"
     ADD_URL_TYPE = "IKEv2IPSec"
     NAME_PREFIX = "iked"
 

@@ -1,6 +1,6 @@
 """OpenVPN客户端综合测试用例
 
-网络配置→内外网设置→VPN客户端→OpenVPN
+虚拟专网→OpenVPN→OpenVPN客户端
 SSH后台: L1数据库(openvpn_client表, must_pass) + L2连接(openvpn进程/tun接口, 软断言)
 字段映射: name(ovpn开头,仅ascii)/remote_addr(服务器)/remote_port(1194)/method(认证方式)/
           username/password/ca(CA证书,textarea必填!)/cipher/proto/dev_type/tun_mtu/comment

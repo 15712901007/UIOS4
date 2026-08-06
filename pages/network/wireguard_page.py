@@ -1,4 +1,4 @@
-"""WireGuard客户端页面类 (网络配置→内外网设置→VPN客户端→WireGuard)
+"""WireGuard客户端页面类 (虚拟专网→WireGuard)
 
 数据库表: wireguard (底层脚本 wireguard.sh, wg接口, peer在wireguard_peers表)
 表单字段(id, 仅本地配置): name*(服务接口,wg开头) | local_address*(本地地址,10.0.8.1/24,unique) |
@@ -17,6 +17,7 @@ class WireguardPage(VpnClientBasePage):
     """WireGuard客户端(服务接口wg开头, 本地地址唯一, 公私钥自动生成)"""
 
     MODULE_NAME = "wireguard"
+    LIST_URL = "/#/vpn/wireGuard"
     SUBTAB = "WireGuard"
     ADD_URL_TYPE = "WireGuard"
     NAME_PREFIX = "wg"

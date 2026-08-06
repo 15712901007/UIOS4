@@ -8,7 +8,7 @@ URL: /#/networkConfiguration/internalAndExternalNetworkSettings
 网卡绑定: 点击"选择网卡"→ 弹窗checkbox勾选/取消网卡
 
 页面特点: 虚拟滚动 div.ant-table-row 表格(非tr), 行操作为链接文字.
-⚠️ 安全约束: wan1(eth5=10.66.0.150测试机访问地址)绝对只读, Page层硬拒绝编辑.
+⚠️ 安全约束: wan1为管理逻辑口，绝对只读；物理绑定名由运行时识别eth/veth.
 
 数据库表 (来自 lan.sh/wan.sh 探索):
 - lan_config: id/tagname/bandif(网卡mac列表)/bandeth/ip_mask/lan_visit(0关1开)/bandmode/comment
@@ -30,11 +30,13 @@ URL: /#/networkConfiguration/internalAndExternalNetworkSettings
   - 按钮: 断开/重拨/保存/取消
 - LAN编辑页字段: 名称/IP地址/子网掩码/允许其他LAN访问(开关)/网卡速率/工作模式
 """
+import re
 from typing import Optional, List, Dict
 from playwright.sync_api import Page, Locator
 
 from pages.base_page import BasePage
 from pages.ikuai_table_page import IkuaiTablePage
+from utils.interface_topology import extract_physical_nic_names
 
 
 class InterfaceSettingsPage(IkuaiTablePage):
@@ -1268,19 +1270,66 @@ class InterfaceSettingsPage(IkuaiTablePage):
             return False
 
     def fill_lan_ip(self, ip: str, netmask: str = "255.255.255.0"):
-        """填写LAN的IP/掩码(LAN编辑页)"""
+        """填写LAN的IP/掩码(LAN编辑页), 兼容空值和不同固件占位符。"""
         try:
-            inputs = self.page.locator("input[type=text]")
-            # LAN编辑页: 名称后是IP/掩码
+            ip_input = self.page.get_by_placeholder("请输入IP地址")
+            if ip_input.count() > 0:
+                ip_input.first.fill(ip)
+                # 当前固件掩码是Ant Select且新建时默认/24；不要把后续备注
+                # 文本框误当成掩码。非默认值再精确寻找掩码下拉。
+                if netmask != "255.255.255.0":
+                    selects = self.page.locator(".ant-select")
+                    for i in range(selects.count()):
+                        selected = selects.nth(i).locator(".ant-select-selection-item")
+                        value = (selected.first.text_content() or "") if selected.count() else ""
+                        if re.search(r"255\.255\.|/\d+", value):
+                            selects.nth(i).locator(".ant-select-selector").click()
+                            option = self.page.locator(".ant-select-dropdown:visible").last.locator(
+                                ".ant-select-item-option-content"
+                            ).filter(has_text=netmask)
+                            if option.count() > 0:
+                                option.first.click()
+                            break
+                return self
+
+            # 优先按表单项标签定位，避免依赖已有IP值(新建LAN时该值为空)。
+            items = self.page.locator(".ant-form-item")
+            filled_ip = False
+            filled_mask = False
+            for i in range(items.count()):
+                item = items.nth(i)
+                label = (item.inner_text(timeout=1000) or "").casefold()
+                if not any(token in label for token in ("ip", "地址", "掩码", "mask")):
+                    continue
+                fields = item.locator("input[type=text]:visible:not([disabled])")
+                if fields.count() == 0:
+                    continue
+                if "掩码" in label or "mask" in label:
+                    fields.nth(0).fill(netmask)
+                    filled_mask = True
+                else:
+                    fields.nth(0).fill(ip)
+                    filled_ip = True
+                    if fields.count() > 1:
+                        fields.nth(1).fill(netmask)
+                        filled_mask = True
+                if filled_ip and filled_mask:
+                    return self
+            if filled_ip and filled_mask:
+                return self
+
+            # 固件有时把IP和掩码拆成无标签输入；排除名称输入后按顺序填充。
+            inputs = self.page.locator("input[type=text]:visible:not([disabled])")
+            candidates = []
             for i in range(inputs.count()):
-                v = inputs.nth(i).input_value(timeout=1000)
-                if self._looks_like_ip(v):
-                    inputs.nth(i).fill("")
-                    inputs.nth(i).fill(ip)
-                    if i + 1 < inputs.count():
-                        inputs.nth(i + 1).fill("")
-                        inputs.nth(i + 1).fill(netmask)
-                    break
+                field = inputs.nth(i)
+                placeholder = (field.get_attribute("placeholder") or "").casefold()
+                if "名称" not in placeholder and "name" not in placeholder:
+                    candidates.append(field)
+            if candidates:
+                candidates[0].fill(ip)
+                if len(candidates) > 1:
+                    candidates[1].fill(netmask)
         except Exception as e:
             print(f"[DEBUG] fill_lan_ip error: {e}")
         return self
@@ -1309,25 +1358,41 @@ class InterfaceSettingsPage(IkuaiTablePage):
         return self.page.locator(".ant-drawer-open .ant-drawer-content").last
 
     def get_nic_dialog_nics(self) -> List[str]:
-        """获取网卡选择抽屉里的网卡列表(如ETH0/ETH1/ETH2)"""
-        nics = []
+        """获取抽屉里的精确网卡名，兼容eth/veth及Linux可预测命名。"""
         try:
             drawer = self._get_drawer()
-            import re
             txt = drawer.inner_text(timeout=2000)
-            nics = list(set(re.findall(r'(?:ETH|eth)\d+', txt)))
-            nics.sort()
+            return extract_physical_nic_names(txt)
         except Exception as e:
             print(f"[DEBUG] get_nic_dialog_nics error: {e}")
-        return nics
+        return []
+
+    def _find_nic_option(self, container: Locator, nic_name: str) -> Optional[Locator]:
+        """按完整接口名定位选择项，兼容抽屉和新增页两种DOM。"""
+        expected = str(nic_name or "").casefold()
+        try:
+            # 选择网卡抽屉使用_checkbox_*；新增配置页使用_select_ports_*。
+            # 两者都按卡片自身文本解析并做完整名称比较，避免eth1命中veth1。
+            for selector in ("[class*=checkbox]", "[class*=select_ports]"):
+                options = container.locator(selector)
+                for index in range(options.count()):
+                    option = options.nth(index)
+                    try:
+                        names = extract_physical_nic_names(option.inner_text(timeout=1000))
+                    except Exception:
+                        continue
+                    if any(name.casefold() == expected for name in names):
+                        return option
+        except Exception as e:
+            print(f"[DEBUG] _find_nic_option({nic_name}) error: {e}")
+        return None
 
     def _is_nic_checked(self, nic_name: str) -> bool:
         """判断抽屉里指定网卡是否已选中(子div类含_checked)"""
         try:
             drawer = self._get_drawer()
-            # 网卡项是 [class*=checkbox] 元素, 文字含网卡名
-            cb = drawer.locator("[class*=checkbox]").filter(has_text=nic_name.upper()).first
-            if cb.count() == 0:
+            cb = self._find_nic_option(drawer, nic_name)
+            if cb is None:
                 return False
             # 选中状态: 子div类含 _checked (排除 _uncheck)
             child_cls = cb.locator("div").first.get_attribute("class") or ""
@@ -1339,8 +1404,8 @@ class InterfaceSettingsPage(IkuaiTablePage):
         """在网卡选择抽屉中勾选/取消指定网卡(ETH1等). 用Playwright真实click触发React"""
         try:
             drawer = self._get_drawer()
-            cb = drawer.locator("[class*=checkbox]").filter(has_text=nic_name.upper()).first
-            if cb.count() == 0:
+            cb = self._find_nic_option(drawer, nic_name)
+            if cb is None:
                 print(f"[DEBUG] toggle_nic_in_dialog: 未找到网卡 {nic_name}")
                 return False
             is_checked = self._is_nic_checked(nic_name)
@@ -1384,7 +1449,10 @@ class InterfaceSettingsPage(IkuaiTablePage):
             # _checked_disable 表示禁用(唯一网卡不能解绑), 这种情况跳过不算失败
             try:
                 drawer = self._get_drawer()
-                cb = drawer.locator("[class*=checkbox]").filter(has_text=nic.upper()).first
+                cb = self._find_nic_option(drawer, nic)
+                if cb is None:
+                    all_ok = False
+                    continue
                 child_cls = cb.locator("div").first.get_attribute("class") or ""
                 if "disable" in child_cls:
                     print(f"[DEBUG] {nic} 被禁用(唯一网卡), 跳过解绑")
@@ -1402,12 +1470,14 @@ class InterfaceSettingsPage(IkuaiTablePage):
         """给接口绑定指定网卡(勾选)"""
         if not self.open_select_nic_dialog(interface_name):
             return False
+        all_ok = True
         for nic in nic_names:
-            self.toggle_nic_in_dialog(nic, check=True)
+            if not self.toggle_nic_in_dialog(nic, check=True):
+                all_ok = False
         ok = self.save_nic_dialog()
         self.page.wait_for_timeout(1500)
         self.back_to_list()
-        return ok
+        return ok and all_ok
 
     # ==================== 新增配置 ====================
     def is_add_button_enabled(self) -> bool:
@@ -1451,26 +1521,41 @@ class InterfaceSettingsPage(IkuaiTablePage):
         停在 addLanWan 或出现错误提示即判失败(防'没新建却显示新建成功').
         注: addLanWan页面网卡/类型为卡片式, 用真实click触发"""
         try:
-            target = nic_name.upper()
-            # addLanWan页面: 网卡是卡片式checkbox(同选择网卡抽屉的_checkbox结构)
-            # 1. 选类型(LAN/WAN) - radio或卡片
+            # 1. 选类型(LAN/WAN)。新固件使用_select_block_*卡片，旧固件
+            # 可能仍是Ant Radio，两种结构都要支持。
             type_kw = "内网" if iftype == "lan" else "外网"
+            type_card_text = "配置LAN" if iftype == "lan" else "配置WAN"
+            type_selected = False
+            try:
+                label = self.page.get_by_text(type_card_text, exact=True).first
+                card = label.locator("xpath=ancestor::div[contains(@class, 'select_block')][1]")
+                if card.count() > 0:
+                    card.click()
+                    self.page.wait_for_timeout(400)
+                    type_selected = True
+            except Exception:
+                pass
             radios = self.page.locator(".ant-radio-wrapper, .ant-radio-button-wrapper")
-            for i in range(min(radios.count(), 6)):
+            for i in range(0 if type_selected else min(radios.count(), 6)):
                 try:
                     t = (radios.nth(i).inner_text(timeout=1000) or "").strip()
                     if type_kw in t:
                         radios.nth(i).click()
                         self.page.wait_for_timeout(400)
+                        type_selected = True
                         break
                 except Exception:
                     continue
-            # 2. 选网卡(卡片式checkbox) — 必须选中, 否则保存必失败, 不浪费保存
-            nic_cb = self.page.locator("[class*=checkbox]").filter(has_text=target)
-            if nic_cb.count() == 0:
-                print(f"[DEBUG] create_interface: 未找到网卡 {target}, 新建失败")
+            if not type_selected:
+                print(f"[DEBUG] create_interface: 未找到用途卡片 {type_card_text}")
                 return False
-            nic_cb.first.click()
+            # 2. 选网卡(卡片式checkbox) — 必须选中, 否则保存必失败, 不浪费保存
+            nic_cb = self._find_nic_option(self.page.locator("body"), nic_name)
+            if nic_cb is None:
+                available = extract_physical_nic_names(self.page.locator("body").inner_text())
+                print(f"[DEBUG] create_interface: 未找到网卡 {nic_name}, 可选={available}")
+                return False
+            nic_cb.click()
             self.page.wait_for_timeout(500)
             # 3. 点保存/确定
             saved = False

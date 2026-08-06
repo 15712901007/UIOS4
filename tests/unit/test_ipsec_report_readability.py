@@ -213,11 +213,13 @@ def test_ipsec_restore_diff_reports_changed_lines_instead_of_only_hashes(monkeyp
     assert "route_hash" not in str(result.details)
 
 
-def test_failed_report_steps_expand_backend_commands_by_default():
+def test_report_steps_keep_backend_commands_inline_and_copyable():
     root = Path(__file__).resolve().parents[2]
     template = (
         root / "reports" / "templates" / "report_template.html"
     ).read_text(encoding="utf-8")
 
     assert "后端人工复验命令（逐条复制执行）" in template
-    assert "step.status in ['failed', 'error'] %} open" in template
+    assert '<div class="verification-command-card">' in template
+    assert 'class="copy-verification-command"' in template
+    assert "step.status in ['failed', 'error'] %} open" not in template

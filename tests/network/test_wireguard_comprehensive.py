@@ -1,6 +1,6 @@
 """WireGuard客户端综合测试用例
 
-网络配置→内外网设置→VPN客户端→WireGuard
+虚拟专网→WireGuard
 SSH后台: L1数据库(wireguard表, must_pass) + L2连接(wg接口UP, 软断言)
 字段映射: name(服务接口,wg开头,仅ascii)/local_address(本地地址,unique)/local_publickey/local_privatekey(自动生成)/
           interface(线路)/local_listenport(监听端口,50000)/mtu(1420)

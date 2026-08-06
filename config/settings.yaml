@@ -159,7 +159,7 @@ test_data:
     route_object_domain:
       export_filename: "route_object_domain_config.txt"
       import_filename: "route_object_domain_import.txt"
-    # VPN客户端(6子模块, 网络配置→内外网设置→VPN客户端)
+    # 虚拟专网客户端(5子模块: PPTP/L2TP/OpenVPN/IKEv2/IPsec/WireGuard)
     pptp_client:
       export_filename: "pptp_client_config.csv"
       import_filename: "pptp_client_import.csv"
@@ -169,6 +169,7 @@ test_data:
     openvpn_client:
       export_filename: "openvpn_client_config.csv"
       import_filename: "openvpn_client_import.csv"
+    # 旧版IPsec(site-to-site)导入导出配置
     ipsec_vpn:
       export_filename: "ipsec_vpn_config.csv"
       import_filename: "ipsec_vpn_import.csv"
@@ -190,6 +191,10 @@ test_data:
     kernel_setting:
       export_filename: "kernel_setting_config.csv"
       import_filename: "kernel_setting_import.csv"
+    # 设备设置>登录管理>账号设置（页面无导入导出入口，底层脚本能力不作为GUI能力暴露）
+    account_setting:
+      export_filename: "account_setting_config.csv"
+      import_filename: "account_setting_import.csv"
     # 设备设置>云服务绑定（绑定云账号管理, 无导入导出, 占位保持配置一致）
     cloud_service_binding:
       export_filename: "cloud_service_binding_config.csv"
@@ -226,6 +231,18 @@ test_data:
     acl:
       export_filename: "acl_config.csv"
       import_filename: "acl_import.csv"
+    # 安全中心>网址浏览控制>网址黑白名单（页面支持CSV/TXT双格式）
+    url_black:
+      export_filename: "url_black_config.csv"
+      import_filename: "url_black_import.csv"
+    # 安全中心>网址浏览控制>禁止娱乐网站（页面支持CSV/TXT双格式）
+    domain_blacklist:
+      export_filename: "domain_blacklist_config.csv"
+      import_filename: "domain_blacklist_import.csv"
+    # 安全中心>网址浏览控制>自定义网址库（页面支持CSV/TXT双格式）
+    custom_domain_group:
+      export_filename: "custom_domain_group_config.csv"
+      import_filename: "custom_domain_group_import.csv"
     # 安全中心>连接数限制
     conn_limit:
       export_filename: "conn_limit_config.csv"

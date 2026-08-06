@@ -218,6 +218,13 @@ class ReportGenerator:
         # 测试用例列表
         test_cases = test_results.get('test_cases', [])
 
+        for case in test_cases:
+            if not isinstance(case, dict):
+                continue
+            for step in case.get('steps', []) or []:
+                if isinstance(step, dict):
+                    self._normalize_step_record(step)
+
         # 为失败用例自动注入"失败原因分析"（中文解读，让报告看得懂）
         for case in test_cases:
             if isinstance(case, dict) and case.get('status') == 'failed' and not case.get('failure_analysis'):
@@ -261,6 +268,77 @@ class ReportGenerator:
             'total_steps': total_steps,  # 添加步骤总数
             'test_cases': test_cases
         }
+
+    @staticmethod
+    def _normalize_step_record(step: Dict) -> None:
+        """Build the unified test-item/action/expected/actual/verdict view.
+
+        New tests provide these fields directly. Historical tests usually put
+        ``操作：...；验证：...`` in description or name, so keep parsing that
+        convention instead of forcing a repository-wide migration.
+        """
+        name = str(step.get("name") or "未命名测试项")
+        description = str(step.get("description") or "")
+        source = description or name
+        action = str(step.get("action") or "")
+        expected = str(step.get("expected") or "")
+        if "操作：" in source and "；验证：" in source:
+            split = source.split("操作：", 1)[1].split("；验证：", 1)
+            action = action or split[0].strip()
+            expected = expected or split[1].strip()
+        else:
+            action = action or source
+        expected = expected or "按本步骤检查项判定"
+
+        status = str(step.get("status") or "pending")
+        status_labels = {
+            "passed": "通过",
+            "failed": "失败",
+            "error": "失败",
+            "warning": "警告",
+            "not_applicable": "不适用",
+            "skipped": "不适用",
+            "pending": "待执行",
+            "running": "执行中",
+        }
+        actual = str(step.get("actual") or "").strip()
+        if not actual:
+            # 优先从 details 提炼带【云端】/【后端】/【页面】等前缀 + [OK]/[FAIL] 的真实证据行,
+            # 作为"实际结果"摘要(让实际结果体现真实命令动作与返回, 而非通用文案)。
+            evidence = []
+            for d in (step.get("details") or []):
+                ds = re.sub(r"\s+", " ", str(d)).strip()
+                if (any(k in ds for k in ("【云端】", "【后端】", "【页面】", "【运行时】",
+                                          "【协议】", "【清理】", "【启用", "【添加】", "【删除】"))
+                        and any(mark in ds for mark in ("[OK]", "[FAIL]", "[WARN]"))):
+                    evidence.append(ds[:100])
+            if evidence:
+                actual = "；".join(evidence[:4])
+            elif status in {"failed", "error", "warning"}:
+                actual = str(step.get("error_message") or "存在检查项未达到预期，见执行证据")
+            elif status in {"not_applicable", "skipped"}:
+                actual = str(step.get("error_message") or "前置条件不满足或当前环境不适用")
+            elif status == "passed":
+                actual = "本步骤记录的页面、后台或真实流量检查均达到预期"
+            else:
+                actual = "尚未形成最终结果"
+
+        step["test_item"] = str(step.get("test_item") or name)
+        step["action"] = action
+        step["expected"] = expected
+        step["actual_result"] = actual
+        step["verdict"] = status_labels.get(status, status)
+        commands = step.get("verification_commands") or []
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            verdict = command.get("verdict")
+            if verdict is True:
+                command["verdict_label"] = "符合预期"
+            elif verdict is False:
+                command["verdict_label"] = "不符合预期"
+            else:
+                command["verdict_label"] = "供人工复验"
 
     def generate_from_pytest_json(self, json_path: str, output_path: str, device_info: Dict = None) -> str:
         """

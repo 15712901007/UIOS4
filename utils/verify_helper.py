@@ -13,9 +13,45 @@ collect_cmds_since_mark 差量捕获, 命令在 SSHClient.exec 咽喉点录制)�
 特化闭包(mac_access 的 PASS/FAIL格式 / ipv6_lan/wan 的自定义count对比)不套工厂,
 用 attach_cmd_recording_to_closure 包一层即可获得命令显示, 逻辑零改动。
 """
+import json
 from typing import Any, Callable, List, Optional, Sequence
 
 from utils.replay_commands import build_verification_commands
+
+
+def _decode_nested_json(value: Any) -> Any:
+    """Decode JSON strings nested inside SSH JSON output for readable reports."""
+    if isinstance(value, dict):
+        return {str(key): _decode_nested_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_nested_json(item) for item in value]
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.startswith(("{", "[")):
+            try:
+                return _decode_nested_json(json.loads(candidate))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+    return value
+
+
+def _format_ssh_json_evidence(label: str, result: Any, raw: Any) -> str:
+    """Wrap exact SSH evidence in a stable, pretty-printed JSON envelope."""
+    raw_text = "" if raw is None else str(raw)
+    try:
+        data = _decode_nested_json(json.loads(raw_text))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        data = {"format": "text", "content": raw_text}
+    payload = {
+        "check": str(label),
+        "level": str(getattr(result, "level", "") or ""),
+        "passed": bool(getattr(result, "passed", False)),
+        "message": str(getattr(result, "message", "") or ""),
+        "data": data,
+    }
+    return "【后端JSON】\n" + json.dumps(
+        payload, ensure_ascii=False, indent=2, sort_keys=False
+    )
 
 
 def _format_cmds(cmds: List[str], per_limit: int = 200) -> str:
@@ -40,8 +76,14 @@ def _is_safe_report_verifier(verify_func: Optional[Callable]) -> bool:
         module.endswith("qemu_verifier") or
         "ospf" in name or
         "ioc" in name.lower() or
+        "webuser" in name.lower() or
         any(service in name for service in ("ftp", "samba", "http")) or
         "alg" in name.lower() or
+        name.startswith((
+            "verify_url_black_",
+            "verify_domain_blacklist_",
+            "verify_custom_domain_group_",
+        )) or
         ("snmp" in name and "netsnmpc" not in name)
     )
 
@@ -51,6 +93,7 @@ def _record_verification_commands(
     rec,
     mark,
     *,
+    io_mark=None,
     verify_func: Optional[Callable] = None,
     verify_args: Sequence[Any] = (),
     verify_kwargs: Optional[dict] = None,
@@ -80,8 +123,103 @@ def _record_verification_commands(
                 manual_commands = []
                 rec.add_detail(f"【人工复验命令】⚠ 生成失败，已隐藏自动化内部脚本：{str(exc)[:160]}")
 
+    verifier_name = getattr(verify_func, "__name__", "")
+    if verifier_name.startswith((
+        "verify_url_black_",
+        "verify_domain_blacklist_",
+        "verify_custom_domain_group_",
+    )) and io_mark is not None:
+        io_pairs = bv.collect_io_since_mark(io_mark)
+        if io_pairs:
+            verdict = getattr(result, "passed", None)
+            message = getattr(result, "message", "") if result is not None else ""
+            actual_commands = []
+            for pair in io_pairs:
+                command = str(pair.get("command") or "").strip()
+                if not command:
+                    continue
+                role = str(pair.get("role") or "router")
+                if "curl " in command:
+                    purpose = (
+                        "执行禁止娱乐网站HTTP/HTTPS真实流量探测"
+                        if verifier_name.startswith("verify_domain_blacklist_")
+                        else "执行网址黑白名单HTTP/HTTPS真实流量探测"
+                    )
+                    expected = "HTTP状态码和curl退出码符合本步骤放行或阻断预期"
+                    effect = "发送一条HTTP或HTTPS测试请求"
+                elif "url_white_refer" in command:
+                    purpose = "读取白名单HTTP外链开关持久化值"
+                    expected = "返回0或1，并与页面保存值一致"
+                    effect = "read_only"
+                elif "05-02-url_black_white.txt" in command:
+                    purpose = "读取网址黑白名单DPI实际下发配置"
+                    expected = "动作、转义域名和src_ipset与本步骤规则状态一致"
+                    effect = "read_only"
+                elif "05-01-domain_blacklist.txt" in command:
+                    purpose = "读取禁止娱乐网站DPI实际下发配置"
+                    expected = "BLACK_DOMAIN、分类域名、src_ipset和time_set与规则状态一致"
+                    effect = "read_only"
+                elif "domain_group.sh" in command:
+                    purpose = "读取自定义网址库分类展开结果"
+                    expected = "目标自定义域名按步骤预期出现在指定网站分类中"
+                    effect = "read_only"
+                elif "ipset test" in command:
+                    purpose = "检查客户端IP是否属于规则源地址集合"
+                    expected = "退出码标记与本步骤成员关系预期一致"
+                    effect = "read_only"
+                elif "ipset list" in command:
+                    purpose = "读取网址规则源地址集合及删除残留"
+                    expected = "集合存在性与规则启停或删除状态一致"
+                    effect = "read_only"
+                elif "FROM url_black" in command or "from url_black" in command:
+                    purpose = "读取网址黑白名单数据库记录"
+                    expected = "规则字段、数量或不存在状态符合本步骤预期"
+                    effect = "read_only"
+                elif "FROM domain_blacklist" in command or "from domain_blacklist" in command:
+                    purpose = "读取禁止娱乐网站数据库记录"
+                    expected = "规则分类、源地址、时间、数量或不存在状态符合本步骤预期"
+                    effect = "read_only"
+                elif "FROM custom_domain_group" in command or "from custom_domain_group" in command:
+                    purpose = "读取自定义网址库数据库记录"
+                    expected = "名称、类别、域名、数量或不存在状态符合本步骤预期"
+                    effect = "read_only"
+                else:
+                    purpose = "执行本步骤后台验证命令"
+                    expected = message or "命令返回支持本步骤判定"
+                    effect = "read_only"
+                try:
+                    host = str(getattr(getattr(bv, "_ssh_config"), role).host)
+                except Exception:
+                    host = ""
+                actual_commands.append({
+                    "target": role,
+                    "target_label": "路由器" if role == "router" else "测试客户端",
+                    "host": host,
+                    "shell": "sh",
+                    "effect": effect,
+                    "purpose": purpose,
+                    "command": command,
+                    "expected": expected,
+                    "actual": str(pair.get("output") or "(命令无标准输出)"),
+                    "valid_when": "本自动化步骤执行期间",
+                    "copy_ready": True,
+                    "contains_secret": False,
+                    "verdict": verdict,
+                    "result_message": message,
+                    "execution_source": "actual",
+                })
+            if actual_commands:
+                rec.add_verification_commands(actual_commands)
+                return
+
     if manual_commands is not None:
         if manual_commands:
+            verdict = getattr(result, "passed", None)
+            message = getattr(result, "message", "") if result is not None else ""
+            for command in manual_commands:
+                if isinstance(command, dict):
+                    command.setdefault("verdict", verdict)
+                    command.setdefault("result_message", message)
             rec.add_verification_commands(manual_commands)
         return
 
@@ -110,6 +248,7 @@ def make_ssh_verify(bv, rec, failures, *, soft_assert: bool = False,
             return None
         mp = must_pass_default if must_pass is None else must_pass
         mark = bv.mark_cmd_start()
+        io_mark = bv.mark_io_start()
         try:
             result = verify_func(*args, **kwargs)
             if soft_assert:
@@ -125,7 +264,7 @@ def make_ssh_verify(bv, rec, failures, *, soft_assert: bool = False,
                 # 6个VPN模块步骤5全链路L2连接软断言(拨号依赖服务端,未连接属预期)均受益
                 if soft_assert and not mp and not result.passed:
                     raw = raw.replace('[FAIL]', '[软断言]')
-                rec.add_detail(f"      SSH数据: {raw}")
+                rec.add_detail(_format_ssh_json_evidence(label, result, raw))
             if mp and not result.passed:
                 failures.append(f"SSH-{label}: {result.message}")
             return result
@@ -140,6 +279,7 @@ def make_ssh_verify(bv, rec, failures, *, soft_assert: bool = False,
                 bv,
                 rec,
                 mark,
+                io_mark=io_mark,
                 verify_func=verify_func,
                 verify_args=args,
                 verify_kwargs=kwargs,

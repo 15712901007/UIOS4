@@ -81,6 +81,21 @@ def _dispatch_packaged_kernel_setting_smoke() -> None:
 _dispatch_packaged_kernel_setting_smoke()
 
 
+def _dispatch_packaged_account_setting_smoke() -> None:
+    """Run the frozen account-setting collect entry before GUI initialization."""
+    if not getattr(sys, "frozen", False):
+        return
+    if "--collect-account-setting-smoke" not in sys.argv:
+        return
+
+    from gui.test_runner import run_packaged_account_setting_collect_smoke
+
+    raise SystemExit(run_packaged_account_setting_collect_smoke())
+
+
+_dispatch_packaged_account_setting_smoke()
+
+
 def _dispatch_packaged_ospf_smoke() -> None:
     """Run the frozen OSPF collect entry before GUI initialization."""
     if not getattr(sys, "frozen", False):

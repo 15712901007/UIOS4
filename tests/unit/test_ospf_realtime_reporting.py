@@ -113,7 +113,7 @@ def test_ospf_report_has_continuous_matching_numbers_and_plain_summary(tmp_path)
     assert "RIB/FIB" not in summary
     assert "daemon" not in summary
     assert "tagname" not in summary
-    for label in ("操作：", "期望结果：", "实际现象：", "后端证据：", "人工复验命令："):
+    for label in ("操作：", "预期结果：", "实际现象：", "后端证据：", "人工复验命令："):
         assert label in html
 
 

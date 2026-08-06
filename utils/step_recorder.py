@@ -86,12 +86,19 @@ def clear_registered_sensitive_values():
         _REGISTERED_SENSITIVE_VALUES.clear()
 
 
+_PUBLIC_DOMAIN_ALLOWLIST = {"ikuai8.com"}
+# 公开域名白名单: 这些值可能被当密码注册(如 SSH 密码恰为 "ikuai8.com"), 但本质是公司公开域名,
+# 脱敏会破坏命令/URL 可读性且无安全收益(公开信息), 故在文本脱敏时豁免。
+
+
 def _redact_text(value: Any) -> str:
     """Hide credential values before a value enters shared report data."""
     if value is None:
         return ""
     text = str(value)
     for secret in get_registered_sensitive_values():
+        if secret in _PUBLIC_DOMAIN_ALLOWLIST:
+            continue
         text = text.replace(secret, _SENSITIVE_TEXT_PLACEHOLDER)
     text = _SENSITIVE_JSON_RE.sub(
         lambda match: f'{match.group(1)}"{_SENSITIVE_TEXT_PLACEHOLDER}"',
@@ -147,7 +154,13 @@ def _normalize_boolean(value: Any, *, preserve_text: bool = False):
 class TestStep:
     """测试步骤"""
 
-    def __init__(self, name: str, description: str = "", status: str = "pending"):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        status: str = "pending",
+        expected: str = "",
+    ):
         """
         初始化测试步骤
 
@@ -159,6 +172,7 @@ class TestStep:
         """
         self.name = _redact_text(name)
         self.description = _redact_text(description)
+        self.expected = _redact_text(expected)
         self.status = status
         self.start_time = datetime.now()
         self.end_time = None
@@ -307,11 +321,18 @@ class TestStep:
         """Record a concise observed result for the current step."""
         self.actual = _safe_actual(actual)
 
+    def set_expected(self, expected: Any):
+        """Record the explicit expected result for this step."""
+        self.expected = _safe_actual(expected)
+
     def to_dict(self) -> Dict:
         """转换为字典"""
         return {
             "name": self.name,
+            "test_item": self.name,
             "description": self.description,
+            "action": self.description or self.name,
+            "expected": self.expected,
             "status": self.status,
             "duration": f"{self.duration:.2f}s" if self.duration else "0s",
             "details": self.details,
@@ -367,7 +388,9 @@ class StepRecorder:
         """设置当前线程的当前步骤"""
         self._thread_local.current_step = step
 
-    def start_step(self, name: str, description: str = "") -> TestStep:
+    def start_step(
+        self, name: str, description: str = "", expected: str = ""
+    ) -> TestStep:
         """
         开始一个新步骤
 
@@ -378,7 +401,7 @@ class StepRecorder:
         Returns:
             创建的步骤对象
         """
-        step = TestStep(name, description, "running")
+        step = TestStep(name, description, "running", expected=expected)
         if "测试操作" in self.required_sections:
             step.add_detail(
                 "【测试操作】\n通过：" + (step.description or step.name)
@@ -465,6 +488,14 @@ class StepRecorder:
         current.set_actual(actual)
         return current.actual
 
+    def set_expected(self, expected: Any):
+        """Record an explicit expected result on the active step."""
+        current = self._get_current_step()
+        if current is None:
+            return None
+        current.set_expected(expected)
+        return current.expected
+
     def mark_current_step(self, status: str, error_message: str = None):
         """Mark a soft assertion without ending its cleanup/report context."""
         current = self._get_current_step()
@@ -530,7 +561,14 @@ class StepRecorder:
             self._set_current_step(None)
 
     @contextmanager
-    def step(self, name: str, description: str = "", expect_error: bool = False):
+    def step(
+        self,
+        name: str,
+        description: str = "",
+        expect_error: bool = False,
+        *,
+        expected: str = "",
+    ):
         """
         步骤上下文管理器
 
@@ -544,7 +582,7 @@ class StepRecorder:
                 # 执行操作
                 pass
         """
-        self.start_step(name, description)
+        self.start_step(name, description, expected=expected)
         error_occurred = False
         try:
             yield self

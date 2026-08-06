@@ -450,7 +450,7 @@ class TestStaticRouteComprehensive:
             print(f"  [OK] 异常输入测试: {tested_count}/{len(invalid_cases)} 正确拦截")
 
         # ========== 步骤13: 当前路由表查看 ==========
-        with rec.step("步骤13: 当前路由表查看", "切换到当前路由表标签页验证"):
+        with rec.step("步骤13: 当前路由表查看", "进入独立路由表页面并验证IPv4/IPv6数据"):
             print("\n[步骤13] 当前路由表查看...")
 
             # 确保在静态路由页面（步骤12异常输入可能导致页面状态异常）
@@ -473,7 +473,7 @@ class TestStaticRouteComprehensive:
             print(f"  IPv6路由表: {ipv6_count} 条")
             rec.add_detail(f"  IPv6路由表: {ipv6_count} 条")
 
-            # 切回静态路由标签页
+            # 返回静态路由页面
             page.switch_to_static_route_tab()
             page.page.wait_for_timeout(500)
             print(f"  [OK] 当前路由表查看完成")

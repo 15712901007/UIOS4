@@ -1,6 +1,6 @@
-"""VPN客户端6模块综合测试通用流程(数据驱动)
+"""虚拟专网客户端及旧版IPsec综合测试通用流程(数据驱动)
 
-6模块(PPTP/L2TP/OpenVPN/IPSec VPN/IKEv2/WireGuard)UI/后端验证逻辑同构,
+5个客户端模块及旧版IPsec的UI/后端验证逻辑同构,
 本helper封装完整测试流程, 各test文件只需提供test_rules数据+module_key+page实例。
 
 流程(参照端口映射27步, 适配VPN客户端特性):
@@ -18,7 +18,7 @@ from utils.verify_helper import make_ssh_verify
 def run_vpn_comprehensive_test(*, page, rec, request,
                                 module_key, test_rules, invalid_base_fields,
                                 edit_spec, ssh_failures, ui_failures):
-    """运行VPN客户端模块综合测试(6模块共用)
+    """运行虚拟专网客户端或旧版IPsec综合测试。
 
     Args:
         page: VPN page实例(已登录导航到本模块)
@@ -50,6 +50,7 @@ def run_vpn_comprehensive_test(*, page, rec, request,
 
     name_prefix = page.NAME_PREFIX
     module_name = page.MODULE_NAME
+    display_name = page.SUBTAB if module_key == "ipsec" else f"{page.SUBTAB}客户端"
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     export_csv = os.path.join(project_root, "test_data", "exports", module_name, f"{module_name}_config.csv")
     export_txt = os.path.join(project_root, "test_data", "exports", module_name, f"{module_name}_config.txt")
@@ -78,7 +79,7 @@ def run_vpn_comprehensive_test(*, page, rec, request,
                 page._set_input(fid, val)
 
     print("\n" + "=" * 60)
-    print(f"{page.SUBTAB}客户端综合测试开始 (module={module_key})")
+    print(f"{display_name}综合测试开始 (module={module_key})")
     print("=" * 60)
     print(f"测试数据: {len(test_rules)} 条规则")
     for r in test_rules:
@@ -490,5 +491,5 @@ def run_vpn_comprehensive_test(*, page, rec, request,
             print(f"  [WARN] 帮助异常: {e}"); rec.add_detail(f"帮助异常: {e}")
 
     print("\n" + "=" * 60)
-    print(f"{page.SUBTAB}客户端综合测试完成 (共{cur}步)")
+    print(f"{display_name}综合测试完成 (共{cur}步)")
     print("=" * 60)

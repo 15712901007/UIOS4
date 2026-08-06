@@ -1,4 +1,4 @@
-"""PPTP客户端页面类 (网络配置→内外网设置→VPN客户端→PPTP)
+"""PPTP客户端页面类 (虚拟专网→PPTP→PPTP客户端)
 
 数据库表: pptp_client (底层脚本 pptp_client.sh, 进程pppd, 拨号生成ppp接口)
 表单字段(id): name*(拨号名称,pptp开头) | server_port*(1723) | server*(服务器) |
@@ -14,6 +14,8 @@ class PptpClientPage(VpnClientBasePage):
     """PPTP客户端(拨号名称pptp开头, 默认端口1723)"""
 
     MODULE_NAME = "pptp_client"
+    LIST_URL = "/#/vpn/pptp"
+    CLIENT_TAB = "PPTP客户端"
     SUBTAB = "PPTP"
     ADD_URL_TYPE = "PPTP"
     NAME_PREFIX = "pptp"

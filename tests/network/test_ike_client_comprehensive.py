@@ -1,6 +1,6 @@
 """IKEv2/IPSec客户端综合测试用例
 
-网络配置→内外网设置→VPN客户端→IKEv2/IPSec
+虚拟专网→IKEv2/IPsec→IKEv2/IPsec客户端
 SSH后台: L1数据库(ike_client表, must_pass) + L2连接(ipsec sa/charon, 软断言)
 字段映射: name(iked开头,仅ascii)/authby(类型,IKEv2/IPsec MSCHAPv2)/remote_addr(服务器)/
           username/passwd(密文)/leftid(本地标识,unique!)/rightid/comment

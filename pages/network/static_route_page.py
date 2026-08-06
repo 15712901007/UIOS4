@@ -15,6 +15,7 @@ class StaticRoutePage(IkuaiTablePage):
 
     MODULE_NAME = "static_route"
     STATIC_ROUTE_URL = "/login#/networkConfiguration/staticRoute"
+    ROUTING_TABLE_URL = "/login#/networkConfiguration/routingTable"
 
     # ==================== 导航 ====================
     def navigate_to_static_route(self):
@@ -215,34 +216,66 @@ class StaticRoutePage(IkuaiTablePage):
 
     # ==================== 当前路由表（静态路由特有） ====================
     def switch_to_current_route_table(self):
-        """切换到当前路由表标签页"""
-        tab = self.page.get_by_role("tab", name="当前路由表")
-        if tab.count() > 0:
-            tab.click()
-            self.page.wait_for_timeout(500)
+        """进入当前路由表，兼容旧版标签页和新版独立菜单页面。"""
+        # 旧版前端：当前路由表位于静态路由页面内的标签页。
+        legacy_tab = self.page.get_by_role("tab", name="当前路由表", exact=True)
+        for index in range(legacy_tab.count()):
+            candidate = legacy_tab.nth(index)
+            if candidate.is_visible():
+                candidate.click()
+                self.page.wait_for_timeout(500)
+                return self
+
+        # 新版前端：路由表已经拆成左侧独立菜单。点击可见菜单项能同时
+        # 验证菜单路由配置；若响应式菜单未渲染，则直接访问已确认的新路由。
+        route_menu = self.page.get_by_role("menuitem", name="路由表", exact=True)
+        for index in range(route_menu.count()):
+            candidate = route_menu.nth(index)
+            if candidate.is_visible():
+                candidate.click()
+                self.page.wait_for_load_state("networkidle")
+                self.page.wait_for_timeout(500)
+                return self
+
+        self.page.goto(f"{self.base_url}{self.ROUTING_TABLE_URL}")
+        self.page.wait_for_load_state("networkidle")
+        self.page.wait_for_timeout(500)
         return self
 
     def switch_to_static_route_tab(self):
-        """切换回静态路由标签页"""
-        tab = self.page.get_by_role("tab", name="静态路由")
-        if tab.count() > 0:
-            tab.click()
-            self.page.wait_for_timeout(500)
-        return self
+        """返回静态路由，兼容旧版标签页和新版独立页面。"""
+        legacy_tab = self.page.get_by_role("tab", name="静态路由", exact=True)
+        for index in range(legacy_tab.count()):
+            candidate = legacy_tab.nth(index)
+            if candidate.is_visible():
+                candidate.click()
+                self.page.wait_for_timeout(500)
+                return self
+
+        return self.navigate_to_static_route()
 
     def get_current_route_table_count(self) -> int:
         """获取当前路由表中的路由条数"""
         try:
             self.page.wait_for_timeout(500)
-            rows = self.page.locator("[role='tabpanel'] table").locator("..").locator("> div > div")
-            row_count = rows.count()
-            if row_count > 0:
-                return row_count
+            # 新版路由表使用虚拟表格，数据行不在 tbody 中；页面底部总数是
+            # 最稳定且不会受视口虚拟滚动影响的权威计数。旧版则优先读取
+            # 当前可见 tabpanel，继续兼容原标签页结构。
+            for selector in ("[role='tabpanel']:visible", "main"):
+                for page_text in self.page.locator(selector).all_inner_texts():
+                    matches = re.findall(r"共\s*(\d+)\s*条", page_text)
+                    if matches:
+                        return int(matches[-1])
 
-            page_text = self.page.text_content("[role='tabpanel']") or ""
-            match = re.search(r"共\s*(\d+)\s*条", page_text)
-            if match:
-                return int(match.group(1))
+            # 无总数文案时，兼容普通 Ant Table 和新版虚拟表格。
+            rows = self.page.locator(
+                "[role='tabpanel']:visible .ant-table-row:visible, "
+                "main .ant-table-row:visible, "
+                "[role='tabpanel']:visible tbody tr:visible, "
+                "main tbody tr:visible"
+            )
+            if rows.count() > 0:
+                return rows.count()
         except Exception:
             pass
         return 0
@@ -253,14 +286,23 @@ class StaticRoutePage(IkuaiTablePage):
         Ant Design的segmented control需要点击label包装器，不能直接点击radio
         """
         try:
-            # 方法1: 点击label包装器（更可靠）
-            label = self.page.locator('label').filter(has_text=protocol)
+            # 新旧版均使用Ant Design segmented control，按title定位可避免
+            # 与页面中其他IPv4/IPv6文字发生误匹配。
+            label_content = self.page.locator(
+                f".ant-segmented-item-label[title='{protocol}']"
+            )
+            if label_content.count() > 0:
+                label_content.first.locator("..").click()
+                self.page.wait_for_timeout(500)
+                return self
+
+            # 旧版DOM回退：按label文本或radio可访问名称定位。
+            label = self.page.locator("label").filter(has_text=protocol)
             if label.count() > 0:
                 label.first.click()
                 self.page.wait_for_timeout(500)
                 return self
 
-            # 方法2: 备用 - 直接点击radio
             radio = self.page.get_by_role("radio", name=protocol)
             if radio.count() > 0:
                 radio.click()

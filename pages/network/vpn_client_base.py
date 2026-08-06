@@ -1,14 +1,13 @@
 """
-VPN客户端页面基类
+虚拟专网页面中的 VPN 客户端基类
 
-网络配置→内外网设置→VPN客户端 tab 下6个子模块(PPTP/L2TP/OpenVPN/IPSec VPN/IKEv2/WireGuard)共用。
+虚拟专网下5个客户端模块(PPTP/L2TP/OpenVPN/IKEv2/IPsec/WireGuard)
+及旧版IPsec共用。
 继承 IkuaiTablePage 获取通用表格CRUD(行内编辑/停用/删除、批量、搜索、导入导出)。
 
-实测UI特征(2026-06-25):
-- 入口URL: /login#/networkConfiguration/internalAndExternalNetworkSettings
-- 顶部第3个tab"VPN客户端" → 6个子tab(PPTP/L2TP/OpenVPN/IPSec VPN/IKEv2/IPSec/WireGuard)
-- 子tab切换不改hash(组件内state), 用JS精确文字点击
-- 添加URL: .../vpnClient/{TYPE}/add (TYPE见各模块ADD_URL_TYPE常量)
+实测UI特征(2026-08-05):
+- 五个模块均为“虚拟专网”侧栏的独立路由，具体 LIST_URL 由子类声明
+- PPTP/L2TP/OpenVPN/IKEv2 页面内再选择“客户端”页签；WireGuard 直达列表
 - 工具栏: 添加/导入/导出/帮助; 搜索框placeholder="请输入搜索内容"
 - 行内按钮: 编辑/停用(启用)/删除; 底部批量栏(div.footer): 启用/停用/删除
 - 表格首列为checkbox, 第2列为拨号名称(name, 规则标识)
@@ -22,27 +21,34 @@ from typing import Optional, List
 
 
 class VpnClientBasePage(IkuaiTablePage):
-    """VPN客户端6子模块基类, 子类设置SUBTAB/ADD_URL_TYPE并实现add_rule"""
+    """虚拟专网客户端及旧版IPsec的公共页面操作。"""
 
-    VPN_URL = "/login#/networkConfiguration/internalAndExternalNetworkSettings"
-    SUBTAB = ""          # 子类设置: "PPTP"/"L2TP"/"OpenVPN"/"IPSec VPN"/"IKEv2/IPSec"/"WireGuard"
-    ADD_URL_TYPE = ""    # 子类设置: 路由TYPE(PPTP/L2TP/openvpn/IPestVPN/IKEv2IPSec/WireGuard)
-    NAME_PREFIX = ""     # 拨号名称前缀(pptp/l2tp/ovpn/ipsec/iked/wg, 部分模块接口名需固定前缀)
+    LIST_URL = ""        # 子类设置: 新版“虚拟专网”中的列表路由
+    CLIENT_TAB = ""      # 有客户端/服务端切换的页面设置精确客户端页签名
+    SUBTAB = ""          # 模块显示名，用于日志和跳过原因
+    ADD_URL_TYPE = ""    # 兼容旧测试元数据；新增操作通过页面“添加”按钮进入
+    NAME_PREFIX = ""     # 规则名称前缀(pptp/l2tp/ovpn/ipsec/iked/wg)
 
     # ==================== 导航 ====================
 
     def navigate_to_module(self):
-        """导航到本模块列表(内外网设置→VPN客户端 tab→子tab)"""
-        self.page.goto(f"{self.base_url}{self.VPN_URL}")
+        """通过新版“虚拟专网”独立路由导航到客户端列表。"""
+        if not self.LIST_URL:
+            raise ValueError(f"{type(self).__name__} 未配置 LIST_URL")
+
+        self.page.goto(f"{self.base_url}{self.LIST_URL}")
+        self.page.wait_for_load_state("domcontentloaded")
         try:
             self.page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
         self.page.wait_for_timeout(800)
-        self._click_tab("VPN客户端")
-        self.page.wait_for_timeout(800)
-        if self.SUBTAB:
-            self._click_tab(self.SUBTAB)
+
+        if self.CLIENT_TAB:
+            if not self._click_tab(self.CLIENT_TAB):
+                raise RuntimeError(
+                    f"{type(self).__name__} 未找到客户端页签: {self.CLIENT_TAB}"
+                )
             self.page.wait_for_timeout(800)
         # 检测企业版专属功能限制(IKEv2/WireGuard在非企业版固件上只提示"此功能只企业版支持",
         # 不渲染列表与"添加"按钮 → click_add_button会超时误报FAIL; 检测后由测试skip)
@@ -54,7 +60,7 @@ class VpnClientBasePage(IkuaiTablePage):
         return self.navigate_to_module()
 
     def _click_tab(self, name: str) -> bool:
-        """精确文字匹配点击tab(VPN客户端/PPTP子tab等, 用JS避开get_by_role子串匹配)"""
+        """精确文字匹配点击客户端页签，用JS避开get_by_role子串匹配。"""
         try:
             return self.page.evaluate("""(name) => {
                 let clicked = false;
@@ -69,7 +75,7 @@ class VpnClientBasePage(IkuaiTablePage):
     def _detect_enterprise_block(self) -> bool:
         """检测当前子tab是否因非企业版被限制。
 
-        IKEv2/IPSec、WireGuard 等企业版专属功能在非企业版固件上, 进入子tab后页面只
+        IKEv2/IPsec、WireGuard 等企业版专属功能在非企业版固件上, 进入子tab后页面只
         显示"此功能只企业版支持"提示, 不渲染表格与"添加"按钮。此时 add_rule 第一步
         click_add_button 会 30s 超时, 被误报为 FAIL(实为授权限制, 非测试/产品bug)。
         检测到提示则返回True, 供测试开头 pytest.skip。

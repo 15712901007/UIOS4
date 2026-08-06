@@ -56,6 +56,10 @@ KERNEL_SETTING_TESTCASE = (
     "device_setting/test_kernel_setting_comprehensive.py::"
     "TestKernelSettingComprehensive::test_kernel_setting_comprehensive"
 )
+ACCOUNT_SETTING_TESTCASE = (
+    "device_setting/test_account_setting_comprehensive.py::"
+    "TestAccountSettingComprehensive::test_account_setting_comprehensive"
+)
 OSPF_TESTCASE = (
     "network/test_ospf_comprehensive.py::"
     "TestOspfComprehensive::test_ospf_comprehensive"
@@ -72,6 +76,7 @@ PACKAGED_BASIC_SETTING_COLLECT_FLAG = "--collect-basic-setting-smoke"
 PACKAGED_ALG_SETTING_COLLECT_FLAG = "--collect-alg-setting-smoke"
 PACKAGED_PROTOCOL_CONTROL_COLLECT_FLAG = "--collect-protocol-control-smoke"
 PACKAGED_KERNEL_SETTING_COLLECT_FLAG = "--collect-kernel-setting-smoke"
+PACKAGED_ACCOUNT_SETTING_COLLECT_FLAG = "--collect-account-setting-smoke"
 PACKAGED_OSPF_COLLECT_FLAG = "--collect-ospf-smoke"
 PACKAGED_IPSEC_COLLECT_FLAG = "--collect-ipsec-smoke"
 
@@ -1023,6 +1028,20 @@ def run_packaged_kernel_setting_collect_smoke(
     )
 
 
+def run_packaged_account_setting_collect_smoke(
+    result_path: Optional[str] = None,
+) -> int:
+    """Collect the packaged account-setting node without device I/O."""
+    return _run_packaged_collect_smoke(
+        testcase=ACCOUNT_SETTING_TESTCASE,
+        page_module="pages.device_setting.account_setting_page",
+        service_name="account_setting",
+        default_result_name="account_setting_collect_smoke.json",
+        result_path=result_path,
+        result_env_name="IKUAI_PACKAGED_ACCOUNT_SETTING_SMOKE_RESULT",
+    )
+
+
 def run_packaged_ospf_collect_smoke(result_path: Optional[str] = None) -> int:
     """Collect the packaged OSPF node without browser or device I/O."""
     return _run_packaged_collect_smoke(
@@ -1048,6 +1067,8 @@ def run_packaged_ipsec_collect_smoke(result_path: Optional[str] = None) -> int:
 
 
 if is_frozen():
+    if PACKAGED_ACCOUNT_SETTING_COLLECT_FLAG in sys.argv:
+        raise SystemExit(run_packaged_account_setting_collect_smoke())
     if PACKAGED_KERNEL_SETTING_COLLECT_FLAG in sys.argv:
         raise SystemExit(run_packaged_kernel_setting_collect_smoke())
     if PACKAGED_PROTOCOL_CONTROL_COLLECT_FLAG in sys.argv:

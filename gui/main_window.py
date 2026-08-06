@@ -723,6 +723,17 @@ class MainWindow(QMainWindow):
                             ],
                         }
                     },
+                    "SD-WAN": {
+                        "testcases": [
+                            # SD-WAN综合测试(云端主导组网: 绑云->立即开通->云端加/删成员->路由器页面+底层铁证->清理解绑)
+                            "test_sdwan_comprehensive.py::TestSdwanComprehensive::test_sdwan_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "test_sdwan_comprehensive.py::TestSdwanComprehensive::test_sdwan_comprehensive",
+                            ],
+                        }
+                    },
                     "跨三层服务": {
                         "testcases": [
                             # 跨三层服务综合测试（21步：添加8条(V2/V3)+编辑+停用+启用+删除+搜索+排序+导出+异常+批量操作+导入+频率+帮助+SSH验证）
@@ -1022,60 +1033,6 @@ class MainWindow(QMainWindow):
                             ],
                         }
                     },
-                    "VPN客户端": {
-                        "children": {
-                            "PPTP": {
-                                "testcases": [
-                                    "test_pptp_client_comprehensive.py::TestPptpClientComprehensive::test_pptp_client_comprehensive",
-                                ],
-                                "groups": {
-                                    "综合测试（推荐）": [
-                                        "test_pptp_client_comprehensive.py::TestPptpClientComprehensive::test_pptp_client_comprehensive",
-                                    ],
-                                }
-                            },
-                            "L2TP": {
-                                "testcases": [
-                                    "test_l2tp_client_comprehensive.py::TestL2tpClientComprehensive::test_l2tp_client_comprehensive",
-                                ],
-                                "groups": {
-                                    "综合测试（推荐）": [
-                                        "test_l2tp_client_comprehensive.py::TestL2tpClientComprehensive::test_l2tp_client_comprehensive",
-                                    ],
-                                }
-                            },
-                            "OpenVPN": {
-                                "testcases": [
-                                    "test_openvpn_client_comprehensive.py::TestOpenvpnClientComprehensive::test_openvpn_client_comprehensive",
-                                ],
-                                "groups": {
-                                    "综合测试（推荐）": [
-                                        "test_openvpn_client_comprehensive.py::TestOpenvpnClientComprehensive::test_openvpn_client_comprehensive",
-                                    ],
-                                }
-                            },
-                            "IKEv2/IPSec": {
-                                "testcases": [
-                                    "test_ike_client_comprehensive.py::TestIkeClientComprehensive::test_ike_client_comprehensive",
-                                ],
-                                "groups": {
-                                    "综合测试（推荐）": [
-                                        "test_ike_client_comprehensive.py::TestIkeClientComprehensive::test_ike_client_comprehensive",
-                                    ],
-                                }
-                            },
-                            "WireGuard": {
-                                "testcases": [
-                                    "test_wireguard_comprehensive.py::TestWireguardComprehensive::test_wireguard_comprehensive",
-                                ],
-                                "groups": {
-                                    "综合测试（推荐）": [
-                                        "test_wireguard_comprehensive.py::TestWireguardComprehensive::test_wireguard_comprehensive",
-                                    ],
-                                }
-                            },
-                        }
-                    },
                     "IPv6设置": {
                         "children": {
                             "外网设置": {
@@ -1186,6 +1143,20 @@ class MainWindow(QMainWindow):
                             "综合测试（推荐）": [
                                 "device_setting/test_basic_setting_comprehensive.py::TestBasicSettingComprehensive::test_basic_setting_comprehensive",
                             ],
+                        }
+                    },
+                    "登录管理": {
+                        "children": {
+                            "账号设置": {
+                                "testcases": [
+                                    "device_setting/test_account_setting_comprehensive.py::TestAccountSettingComprehensive::test_account_setting_comprehensive",
+                                ],
+                                "groups": {
+                                    "综合测试（推荐）": [
+                                        "device_setting/test_account_setting_comprehensive.py::TestAccountSettingComprehensive::test_account_setting_comprehensive",
+                                    ],
+                                }
+                            },
                         }
                     },
                     "高级管理": {
@@ -1330,6 +1301,66 @@ class MainWindow(QMainWindow):
                             ],
                         }
                     },
+                    "PPTP": {
+                        "testcases": [
+                            "network/test_pptp_client_comprehensive.py::TestPptpClientComprehensive::test_pptp_client_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "network/test_pptp_client_comprehensive.py::TestPptpClientComprehensive::test_pptp_client_comprehensive",
+                            ],
+                        }
+                    },
+                    "L2TP": {
+                        "testcases": [
+                            "network/test_l2tp_client_comprehensive.py::TestL2tpClientComprehensive::test_l2tp_client_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "network/test_l2tp_client_comprehensive.py::TestL2tpClientComprehensive::test_l2tp_client_comprehensive",
+                            ],
+                        }
+                    },
+                    "OpenVPN": {
+                        "testcases": [
+                            "network/test_openvpn_client_comprehensive.py::TestOpenvpnClientComprehensive::test_openvpn_client_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "network/test_openvpn_client_comprehensive.py::TestOpenvpnClientComprehensive::test_openvpn_client_comprehensive",
+                            ],
+                        }
+                    },
+                    "旧版IPsec": {
+                        "testcases": [
+                            "network/test_old_ipsec_vpn_comprehensive.py::TestOldIpsecVpnComprehensive::test_old_ipsec_vpn_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "network/test_old_ipsec_vpn_comprehensive.py::TestOldIpsecVpnComprehensive::test_old_ipsec_vpn_comprehensive",
+                            ],
+                        }
+                    },
+                    "IKEv2/IPsec": {
+                        "testcases": [
+                            "network/test_ike_client_comprehensive.py::TestIkeClientComprehensive::test_ike_client_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "network/test_ike_client_comprehensive.py::TestIkeClientComprehensive::test_ike_client_comprehensive",
+                            ],
+                        }
+                    },
+                    "WireGuard": {
+                        "testcases": [
+                            "network/test_wireguard_comprehensive.py::TestWireguardComprehensive::test_wireguard_comprehensive",
+                        ],
+                        "groups": {
+                            "综合测试（推荐）": [
+                                "network/test_wireguard_comprehensive.py::TestWireguardComprehensive::test_wireguard_comprehensive",
+                            ],
+                        }
+                    },
                 }
             },
             "安全中心": {
@@ -1364,6 +1395,60 @@ class MainWindow(QMainWindow):
                             "综合测试（推荐）": [
                                 "security/test_mac_access_control_comprehensive.py::TestMacAccessControlComprehensive::test_mac_access_control_comprehensive",
                             ]
+                        }
+                    },
+                    "网址浏览控制-网址黑白名单": {
+                        "testcases": [
+                            "security/test_url_black_comprehensive.py::TestUrlBlackComprehensive::test_url_black_comprehensive",
+                            "security/test_url_black_functional.py::TestUrlBlackFunctional::test_url_black_http_https_flow",
+                        ],
+                        "groups": {
+                            "综合测试（L1-L4）": [
+                                "security/test_url_black_comprehensive.py::TestUrlBlackComprehensive::test_url_black_comprehensive",
+                            ],
+                            "功能测试（L5真实流量）": [
+                                "security/test_url_black_functional.py::TestUrlBlackFunctional::test_url_black_http_https_flow",
+                            ],
+                            "完整验证（推荐）": [
+                                "security/test_url_black_comprehensive.py::TestUrlBlackComprehensive::test_url_black_comprehensive",
+                                "security/test_url_black_functional.py::TestUrlBlackFunctional::test_url_black_http_https_flow",
+                            ],
+                        }
+                    },
+                    "网址浏览控制-禁止娱乐网站": {
+                        "testcases": [
+                            "security/test_domain_blacklist_comprehensive.py::TestDomainBlacklistComprehensive::test_domain_blacklist_comprehensive",
+                            "security/test_domain_blacklist_functional.py::TestDomainBlacklistFunctional::test_domain_blacklist_http_https_flow",
+                        ],
+                        "groups": {
+                            "综合测试（L1-L4）": [
+                                "security/test_domain_blacklist_comprehensive.py::TestDomainBlacklistComprehensive::test_domain_blacklist_comprehensive",
+                            ],
+                            "功能测试（L5真实流量）": [
+                                "security/test_domain_blacklist_functional.py::TestDomainBlacklistFunctional::test_domain_blacklist_http_https_flow",
+                            ],
+                            "完整验证（推荐）": [
+                                "security/test_domain_blacklist_comprehensive.py::TestDomainBlacklistComprehensive::test_domain_blacklist_comprehensive",
+                                "security/test_domain_blacklist_functional.py::TestDomainBlacklistFunctional::test_domain_blacklist_http_https_flow",
+                            ],
+                        }
+                    },
+                    "网址浏览控制-自定义网址库": {
+                        "testcases": [
+                            "security/test_custom_domain_group_comprehensive.py::TestCustomDomainGroupComprehensive::test_custom_domain_group_comprehensive",
+                            "security/test_custom_domain_group_functional.py::TestCustomDomainGroupFunctional::test_custom_domain_group_http_https_flow",
+                        ],
+                        "groups": {
+                            "综合测试（L1-L2）": [
+                                "security/test_custom_domain_group_comprehensive.py::TestCustomDomainGroupComprehensive::test_custom_domain_group_comprehensive",
+                            ],
+                            "功能测试（L5真实流量）": [
+                                "security/test_custom_domain_group_functional.py::TestCustomDomainGroupFunctional::test_custom_domain_group_http_https_flow",
+                            ],
+                            "完整验证（推荐）": [
+                                "security/test_custom_domain_group_comprehensive.py::TestCustomDomainGroupComprehensive::test_custom_domain_group_comprehensive",
+                                "security/test_custom_domain_group_functional.py::TestCustomDomainGroupFunctional::test_custom_domain_group_http_https_flow",
+                            ],
                         }
                     },
                     "应用协议控制": {

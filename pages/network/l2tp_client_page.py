@@ -1,4 +1,4 @@
-"""L2TP客户端页面类 (网络配置→内外网设置→VPN客户端→L2TP)
+"""L2TP客户端页面类 (虚拟专网→L2TP→L2TP客户端)
 
 数据库表: l2tp_client (底层脚本 l2tp_client.sh, 进程xl2tpd, 拨号生成ppp接口)
 表单字段(id): name*(l2tp开头) | server_port*(1701) | server*(服务器) |
@@ -15,6 +15,8 @@ class L2tpClientPage(VpnClientBasePage):
     """L2TP客户端(拨号名称l2tp开头, 默认端口1701, 可选IPSec预共享密钥)"""
 
     MODULE_NAME = "l2tp_client"
+    LIST_URL = "/#/vpn/l2tp"
+    CLIENT_TAB = "L2TP客户端"
     SUBTAB = "L2TP"
     ADD_URL_TYPE = "L2TP"
     NAME_PREFIX = "l2tp"

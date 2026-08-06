@@ -1,6 +1,6 @@
 """L2TP客户端综合测试用例
 
-网络配置→内外网设置→VPN客户端→L2TP
+虚拟专网→L2TP→L2TP客户端
 SSH后台: L1数据库(l2tp_client表, must_pass) + L2连接(xl2tpd/ppp接口, 软断言)
 字段映射: name(l2tp开头,仅ascii)/server/server_port(1701)/username/passwd/ipsec_secret(预共享密钥,密文)/
           leftid(本地标识)/rightid(对方标识)/mtu/mru/comment

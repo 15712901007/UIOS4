@@ -1207,6 +1207,164 @@ def _basic_add_iperf(
     )
 
 
+def _webuser_account_sql(username: str) -> str:
+    return (
+        "SELECT w.id,w.enabled,w.username,w.force,w.interval,w.passwd_timeout,"
+        "w.sesstimeout,w.group_id,length(COALESCE(w.passwd,'')) AS passwd_len,"
+        "g.group_name,g.ip_addr,g.perm_default,"
+        "length(COALESCE(g.perm_config,'')) AS perm_config_len "
+        "FROM webuser w LEFT JOIN usergroup g ON g.id=w.group_id "
+        f"WHERE w.username={_sql_literal(username)}"
+    )
+
+
+def _webuser_add_runtime_commands(
+    bv, out: List[Dict[str, Any]], username: str, actual: str
+) -> None:
+    _add_router(
+        bv, out, "查看目标账号的Web登录缓存",
+        "grep -F -- " + _double_quote(f"username={username} ")
+        + " /tmp/iktmp/cache/homepage_custom",
+        "启用账号显示一条对应缓存；已删除账号无输出",
+        actual=actual,
+    )
+    _add_router(
+        bv, out, "确认OpenResty主进程正在运行",
+        "pgrep -af 'nginx: master process openresty'",
+        "至少显示一个OpenResty主进程",
+        actual=actual,
+    )
+    _add_router(
+        bv, out, "确认本机登录入口健康",
+        "curl -sS -o /dev/null -w 'HTTP %{http_code}' --connect-timeout 3 http://127.0.0.1/login",
+        "输出HTTP 200、301或302",
+        actual=actual,
+    )
+
+
+def _build_webuser_verification_commands(
+    bv,
+    name: str,
+    params: Dict[str, Any],
+    result: Any,
+) -> List[Dict[str, Any]]:
+    """Build safe, one-command-per-card account-setting replay commands."""
+    out: List[Dict[str, Any]] = []
+    actual = _basic_result_actual(result, params)
+    username = str(params.get("username") or "")
+
+    if name == "verify_webuser_script_contract":
+        _add_router(
+            bv, out, "查看账号脚本的增删改、启停和初始化入口",
+            "grep -nE '^(add|edit|del|up|down|init)\\(\\)' /usr/ikuai/script/webuser.sh",
+            "显示add、edit、del、up、down和init函数入口",
+            actual=actual,
+        )
+        _add_router(
+            bv, out, "查看权限组脚本的增删改和初始化入口",
+            "grep -nE '^(add|edit|del|init)\\(\\)' /usr/ikuai/script/usergroup.sh",
+            "显示add、edit、del和init函数入口",
+            actual=actual,
+        )
+        for table in ("webuser", "usergroup"):
+            _add_router(
+                bv, out, f"查看{table}表结构",
+                f"sqlite3 {DB_PATH} {_double_quote('.schema ' + table)}",
+                "显示字段、默认值、索引和约束",
+                actual=actual,
+            )
+    elif name == "verify_webuser_database" and username:
+        expected = params.get("expected") or {}
+        _add_sql(
+            bv, out, "查看目标账号及关联权限组字段（密码仅显示摘要长度）",
+            _webuser_account_sql(username),
+            f"账号存在且字段符合期望；期望字段={expected}",
+            actual=actual,
+        )
+    elif name == "verify_webuser_default_permission" and username:
+        expected = str(params.get("expected") or "")
+        _add_sql(
+            bv, out, "查看新功能默认权限策略",
+            "SELECT w.username,g.group_name,g.perm_default,"
+            "length(COALESCE(g.perm_config,'')) AS perm_config_len "
+            "FROM webuser w LEFT JOIN usergroup g ON g.id=w.group_id "
+            f"WHERE w.username={_sql_literal(username)}",
+            f"perm_default={expected}（none=不可见，r=可见，rx=可读写）",
+            actual=actual,
+        )
+    elif name == "verify_webuser_permission" and username:
+        mode = str(params.get("mode") or "read")
+        query = _sqlite(
+            "SELECT COALESCE(g.perm_config,'') FROM webuser w "
+            "LEFT JOIN usergroup g ON g.id=w.group_id "
+            f"WHERE w.username={_sql_literal(username)}"
+        )
+        _add_router(
+            bv, out, "逐行查看目标账号的权限项",
+            query + " | tr ',' '\\n'",
+            f"每行格式为功能:权限，关键功能符合{mode}模式",
+            actual=actual,
+        )
+    elif name == "verify_webuser_runtime" and username:
+        _webuser_add_runtime_commands(bv, out, username, actual)
+    elif name == "verify_webuser_reinit" and username:
+        _add_router(
+            bv, out, "按产品脚本重建账号Web运行态",
+            "/usr/ikuai/script/webuser.sh init",
+            "命令退出码为0，账号数据库内容不变",
+            actual=actual,
+            effect="重建账号缓存、权限哈希并重载OpenResty",
+            valid_when="目标账号存在且允许重载Web运行态时",
+        )
+        _add_sql(
+            bv, out, "重建后复核目标账号数据库字段",
+            _webuser_account_sql(username),
+            "账号和关联权限组仍存在，字段与重建前一致",
+            actual=actual,
+        )
+        _webuser_add_runtime_commands(bv, out, username, actual)
+    elif name == "verify_webuser_not_exists" and username:
+        _add_sql(
+            bv, out, "确认账号、同名权限组和API令牌均已删除",
+            "SELECT "
+            f"(SELECT count(*) FROM webuser WHERE username={_sql_literal(username)}) AS account_count,"
+            f"(SELECT count(*) FROM usergroup WHERE group_name={_sql_literal(username)}) AS group_count,"
+            f"(SELECT count(*) FROM api_tokens WHERE username={_sql_literal(username)}) AS token_count",
+            "account_count、group_count、token_count均为0",
+            actual=actual,
+            valid_when="目标账号删除完成后",
+        )
+    elif name == "verify_webuser_environment_unchanged":
+        snapshot = params.get("snapshot") or {}
+        prefix = str(snapshot.get("prefix") or "acct_l15_")
+        predicate = _prefix_predicate(prefix, ("username",))
+        group_predicate = _prefix_predicate(prefix, ("group_name",))
+        _add_sql(
+            bv, out, "核对账号表计数和测试前缀残留",
+            "SELECT "
+            "(SELECT count(*) FROM webuser) AS webuser_count,"
+            "(SELECT count(*) FROM usergroup) AS usergroup_count,"
+            "(SELECT count(*) FROM api_tokens) AS token_count,"
+            f"(SELECT count(*) FROM webuser WHERE {predicate}) AS test_account_count,"
+            f"(SELECT count(*) FROM usergroup WHERE {group_predicate}) AS test_group_count",
+            "总数与测试前快照一致，test_account_count和test_group_count均为0",
+            actual=actual,
+            valid_when="finally清理完成后",
+        )
+        _add_sql(
+            bv, out, "核对管理员非敏感字段未变化",
+            "SELECT id,enabled,username,force,interval,passwd_timeout,sesstimeout,"
+            "group_id,length(COALESCE(passwd,'')) AS passwd_len "
+            "FROM webuser WHERE username='admin'",
+            "管理员字段与测试前一致，passwd_len为32",
+            actual=actual,
+            valid_when="finally清理完成后",
+        )
+        _webuser_add_runtime_commands(bv, out, "admin", actual)
+
+    return _deduplicate(out)
+
+
 def build_verification_commands(
     bv,
     verify_func,
@@ -1255,11 +1413,15 @@ def build_verification_commands(
         module.endswith("ospf_verifier") or
         "ospf" in name or
         name.startswith("verify_vlan_") or
+        name.startswith(("get_webuser_", "verify_webuser_", "cleanup_webuser_")) or
         "alg" in name.lower() or "protocol_control" in name.lower() or
         name.startswith((
             "get_kernel_", "verify_kernel_", "run_kernel_",
             "restore_kernel_", "cleanup_kernel_", "choose_kernel_",
         )) or
+        name.startswith("verify_url_black_") or
+        name.startswith("verify_domain_blacklist_") or
+        name.startswith("verify_custom_domain_group_") or
         "ftp" in name or "samba" in name or "http" in name or
         ("snmp" in name and "netsnmpc" not in name)
     ):
@@ -1267,12 +1429,232 @@ def build_verification_commands(
     params = _bound_arguments(verify_func, args, kwargs)
     out: List[Dict[str, Any]] = []
 
+    if name.startswith("verify_custom_domain_group_"):
+        actual = _basic_result_actual(result, params)
+        tagname = str(params.get("tagname") or "")
+        if name == "verify_custom_domain_group_database":
+            _add_sql(
+                bv, out, "查看自定义网址库数据库记录",
+                "SELECT id,tagname,name,domains FROM custom_domain_group "
+                f"WHERE tagname={_sql_literal(tagname)}",
+                "返回一行，名称、类别和域名与页面一致",
+                actual=actual,
+            )
+        elif name == "verify_custom_domain_group_not_exists":
+            _add_sql(
+                bv, out, "确认自定义网址库记录已删除",
+                "SELECT id,tagname FROM custom_domain_group "
+                f"WHERE tagname={_sql_literal(tagname)}",
+                "无输出", actual=actual,
+            )
+        elif name == "verify_custom_domain_group_rule_set":
+            _add_sql(
+                bv, out, "查看自定义网址库记录集合",
+                "SELECT id,tagname,name,domains FROM custom_domain_group ORDER BY id",
+                "名称集合与本步骤期望完全一致且无重复",
+                actual=actual,
+            )
+        elif name == "verify_custom_domain_group_script_contract":
+            _add_router(
+                bv, out, "审计domain_group.sh底层实现",
+                "sed -n '1,360p' /usr/ikuai/script/domain_group.sh",
+                "包含custom_domain_group、分类展开、查询、CRUD和导入导出入口",
+                actual=actual,
+            )
+        elif name in {
+            "verify_custom_domain_group_category_domains",
+            "verify_custom_domain_group_resolution",
+            "verify_custom_domain_group_consistency",
+        }:
+            # The device entry point requires a shell-style ``groups=``
+            # argument. The report uses the actually executed, validated command
+            # captured by verify_helper instead of synthesizing one here.
+            return []
+        return _deduplicate(out)
+
+    if name.startswith("verify_domain_blacklist_"):
+        actual = _basic_result_actual(result, params)
+        tagname = str(params.get("tagname") or "")
+        if name == "verify_domain_blacklist_database":
+            _add_sql(
+                bv, out, "查看禁止娱乐网站数据库记录",
+                "SELECT id,enabled,domain_group,src_addr,time,comment,tagname "
+                f"FROM domain_blacklist WHERE tagname={_sql_literal(tagname)}",
+                "返回一行，分类、内网IP、时间、备注及启用状态与页面一致",
+                actual=actual,
+            )
+        elif name == "verify_domain_blacklist_not_exists":
+            _add_sql(
+                bv, out, "确认禁止娱乐网站规则已删除",
+                f"SELECT id,tagname FROM domain_blacklist WHERE tagname={_sql_literal(tagname)}",
+                "无输出", actual=actual,
+            )
+        elif name == "verify_domain_blacklist_rule_set":
+            _add_sql(
+                bv, out, "查看禁止娱乐网站规则集合",
+                "SELECT id,tagname,enabled,domain_group FROM domain_blacklist ORDER BY id",
+                "名称集合与本步骤期望完全一致且无重复",
+                actual=actual,
+            )
+        elif name == "verify_domain_blacklist_script_contract":
+            _add_router(
+                bv, out, "审计domain_blacklist.sh底层实现",
+                "sed -n '1,420p' /usr/ikuai/script/domain_blacklist.sh",
+                "包含REST注册、DB表、分类展开、BLACK_DOMAIN、src/time和完整生命周期入口",
+                actual=actual,
+            )
+        elif name == "verify_domain_blacklist_group_catalog":
+            _add_router(
+                bv, out, "核对休闲娱乐网站分类库",
+                "find /usr/libproto/domaingroup -maxdepth 1 -type f -name '休闲娱乐-*.txt' -print | sort",
+                "显示动漫、娱乐时尚、小说、笑话、收藏、星座、游戏、社交、视频、音乐共10类",
+                actual=actual,
+            )
+        elif name == "verify_domain_blacklist_generated_rule":
+            _add_router(
+                bv, out, "查看禁止娱乐网站DPI生成配置",
+                "grep -E 'name: \"domain_blacklist\"|action: BLACK_DOMAIN|mul_hosts:|src_ipset:|time_set:' "
+                "/tmp/iktmp/url_filter/05-01-domain_blacklist.txt",
+                "启用规则包含BLACK_DOMAIN、分类代表域名及专属src_ipset/time_set；停用或删除后专属标记消失",
+                actual=actual,
+            )
+        elif name == "verify_domain_blacklist_ipset":
+            source = str(ipaddress.ip_address(str(params.get("source"))))
+            rule = bv.find_domain_blacklist_rule(tagname) or {}
+            rule_id = int(rule.get("id", 0))
+            _add_router(
+                bv, out, "确认客户端IP属于禁止娱乐网站源集合",
+                f"ipset test _domain_blacklist_src_{rule_id} {source}",
+                f"退出码为0，{source}属于_domain_blacklist_src_{rule_id}",
+                actual=actual,
+            )
+        elif name == "verify_domain_blacklist_consistency":
+            _add_sql(
+                bv, out, "统计禁止娱乐网站启用规则",
+                "SELECT count(*) AS enabled_count FROM domain_blacklist WHERE enabled='yes'",
+                "enabled_count等于domain_blacklist DPI块数量",
+                actual=actual,
+            )
+            _add_router(
+                bv, out, "统计禁止娱乐网站DPI配置块",
+                "grep -c 'name: \"domain_blacklist\"' /tmp/iktmp/url_filter/05-01-domain_blacklist.txt",
+                "数量与数据库启用规则数一致，每条启用规则有专属src/time标记",
+                actual=actual,
+            )
+        elif name == "verify_domain_blacklist_artifacts_absent":
+            rule_id = int(params.get("rule_id") or 0)
+            _add_router(
+                bv, out, "检查禁止娱乐网站源集合删除残留",
+                f"ipset list -n | grep -E '^_?domain_blacklist_src_{rule_id}(_mac)?$'",
+                "无输出",
+                actual=actual,
+            )
+            _add_router(
+                bv, out, "检查禁止娱乐网站时间计划删除残留",
+                f"grep -F 'domain_blacklist_time_{rule_id}' /tmp/iktmp/url_filter/05-01-domain_blacklist.txt",
+                "无输出",
+                actual=actual,
+            )
+        elif name == "verify_domain_blacklist_flow":
+            protocol = str(params.get("protocol") or "http").lower()
+            domain = str(params.get("domain") or "")
+            iface = str(params.get("iface") or "ens11")
+            _add_client(
+                bv, out, f"复验{protocol.upper()}禁止娱乐网站真实流量",
+                f"curl --noproxy '*' --interface {iface} --connect-timeout 6 --max-time 12 "
+                f"--silent --show-error --output /dev/null --write-out '%{{http_code}}' {protocol}://{domain}/",
+                "放行返回100-599状态码且curl成功；阻断为连接重置、TLS握手失败或000",
+                actual=actual,
+                effect="发送一条HTTP或HTTPS测试请求",
+            )
+        return _deduplicate(out)
+
+    if name.startswith("verify_url_black_"):
+        actual = _basic_result_actual(result, params)
+        tagname = str(params.get("tagname") or "")
+        if name == "verify_url_black_database":
+            _add_sql(
+                bv, out, "查看网址黑白名单数据库记录",
+                "SELECT id,enabled,tagname,comment,domain,src_addr,time,mode "
+                f"FROM url_black WHERE tagname={_sql_literal(tagname)}",
+                "返回一行，模式、域名、内网IP、生效时间及启用状态与页面一致",
+                actual=actual,
+            )
+        elif name == "verify_url_black_not_exists":
+            _add_sql(
+                bv, out, "确认网址黑白名单规则已删除",
+                f"SELECT id,tagname FROM url_black WHERE tagname={_sql_literal(tagname)}",
+                "无输出", actual=actual,
+            )
+        elif name == "verify_url_black_generated_rule":
+            _add_router(
+                bv, out, "查看网址黑白名单DPI生成配置",
+                "sed -n '/name: \"black_white_domain\"/,+12p' /tmp/iktmp/url_filter/05-02-url_black_white.txt",
+                "启用规则显示BLACK_DOMAIN或WHITE_DOMAIN、转义域名及可选src_ipset/time_set",
+                actual=actual,
+            )
+        elif name == "verify_url_black_ipset":
+            source = str(ipaddress.ip_address(str(params.get("source"))))
+            rule = bv.find_url_black_rule(tagname) or {}
+            rule_id = int(rule.get("id", 0))
+            _add_router(
+                bv, out, "确认客户端IP属于网址规则源地址集合",
+                f"ipset test _urlblack_src_{rule_id} {source}",
+                f"输出{source} is in set _urlblack_src_{rule_id}，退出码为0",
+                actual=actual,
+            )
+        elif name == "verify_url_black_consistency":
+            _add_sql(
+                bv, out, "统计网址黑白名单启用规则",
+                "SELECT count(*) AS enabled_count FROM url_black WHERE enabled='yes'",
+                "enabled_count等于DPI配置中的black_white_domain块数量",
+                actual=actual,
+            )
+            _add_router(
+                bv, out, "统计网址黑白名单DPI配置块",
+                "grep -c 'name: \"black_white_domain\"' /tmp/iktmp/url_filter/05-02-url_black_white.txt",
+                "数量与数据库启用规则数一致", actual=actual,
+            )
+            _add_router(
+                bv, out, "查看网址黑白名单源地址集合",
+                "ipset list -n 2>/dev/null | grep -E '^_?urlblack_src_[0-9]+'",
+                "仅出现数据库现存规则ID对应的集合；无源地址规则可无输出",
+                actual=actual,
+            )
+        elif name == "verify_url_black_setting":
+            _add_sql(
+                bv, out, "查看白名单HTTP外链放行开关",
+                "SELECT url_white_refer FROM global_config WHERE id=1",
+                "关闭为0，开启为1；该开关只处理可见的HTTP Referer",
+                actual=actual,
+            )
+        elif name == "verify_url_black_flow":
+            protocol = str(params.get("protocol") or "http").lower()
+            domain = str(params.get("domain") or "")
+            iface = str(params.get("iface") or "ens11")
+            referer = str(params.get("referer") or "")
+            header = f" -H {_double_quote('Referer: ' + referer)}" if referer else ""
+            _add_client(
+                bv, out, f"复验{protocol.upper()}网址黑白名单真实流量",
+                f"curl --noproxy '*' --interface {iface} --connect-timeout 6 --max-time 12{header} "
+                f"--silent --show-error --output /dev/null --write-out '%{{http_code}}' {protocol}://{domain}/",
+                "正向放行返回100-599状态码且curl成功；阻断场景为连接重置/握手失败或000",
+                actual=actual,
+                effect="发送一条HTTP或HTTPS测试请求",
+            )
+        return _deduplicate(out)
+
     # Mutating restoration/cleanup helpers are intentionally never offered as
     # copy-ready commands.  Their separate read-only audit calls carry commands.
     if name.startswith(("get_", "restore_", "cleanup_", "prepare_")):
         return []
     if name in {"repair_alg_nat_runtime", "repair_protocol_control_nat_runtime"}:
         return []
+
+    if name.startswith("verify_webuser_"):
+        return _build_webuser_verification_commands(
+            bv, name, params, result
+        )
 
     if module.endswith("ipsec_verifier"):
         actual = _basic_result_actual(result, params)
